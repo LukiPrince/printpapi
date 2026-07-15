@@ -1,0 +1,2 @@
+# Normalize all text to LF in the repo and working tree (Windows agent dev churns CRLF otherwise).
+* text=auto eol=lf

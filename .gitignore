@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+*.egg-info/
+.venv/
+venv/
+
+# Build / packaging artifacts
+dist/
+build/
+*.exe
+*.zip
+*.spec
+SumatraPDF.exe
+
+# Secrets / local config — never commit
+.env
+agent.ini
+*-error.log
+
+# Local databases (quickstart creates dev.db; server default is printpapi.db)
+*.db
+*.db-wal
+*.db-shm
+
+# SDD scratch (briefs, reports, progress ledger)
+.superpowers/

@@ -1,0 +1,398 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>printpapi</title>
+<link rel="icon" href="data:image/png;base64,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">
+<style>
+:root{
+  color-scheme:light dark;
+  --paper:#f3f2ee;        /* thermal-paper neutral */
+  --panel:#ffffff;
+  --ink:#1b2733;          /* printer ink */
+  --muted:#67717c;
+  --line:#e2e2dc;
+  --side:#141b22;         /* sidebar = the ink block */
+  --side-ink:#9fabb8;
+  --accent:#f59e0b;       /* spool amber */
+  --accent-ink:#6b4102;
+  --blue:#2563eb;
+  --ok:#178a43;--ok-bg:#e0f2e6;
+  --bad:#c22e2e;--bad-bg:#fbe9e9;
+  --wait:#5b6570;--wait-bg:#eceded;
+  --claim:#1d5fd4;--claim-bg:#e6eeff;
+  --mono:ui-monospace,"Cascadia Code",Consolas,"SF Mono",Menlo,monospace;
+  --sans:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;
+}
+@media (prefers-color-scheme: dark){
+  :root{
+    --paper:#12161b;--panel:#1a2027;--ink:#e4e8ec;--muted:#8b96a1;--line:#2a323b;
+    --side:#0d1116;--side-ink:#8d99a6;
+    --ok-bg:#12331f;--bad-bg:#3a1717;--wait-bg:#252a30;--claim-bg:#16243f;
+  }
+}
+*{box-sizing:border-box}
+body{margin:0;font:15px/1.55 var(--sans);background:var(--paper);color:var(--ink)}
+a{color:var(--blue);text-decoration:none}
+code,pre,.mono{font-family:var(--mono)}
+:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+
+/* the barcode strip — printpapi's mark. pure CSS, reads as printed. */
+.barcode{height:16px;background:repeating-linear-gradient(90deg,
+  currentColor 0 2px,transparent 2px 5px,currentColor 5px 9px,transparent 9px 11px,
+  currentColor 11px 12px,transparent 12px 17px,currentColor 17px 19px,transparent 19px 24px);
+  opacity:.85}
+
+/* login — a shipping label */
+#login{max-width:23rem;margin:12vh auto 0;background:var(--panel);border:1.5px solid var(--ink);
+  padding:1.4rem 1.5rem 1.6rem;box-shadow:6px 6px 0 rgba(27,39,51,.14)}
+@media (prefers-reduced-motion: no-preference){
+  #login{animation:feed .45s cubic-bezier(.2,.8,.3,1) both}
+  @keyframes feed{from{opacity:0;transform:translateY(-14px)}to{opacity:1;transform:none}}
+}
+#login .brandrow{display:flex;align-items:center;gap:.7rem;margin-bottom:.9rem}
+#login .brandrow img{width:44px;height:44px}
+#login h1{margin:0;font:700 1.35rem/1 var(--mono);letter-spacing:-.02em}
+#login .eyebrow{font:600 .68rem/1 var(--mono);letter-spacing:.22em;text-transform:uppercase;color:var(--muted)}
+#login .barcode{margin:0 0 1.1rem;color:var(--ink)}
+#login button{width:100%;margin-top:.6rem}
+
+input,select{font:inherit;color:var(--ink);background:var(--panel);border:1px solid var(--line);
+  border-radius:6px;padding:.5rem .6rem;width:100%}
+input::placeholder{color:var(--muted)}
+button{font:600 .9rem/1.4 var(--sans);cursor:pointer;border:0;border-radius:6px;
+  padding:.55rem .95rem;background:var(--ink);color:var(--paper)}
+button:hover{filter:brightness(1.12)}
+button.accent{background:var(--accent);color:#231503;font-family:var(--mono);
+  font-weight:700;letter-spacing:.06em}
+button.ghost{background:transparent;color:var(--ink);border:1px solid var(--line)}
+button.danger{background:transparent;color:var(--bad);border:1px solid var(--bad)}
+
+#app{display:none;grid-template-columns:230px minmax(0,1fr) 290px;min-height:100vh}
+#app.show{display:grid}
+
+nav{background:var(--side);color:var(--side-ink);padding:1.1rem .8rem;display:flex;flex-direction:column;gap:.15rem}
+nav .brand{display:flex;align-items:center;gap:.6rem;color:#fff;
+  font:700 1.05rem/1 var(--mono);letter-spacing:-.02em;padding:.3rem .5rem .8rem}
+nav .brand img{width:30px;height:30px}
+nav .barcode{color:#fff;opacity:.3;margin:0 .5rem .9rem}
+nav a{color:var(--side-ink);padding:.55rem .7rem;border-radius:6px;font-size:.95rem}
+nav a.active{background:var(--accent);color:#231503;font-weight:600}
+nav a:hover:not(.active){background:rgba(255,255,255,.07);color:#fff}
+nav #signout{font-family:var(--mono);font-size:.8rem;letter-spacing:.08em;text-transform:uppercase}
+
+main{padding:1.5rem 1.8rem;min-width:0}
+.topbar{margin-bottom:1.1rem}
+.topbar .eyebrow{font:600 .68rem/1 var(--mono);letter-spacing:.22em;text-transform:uppercase;color:var(--muted)}
+h2{font:700 1.45rem/1.2 var(--sans);margin:.25rem 0 0;letter-spacing:-.01em}
+
+aside{padding:1.5rem 1.2rem;border-left:1px solid var(--line);background:var(--panel)}
+aside h3{margin:.1rem 0 .6rem;font:600 .72rem/1 var(--mono);letter-spacing:.2em;
+  text-transform:uppercase;color:var(--accent-ink)}
+@media (prefers-color-scheme: dark){ aside h3{color:var(--accent)} }
+
+.card{background:var(--panel);border:1px solid var(--line);border-radius:10px;
+  padding:1.1rem 1.2rem;margin-bottom:1.2rem;overflow-x:auto}
+label.f{display:block;font:600 .72rem/1 var(--mono);letter-spacing:.14em;text-transform:uppercase;
+  color:var(--muted);margin:.9rem 0 .3rem}
+.row{display:flex;gap:.6rem;align-items:center}
+
+table{width:100%;border-collapse:collapse;font-family:var(--mono);font-size:.88rem}
+th,td{text-align:left;padding:.6rem .65rem;border-bottom:1px solid var(--line);white-space:nowrap}
+th{font:600 .68rem/1 var(--mono);text-transform:uppercase;letter-spacing:.16em;color:var(--muted)}
+tr:last-child td{border-bottom:0}
+td .muted{font-size:.8rem}
+
+/* status chips — little thermal labels */
+.badge{display:inline-block;padding:.14rem .5rem;border-radius:3px;
+  font:600 .72rem/1.5 var(--mono);text-transform:uppercase;letter-spacing:.08em}
+.on,.done{background:var(--ok-bg);color:var(--ok)}
+.off,.failed{background:var(--bad-bg);color:var(--bad)}
+.queued{background:var(--wait-bg);color:var(--wait)}
+.claimed{background:var(--claim-bg);color:var(--claim)}
+
+.muted{color:var(--muted)}.err{color:var(--bad)}
+.drop{border:2px dashed var(--line);border-radius:8px;padding:1.5rem;text-align:center;
+  color:var(--muted);cursor:pointer;font-family:var(--mono);font-size:.85rem}
+.drop.hl{border-color:var(--accent);color:var(--accent-ink)}
+.keybox{background:var(--wait-bg);border:1.5px dashed var(--accent);border-radius:6px;
+  padding:.7rem .8rem;font-family:var(--mono);font-size:.85rem;word-break:break-all;margin-top:.8rem}
+.jrow{cursor:pointer}
+.jrow:hover td{background:rgba(245,158,11,.06)}
+pre{background:var(--side);color:#dfe5ea;border-radius:8px;padding:.9rem 1rem;overflow:auto;
+  font-size:.83rem;line-height:1.6}
+.hint{font-size:.9rem;color:var(--muted)}
+
+@media (max-width:1100px){
+  #app{grid-template-columns:230px minmax(0,1fr)}
+  aside{display:none}
+}
+@media (max-width:780px){
+  #app.show{display:block}
+  nav{flex-direction:row;align-items:center;overflow-x:auto;gap:.3rem;padding:.6rem .8rem}
+  nav .brand{padding:.3rem .4rem}
+  nav .barcode,nav div[style]{display:none}
+  main{padding:1.1rem 1rem}
+}
+</style>
+</head>
+<body>
+<div id="login">
+  <div class="brandrow">
+    <img src="data:image/png;base64,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" alt="">
+    <div>
+      <div class="eyebrow">Print bridge</div>
+      <h1>printpapi</h1>
+    </div>
+  </div>
+  <div class="barcode" aria-hidden="true"></div>
+  <p class="hint">Enter your API token to connect.</p>
+  <input id="tok" type="password" placeholder="API token" autocomplete="off">
+  <button id="connect">Connect</button>
+  <p id="loginerr" class="err"></p>
+</div>
+
+<div id="app">
+  <nav>
+    <div class="brand"><img src="data:image/png;base64,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" alt="">printpapi</div>
+    <div class="barcode" aria-hidden="true"></div>
+    <a href="#print">Print Something</a>
+    <a href="#devices">Devices</a>
+    <a href="#history">Print History</a>
+    <a href="#keys">API Keys</a>
+    <a href="#downloads">Downloads</a>
+    <div style="flex:1"></div>
+    <a href="#" id="signout">Sign Out</a>
+  </nav>
+  <main>
+    <div class="topbar"><div class="eyebrow" id="crumb">printpapi</div><h2 id="title">Print Something</h2></div>
+    <div id="view"></div>
+  </main>
+  <aside><h3>Help &amp; Tips</h3><div id="help" class="hint"></div></aside>
+</div>
+
+<script>
+const PDF_B64="__PDF_B64__", ZPL_B64="__ZPL_B64__";
+const $=s=>document.querySelector(s);
+const esc=s=>(s==null?"":String(s)).replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+const token=()=>localStorage.getItem("printpapi_token")||"";
+const fmt=t=>t?new Date(t*1000).toLocaleString():"";
+let PRINTERS=[], JUST_ISSUED=null;
+
+async function api(path,opts){
+  opts=opts||{};
+  opts.headers=Object.assign({},opts.headers,{Authorization:"Bearer "+token()});
+  const r=await fetch(path,opts);
+  if(r.status===401){ logout(); throw new Error("unauthorized"); }
+  return r;
+}
+function fileToB64(file){
+  return new Promise((res,rej)=>{const r=new FileReader();
+    r.onload=()=>res(r.result.split(",",2)[1]); r.onerror=rej; r.readAsDataURL(file);});
+}
+async function loadPrinters(){ const r=await api("/printers"); PRINTERS=(await r.json()).printers||[]; return PRINTERS; }
+
+function showApp(){ $("#login").style.display="none"; $("#app").classList.add("show"); }
+function showLogin(){ $("#app").classList.remove("show"); $("#login").style.display="block"; }
+function logout(){ localStorage.removeItem("printpapi_token"); showLogin(); }
+$("#connect").onclick=async()=>{
+  const t=$("#tok").value.trim(); if(!t)return;
+  localStorage.setItem("printpapi_token",t);
+  try{ const r=await fetch("/printers",{headers:{Authorization:"Bearer "+t}});
+    if(r.status===401){ $("#loginerr").textContent="Invalid token."; localStorage.removeItem("printpapi_token"); return; }
+    if(!location.hash) location.hash="#print"; showApp(); route();
+  }catch(e){ $("#loginerr").textContent="Cannot reach server."; }
+};
+$("#tok").addEventListener("keydown",e=>{if(e.key==="Enter")$("#connect").click();});
+$("#signout").onclick=e=>{e.preventDefault(); logout();};
+
+const HELP={
+  print:"Pick a source and a printer, then hit PRINT. Label printers (raw) can’t render PDFs — upload ZPL/raw for those.",
+  devices:"Printers registered by your agents. Green = the agent polled within the last minute. Test-print sends a sample label or PDF.",
+  history:"Recent jobs. Click a row for type, mode and any error. State: queued → claimed → done/failed.",
+  keys:"Per-client API keys — one per integration. The key is shown once; revoke to cut access instantly.",
+  downloads:"Install the agent on the machine with the printers. It polls this server — no inbound ports needed."
+};
+const TITLES={print:"Print Something",devices:"Devices",history:"Print History",keys:"API Keys",downloads:"Downloads"};
+const CRUMBS={print:"Submit a job",devices:"Agents & printers",history:"Job queue",keys:"Access",downloads:"Agent setup"};
+function route(){
+  const h=location.hash.replace("#","")||"print";
+  const view=["print","devices","history","keys","downloads"].includes(h)?h:"print";
+  document.querySelectorAll("nav a").forEach(a=>a.classList.toggle("active",a.getAttribute("href")==="#"+view));
+  $("#title").textContent=TITLES[view];
+  $("#crumb").textContent=CRUMBS[view];
+  $("#help").innerHTML=HELP[view];
+  ({print:viewPrint,devices:viewDevices,history:viewHistory,keys:viewKeys,downloads:viewDownloads}[view])();
+}
+window.addEventListener("hashchange",route);
+
+function viewError(msg){ $("#view").innerHTML='<div class="card err">'+esc(msg)+'</div>'; }
+
+async function viewPrint(){
+  try{ await loadPrinters(); }
+  catch(e){ return viewError(e.message==="unauthorized" ? "This page needs the admin (bootstrap) token. Sign out and log in with it." : "Could not load: "+e.message); }
+  const opts=PRINTERS.map(p=>`<option value="${p.id}" data-pdf="${p.can_pdf?1:0}">${esc(p.name)} — ${esc(p.agent_name)}${p.online?"":" (offline)"}</option>`).join("");
+  $("#view").innerHTML=`
+   <div class="card" style="max-width:640px">
+    <label class="f">Source</label>
+    <select id="src">
+      <option value="pdf">Upload a PDF (document printer)</option>
+      <option value="raw">Upload a raw file (ZPL / label printer)</option>
+      <option value="url">Fetch from URL</option>
+      <option value="test">Test document</option>
+    </select>
+    <label class="f">Printer</label>
+    <select id="printer">${opts||'<option value="">No printers registered</option>'}</select>
+    <label class="f">Title (optional)</label>
+    <input id="jobtitle" placeholder="e.g. Shipping label #4712">
+    <div id="srcinput"></div>
+    <div style="height:1rem"></div>
+    <button class="accent" id="print">PRINT</button>
+    <span id="printmsg" class="hint"></span>
+   </div>`;
+  let picked=null;
+  function wireDrop(){
+    const drop=$("#drop"), file=$("#file"); if(!drop)return;
+    drop.onclick=()=>file.click();
+    file.onchange=()=>{picked=file.files[0]; $("#fname").textContent=picked?picked.name:"";};
+    ["dragover","dragenter"].forEach(ev=>drop.addEventListener(ev,e=>{e.preventDefault();drop.classList.add("hl");}));
+    ["dragleave"].forEach(ev=>drop.addEventListener(ev,e=>{e.preventDefault();drop.classList.remove("hl");}));
+    drop.addEventListener("drop",e=>{e.preventDefault();drop.classList.remove("hl");picked=e.dataTransfer.files[0]; $("#fname").textContent=picked?picked.name:"";});
+  }
+  function srcInput(){
+    const s=$("#src").value;
+    if(s==="url") $("#srcinput").innerHTML=`<label class="f">URL</label><input id="url" placeholder="https://…"><label class="f"><input type="checkbox" id="urlpdf" style="width:auto"> This URL returns a PDF (render it)</label>`;
+    else if(s==="test") $("#srcinput").innerHTML=`<p class="hint">Sends the built-in test page (PDF for document printers, a ZPL label otherwise).</p>`;
+    else $("#srcinput").innerHTML=`<label class="f">File</label><div class="drop" id="drop">Drag &amp; drop or click to choose a file</div><input type="file" id="file" style="display:none"><span id="fname" class="hint"></span>`;
+    wireDrop();
+  }
+  function msg(t,isErr){ const m=$("#printmsg"); m.textContent=" "+t; m.className="hint "+(isErr?"err":""); }
+  $("#src").onchange=()=>{picked=null; srcInput();}; srcInput();
+  $("#print").onclick=async()=>{
+    const sel=$("#printer"), opt=sel.selectedOptions[0];
+    const printer_id=Number(sel.value); const canPdf=!!(opt&&opt.dataset.pdf==="1");
+    if(!printer_id) return msg("Select a printer.",true);
+    const title=$("#jobtitle").value.trim()||null; const s=$("#src").value; let body;
+    try{
+      if(s==="pdf"){ if(!canPdf) return msg("This printer is raw-only (label). Use a raw file.",true);
+        if(!picked) return msg("Choose a PDF first.",true);
+        body={printer_id,type:"pdf_base64",content:await fileToB64(picked),title}; }
+      else if(s==="raw"){ if(!picked) return msg("Choose a file first.",true);
+        body={printer_id,type:"raw_base64",content:await fileToB64(picked),title}; }
+      else if(s==="url"){ const u=$("#url").value.trim(); if(!u) return msg("Enter a URL.",true);
+        const asPdf=$("#urlpdf").checked; if(asPdf&&!canPdf) return msg("This printer can’t render PDF.",true);
+        body={printer_id,type:asPdf?"pdf_uri":"raw_uri",url:u,title}; }
+      else { body=canPdf?{printer_id,type:"pdf_base64",content:PDF_B64,title:title||"test page"}
+                        :{printer_id,type:"raw_base64",content:ZPL_B64,title:title||"test label"}; }
+      const r=await api("/jobs",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)});
+      msg(r.ok?"Job queued.":"Failed ("+r.status+").",!r.ok);
+    }catch(e){ msg("Error: "+e.message,true); }
+  };
+}
+
+async function viewDevices(){
+  try{
+  await loadPrinters();
+  const rows=PRINTERS.length?PRINTERS.map(p=>`<tr>
+    <td>${esc(p.name)}</td><td class="muted">${esc(p.agent_name)}</td>
+    <td><span class="badge ${p.online?"on":"off"}">${p.online?"online":"offline"}</span></td>
+    <td>${p.can_pdf?"yes":"no"}</td>
+    <td><button class="ghost" data-pid="${p.id}" data-pdf="${p.can_pdf?1:0}">Test print</button></td>
+    </tr>`).join(""):`<tr><td colspan="5" class="muted">No printers registered yet — install an agent to add some.</td></tr>`;
+  $("#view").innerHTML=`<div class="card"><table>
+    <thead><tr><th>Printer</th><th>Computer</th><th>Status</th><th>PDF</th><th></th></tr></thead>
+    <tbody>${rows}</tbody></table></div>`;
+  $("#view").querySelectorAll("button[data-pid]").forEach(b=>b.onclick=async()=>{
+    const pid=Number(b.dataset.pid), canPdf=b.dataset.pdf==="1";
+    const body=canPdf?{printer_id:pid,type:"pdf_base64",content:PDF_B64,title:"test page"}
+                     :{printer_id:pid,type:"raw_base64",content:ZPL_B64,title:"test label"};
+    const r=await api("/jobs",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)});
+    b.textContent=r.ok?"Queued ✓":"Failed"; setTimeout(()=>b.textContent="Test print",1500);
+  });
+  }catch(e){ viewError(e.message==="unauthorized" ? "This page needs the admin (bootstrap) token. Sign out and log in with it." : "Could not load: "+e.message); }
+}
+
+async function viewHistory(){
+  try{
+  const r=await api("/jobs"); const jobs=(await r.json()).jobs||[];
+  const rows=jobs.length?jobs.map(j=>`
+    <tr class="jrow" data-id="${j.id}">
+      <td>${j.id}<div class="muted">${esc(j.title||"")}</div></td>
+      <td class="muted">${esc(j.agent_name)}</td>
+      <td>${esc(j.printer_name)}</td>
+      <td class="muted">${fmt(j.created_at)}</td>
+      <td><span class="badge ${esc(j.state)}">${esc(j.state)}</span></td>
+    </tr>
+    <tr class="jdet" data-for="${j.id}" style="display:none"><td colspan="5" class="muted">
+      type ${esc(j.type)} · mode ${esc(j.mode)} · finished ${fmt(j.finished_at)||"—"}${j.error?` · <span class="err">${esc(j.error)}</span>`:""}
+    </td></tr>`).join(""):`<tr><td colspan="5" class="muted">No jobs yet — print something.</td></tr>`;
+  $("#view").innerHTML=`<div class="card"><table>
+    <thead><tr><th>Job</th><th>Computer</th><th>Printer</th><th>Created</th><th>State</th></tr></thead>
+    <tbody>${rows}</tbody></table></div>`;
+  $("#view").querySelectorAll(".jrow").forEach(tr=>tr.onclick=()=>{
+    const d=$(`.jdet[data-for="${tr.dataset.id}"]`); d.style.display=d.style.display==="none"?"table-row":"none";
+  });
+  }catch(e){ viewError(e.message==="unauthorized" ? "This page needs the admin (bootstrap) token. Sign out and log in with it." : "Could not load: "+e.message); }
+}
+
+async function viewKeys(){
+  try{
+  const r=await api("/apikeys"); const keys=(await r.json()).keys||[];
+  const rows=keys.length?keys.map(k=>`<tr>
+    <td>${esc(k.label)}</td><td class="muted">${fmt(k.created_at)}</td>
+    <td><span class="badge ${k.active?"on":"off"}">${k.active?"active":"revoked"}</span></td>
+    <td>${k.active?`<button class="danger" data-kid="${k.id}">Revoke</button>`:""}</td>
+    </tr>`).join(""):`<tr><td colspan="4" class="muted">No keys yet.</td></tr>`;
+  const box=JUST_ISSUED?`<div class="keybox"><b>${esc(JUST_ISSUED.label)}</b> — copy now, shown once:<br>${esc(JUST_ISSUED.key)}</div>`:"";
+  JUST_ISSUED=null;
+  $("#view").innerHTML=`
+   <div class="card" style="max-width:520px">
+    <label class="f">New key label</label>
+    <div class="row"><input id="klabel" placeholder="e.g. n8n"><button id="newkey">Issue</button></div>
+    ${box}
+   </div>
+   <div class="card"><table>
+    <thead><tr><th>Label</th><th>Created</th><th>Status</th><th></th></tr></thead>
+    <tbody>${rows}</tbody></table></div>`;
+  $("#newkey").onclick=async()=>{
+    const label=$("#klabel").value.trim()||"client";
+    const rr=await api("/apikeys",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({label})});
+    if(rr.ok){ JUST_ISSUED=await rr.json(); viewKeys(); }
+  };
+  $("#view").querySelectorAll("button[data-kid]").forEach(b=>b.onclick=async()=>{
+    const rr=await api("/apikeys/"+b.dataset.kid,{method:"DELETE"}); if(rr.ok) viewKeys();
+  });
+  }catch(e){ viewError(e.message==="unauthorized" ? "This page needs the admin (bootstrap) token. Sign out and log in with it." : "Could not load: "+e.message); }
+}
+
+function viewDownloads(){
+  $("#view").innerHTML=`
+   <div class="card">
+    <h3>Install the agent</h3>
+    <p class="hint">Run on the machine connected to the printers. It polls this server over HTTP(S) — no inbound ports required.</p>
+    <ol>
+      <li>Get <code>agent/print_agent.py</code> from the printpapi repo.</li>
+      <li>Python 3.9+. Windows also needs <code>pywin32</code> + SumatraPDF (PDF); Linux uses CUPS <code>lp</code>.</li>
+      <li>Create <code>agent.ini</code> next to the script (template below).</li>
+      <li>Run <code>python print_agent.py</code> (autostart via Task Scheduler / systemd).</li>
+    </ol>
+    <h3>agent.ini</h3>
+    <pre>[agent]
+server_url = ${esc(location.origin)}
+api_key = &lt;your agent key&gt;
+name = office-pc
+; printers: semicolon-separated. Append |pdf for document printers.
+; A CUPS queue / Windows printer name, or socket://IP:PORT for a raw network printer.
+printers = Zebra GK420d ; HP LaserJet|pdf ; netz-bixolon = socket://192.168.1.50:9100</pre>
+    <p class="hint">socket:// printers are raw-only (ZPL/ESC-POS) — a network printer can’t render a PDF.</p>
+   </div>`;
+}
+
+if(token()){ if(!location.hash) location.hash="#print"; showApp(); route(); } else { showLogin(); }
+setInterval(()=>{ if(token()&&$("#app").classList.contains("show")){
+  const h=location.hash.replace("#","")||"print";
+  if(h==="devices")viewDevices(); else if(h==="history")viewHistory(); } },5000);
+</script>
+</body>
+</html>
