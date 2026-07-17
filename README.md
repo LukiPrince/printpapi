@@ -21,11 +21,15 @@ git clone https://github.com/LukiPrince/printpapi && cd printpapi
 PRINTAPI_TOKEN=change-me python -m app.server
 ```
 
-Open the dashboard at http://localhost:3460 and paste the token. Or use Docker:
+Open the dashboard at http://localhost:3460 and paste the token. Or use the prebuilt
+Docker image — no build needed (amd64 + arm64):
 
 ```bash
-docker build -t printpapi . && docker run -e PRINTAPI_TOKEN=change-me -p 3460:3460 printpapi
+docker run -e PRINTAPI_TOKEN=change-me -p 3460:3460 ghcr.io/lukiprince/printpapi
 ```
+
+Or `docker compose up -d` (persists the DB in a volume — see [`docker-compose.yml`](docker-compose.yml)).
+Prefer to build it yourself? `docker build -t printpapi .`
 
 **Agent** — on the machine with the printers:
 

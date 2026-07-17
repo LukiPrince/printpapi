@@ -1,0 +1,16 @@
+# Prebuilt image, no build step. `docker compose up -d`.
+# Set PRINTAPI_TOKEN first: export PRINTAPI_TOKEN=change-me
+services:
+  printpapi:
+    image: ghcr.io/lukiprince/printpapi:latest
+    ports:
+      - "3460:3460"
+    environment:
+      PRINTAPI_TOKEN: ${PRINTAPI_TOKEN:?set PRINTAPI_TOKEN}
+      PRINT_DB: /app/data/printpapi.db   # SQLite holds jobs + API keys — keep it on the volume
+    volumes:
+      - printpapi-data:/app/data
+    restart: unless-stopped
+
+volumes:
+  printpapi-data:

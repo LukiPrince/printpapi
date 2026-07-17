@@ -1,0 +1,10 @@
+.git
+__pycache__/
+*.pyc
+.pytest_cache/
+tests/
+agent/
+docs/
+*.db
+*.db-wal
+*.db-shm

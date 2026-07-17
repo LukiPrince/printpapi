@@ -37,11 +37,20 @@ PRINTAPI_TOKEN=change-me PRINT_DB=data/printpapi.db python -m app.server
 
 ## Docker
 
+Pull the prebuilt image (published to GHCR on every release, amd64 + arm64):
+
 ```bash
-docker build -t printpapi .
 docker run -e PRINTAPI_TOKEN=change-me -p 3460:3460 \
-           -v $PWD/data:/app/data -e PRINT_DB=/app/data/printpapi.db printpapi
+           -v $PWD/data:/app/data -e PRINT_DB=/app/data/printpapi.db \
+           ghcr.io/lukiprince/printpapi
 ```
+
+The `-v` + `PRINT_DB` keep the SQLite DB (jobs **and** issued API keys) on the host, so
+recreating the container doesn't wipe them. `docker compose up -d` does the same with a named
+volume — see [`docker-compose.yml`](../docker-compose.yml).
+
+Build it yourself instead: `docker build -t printpapi .` then run the same command with
+`printpapi` in place of the `ghcr.io/...` image.
 
 Image is `python:3.12-slim` + `cups-client`. The server itself needs no Python packages.
 
