@@ -261,6 +261,27 @@ def test_dashboard_has_sidebar_nav():
         httpd.shutdown()
 
 
+def test_metrics_endpoint_prometheus_text():
+    conn = _mem()
+    reg = store.register_agent(conn, "pc", "ak", [{"name": "Z", "can_pdf": False}])
+    pid = reg["printer_ids"]["Z"]
+    j = store.enqueue_job(conn, pid, "raw_base64", "raw", b"x")
+    store.claim_job(conn, reg["computer_id"])
+    store.finish_job(conn, j, reg["computer_id"], ok=True)
+    httpd, base = _serve(conn)
+    try:
+        assert _req("GET", base + "/metrics")[0] == 401                 # auth required
+        code, raw = _req("GET", base + "/metrics", token="t")
+        assert code == 200
+        text = raw.decode()
+        assert 'printpapi_jobs{state="done"} 1' in text
+        assert 'printpapi_jobs{state="queued"} 0' in text               # stable zero series
+        assert "printpapi_printers_total 1" in text
+        assert "# TYPE printpapi_jobs gauge" in text
+    finally:
+        httpd.shutdown()
+
+
 def test_dashboard_has_copies_input():
     conn = _mem()
     httpd, base = _serve(conn)

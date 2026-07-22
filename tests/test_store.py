@@ -214,6 +214,26 @@ def test_cancel_unknown_job_is_not_found():
     assert store.cancel_job(conn, 999999) == "not_found"
 
 
+def test_metrics_snapshot_counts_jobs_agents_printers():
+    conn = _db()
+    reg = store.register_agent(conn, "w", "k",
+                               [{"name": "Z", "can_pdf": False}, {"name": "Y", "can_pdf": True}])
+    aid, pid = reg["computer_id"], reg["printer_ids"]["Z"]
+    j1 = store.enqueue_job(conn, pid, "raw_base64", "raw", b"a")
+    j2 = store.enqueue_job(conn, pid, "raw_base64", "raw", b"b")
+    store.claim_job(conn, aid)                 # claims j1 -> claimed; last_seen ~now
+    store.finish_job(conn, j1, aid, ok=True)   # j1 -> done
+    store.cancel_job(conn, j2)                 # j2 -> cancelled
+    m = store.metrics(conn, online_window_s=60)
+    assert m["jobs"]["done"] == 1 and m["jobs"]["cancelled"] == 1
+    assert m["jobs"].get("queued", 0) == 0
+    assert m["agents_total"] == 1 and m["agents_online"] == 1
+    assert m["printers_total"] == 2
+    # aged past the window -> offline
+    assert store.metrics(conn, online_window_s=60,
+                         now=__import__("time").time() + 600)["agents_online"] == 0
+
+
 def test_copies_column_migration_is_idempotent():
     conn = _db()
     store.init_db(conn)  # run migration a second time — must not raise or duplicate

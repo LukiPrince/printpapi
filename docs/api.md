@@ -17,6 +17,7 @@ Token comparison is constant-time (`hmac.compare_digest`).
 |---|---|---|
 | `GET /` | none | Web dashboard (static shell; data fetched with the token) |
 | `GET /health` | none | Liveness check |
+| `GET /metrics` | client | Prometheus text: job counts by state, agent/printer liveness |
 | `POST /jobs` | client | Submit a job → `{job_id}` |
 | `GET /jobs` | client | Recent job history |
 | `GET /jobs/{id}` | client | One job's state: `queued` \| `claimed` \| `done` \| `failed` \| `cancelled` |
@@ -59,6 +60,19 @@ Out of range or non-integer → `400`.
 
 URL fetches are `http(s)`-only and sent with a browser User-Agent (WAF/CDN-fronted services
 reject the default Python one).
+
+## Metrics
+
+`GET /metrics` returns Prometheus text (`text/plain; version=0.0.4`) — `printpapi_jobs{state=…}`
+(all five states, including zeros), `printpapi_agents_online`, `printpapi_agents_total`,
+`printpapi_printers_total`. It needs client auth, so point your scraper at it with a bearer token:
+
+```yaml
+scrape_configs:
+  - job_name: printpapi
+    authorization: { credentials: <client-key> }
+    static_configs: [{ targets: ["yourserver:3460"] }]
+```
 
 ## Job lifecycle
 

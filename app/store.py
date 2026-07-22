@@ -293,6 +293,18 @@ def recent_jobs(conn, limit=50):
     return [dict(r) for r in rows]
 
 
+def metrics(conn, online_window_s, now=None):
+    """Aggregate snapshot for /metrics: job counts by state, agent liveness, printer count."""
+    now = time.time() if now is None else now
+    with _LOCK:
+        jobrows = conn.execute("SELECT state, COUNT(*) c FROM jobs GROUP BY state").fetchall()
+        seen = [r["last_seen_at"] for r in conn.execute("SELECT last_seen_at FROM agents").fetchall()]
+        printers = conn.execute("SELECT COUNT(*) c FROM printers").fetchone()["c"]
+    online = sum(1 for s in seen if s is not None and (now - s) <= online_window_s)
+    return {"jobs": {r["state"]: r["c"] for r in jobrows},
+            "agents_total": len(seen), "agents_online": online, "printers_total": printers}
+
+
 def list_printers(conn, online_window_s, now=None):
     now = time.time() if now is None else now
     with _LOCK:

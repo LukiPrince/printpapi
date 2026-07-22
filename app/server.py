@@ -48,6 +48,23 @@ _DASHBOARD_HTML = (
 )
 
 
+_JOB_STATES = ("queued", "claimed", "done", "failed", "cancelled")
+
+
+def _prometheus(m):
+    """Render a store.metrics() snapshot as Prometheus text (v0.0.4)."""
+    out = ["# HELP printpapi_jobs Jobs by state.", "# TYPE printpapi_jobs gauge"]
+    for s in _JOB_STATES:                       # emit all states (incl. 0) for stable series
+        out.append(f'printpapi_jobs{{state="{s}"}} {m["jobs"].get(s, 0)}')
+    for name, help_, val in (
+        ("printpapi_agents_online", "Agents seen within the online window.", m["agents_online"]),
+        ("printpapi_agents_total", "Registered agents.", m["agents_total"]),
+        ("printpapi_printers_total", "Registered printers.", m["printers_total"]),
+    ):
+        out += [f"# HELP {name} {help_}", f"# TYPE {name} gauge", f"{name} {val}"]
+    return "\n".join(out) + "\n"
+
+
 def make_handler(*, conn, token, agent_auth=store.authenticate_agent, fetch_url=None,
                  long_poll_timeout=25.0, poll_interval=1.0, online_window_s=60):
     fetch = fetch_url or _http_get
@@ -102,6 +119,16 @@ def make_handler(*, conn, token, agent_auth=store.authenticate_agent, fetch_url=
                 return self._html(200, _DASHBOARD_HTML)
             if self.path == "/health":
                 return self._json(200, {"ok": True})
+            if self.path == "/metrics":
+                if not self._client_ok():
+                    return self._json(401, {"error": "unauthorized"})
+                body = _prometheus(store.metrics(conn, online_window_s)).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                return
             if self.path == "/jobs":
                 if not self._client_ok():
                     return self._json(401, {"error": "unauthorized"})
