@@ -27,6 +27,7 @@ CREATE TABLE IF NOT EXISTS jobs(
   printer_id INTEGER NOT NULL, agent_id INTEGER NOT NULL, type TEXT NOT NULL, mode TEXT NOT NULL,
   state TEXT NOT NULL DEFAULT 'queued', payload BLOB NOT NULL, error TEXT, title TEXT,
   copies INTEGER NOT NULL DEFAULT 1,
+  callback_url TEXT, hook_attempts INTEGER NOT NULL DEFAULT 0, hook_delivered_at REAL,
   retries INTEGER NOT NULL DEFAULT 0, created_at REAL NOT NULL, claimed_at REAL, finished_at REAL);
 CREATE TABLE IF NOT EXISTS api_keys(
   id INTEGER PRIMARY KEY AUTOINCREMENT, org_id INTEGER NOT NULL, label TEXT NOT NULL,
@@ -47,7 +48,10 @@ def init_db(conn):
         try:
             conn.executescript(_SCHEMA)
             for ddl in ("ALTER TABLE jobs ADD COLUMN title TEXT",
-                        "ALTER TABLE jobs ADD COLUMN copies INTEGER NOT NULL DEFAULT 1"):
+                        "ALTER TABLE jobs ADD COLUMN copies INTEGER NOT NULL DEFAULT 1",
+                        "ALTER TABLE jobs ADD COLUMN callback_url TEXT",
+                        "ALTER TABLE jobs ADD COLUMN hook_attempts INTEGER NOT NULL DEFAULT 0",
+                        "ALTER TABLE jobs ADD COLUMN hook_delivered_at REAL"):
                 try:
                     conn.execute(ddl)
                 except sqlite3.OperationalError:
@@ -169,7 +173,8 @@ class UnknownPrinter(Exception):
     pass
 
 
-def enqueue_job(conn, printer_id, type_, mode, payload, user_id=DEFAULT_USER, title=None, copies=1):
+def enqueue_job(conn, printer_id, type_, mode, payload, user_id=DEFAULT_USER, title=None, copies=1,
+                callback_url=None):
     now = time.time()
     with _LOCK:
         try:
@@ -179,9 +184,9 @@ def enqueue_job(conn, printer_id, type_, mode, payload, user_id=DEFAULT_USER, ti
                 raise UnknownPrinter(f"unknown printer: {printer_id}")
             cur = conn.execute(
                 "INSERT INTO jobs(org_id, user_id, printer_id, agent_id, type, mode, state, "
-                "payload, title, copies, created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                "payload, title, copies, callback_url, created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
                 (p["org_id"], user_id, printer_id, p["agent_id"], type_, mode, "queued",
-                 sqlite3.Binary(payload), title, copies, now))
+                 sqlite3.Binary(payload), title, copies, callback_url, now))
             conn.commit()
             return cur.lastrowid
         except Exception:
@@ -269,6 +274,45 @@ def cancel_job(conn, job_id):
             row = conn.execute("SELECT 1 FROM jobs WHERE id=?", (job_id,)).fetchone()
             conn.commit()
             return "not_found" if row is None else "not_cancellable"
+        except Exception:
+            conn.rollback()
+            raise
+
+
+_TERMINAL = ("done", "failed", "cancelled")
+
+
+def pending_webhooks(conn, max_attempts):
+    """Jobs in a terminal state with a callback_url, not yet delivered, under the attempt cap.
+    State-based (not transition-hooked), so every terminal path — agent report, cancel, reaper —
+    is covered without touching the mutators."""
+    # ponytail: unindexed full scan under _LOCK every dispatch tick (like metrics/requeue_stale);
+    # add a partial index on (callback_url, hook_delivered_at) if the jobs table ever gets large.
+    q = ("SELECT id, callback_url, state, error, title, printer_id FROM jobs "
+         "WHERE callback_url IS NOT NULL AND hook_delivered_at IS NULL AND hook_attempts < ? "
+         f"AND state IN ({','.join('?' * len(_TERMINAL))}) ORDER BY id")
+    with _LOCK:
+        rows = conn.execute(q, (max_attempts, *_TERMINAL)).fetchall()
+    return [{"job_id": r["id"], "callback_url": r["callback_url"], "state": r["state"],
+             "error": r["error"], "title": r["title"], "printer_id": r["printer_id"]} for r in rows]
+
+
+def mark_webhook_delivered(conn, job_id, now=None):
+    now = time.time() if now is None else now
+    with _LOCK:
+        try:
+            conn.execute("UPDATE jobs SET hook_delivered_at=? WHERE id=?", (now, job_id))
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+
+
+def bump_webhook_attempt(conn, job_id):
+    with _LOCK:
+        try:
+            conn.execute("UPDATE jobs SET hook_attempts=hook_attempts+1 WHERE id=?", (job_id,))
+            conn.commit()
         except Exception:
             conn.rollback()
             raise

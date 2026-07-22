@@ -47,6 +47,9 @@ curl -s -X POST localhost:3460/jobs \
 `copies` is optional (default `1`, integer `1`–`100`) — the agent prints the job that many times.
 Out of range or non-integer → `400`.
 
+`callback_url` is optional (`http(s)` only) — the server POSTs the job's outcome there once it
+reaches a terminal state. See [Webhooks](#webhooks). A non-`http(s)` scheme → `400`.
+
 ## Content types
 
 | `type` | Payload | The server… |
@@ -60,6 +63,24 @@ Out of range or non-integer → `400`.
 
 URL fetches are `http(s)`-only and sent with a browser User-Agent (WAF/CDN-fronted services
 reject the default Python one).
+
+## Webhooks
+
+Set `callback_url` on a job and the server POSTs this JSON once the job reaches a terminal state:
+
+```json
+{"job_id": 1, "state": "done", "error": null, "title": "Label #4712", "printer_id": 3}
+```
+
+- Fires on `done`, `failed`, and `cancelled` (state-based, so agent-reported, cancelled, and
+  reaper-failed jobs all deliver).
+- **Best-effort with retries:** any non-2xx or connection error is retried a few times by a
+  background dispatcher, then given up (logged). Delivery is not guaranteed — if it matters, treat
+  `GET /jobs/{id}` as the source of truth.
+- **At-least-once:** a delivery can arrive **more than once** (e.g. the POST succeeded but its ack
+  was lost, so it retries). Make your handler idempotent — dedupe on `job_id` + `state`.
+- The payload is **unsigned** and the URL is fetched server-side (`http(s)` only) — same trust model
+  as the `*_uri` content types. Point it at a trusted endpoint.
 
 ## Metrics
 

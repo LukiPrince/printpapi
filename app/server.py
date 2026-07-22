@@ -12,7 +12,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 from app import store
-from app.dispatch import decode_payload, agent_mode, parse_copies, DispatchError, FetchError, _http_get
+from app.dispatch import (decode_payload, agent_mode, parse_copies, parse_callback_url,
+                          DispatchError, FetchError, _http_get, _http_post)
 
 _MAX_BODY = 32 * 1024 * 1024  # ponytail: flat 32 MB body cap; make env-tunable if someone needs bigger
 
@@ -189,8 +190,10 @@ def make_handler(*, conn, token, agent_auth=store.authenticate_agent, fetch_url=
                     data = decode_payload(body, fetch_url=fetch)
                     mode = agent_mode(body.get("type"))
                     copies = parse_copies(body)
+                    callback_url = parse_callback_url(body)
                     jid = store.enqueue_job(conn, body.get("printer_id"), body.get("type"),
-                                            mode, data, title=body.get("title"), copies=copies)
+                                            mode, data, title=body.get("title"), copies=copies,
+                                            callback_url=callback_url)
                 except FetchError as e:
                     return self._json(502, {"error": f"downstream: {e}"})
                 except (DispatchError, store.UnknownPrinter) as e:
@@ -266,6 +269,41 @@ def create_server(conn, token, host="127.0.0.1", port=0, **handler_kwargs):
     return ThreadingHTTPServer((host, port), handler)
 
 
+def deliver_webhooks(conn, post, max_attempts):
+    """One delivery pass: POST each pending terminal job to its callback_url (outside the DB
+    lock). 2xx (no exception from `post`) -> mark delivered; any error -> bump the attempt count
+    (retried next pass until the cap, then given up). One bad URL never aborts the pass."""
+    for job in store.pending_webhooks(conn, max_attempts):
+        payload = {"job_id": job["job_id"], "state": job["state"], "error": job["error"],
+                   "title": job["title"], "printer_id": job["printer_id"]}
+        try:
+            post(job["callback_url"], payload)
+        except Exception as e:                   # only a POST failure counts as a delivery failure
+            store.bump_webhook_attempt(conn, job["job_id"])
+            print(f"webhook {job['job_id']} -> {job['callback_url']} failed: {e}", file=sys.stderr)
+        else:                                    # mark outside the post try: a mark-time DB error
+            store.mark_webhook_delivered(conn, job["job_id"])   # must not look like a POST failure
+
+
+def _hook_post(url, body):
+    return _http_post(url, body, timeout=10)   # background sender: shorter than the 30s default
+
+
+def start_webhook_dispatcher(conn, *, post=_hook_post, interval_s=5, max_attempts=5):
+    # ponytail: one thread, sequential delivery — a slow callback delays the ones behind it (bounded
+    # by the 10s timeout x attempt cap). A worker pool / async delivery only if hook volume grows.
+    def loop():
+        while True:
+            try:
+                deliver_webhooks(conn, post, max_attempts)
+            except Exception as e:
+                print(f"webhook dispatcher error: {e}", file=sys.stderr)
+            time.sleep(interval_s)
+    t = threading.Thread(target=loop, daemon=True)
+    t.start()
+    return t
+
+
 def start_reaper(conn, *, timeout_s=300, max_retries=2, interval_s=30):
     def loop():
         while True:
@@ -286,6 +324,7 @@ def main():
     conn = store.connect(db_path)
     store.init_db(conn)
     start_reaper(conn)
+    start_webhook_dispatcher(conn)
     httpd = create_server(conn, token, host="0.0.0.0", port=port)
     print(f"printpapi listening on :{port}")
     httpd.serve_forever()

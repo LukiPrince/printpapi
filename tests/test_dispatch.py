@@ -1,6 +1,6 @@
 import base64
 import pytest
-from app.dispatch import decode_payload, agent_mode, parse_copies, DispatchError
+from app.dispatch import decode_payload, agent_mode, parse_copies, parse_callback_url, DispatchError
 
 
 def test_raw_base64_decodes():
@@ -152,6 +152,30 @@ def test_parse_copies_rejects_non_int_types():
     for v in ("3", 2.5, True):
         with pytest.raises(DispatchError):
             parse_copies({"copies": v})
+
+
+def test_parse_callback_url_absent_or_empty_is_none():
+    assert parse_callback_url({}) is None
+    assert parse_callback_url({"callback_url": ""}) is None
+    assert parse_callback_url({"callback_url": None}) is None
+
+
+def test_parse_callback_url_accepts_http_and_https():
+    assert parse_callback_url({"callback_url": "https://hook.example/x"}) == "https://hook.example/x"
+    assert parse_callback_url({"callback_url": "http://hook/x"}) == "http://hook/x"
+
+
+def test_parse_callback_url_rejects_non_http_scheme():
+    for u in ("file:///etc/passwd", "ftp://x", "gopher://x", "javascript:alert(1)"):
+        with pytest.raises(DispatchError):
+            parse_callback_url({"callback_url": u})
+
+
+def test_parse_callback_url_rejects_non_string():
+    # a truthy non-string must be a clean DispatchError (-> 400), not an uncaught crash
+    for v in (123, 1.5, True, ["https://x"], {"u": "https://x"}):
+        with pytest.raises(DispatchError):
+            parse_callback_url({"callback_url": v})
 
 
 def test_pdf_uri_uses_injected_fetcher_and_is_pdf_mode():

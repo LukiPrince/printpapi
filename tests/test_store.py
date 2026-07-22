@@ -234,6 +234,55 @@ def test_metrics_snapshot_counts_jobs_agents_printers():
                          now=__import__("time").time() + 600)["agents_online"] == 0
 
 
+def test_pending_webhooks_selects_only_terminal_undelivered_with_callback():
+    conn = _db()
+    reg = store.register_agent(conn, "w", "k", [{"name": "Z", "can_pdf": False}])
+    aid, pid = reg["computer_id"], reg["printer_ids"]["Z"]
+    a = store.enqueue_job(conn, pid, "raw_base64", "raw", b"a", callback_url="https://h/a", title="A")
+    store.claim_job(conn, aid); store.finish_job(conn, a, aid, ok=True)          # done + cb
+    store.enqueue_job(conn, pid, "raw_base64", "raw", b"b", callback_url="https://h/b")  # queued + cb
+    c = store.enqueue_job(conn, pid, "raw_base64", "raw", b"c")                  # failed, NO cb
+    store.claim_job(conn, aid); store.finish_job(conn, c, aid, ok=False, error="boom")
+    d = store.enqueue_job(conn, pid, "raw_base64", "raw", b"d", callback_url="https://h/d")
+    store.cancel_job(conn, d)                                                    # cancelled + cb
+    pend = store.pending_webhooks(conn, max_attempts=5)
+    assert [p["job_id"] for p in pend] == [a, d]
+    assert pend[0]["callback_url"] == "https://h/a" and pend[0]["state"] == "done"
+    assert pend[0]["title"] == "A" and pend[0]["printer_id"] == pid
+    assert pend[1]["state"] == "cancelled"
+
+
+def test_mark_webhook_delivered_removes_from_pending():
+    conn = _db()
+    reg = store.register_agent(conn, "w", "k", [{"name": "Z", "can_pdf": False}])
+    aid, pid = reg["computer_id"], reg["printer_ids"]["Z"]
+    a = store.enqueue_job(conn, pid, "raw_base64", "raw", b"a", callback_url="https://h/a")
+    store.claim_job(conn, aid); store.finish_job(conn, a, aid, ok=True)
+    assert len(store.pending_webhooks(conn, max_attempts=5)) == 1
+    store.mark_webhook_delivered(conn, a)
+    assert store.pending_webhooks(conn, max_attempts=5) == []
+
+
+def test_bump_webhook_attempt_caps_retries():
+    conn = _db()
+    reg = store.register_agent(conn, "w", "k", [{"name": "Z", "can_pdf": False}])
+    aid, pid = reg["computer_id"], reg["printer_ids"]["Z"]
+    a = store.enqueue_job(conn, pid, "raw_base64", "raw", b"a", callback_url="https://h/a")
+    store.claim_job(conn, aid); store.finish_job(conn, a, aid, ok=True)
+    for _ in range(3):
+        store.bump_webhook_attempt(conn, a)
+    assert store.pending_webhooks(conn, max_attempts=3) == []          # attempts >= cap -> given up
+    assert store.pending_webhooks(conn, max_attempts=4)[0]["job_id"] == a
+
+
+def test_webhook_columns_migration_is_idempotent():
+    conn = _db()
+    store.init_db(conn)
+    cols = [r["name"] for r in conn.execute("PRAGMA table_info(jobs)").fetchall()]
+    for col in ("callback_url", "hook_attempts", "hook_delivered_at"):
+        assert cols.count(col) == 1
+
+
 def test_copies_column_migration_is_idempotent():
     conn = _db()
     store.init_db(conn)  # run migration a second time — must not raise or duplicate

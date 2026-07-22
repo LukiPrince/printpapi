@@ -85,3 +85,18 @@ def parse_copies(body):
     if type(c) is not int or not (1 <= c <= _MAX_COPIES):
         raise DispatchError(f"copies must be an integer 1..{_MAX_COPIES}")
     return c
+
+
+def parse_callback_url(body):
+    """Optional 'callback_url' -> validated http(s) URL, or None if absent/empty.
+    The server POSTs job-state changes here (see the webhook dispatcher). http(s)-only.
+    # ponytail: no private-IP/SSRF block — same authenticated-client trust as raw_uri/pdf_uri_post;
+    # add an IP-range denylist here if untrusted clients ever get keys."""
+    url = body.get("callback_url")
+    if not url:
+        return None
+    if type(url) is not str:                     # a truthy non-string must 400, not crash urlparse
+        raise DispatchError(f"callback_url must be a string: {url!r}")
+    if urlparse(url).scheme not in ("http", "https"):
+        raise DispatchError(f"callback_url must be http(s): {url!r}")
+    return url

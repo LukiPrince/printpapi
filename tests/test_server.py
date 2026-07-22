@@ -387,6 +387,66 @@ def test_cancel_claimed_job_returns_409_via_http():
         httpd.shutdown()
 
 
+def test_bad_callback_url_rejected_via_http():
+    conn = _mem()
+    reg = store.register_agent(conn, "pc", "ak", [{"name": "Z", "can_pdf": False}])
+    pid = reg["printer_ids"]["Z"]
+    httpd, base = _serve(conn)
+    try:
+        assert _req("POST", base + "/jobs", token="t",
+                    body={"printer_id": pid, "type": "raw_base64", "content": "QUJD",
+                          "callback_url": "file:///etc/passwd"})[0] == 400
+        # a valid https callback is accepted
+        assert _req("POST", base + "/jobs", token="t",
+                    body={"printer_id": pid, "type": "raw_base64", "content": "QUJD",
+                          "callback_url": "https://hook/x"})[0] == 200
+    finally:
+        httpd.shutdown()
+
+
+def test_webhook_dispatcher_delivers_and_marks():
+    conn = _mem()
+    reg = store.register_agent(conn, "pc", "ak", [{"name": "Z", "can_pdf": False}])
+    aid, pid = reg["computer_id"], reg["printer_ids"]["Z"]
+    a = store.enqueue_job(conn, pid, "raw_base64", "raw", b"x", callback_url="https://h/a", title="T")
+    store.claim_job(conn, aid); store.finish_job(conn, a, aid, ok=True)
+    posts = []
+    server.deliver_webhooks(conn, lambda url, body: posts.append((url, body)), max_attempts=5)
+    assert posts == [("https://h/a",
+                      {"job_id": a, "state": "done", "error": None, "title": "T", "printer_id": pid})]
+    assert store.pending_webhooks(conn, max_attempts=5) == []   # marked delivered, not re-sent
+    server.deliver_webhooks(conn, lambda url, body: posts.append((url, body)), max_attempts=5)
+    assert len(posts) == 1                                       # second pass sends nothing
+
+
+def test_webhook_payload_carries_failure_error():
+    conn = _mem()
+    reg = store.register_agent(conn, "pc", "ak", [{"name": "Z", "can_pdf": False}])
+    aid, pid = reg["computer_id"], reg["printer_ids"]["Z"]
+    a = store.enqueue_job(conn, pid, "raw_base64", "raw", b"x", callback_url="https://h/a", title="T")
+    store.claim_job(conn, aid); store.finish_job(conn, a, aid, ok=False, error="boom")
+    posts = []
+    server.deliver_webhooks(conn, lambda url, body: posts.append(body), max_attempts=5)
+    assert posts == [{"job_id": a, "state": "failed", "error": "boom",
+                      "title": "T", "printer_id": pid}]
+
+
+def test_webhook_dispatcher_retries_then_gives_up():
+    conn = _mem()
+    reg = store.register_agent(conn, "pc", "ak", [{"name": "Z", "can_pdf": False}])
+    aid, pid = reg["computer_id"], reg["printer_ids"]["Z"]
+    a = store.enqueue_job(conn, pid, "raw_base64", "raw", b"x", callback_url="https://h/a")
+    store.claim_job(conn, aid); store.finish_job(conn, a, aid, ok=False, error="boom")
+    calls = []
+    def boom(url, body):
+        calls.append(url)
+        raise OSError("hook down")
+    for _ in range(5):                                           # more passes than the cap
+        server.deliver_webhooks(conn, boom, max_attempts=3)
+    assert len(calls) == 3                                       # tried exactly cap times, then gave up
+    assert store.get_job(conn, a)["state"] == "failed"           # job state untouched by hook failure
+
+
 def test_job_title_roundtrips_through_http():
     conn = _mem()
     reg = store.register_agent(conn, "pc", "ak", [{"name": "Z", "can_pdf": False}])
