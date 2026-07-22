@@ -219,6 +219,16 @@ def make_handler(*, conn, token, agent_auth=store.authenticate_agent, fetch_url=
                     return self._json(401, {"error": "unauthorized"})
                 ok = store.revoke_api_key(conn, int(m.group(1)))
                 return self._json(200, {"ok": True}) if ok else self._json(404, {"error": "not found"})
+            mj = _JOB_ID.match(self.path)
+            if mj:
+                if not self._client_ok():
+                    return self._json(401, {"error": "unauthorized"})
+                res = store.cancel_job(conn, int(mj.group(1)))
+                if res == "cancelled":
+                    return self._json(200, {"ok": True, "state": "cancelled"})
+                if res == "not_found":
+                    return self._json(404, {"error": "not found"})
+                return self._json(409, {"error": "job not cancellable (already claimed or finished)"})
             self._json(404, {"error": "not found"})
 
     return Handler

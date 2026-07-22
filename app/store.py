@@ -253,6 +253,27 @@ def requeue_stale(conn, timeout_s, max_retries, now=None):
             raise
 
 
+def cancel_job(conn, job_id):
+    """Cancel a job while it is still 'queued' (before any agent claims it).
+    Returns 'cancelled' | 'not_cancellable' (already claimed/finished) | 'not_found'.
+    The UPDATE is state-guarded so a claim racing the cancel can't be undone."""
+    now = time.time()
+    with _LOCK:
+        try:
+            cur = conn.execute(
+                "UPDATE jobs SET state='cancelled', finished_at=? WHERE id=? AND state='queued'",
+                (now, job_id))
+            if cur.rowcount == 1:
+                conn.commit()
+                return "cancelled"
+            row = conn.execute("SELECT 1 FROM jobs WHERE id=?", (job_id,)).fetchone()
+            conn.commit()
+            return "not_found" if row is None else "not_cancellable"
+        except Exception:
+            conn.rollback()
+            raise
+
+
 def get_job(conn, job_id):
     with _LOCK:
         row = conn.execute(

@@ -19,7 +19,8 @@ Token comparison is constant-time (`hmac.compare_digest`).
 | `GET /health` | none | Liveness check |
 | `POST /jobs` | client | Submit a job → `{job_id}` |
 | `GET /jobs` | client | Recent job history |
-| `GET /jobs/{id}` | client | One job's state: `queued` \| `claimed` \| `done` \| `failed` |
+| `GET /jobs/{id}` | client | One job's state: `queued` \| `claimed` \| `done` \| `failed` \| `cancelled` |
+| `DELETE /jobs/{id}` | client | Cancel a still-`queued` job (`409` once claimed, `404` if unknown) |
 | `GET /printers` | client | Registered printers + online/offline |
 | `POST /apikeys` | admin | Issue a per-client key → `{id, label, key}` (key shown once) |
 | `GET /apikeys` | admin | List key labels (never the secret) |
@@ -64,3 +65,7 @@ reject the default Python one).
 `queued` → agent claims it (`claimed`) → agent reports → `done` or `failed`.
 If an agent claims a job and never reports (crash, network), the visibility-timeout reaper
 requeues it — after a bounded number of retries the job is marked `failed`.
+
+`DELETE /jobs/{id}` moves a job from `queued` to `cancelled` (a terminal state the agent never
+claims). The cancel is state-guarded: once an agent has claimed the job it returns `409` — there
+is no mid-print interrupt.

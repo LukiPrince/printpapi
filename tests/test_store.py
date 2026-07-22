@@ -187,6 +187,33 @@ def test_enqueue_copies_defaults_to_one():
     assert store.claim_job(conn, aid)["copies"] == 1
 
 
+def test_cancel_queued_job_marks_cancelled():
+    conn = _db()
+    reg = store.register_agent(conn, "w", "k", [{"name": "Z", "can_pdf": False}])
+    aid, pid = reg["computer_id"], reg["printer_ids"]["Z"]
+    jid = store.enqueue_job(conn, pid, "raw_base64", "raw", b"x")
+    assert store.cancel_job(conn, jid) == "cancelled"
+    row = conn.execute("SELECT state, finished_at FROM jobs WHERE id=?", (jid,)).fetchone()
+    assert row["state"] == "cancelled" and row["finished_at"] is not None
+    # a cancelled job is never claimable
+    assert store.claim_job(conn, aid) is None
+
+
+def test_cancel_claimed_job_is_refused():
+    conn = _db()
+    reg = store.register_agent(conn, "w", "k", [{"name": "Z", "can_pdf": False}])
+    aid, pid = reg["computer_id"], reg["printer_ids"]["Z"]
+    jid = store.enqueue_job(conn, pid, "raw_base64", "raw", b"x")
+    store.claim_job(conn, aid)
+    assert store.cancel_job(conn, jid) == "not_cancellable"
+    assert conn.execute("SELECT state FROM jobs WHERE id=?", (jid,)).fetchone()["state"] == "claimed"
+
+
+def test_cancel_unknown_job_is_not_found():
+    conn = _db()
+    assert store.cancel_job(conn, 999999) == "not_found"
+
+
 def test_copies_column_migration_is_idempotent():
     conn = _db()
     store.init_db(conn)  # run migration a second time — must not raise or duplicate

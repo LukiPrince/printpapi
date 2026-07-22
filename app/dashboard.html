@@ -111,6 +111,7 @@ td .muted{font-size:.8rem}
 .off,.failed{background:var(--bad-bg);color:var(--bad)}
 .queued{background:var(--wait-bg);color:var(--wait)}
 .claimed{background:var(--claim-bg);color:var(--claim)}
+.cancelled{background:var(--line);color:var(--muted)}   /* neutral/greyed — not an error */
 
 .muted{color:var(--muted)}.err{color:var(--bad)}
 .drop{border:2px dashed var(--line);border-radius:8px;padding:1.5rem;text-align:center;
@@ -326,7 +327,7 @@ async function viewHistory(){
       <td class="muted">${esc(j.agent_name)}</td>
       <td>${esc(j.printer_name)}</td>
       <td class="muted">${fmt(j.created_at)}</td>
-      <td><span class="badge ${esc(j.state)}">${esc(j.state)}</span></td>
+      <td><span class="badge ${esc(j.state)}">${esc(j.state)}</span>${j.state==="queued"?` <button class="danger" data-cancel="${j.id}">Cancel</button>`:""}</td>
     </tr>
     <tr class="jdet" data-for="${j.id}" style="display:none"><td colspan="5" class="muted">
       type ${esc(j.type)} · mode ${esc(j.mode)} · finished ${fmt(j.finished_at)||"—"}${j.error?` · <span class="err">${esc(j.error)}</span>`:""}
@@ -336,6 +337,11 @@ async function viewHistory(){
     <tbody>${rows}</tbody></table></div>`;
   $("#view").querySelectorAll(".jrow").forEach(tr=>tr.onclick=()=>{
     const d=$(`.jdet[data-for="${tr.dataset.id}"]`); d.style.display=d.style.display==="none"?"table-row":"none";
+  });
+  $("#view").querySelectorAll("button[data-cancel]").forEach(b=>b.onclick=async(e)=>{
+    e.stopPropagation();                       // don't also toggle the row's detail
+    const rr=await api("/jobs/"+b.dataset.cancel,{method:"DELETE"});
+    if(rr.ok||rr.status===409) viewHistory();   // 409 = already claimed; refresh to show its real state
   });
   }catch(e){ viewError(e.message==="unauthorized" ? "This page needs the admin (bootstrap) token. Sign out and log in with it." : "Could not load: "+e.message); }
 }

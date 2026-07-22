@@ -271,6 +271,16 @@ def test_dashboard_has_copies_input():
         httpd.shutdown()
 
 
+def test_dashboard_has_cancel_affordance():
+    conn = _mem()
+    httpd, base = _serve(conn)
+    try:
+        html = _req("GET", base + "/")[1].decode()
+        assert "data-cancel" in html   # queued jobs get a Cancel button wired to DELETE /jobs/{id}
+    finally:
+        httpd.shutdown()
+
+
 def test_bad_content_length_rejected():
     import socket as socketlib
     conn = _mem()
@@ -311,6 +321,47 @@ def test_copies_roundtrip_and_validation_via_http():
                     body={"printer_id": pid, "type": "raw_base64", "content": "QUJD",
                           "copies": 0})[0] == 400
         assert _areq("GET", base + "/agent/jobs", "ak")[0] == 204
+    finally:
+        httpd.shutdown()
+
+
+def test_cancel_job_via_http_states_and_auth():
+    conn = _mem()
+    reg = store.register_agent(conn, "pc", "ak", [{"name": "Z", "can_pdf": False}])
+    pid = reg["printer_ids"]["Z"]
+    httpd, base = _serve(conn)
+    try:
+        jid = json.loads(_req("POST", base + "/jobs", token="t",
+                              body={"printer_id": pid, "type": "raw_base64", "content": "QUJD"})[1])["job_id"]
+        # cancel requires client auth
+        assert _dreq("DELETE", base + f"/jobs/{jid}")[0] == 401
+        # queued -> cancelled (200)
+        code, raw = _dreq("DELETE", base + f"/jobs/{jid}", token="t")
+        assert code == 200 and json.loads(raw)["state"] == "cancelled"
+        assert store.get_job(conn, jid)["state"] == "cancelled"
+        # agent never sees a cancelled job
+        assert _areq("GET", base + "/agent/jobs", "ak")[0] == 204
+        # cancelling again (now cancelled, not queued) -> 409
+        assert _dreq("DELETE", base + f"/jobs/{jid}", token="t")[0] == 409
+        # unknown job -> 404
+        assert _dreq("DELETE", base + "/jobs/999999", token="t")[0] == 404
+        # a per-client (non-bootstrap) issued key can also cancel (not admin-only)
+        newkey = json.loads(_req("POST", base + "/apikeys", token="t", body={"label": "c"})[1])["key"]
+        jid2 = store.enqueue_job(conn, pid, "raw_base64", "raw", b"y")
+        assert _dreq("DELETE", base + f"/jobs/{jid2}", token=newkey)[0] == 200
+    finally:
+        httpd.shutdown()
+
+
+def test_cancel_claimed_job_returns_409_via_http():
+    conn = _mem()
+    reg = store.register_agent(conn, "pc", "ak", [{"name": "Z", "can_pdf": False}])
+    pid = reg["printer_ids"]["Z"]
+    jid = store.enqueue_job(conn, pid, "raw_base64", "raw", b"x")
+    store.claim_job(conn, reg["computer_id"])
+    httpd, base = _serve(conn)
+    try:
+        assert _dreq("DELETE", base + f"/jobs/{jid}", token="t")[0] == 409
     finally:
         httpd.shutdown()
 

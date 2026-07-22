@@ -10,7 +10,7 @@ up and prints it — documents **and** label printers (Zebra/ZPL, Bixolon, therm
 - Server is Python **standard library only** — no framework, nothing to install
 - Web dashboard, REST API, per-client API keys, SQLite job queue
 - Cross-platform agent: Windows (`win32print` + SumatraPDF) and Linux (CUPS)
-- MIT licensed · 81 tests
+- MIT licensed · 87 tests
 
 ## Get started
 
