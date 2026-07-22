@@ -168,3 +168,27 @@ def test_title_column_migration_is_idempotent():
     store.init_db(conn)  # run migration a second time — must not raise or duplicate
     cols = [r["name"] for r in conn.execute("PRAGMA table_info(jobs)").fetchall()]
     assert cols.count("title") == 1
+
+
+def test_enqueue_stores_copies_and_claim_returns_it():
+    conn = _db()
+    reg = store.register_agent(conn, "w", "k", [{"name": "Z", "can_pdf": False}])
+    aid, pid = reg["computer_id"], reg["printer_ids"]["Z"]
+    jid = store.enqueue_job(conn, pid, "raw_base64", "raw", b"x", copies=3)
+    assert store.claim_job(conn, aid)["copies"] == 3
+    assert conn.execute("SELECT copies FROM jobs WHERE id=?", (jid,)).fetchone()["copies"] == 3
+
+
+def test_enqueue_copies_defaults_to_one():
+    conn = _db()
+    reg = store.register_agent(conn, "w", "k", [{"name": "Z", "can_pdf": False}])
+    aid, pid = reg["computer_id"], reg["printer_ids"]["Z"]
+    store.enqueue_job(conn, pid, "raw_base64", "raw", b"x")
+    assert store.claim_job(conn, aid)["copies"] == 1
+
+
+def test_copies_column_migration_is_idempotent():
+    conn = _db()
+    store.init_db(conn)  # run migration a second time — must not raise or duplicate
+    cols = [r["name"] for r in conn.execute("PRAGMA table_info(jobs)").fetchall()]
+    assert cols.count("copies") == 1

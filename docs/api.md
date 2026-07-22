@@ -36,11 +36,14 @@ Request bodies are capped at 32 MB.
 ```bash
 curl -s -X POST localhost:3460/jobs \
      -H 'Authorization: Bearer <client-key>' -H 'Content-Type: application/json' \
-     -d '{"printer_id":1,"type":"raw_base64","content":"<base64 ZPL>","title":"Label #4712"}'
+     -d '{"printer_id":1,"type":"raw_base64","content":"<base64 ZPL>","title":"Label #4712","copies":2}'
 # -> {"job_id": 1}
 ```
 
 `title` is optional and shows up in the dashboard's history.
+
+`copies` is optional (default `1`, integer `1`–`100`) — the agent prints the job that many times.
+Out of range or non-integer → `400`.
 
 ## Content types
 

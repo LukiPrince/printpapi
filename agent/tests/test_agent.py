@@ -70,6 +70,46 @@ def test_run_once_prints_pdf_and_reports_success():
     assert url.endswith("/agent/jobs/5/result") and body == {"ok": True, "error": None}
 
 
+def test_print_job_copies_repeats_raw_send():
+    sends = []
+    entry = {"name": "Zebra", "can_pdf": False, "target": "Zebra"}
+    print_agent.print_job("raw", entry, b"ZPL", copies=3,
+                          raw_fn=lambda t, d: sends.append(d), pdf_fn=lambda *a: None)
+    assert sends == [b"ZPL", b"ZPL", b"ZPL"]
+
+
+def test_print_job_copies_repeats_pdf_and_socket():
+    pdfs, socks = [], []
+    print_agent.print_job("pdf", {"name": "HP", "can_pdf": True, "target": "HP"}, b"%PDF",
+                          copies=2, raw_fn=lambda *a: None, pdf_fn=lambda t, d: pdfs.append(d))
+    assert pdfs == [b"%PDF", b"%PDF"]
+    print_agent.print_job("raw", {"name": "n", "target": "socket://10.0.0.5:9100"}, b"Z",
+                          copies=2, socket_fn=lambda t, d: socks.append(d),
+                          raw_fn=lambda *a: None, pdf_fn=lambda *a: None)
+    assert socks == [b"Z", b"Z"]
+
+
+def test_run_once_applies_job_copies():
+    http = FakeHTTP({"job_id": 7, "printer_id": 1, "mode": "raw", "copies": 3}, b"D")
+    sends = []
+    print_agent.run_once(
+        "http://x", "k", {1: {"name": "Z", "can_pdf": False, "target": "Z"}},
+        http_get=http.get, http_get_bytes=http.get_bytes, http_post=http.post,
+        raw_fn=lambda t, d: sends.append(d), pdf_fn=lambda *a: None)
+    assert sends == [b"D", b"D", b"D"]
+
+
+def test_run_once_defaults_copies_to_one_for_old_server():
+    # a server without the copies field (older) -> exactly one print
+    http = FakeHTTP({"job_id": 8, "printer_id": 1, "mode": "raw"}, b"D")
+    sends = []
+    print_agent.run_once(
+        "http://x", "k", {1: {"name": "Z", "can_pdf": False, "target": "Z"}},
+        http_get=http.get, http_get_bytes=http.get_bytes, http_post=http.post,
+        raw_fn=lambda t, d: sends.append(d), pdf_fn=lambda *a: None)
+    assert sends == [b"D"]
+
+
 def test_print_job_bad_mode_raises():
     entry = {"name": "P", "can_pdf": False, "target": "P"}
     with pytest.raises(ValueError, match="bad mode"):

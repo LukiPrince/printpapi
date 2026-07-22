@@ -12,7 +12,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 from app import store
-from app.dispatch import decode_payload, agent_mode, DispatchError, FetchError, _http_get
+from app.dispatch import decode_payload, agent_mode, parse_copies, DispatchError, FetchError, _http_get
 
 _MAX_BODY = 32 * 1024 * 1024  # ponytail: flat 32 MB body cap; make env-tunable if someone needs bigger
 
@@ -161,8 +161,9 @@ def make_handler(*, conn, token, agent_auth=store.authenticate_agent, fetch_url=
                 try:
                     data = decode_payload(body, fetch_url=fetch)
                     mode = agent_mode(body.get("type"))
+                    copies = parse_copies(body)
                     jid = store.enqueue_job(conn, body.get("printer_id"), body.get("type"),
-                                            mode, data, title=body.get("title"))
+                                            mode, data, title=body.get("title"), copies=copies)
                 except FetchError as e:
                     return self._json(502, {"error": f"downstream: {e}"})
                 except (DispatchError, store.UnknownPrinter) as e:

@@ -71,3 +71,17 @@ def decode_payload(body, fetch_url=_http_get, post_fetch=_http_post):
 
 def agent_mode(type_):
     return "pdf" if type_ in ("pdf_base64", "pdf_uri_post", "pdf_uri") else "raw"
+
+
+_MAX_COPIES = 100  # ponytail: flat cap so one job can't spool 10k prints; env-tunable if ever needed
+
+
+def parse_copies(body):
+    """Optional 'copies' from a job body -> int in 1.._MAX_COPIES (default 1).
+    Absent/null -> 1. type(c) is int rejects bool/float/str at the trust boundary."""
+    c = body.get("copies")
+    if c is None:
+        return 1
+    if type(c) is not int or not (1 <= c <= _MAX_COPIES):
+        raise DispatchError(f"copies must be an integer 1..{_MAX_COPIES}")
+    return c

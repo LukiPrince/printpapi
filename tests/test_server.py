@@ -261,6 +261,16 @@ def test_dashboard_has_sidebar_nav():
         httpd.shutdown()
 
 
+def test_dashboard_has_copies_input():
+    conn = _mem()
+    httpd, base = _serve(conn)
+    try:
+        html = _req("GET", base + "/")[1].decode()
+        assert 'id="copies"' in html
+    finally:
+        httpd.shutdown()
+
+
 def test_bad_content_length_rejected():
     import socket as socketlib
     conn = _mem()
@@ -276,6 +286,31 @@ def test_bad_content_length_rejected():
             assert " 400 " in resp.splitlines()[0], f"Content-Length {cl}: got {resp.splitlines()[0]!r}"
         # server still alive afterwards
         assert _req("GET", base + "/health")[0] == 200
+    finally:
+        httpd.shutdown()
+
+
+def test_copies_roundtrip_and_validation_via_http():
+    conn = _mem()
+    reg = store.register_agent(conn, "pc", "ak", [{"name": "Z", "can_pdf": False}])
+    pid = reg["printer_ids"]["Z"]
+    httpd, base = _serve(conn)
+    try:
+        # submit with copies=2, agent claim sees copies=2
+        code, _ = _req("POST", base + "/jobs", token="t",
+                       body={"printer_id": pid, "type": "raw_base64", "content": "QUJD", "copies": 2})
+        assert code == 200
+        claim = json.loads(_areq("GET", base + "/agent/jobs", "ak")[1])
+        assert claim["copies"] == 2
+        # omitted -> default 1
+        _req("POST", base + "/jobs", token="t",
+             body={"printer_id": pid, "type": "raw_base64", "content": "QUJD"})
+        assert json.loads(_areq("GET", base + "/agent/jobs", "ak")[1])["copies"] == 1
+        # invalid copies -> 400, and nothing was enqueued (queue is empty on the next claim)
+        assert _req("POST", base + "/jobs", token="t",
+                    body={"printer_id": pid, "type": "raw_base64", "content": "QUJD",
+                          "copies": 0})[0] == 400
+        assert _areq("GET", base + "/agent/jobs", "ak")[0] == 204
     finally:
         httpd.shutdown()
 

@@ -1,6 +1,6 @@
 import base64
 import pytest
-from app.dispatch import decode_payload, agent_mode, DispatchError
+from app.dispatch import decode_payload, agent_mode, parse_copies, DispatchError
 
 
 def test_raw_base64_decodes():
@@ -123,6 +123,35 @@ def test_uri_post_fetch_failure_is_fetcherror():
 def test_agent_mode_pdf_uri_post():
     assert agent_mode("pdf_uri_post") == "pdf"
     assert agent_mode("raw_uri_post") == "raw"
+
+
+def test_parse_copies_defaults_to_one_when_absent_or_null():
+    assert parse_copies({}) == 1
+    assert parse_copies({"copies": None}) == 1
+
+
+def test_parse_copies_accepts_valid_count():
+    assert parse_copies({"copies": 3}) == 3
+    assert parse_copies({"copies": 1}) == 1
+    assert parse_copies({"copies": 100}) == 100   # inclusive upper cap
+
+
+def test_parse_copies_rejects_zero_and_negative():
+    for n in (0, -1, -100):
+        with pytest.raises(DispatchError):
+            parse_copies({"copies": n})
+
+
+def test_parse_copies_rejects_over_cap():
+    with pytest.raises(DispatchError):
+        parse_copies({"copies": 101})
+
+
+def test_parse_copies_rejects_non_int_types():
+    # trust boundary: "3", 2.5, and bool are not a valid copy count
+    for v in ("3", 2.5, True):
+        with pytest.raises(DispatchError):
+            parse_copies({"copies": v})
 
 
 def test_pdf_uri_uses_injected_fetcher_and_is_pdf_mode():

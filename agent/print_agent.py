@@ -152,20 +152,24 @@ def _report_with_retry(base, key, job_id, ok, error=None, *, http_post=_post,
     return False  # ponytail: after 5 tries we drop the result; reaper requeues -> possible dup
 
 
-def print_job(mode, entry, data, raw_fn=raw_to_printer, pdf_fn=pdf_to_printer,
+def print_job(mode, entry, data, copies=1, raw_fn=raw_to_printer, pdf_fn=pdf_to_printer,
               socket_fn=raw_to_socket):
     target = entry["target"]
+    # ponytail: loop the whole send per copy — correct on every backend without a per-driver
+    # copies flag (win32/Sumatra/CUPS/socket differ). Native flags (lp -n, Sumatra "Nx") would
+    # be one call instead of N; not worth the branching for the small copy counts labels use.
     if target.startswith("socket://"):
         if mode != "raw":
             raise ValueError("network socket printer is raw-only (cannot render PDF)")
-        socket_fn(target, data)
-        return
-    if mode == "raw":
-        raw_fn(target, data)
+        send = lambda: socket_fn(target, data)
+    elif mode == "raw":
+        send = lambda: raw_fn(target, data)
     elif mode == "pdf":
-        pdf_fn(target, data)
+        send = lambda: pdf_fn(target, data)
     else:
         raise ValueError(f"bad mode: {mode}")
+    for _ in range(copies):
+        send()
 
 
 def run_once(base, key, printer_by_id, *, http_get=_get, http_get_bytes=_get_bytes,
@@ -180,7 +184,8 @@ def run_once(base, key, printer_by_id, *, http_get=_get, http_get_bytes=_get_byt
         data = download_payload(base, key, job_id, http_get_bytes=http_get_bytes)
         if printer is None:
             raise ValueError(f"unknown printer id: {job['printer_id']}")
-        print_job(job["mode"], printer, data, raw_fn=raw_fn, pdf_fn=pdf_fn)
+        print_job(job["mode"], printer, data, copies=job.get("copies", 1),
+                  raw_fn=raw_fn, pdf_fn=pdf_fn)
     except Exception as e:
         _report_with_retry(base, key, job_id, False, str(e), http_post=http_post,
                            sleep=report_sleep)

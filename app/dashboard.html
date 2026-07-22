@@ -246,6 +246,8 @@ async function viewPrint(){
     <select id="printer">${opts||'<option value="">No printers registered</option>'}</select>
     <label class="f">Title (optional)</label>
     <input id="jobtitle" placeholder="e.g. Shipping label #4712">
+    <label class="f">Copies</label>
+    <input id="copies" type="number" min="1" max="100" value="1" style="max-width:6rem">
     <div id="srcinput"></div>
     <div style="height:1rem"></div>
     <button class="accent" id="print">PRINT</button>
@@ -274,6 +276,7 @@ async function viewPrint(){
     const printer_id=Number(sel.value); const canPdf=!!(opt&&opt.dataset.pdf==="1");
     if(!printer_id) return msg("Select a printer.",true);
     const title=$("#jobtitle").value.trim()||null; const s=$("#src").value; let body;
+    const copies=Math.max(1,Math.min(100,Math.trunc(Number($("#copies").value))||1));
     try{
       if(s==="pdf"){ if(!canPdf) return msg("This printer is raw-only (label). Use a raw file.",true);
         if(!picked) return msg("Choose a PDF first.",true);
@@ -285,6 +288,7 @@ async function viewPrint(){
         body={printer_id,type:asPdf?"pdf_uri":"raw_uri",url:u,title}; }
       else { body=canPdf?{printer_id,type:"pdf_base64",content:PDF_B64,title:title||"test page"}
                         :{printer_id,type:"raw_base64",content:ZPL_B64,title:title||"test label"}; }
+      body.copies=copies;
       const r=await api("/jobs",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)});
       msg(r.ok?"Job queued.":"Failed ("+r.status+").",!r.ok);
     }catch(e){ msg("Error: "+e.message,true); }
