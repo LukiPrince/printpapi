@@ -1,0 +1,196 @@
+@import "tailwindcss";
+@import "tw-animate-css";
+@import "shadcn/tailwind.css";
+
+@custom-variant dark (&:is(.dark *));
+
+@theme inline {
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --font-sans: var(--font-sans);
+  --font-mono: var(--font-geist-mono);
+  --font-heading: var(--font-sans);
+  --color-sidebar-ring: var(--sidebar-ring);
+  --color-sidebar-border: var(--sidebar-border);
+  --color-sidebar-accent-foreground: var(--sidebar-accent-foreground);
+  --color-sidebar-accent: var(--sidebar-accent);
+  --color-sidebar-primary-foreground: var(--sidebar-primary-foreground);
+  --color-sidebar-primary: var(--sidebar-primary);
+  --color-sidebar-foreground: var(--sidebar-foreground);
+  --color-sidebar: var(--sidebar);
+  --color-chart-5: var(--chart-5);
+  --color-chart-4: var(--chart-4);
+  --color-chart-3: var(--chart-3);
+  --color-chart-2: var(--chart-2);
+  --color-chart-1: var(--chart-1);
+  --color-ring: var(--ring);
+  --color-input: var(--input);
+  --color-border: var(--border);
+  --color-destructive: var(--destructive);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-accent: var(--accent);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-muted: var(--muted);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-secondary: var(--secondary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-primary: var(--primary);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-popover: var(--popover);
+  --color-card-foreground: var(--card-foreground);
+  --color-card: var(--card);
+
+  /* printpapi brand + job-state tokens */
+  --color-brand: var(--brand);
+  --color-brand-foreground: var(--brand-foreground);
+  --color-state-queued: var(--state-queued);
+  --color-state-claimed: var(--state-claimed);
+  --color-state-done: var(--state-done);
+  --color-state-failed: var(--state-failed);
+  --color-state-cancelled: var(--state-cancelled);
+
+  --radius-sm: calc(var(--radius) * 0.6);
+  --radius-md: calc(var(--radius) * 0.8);
+  --radius-lg: var(--radius);
+  --radius-xl: calc(var(--radius) * 1.4);
+  --radius-2xl: calc(var(--radius) * 1.8);
+  --radius-3xl: calc(var(--radius) * 2.2);
+  --radius-4xl: calc(var(--radius) * 2.6);
+}
+
+/*
+  Palette keeps printpapi's identity: thermal-paper neutrals, printer-ink darks,
+  spool amber as the one accent. Job-state colours are the dataviz status slots
+  (fixed, never themed) — always shipped with an icon AND the state word, never
+  colour alone, which is the documented mitigation for the sub-3:1 status pairs.
+*/
+:root {
+  --radius: 0.625rem;
+
+  --background: #f3f2ee; /* thermal paper */
+  --foreground: #16202a; /* printer ink */
+  --card: #fbfaf7;
+  --card-foreground: #16202a;
+  --popover: #fbfaf7;
+  --popover-foreground: #16202a;
+  --primary: #1b2733;
+  --primary-foreground: #f6f5f1;
+  --secondary: #e9e7e0;
+  --secondary-foreground: #1b2733;
+  --muted: #eceae4;
+  --muted-foreground: #626c78;
+  --accent: #e9e7e0;
+  --accent-foreground: #1b2733;
+  --destructive: #d03b3b;
+  --border: #dedbd3;
+  --input: #dedbd3;
+  --ring: #f59e0b;
+
+  --brand: #f59e0b; /* spool amber */
+  --brand-foreground: #231503;
+
+  --state-queued: #b07400;
+  --state-claimed: #2a78d6;
+  --state-done: #0ca30c;
+  --state-failed: #d03b3b;
+  --state-cancelled: #6e6c66;
+
+  --chart-1: #2a78d6;
+  --chart-2: #eb6834;
+  --chart-3: #1baf7a;
+  --chart-4: #eda100;
+  --chart-5: #4a3aa7;
+
+  --sidebar: #141b22; /* the ink block */
+  --sidebar-foreground: #a6b2bf;
+  --sidebar-primary: #f59e0b;
+  --sidebar-primary-foreground: #231503;
+  --sidebar-accent: #1f2831;
+  --sidebar-accent-foreground: #ffffff;
+  --sidebar-border: #232c35;
+  --sidebar-ring: #f59e0b;
+}
+
+.dark {
+  --background: #0f1419;
+  --foreground: #e4e8ec;
+  --card: #1a2027;
+  --card-foreground: #e4e8ec;
+  --popover: #1a2027;
+  --popover-foreground: #e4e8ec;
+  --primary: #e4e8ec;
+  --primary-foreground: #16202a;
+  --secondary: #232b34;
+  --secondary-foreground: #e4e8ec;
+  --muted: #232b34;
+  --muted-foreground: #93a0ad;
+  --accent: #232b34;
+  --accent-foreground: #ffffff;
+  --destructive: #e05a5a;
+  --border: oklch(1 0 0 / 11%);
+  --input: oklch(1 0 0 / 15%);
+  --ring: #f59e0b;
+
+  --brand: #fbbf24;
+  --brand-foreground: #231503;
+
+  --state-queued: #fab219;
+  --state-claimed: #3987e5;
+  --state-done: #2fb92f;
+  --state-failed: #e05a5a;
+  --state-cancelled: #98a3ae;
+
+  --chart-1: #3987e5;
+  --chart-2: #d95926;
+  --chart-3: #199e70;
+  --chart-4: #c98500;
+  --chart-5: #9085e9;
+
+  --sidebar: #0b0f13;
+  --sidebar-foreground: #93a0ad;
+  --sidebar-primary: #fbbf24;
+  --sidebar-primary-foreground: #231503;
+  --sidebar-accent: #1a2027;
+  --sidebar-accent-foreground: #ffffff;
+  --sidebar-border: #1c242c;
+  --sidebar-ring: #fbbf24;
+}
+
+@layer base {
+  * {
+    @apply border-border outline-ring/50;
+  }
+  body {
+    @apply bg-background text-foreground;
+  }
+  html {
+    @apply font-sans;
+  }
+}
+
+@layer components {
+  /* The barcode strip — printpapi's mark. Pure CSS, reads as printed. */
+  .barcode {
+    background: repeating-linear-gradient(
+      90deg,
+      currentColor 0 2px,
+      transparent 2px 5px,
+      currentColor 5px 9px,
+      transparent 9px 11px,
+      currentColor 11px 12px,
+      transparent 12px 17px,
+      currentColor 17px 19px,
+      transparent 19px 24px
+    );
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}

@@ -16,10 +16,13 @@ extracted, generalized OSS project.
 
 **Server** (`app/`, Python stdlib only):
 
-- `GET /` — **web dashboard** (static, secret-free shell): printers online/offline, recent job
-  history, one-click test print. Prompts for the token and calls the JSON endpoints with it, so all
-  data stays behind auth. Test print picks a PDF for PDF-capable printers, a ZPL label otherwise
-  (gotcha #1).
+- `GET /` — **web dashboard**: a Next.js **static export** (source in `web/`, built bundle committed
+  to `app/web`), served straight off disk by the stdlib server. Live overview (queue counters,
+  outcome breakdown, activity feed), devices, searchable job history with cancel, API keys,
+  agent setup, light/dark, ⌘K palette. Secret-free shell — it prompts for the token and calls the
+  JSON endpoints with it, so all data stays behind auth. Test print picks a PDF for PDF-capable
+  printers, a ZPL label otherwise (gotcha #1). Static serving is confined to `app/web`
+  (traversal 404s); `/_next/static/` is immutable-cached, HTML is `no-cache`.
 - Client endpoints (bearer auth — the bootstrap `PRINTAPI_TOKEN` or any issued per-client key):
   - `POST /jobs` — submit a job `{printer_id, type, content|url}` → `{job_id}`.
   - `GET /jobs` — recent job history; `GET /jobs/{id}` — job state: `queued | claimed | done | failed`.
@@ -53,7 +56,7 @@ extracted, generalized OSS project.
   (semicolon-separated — Windows printer names, or CUPS queue names on Linux).
 - Shipped in the homelab as a signed-Python install (see gotcha #2), autostart via Task Scheduler.
 
-**Tests:** 101, all green (`python -m pytest`). Real loopback HTTP servers (ThreadingHTTPServer),
+**Tests:** 106, all green (`python -m pytest`). Real loopback HTTP servers (ThreadingHTTPServer),
 real SQLite (:memory:), injected render fns / subprocess runners — no mocks, no real printers.
 
 **Model:** **poll** — agent opens a long-poll `GET /agent/jobs` to the server, receives jobs, prints,
@@ -99,12 +102,14 @@ webhooks, a full print-options matrix (copies/tray/duplex/rotate), deep capabili
 
 ## 5. Suggested next steps
 
-The v1 poll engine plus the full v1 feature set is complete and tested (46 tests):
+The v1 poll engine plus the full v1 feature set is complete and tested (106 tests):
 
-- ✅ **Web dashboard** (`GET /`) — printers online/offline, recent job history, test-print button.
+- ✅ **Web dashboard** (`GET /`) — Next.js static export in `app/web`: overview, devices,
+  history, keys, downloads.
 - ✅ **Linux/CUPS agent** — `lp -d <queue>` raw + PDF path; backend auto-selected per OS.
 - ✅ **Per-client API keys** — issue/list/revoke via `/apikeys`; multi-key auth in the store.
-- ✅ **Docker image** — `Dockerfile` (python:3.12-slim + cups-client); server needs no Python deps.
+- ✅ **Docker image** — `Dockerfile` (node stage builds the UI, python:3.12-slim + cups-client
+  runs it); the server needs no Python deps.
 
 Remaining before a public release (ops/admin, not code — see `RELEASE_CHECKLIST.md`):
 

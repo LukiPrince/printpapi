@@ -12,12 +12,17 @@ Thanks for helping! The bar for merging is low ceremony, high discipline:
   shortcuts are marked with a `# ponytail:` comment naming the ceiling and the upgrade path.
 - **Security invariants stay:** bearer auth on every endpoint, constant-time token compare
   (`hmac.compare_digest`), hashed keys at rest, `http(s)`-only URL fetches, no `shell=True`.
+- **`app/web` is build output, never hand-edited.** The dashboard source is `web/` (Next.js). It is
+  committed as a static export so a Node-less checkout still has a UI — see
+  [docs/server.md](docs/server.md#dashboard).
 
 ## Workflow
 
 1. Fork, branch from `main`.
 2. Add a failing test, make it pass, keep the suite green.
-3. Open a PR with a short description of the *why*.
+3. Touched `web/`? Run `cd web && npm run build:app` and commit the regenerated `app/web` with it —
+   CI fails the PR otherwise, and self-hosters would keep serving the old dashboard.
+4. Open a PR with a short description of the *why*.
 
 ## Test conventions
 

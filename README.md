@@ -8,9 +8,9 @@ up and prints it — documents **and** label printers (Zebra/ZPL, Bixolon, therm
 
 - Agent **polls outbound** — printers behind NAT/firewall work with **no inbound ports**
 - Server is Python **standard library only** — no framework, nothing to install
-- Web dashboard, REST API, per-client API keys, SQLite job queue
+- React dashboard (live queue, job history, test print, API keys), REST API, SQLite job queue
 - Cross-platform agent: Windows (`win32print` + SumatraPDF) and Linux (CUPS)
-- MIT licensed · 101 tests
+- MIT licensed · 106 tests
 
 ## Get started
 
@@ -53,7 +53,7 @@ First print: dashboard → **Devices** → **Test print**.
 
 | | |
 |---|---|
-| [Server](docs/server.md) | how it works, configuration, Docker, dashboard, API keys, security |
+| [Server](docs/server.md) | how it works, configuration, Docker, dashboard (+ rebuilding it), API keys, security |
 | [Agent](docs/agent.md) | install, `agent.ini`, printer syntax, labels vs PDF |
 | [HTTP API](docs/api.md) | endpoints, auth, content types, job lifecycle |
 | [Roadmap](docs/roadmap.md) | what's planned for v2 |

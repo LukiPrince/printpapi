@@ -1,2 +1,7 @@
 # Normalize all text to LF in the repo and working tree (Windows agent dev churns CRLF otherwise).
 * text=auto eol=lf
+
+# app/web is committed build output — store it byte-for-byte as the build emitted it. Without this
+# the fonts ride on git's binary heuristic and every JS chunk is a normalization candidate, so a
+# rebuild could "change" files it never touched.
+app/web/** -text

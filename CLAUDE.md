@@ -12,17 +12,25 @@ gotchas, and the v1 plan. Don't re-derive; build on it.
   framework yet — keep it that way until a route count actually justifies one.
 - **Agent:** Python, cross-platform. Windows: `pywin32` (raw) + SumatraPDF (PDF). Linux: CUPS `lp`.
   Backend auto-selected per OS by `select_backend`.
+- **Dashboard:** Next.js (App Router, TS) + Tailwind v4 + **shadcn/ui** (Radix) + Motion, built as
+  a **static export** into `app/web` and served by the Python server. No Node at runtime — the
+  stdlib-only rule applies to the *server*, not to the build-time UI toolchain.
 - **Tests:** `pytest`, no fixtures/frameworks beyond it. `python -m pytest` from repo root.
-- Container: `Dockerfile` (python:3.12-slim + cups-client).
+- Container: `Dockerfile` (node stage builds the UI → python:3.12-slim + cups-client runs it).
 
 ## Structure
 
 ```
-app/        server: dispatch.py (pure logic) + store.py (SQLite) + server.py (HTTP + dashboard)
+app/        server: dispatch.py (pure logic) + store.py (SQLite) + server.py (HTTP + static serve)
+app/web/    built dashboard bundle — generated, committed, never hand-edited
+web/        dashboard source (Next.js). `npm run build:app` builds + syncs into app/web
 agent/      cross-platform agent (Windows + Linux/CUPS): print_agent.py + tests
 tests/      server/dispatch/integration tests
 docs/       design-v0-homelab.md (the original homelab design)
 ```
+
+**Never edit `app/web` by hand** — it is build output. Change `web/`, run `npm run build:app`,
+commit both. It is committed so a Node-less `python -m app.server` checkout still has a UI.
 
 `app/dispatch.py` is pure (no IO, injectable fetchers) → easy to test. `app/server.py` owns the IO
 (socket/agent/cups senders, all injectable for tests). Keep that split.

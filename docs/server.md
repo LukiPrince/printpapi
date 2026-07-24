@@ -52,15 +52,45 @@ volume — see [`docker-compose.yml`](../docker-compose.yml).
 Build it yourself instead: `docker build -t printpapi .` then run the same command with
 `printpapi` in place of the `ghcr.io/...` image.
 
-Image is `python:3.12-slim` + `cups-client`. The server itself needs no Python packages.
+Image is `python:3.12-slim` + `cups-client`. The server itself needs no Python packages. The
+build is two-stage: a `node:22-slim` stage compiles the dashboard, and only its static output
+is copied into the runtime image — there is no Node at runtime.
 
 ## Dashboard
 
-`GET /` serves a static, secret-free single page: printers online/offline, job history,
-one-click test print, API-key management, agent install instructions. You paste the token
-once; it's kept in `localStorage` and sent as a bearer header — nothing sensitive lives in
-the HTML. The test print sends a PDF only to PDF-capable printers and a ZPL label to
-everything else.
+`GET /` serves a static, secret-free React dashboard: a live overview (queue counters,
+job-outcome breakdown, activity feed), printers online/offline, searchable job history with
+cancel, one-click test print, API-key management, agent install instructions, light/dark
+theme and a ⌘K command palette. You paste the token once; it's kept in `localStorage` and
+sent as a bearer header — nothing sensitive lives in the served files. The test print sends a
+PDF only to PDF-capable printers and a ZPL label to everything else.
+
+**Where it comes from.** The source is a Next.js app in [`web/`](../web) (App Router,
+TypeScript, Tailwind v4, [shadcn/ui](https://ui.shadcn.com) on Radix, Motion for animation).
+It is built as a **static export** — plain HTML/JS/CSS — and committed to `app/web`, which
+the server serves directly. That keeps the server stdlib-only and means a plain
+`python -m app.server` checkout has a working dashboard with no Node installed.
+
+Changing the UI:
+
+```bash
+PRINTAPI_TOKEN=change-me python -m app.server   # the API, on :3460
+
+cd web
+npm install
+npm run dev        # localhost:3000 with hot reload; API calls are proxied to :3460 in dev
+npm run build:app  # static export -> web/out, then synced into app/web (commit that)
+```
+
+`npm run dev` only works against a running server — it has no API of its own. The dev-only proxy
+lives in `web/next.config.ts`; point it elsewhere with `PRINTPAPI_ORIGIN=http://host:port`. It is
+stripped from the production build, where the Python server serves the bundle and the API together.
+**`app/web` is build output** — change `web/`, run `npm run build:app`, commit both.
+
+Asset paths under `/_next/static/` are content-hashed and served `immutable`; the HTML is
+served `no-cache`. Requests are confined to `app/web` — a path that escapes it 404s.
+If `app/web` is missing (source checkout, never built), `GET /` returns a short page telling
+you to build it; the JSON API is unaffected.
 
 ## API keys
 

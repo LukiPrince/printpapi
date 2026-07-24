@@ -13,3 +13,38 @@ jobs:
           python-version: "3.12"
       - run: pip install pytest
       - run: python -m pytest -q
+
+  # The dashboard bundle in app/web is committed (so a plain `python -m app.server` checkout works
+  # without Node). This job proves the source in web/ still builds, and that nobody changed the
+  # source without regenerating the bundle that actually ships.
+  dashboard:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # history needed to diff the push / PR range
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - run: npm ci
+        working-directory: web
+      - run: npm run lint
+        working-directory: web
+      - run: npm run build
+        working-directory: web
+      - name: bundle must be rebuilt when the UI source changes
+        run: |
+          base='${{ github.event.pull_request.base.sha || github.event.before }}'
+          if [ -z "$base" ] || [ "$base" = "0000000000000000000000000000000000000000" ] \
+             || ! git cat-file -e "$base^{commit}" 2>/dev/null; then
+            echo "no usable base commit — skipping drift check"; exit 0
+          fi
+          changed=$(git diff --name-only "$base" HEAD)
+          if echo "$changed" | grep -q '^web/' && ! echo "$changed" | grep -q '^app/web/'; then
+            echo "::error::web/ changed but app/web/ was not regenerated."
+            echo "Run: cd web && npm run build:app   — then commit app/web."
+            exit 1
+          fi
+          echo "bundle is in step with the source"

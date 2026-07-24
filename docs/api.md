@@ -15,7 +15,7 @@ Token comparison is constant-time (`hmac.compare_digest`).
 
 | Method & path | Auth | Purpose |
 |---|---|---|
-| `GET /` | none | Web dashboard (static shell; data fetched with the token) |
+| `GET /` | none | Web dashboard (static bundle from `app/web`; data fetched with the token) |
 | `GET /health` | none | Liveness check |
 | `GET /metrics` | client | Prometheus text: job counts by state, agent/printer liveness |
 | `POST /jobs` | client | Submit a job → `{job_id}` |

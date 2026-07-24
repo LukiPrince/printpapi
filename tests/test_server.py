@@ -1,4 +1,4 @@
-import json, time, threading, urllib.request, urllib.error
+import json, socket, time, threading, urllib.request, urllib.error
 from http.server import ThreadingHTTPServer
 from app import store, server
 
@@ -236,27 +236,128 @@ def test_apikeys_issue_list_revoke_and_scoped_client_auth():
 
 def test_dashboard_served_at_root_as_html():
     conn = _mem()
-    httpd, base = _serve(conn)
+    httpd, base = _serve(conn, token="bootstrap-s3cret-value")
     try:
         code, raw = _req("GET", base + "/")
         assert code == 200
         html = raw.decode()
         assert "<!doctype html>" in html.lower()
         assert "printpapi" in html.lower()
-        # the static shell carries no secrets; data is fetched with the bearer token
-        assert "/printers" in html and "/jobs" in html
+        assert "/_next/static/" in html            # the bundle, which fetches with the token
+        assert "bootstrap-s3cret-value" not in html  # the shell itself carries no secret
     finally:
         httpd.shutdown()
 
 
-def test_dashboard_has_sidebar_nav():
+def test_dashboard_deep_links_resolve_to_their_page():
     conn = _mem()
     httpd, base = _serve(conn)
     try:
-        html = _req("GET", base + "/")[1].decode()
-        for h in ("#print", "#devices", "#history", "#keys", "#downloads"):
-            assert h in html
-        assert "Sign Out" in html
+        for route in ("/print/", "/devices/", "/history/", "/keys/", "/downloads/"):
+            code, raw = _req("GET", base + route)
+            assert code == 200, route
+            # byte-identity, not just "some HTML" — serving the root shell for every deep link
+            # would otherwise pass, and each exported page is a distinct file
+            expected = (server._WEB_DIR / route.strip("/") / "index.html").read_bytes()
+            assert raw == expected, route
+    finally:
+        httpd.shutdown()
+
+
+def test_dashboard_assets_get_correct_type_and_cache():
+    conn = _mem()
+    httpd, base = _serve(conn)
+    static = server._WEB_DIR / "_next" / "static"
+    # every extension the bundle actually ships must be in the explicit table: a .css served as
+    # octet-stream leaves the dashboard unstyled, a mistyped .js won't execute at all
+    wanted = {".js": "text/javascript", ".css": "text/css", ".woff2": "font/woff2"}
+    try:
+        for suffix, ctype in wanted.items():
+            asset = next((p for p in static.rglob(f"*{suffix}")), None)
+            assert asset is not None, f"no {suffix} in the bundle — run `npm run build:app` in web/"
+            url = base + "/" + asset.relative_to(server._WEB_DIR).as_posix()
+            with urllib.request.urlopen(url) as resp:
+                assert resp.status == 200, url
+                assert resp.headers["Content-Type"].startswith(ctype), url
+                assert "immutable" in resp.headers["Cache-Control"], url
+        with urllib.request.urlopen(base + "/") as resp:
+            assert resp.headers["Cache-Control"] == "no-cache"   # HTML must not be pinned
+    finally:
+        httpd.shutdown()
+
+
+def test_immutable_cache_is_decided_by_the_resolved_file():
+    """A dotted path back out of /_next/static/ must not inherit the year-long cache."""
+    conn = _mem()
+    httpd, base = _serve(conn)
+    try:
+        with urllib.request.urlopen(base + "/_next/static/..%2f..%2findex.html") as resp:
+            assert resp.status == 200
+            assert resp.headers["Cache-Control"] == "no-cache"
+    finally:
+        httpd.shutdown()
+
+
+def test_unstattable_path_is_a_clean_404():
+    """An embedded NUL makes realpath raise on POSIX; it must not kill the request."""
+    conn = _mem()
+    httpd, base = _serve(conn)
+    try:
+        for path in ("/a%00b", "/jobs%00", "/_next/static/x%00.js"):
+            code, raw = _req("GET", base + path)
+            assert code == 404, path
+            assert json.loads(raw)["error"] == "not found", path
+        assert _req("GET", base + "/health")[0] == 200      # server still healthy afterwards
+    finally:
+        httpd.shutdown()
+
+
+def test_head_requests_answer_without_a_body():
+    conn = _mem()
+    httpd, base = _serve(conn)
+    try:
+        for path, code in (("/", 200), ("/health", 200), ("/nope", 404)):
+            req = urllib.request.Request(base + path, method="HEAD")
+            try:
+                with urllib.request.urlopen(req) as resp:
+                    assert resp.status == code, path
+                    assert resp.read() == b"", path       # RFC 9110: HEAD carries no body
+            except urllib.error.HTTPError as e:
+                assert e.code == code, path
+                assert e.read() == b"", path
+    finally:
+        httpd.shutdown()
+
+
+def test_missing_bundle_explains_itself_instead_of_500(tmp_path, monkeypatch):
+    conn = _mem()
+    monkeypatch.setattr(server, "_WEB_DIR", tmp_path / "absent")
+    monkeypatch.setattr(server, "_INDEX", tmp_path / "absent" / "index.html")
+    httpd, base = _serve(conn)
+    try:
+        code, raw = _req("GET", base + "/")
+        assert code == 503
+        assert "build:app" in raw.decode()
+        assert _req("GET", base + "/health")[0] == 200      # the JSON API is unaffected
+    finally:
+        httpd.shutdown()
+
+
+def test_dashboard_path_traversal_is_blocked():
+    conn = _mem()
+    httpd, base = _serve(conn)
+    host, port = base.replace("http://", "").split(":")
+    try:
+        # urllib collapses "..", so speak HTTP directly to get the raw path through
+        for path in ("/../server.py", "/..%2fserver.py", "/%2e%2e/store.py", "/../../app/store.py"):
+            s = socket.create_connection((host, int(port)), timeout=5)
+            s.sendall(f"GET {path} HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n".encode())
+            body = b""
+            while chunk := s.recv(4096):
+                body += chunk
+            s.close()
+            assert b" 404 " in body.split(b"\r\n", 1)[0], path
+            assert b"import sqlite3" not in body, f"leaked source via {path}"
     finally:
         httpd.shutdown()
 
@@ -282,22 +383,12 @@ def test_metrics_endpoint_prometheus_text():
         httpd.shutdown()
 
 
-def test_dashboard_has_copies_input():
+def test_unknown_path_is_json_404_not_the_dashboard():
     conn = _mem()
     httpd, base = _serve(conn)
     try:
-        html = _req("GET", base + "/")[1].decode()
-        assert 'id="copies"' in html
-    finally:
-        httpd.shutdown()
-
-
-def test_dashboard_has_cancel_affordance():
-    conn = _mem()
-    httpd, base = _serve(conn)
-    try:
-        html = _req("GET", base + "/")[1].decode()
-        assert "data-cancel" in html   # queued jobs get a Cancel button wired to DELETE /jobs/{id}
+        code, raw = _req("GET", base + "/nope")
+        assert code == 404 and json.loads(raw)["error"] == "not found"
     finally:
         httpd.shutdown()
 

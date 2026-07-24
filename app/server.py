@@ -10,6 +10,7 @@ import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from urllib.parse import unquote
 
 from app import store
 from app.dispatch import (decode_payload, agent_mode, parse_copies, parse_callback_url,
@@ -22,31 +23,52 @@ _AGENT_PAYLOAD = re.compile(r"^/agent/jobs/(\d+)/payload$")
 _AGENT_RESULT = re.compile(r"^/agent/jobs/(\d+)/result$")
 _APIKEY_ID = re.compile(r"^/apikeys/(\d+)$")
 
-# Static, secret-free single-page dashboard. It prompts for the API token, keeps it in
-# localStorage, and calls /printers + /jobs with the bearer header — so all data stays behind
-# auth and the HTML itself carries nothing sensitive. Test-print picks a PDF for PDF-capable
-# printers and a ZPL label otherwise (gotcha #1: never send PDF bytes raw to a label printer).
-_TEST_PDF_B64 = ("JVBERi0xLjQKMSAwIG9iago8PCAvVHlwZSAvQ2F0YWxvZyAvUGFnZXMgMiAwIFIgPj4KZW5kb2JqCjIg"
-                 "MCBvYmoKPDwgL1R5cGUgL1BhZ2VzIC9LaWRzIFszIDAgUl0gL0NvdW50IDEgPj4KZW5kb2JqCjMgMCBv"
-                 "YmoKPDwgL1R5cGUgL1BhZ2UgL1BhcmVudCAyIDAgUiAvTWVkaWFCb3ggWzAgMCA2MTIgNzkyXSAvUmVz"
-                 "b3VyY2VzIDw8IC9Gb250IDw8IC9GMSA0IDAgUiA+PiA+PiAvQ29udGVudHMgNSAwIFIgPj4KZW5kb2Jq"
-                 "CjQgMCBvYmoKPDwgL1R5cGUgL0ZvbnQgL1N1YnR5cGUgL1R5cGUxIC9CYXNlRm9udCAvSGVsdmV0aWNh"
-                 "ID4+CmVuZG9iago1IDAgb2JqCjw8IC9MZW5ndGggNTAgPj4Kc3RyZWFtCkJUIC9GMSAyNCBUZiA3MiA3"
-                 "MDAgVGQgKHByaW50cGFwaSB0ZXN0IHBhZ2UpIFRqIEVUCmVuZHN0cmVhbQplbmRvYmoKeHJlZgowIDYK"
-                 "MDAwMDAwMDAwMCA2NTUzNSBmIAowMDAwMDAwMDA5IDAwMDAwIG4gCjAwMDAwMDAwNTggMDAwMDAgbiAK"
-                 "MDAwMDAwMDExNSAwMDAwMCBuIAowMDAwMDAwMjQxIDAwMDAwIG4gCjAwMDAwMDAzMTEgMDAwMDAgbiAK"
-                 "dHJhaWxlcgo8PCAvU2l6ZSA2IC9Sb290IDEgMCBSID4+CnN0YXJ0eHJlZgo0MTEKJSVFT0Y=")
-_TEST_ZPL_B64 = "XlhBXkZPNDAsNDBeQUROLDM2LDIwXkZEcHJpbnRwYXBpIHRlc3ReRlNeWFo="
+# The dashboard is a static, secret-free Next.js export in app/web (source in web/, built with
+# `npm run build:app`). It prompts for the API token, keeps it in localStorage, and calls the JSON
+# endpoints with the bearer header — so all data stays behind auth and the bundle itself carries
+# nothing sensitive. Serving it from here keeps the server stdlib-only: no Node at runtime.
+_WEB_DIR = Path(__file__).resolve().parent / "web"
+_INDEX = _WEB_DIR / "index.html"
+_IMMUTABLE_DIR = _WEB_DIR / "_next" / "static"   # content-hashed names, safe to cache forever
 
-# Static, secret-free dashboard SPA loaded from app/dashboard.html. It prompts for the API token,
-# keeps it in localStorage, and calls the JSON endpoints with the bearer header — so all data stays
-# behind auth and the HTML carries nothing sensitive. __PDF_B64__/__ZPL_B64__ are the built-in test
-# payloads (gotcha #1: PDF only reaches PDF-capable printers; label printers get the ZPL label).
-_DASHBOARD_HTML = (
-    (Path(__file__).resolve().parent / "dashboard.html").read_text(encoding="utf-8")
-    .replace("__PDF_B64__", _TEST_PDF_B64)
-    .replace("__ZPL_B64__", _TEST_ZPL_B64)
-)
+# Explicit table: mimetypes.guess_type consults the Windows registry, where .js is routinely
+# mapped to text/plain — which browsers refuse to execute as a module.
+_CONTENT_TYPES = {
+    ".html": "text/html; charset=utf-8",
+    ".js": "text/javascript; charset=utf-8",
+    ".mjs": "text/javascript; charset=utf-8",
+    ".css": "text/css; charset=utf-8",
+    ".json": "application/json",
+    ".txt": "text/plain; charset=utf-8",
+    ".svg": "image/svg+xml",
+    ".ico": "image/x-icon",
+    ".png": "image/png",
+    ".webmanifest": "application/manifest+json",
+    ".woff": "font/woff",
+    ".woff2": "font/woff2",
+}
+
+_NO_DASHBOARD_HTML = """<!doctype html><meta charset="utf-8"><title>printpapi</title>
+<body style="font:15px system-ui;margin:3rem auto;max-width:34rem;padding:0 1rem">
+<h1>printpapi</h1><p>The dashboard bundle is missing. Build it once:</p>
+<pre>cd web &amp;&amp; npm install &amp;&amp; npm run build:app</pre>
+<p>The JSON API works either way.</p>"""
+
+
+def _static_path(url_path):
+    """Map a URL path to a file inside app/web, or None if it escapes the dir or is missing."""
+    rel = unquote(url_path.split("?", 1)[0].split("#", 1)[0]).lstrip("/")
+    try:
+        target = (_WEB_DIR / rel).resolve() if rel else _WEB_DIR
+        if target != _WEB_DIR and not target.is_relative_to(_WEB_DIR):
+            return None                   # ../ traversal — an absolute rel path lands here too
+        if target.is_dir():
+            target = target / "index.html"    # /devices/ -> devices/index.html
+        return target if target.is_file() else None
+    except (OSError, ValueError):
+        # A path the OS refuses to even stat — on POSIX an embedded NUL ("/a%00b") makes
+        # realpath raise ValueError, which would otherwise kill the request with a traceback.
+        return None
 
 
 _JOB_STATES = ("queued", "claimed", "done", "failed", "cancelled")
@@ -107,17 +129,55 @@ def make_handler(*, conn, token, agent_auth=store.authenticate_agent, fetch_url=
             key = self._presented_key()
             return agent_auth(conn, key) if key else None
 
-        def _html(self, code, body):
-            data = body.encode()
+        def _html(self, code, html, body=True):
+            data = html.encode()
             self.send_response(code)
             self.send_header("Content-Type", "text/html; charset=utf-8")
             self.send_header("Content-Length", str(len(data)))
             self.end_headers()
-            self.wfile.write(data)
+            if body:                      # a HEAD response must not carry one
+                self.wfile.write(data)
+
+        def _serve_dashboard(self, body=True):
+            """Serve the static dashboard bundle. Returns False if the path isn't one of ours."""
+            target = _static_path(self.path)
+            if target is None:
+                if self.path in ("/", "/index.html") and not _INDEX.is_file():
+                    self._html(503, _NO_DASHBOARD_HTML, body)   # bundle not built yet
+                    return True
+                return False
+            data = target.read_bytes()
+            self.send_response(200)
+            self.send_header("Content-Type",
+                             _CONTENT_TYPES.get(target.suffix.lower(), "application/octet-stream"))
+            self.send_header("Content-Length", str(len(data)))
+            # Decide from the *resolved* file, not the raw URL: "/_next/static/..%2f..%2findex.html"
+            # is inside the bundle but is not a content-hashed asset.
+            self.send_header("Cache-Control",
+                             "public, max-age=31536000, immutable"
+                             if target.is_relative_to(_IMMUTABLE_DIR) else "no-cache")
+            self.end_headers()
+            if body:
+                self.wfile.write(data)
+            return True
+
+        def _empty(self, code):
+            self.send_response(code)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+
+        def do_HEAD(self):
+            # Uptime checks and the browser's own probes HEAD the dashboard and /health;
+            # without this BaseHTTPRequestHandler answers 501 to both.
+            if self.path == "/health":
+                return self._empty(200)
+            if self._serve_dashboard(body=False):
+                return
+            self._empty(404)
 
         def do_GET(self):
             if self.path in ("/", "/index.html"):
-                return self._html(200, _DASHBOARD_HTML)
+                return None if self._serve_dashboard() else self._json(404, {"error": "not found"})
             if self.path == "/health":
                 return self._json(200, {"ok": True})
             if self.path == "/metrics":
@@ -176,6 +236,10 @@ def make_handler(*, conn, token, agent_auth=store.authenticate_agent, fetch_url=
                         self.end_headers()
                         return
                     time.sleep(poll_interval)  # ponytail: DB poll; notify-on-enqueue if latency matters
+            # Last: the dashboard bundle (/_next/..., /devices/, …). After the API routes, so a
+            # stray file in app/web can never shadow an endpoint.
+            if self._serve_dashboard():
+                return
             self._json(404, {"error": "not found"})
 
         def do_POST(self):

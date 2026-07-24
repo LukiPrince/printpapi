@@ -8,3 +8,8 @@ docs/
 *.db
 *.db-wal
 *.db-shm
+# The dashboard is rebuilt in the image's `web` stage, never copied from the context.
+app/web/
+web/node_modules/
+web/.next/
+web/out/
