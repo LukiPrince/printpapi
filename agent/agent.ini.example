@@ -1,0 +1,21 @@
+; printpapi agent configuration — copy to agent.ini next to print_agent.py and edit.
+; Full reference: https://github.com/LukiPrince/printpapi/blob/main/docs/agent.md
+
+[agent]
+; Where the printpapi server lives. Reached outbound only — no inbound port on this machine.
+server_url = http://yourserver:3460
+
+; A key issued in the dashboard (API keys). The agent binds this key to its name on first
+; contact, so nobody else can register under it.
+api_key = your-agent-key
+
+; How this machine shows up on the Devices page.
+name = office-pc
+
+; Semicolon-separated printers:  name [|pdf] [= target]
+;   plain name              -> a Windows printer name or a CUPS queue (Linux/macOS)
+;   |pdf                    -> this printer can render PDFs. Default is raw-only, so a label
+;                              printer is never sent a PDF by accident (it would print blanks).
+;   = socket://host:port    -> the agent opens a raw TCP socket, e.g. a network label printer's
+;                              :9100. Always raw-only — a bare socket has no renderer.
+printers = Zebra GK420d ; HP LaserJet|pdf ; warehouse-label = socket://192.168.1.50:9100
