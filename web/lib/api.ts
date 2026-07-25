@@ -15,6 +15,16 @@ export type Printer = {
   online: boolean;
 };
 
+/** An agent machine. `printers` is a count here — the devices page pairs it with /printers. */
+export type Computer = {
+  id: number;
+  name: string;
+  online: boolean;
+  last_seen_at: number | null;
+  created_at: number;
+  printers: number;
+};
+
 export type Job = {
   id: number;
   printer_id: number;
@@ -134,6 +144,9 @@ export async function checkToken(token: string): Promise<boolean> {
 
 export const listPrinters = () =>
   getJSON<{ printers: Printer[] }>("/printers").then((r) => r.printers ?? []);
+
+export const listComputers = () =>
+  getJSON<{ computers: Computer[] }>("/computers").then((r) => r.computers ?? []);
 
 export const listJobs = () => getJSON<{ jobs: Job[] }>("/jobs").then((r) => r.jobs ?? []);
 

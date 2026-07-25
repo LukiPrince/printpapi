@@ -25,8 +25,8 @@ issue tracker, PrintNode's feature surface, e-commerce/ERP forums, and OSS compe
 order of pull:
 
 1. ~~**Agent/computer status API + online/offline webhooks**~~ ✅ **shipped** — `GET /computers`
-   with liveness + per-org `event_url` transitions. Still open on top: a dashboard view for it
-   (the UI only lists printers) and signed event payloads.
+   with liveness + per-org `event_url` transitions, and the Devices page built on it. Still open
+   on top: signed event payloads.
 2. ~~**Idempotency keys + job expiration**~~ ✅ **shipped** — `idempotency_key` (per-org, returns
    the original job) and `expire_after` (deadline-passed jobs fail as `expired`, never print).
 3. **macOS agent** — it's CUPS underneath, so likely test + docs (plus macOS raw-printing quirks).

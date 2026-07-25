@@ -28,7 +28,7 @@ export const NAV: NavItem[] = [
     label: "Devices",
     eyebrow: "Agents & printers",
     icon: Printer,
-    help: "Printers registered by your agents. Online means the agent polled within the last minute. Test print sends a sample label or PDF, whichever the printer can handle.",
+    help: "Every agent from /computers with its printers. Online means the agent polled within the last minute; an offline one shows when it was last seen. Test print sends a sample label or PDF, whichever the printer can handle.",
   },
   {
     href: "/history",

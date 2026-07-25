@@ -148,7 +148,10 @@ gotcha #2).
   `enqueue_job`'s transaction; `expire_after` writes `jobs.expires_at`, the claim query skips
   deadline-passed jobs (that is what guarantees no late print) and the reaper fails them as
   `expired`. No new job state — the error string carries the reason.
-- Left open: the dashboard still has no computers view, and event payloads are unsigned.
+- The dashboard's Devices page is driven by `/computers` (with `/printers` for the cards), so an
+  agent that reported no printers is visible instead of silently missing, and an offline one shows
+  "last seen 4m ago". If `/computers` is unavailable it falls back to grouping `/printers`.
+- Left open: event payloads are unsigned.
 
 **Strategic context for what comes next:** the repo owner wants a cheap hosted SaaS
 ("Shopify/WooCommerce order comes in → label/packing slip prints") undercutting the paid
