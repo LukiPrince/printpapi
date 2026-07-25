@@ -1,11 +1,11 @@
 name: docker
 # Builds the server image and pushes it to GHCR so users can pull a prebuilt
-# image instead of `docker build`. Fires on version tags and published releases.
+# image instead of `docker build`. Fires on version tags only — a `release:
+# published` trigger would run the identical build a second time, since the tag
+# is always pushed first and the release page is cut from it afterwards.
 on:
   push:
     tags: ["v*"]
-  release:
-    types: [published]
   workflow_dispatch:
 
 jobs:
