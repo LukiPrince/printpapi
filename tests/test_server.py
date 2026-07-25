@@ -728,3 +728,67 @@ def test_job_title_roundtrips_through_http():
         assert jobs[0]["agent_name"] == "pc"
     finally:
         httpd.shutdown()
+
+
+def test_computers_endpoint_lists_agents_scoped_to_the_org():
+    conn = _mem()
+    other, a, b, ja = _two_org_fixture(conn)
+    httpd, base = _serve(conn)
+    try:
+        assert _req("GET", base + "/computers")[0] == 401
+        cs = json.loads(_req("GET", base + "/computers", token="acme-key")[1])["computers"]
+        assert [c["id"] for c in cs] == [b["computer_id"]]
+        assert cs[0]["name"] == "pc" and cs[0]["online"] is True and cs[0]["printers"] == 1
+        assert len(json.loads(_req("GET", base + "/computers", token="t")[1])["computers"]) == 2
+    finally:
+        httpd.shutdown()
+
+
+def test_org_event_url_is_set_by_root_only_and_must_be_http():
+    conn = _mem()
+    httpd, base = _serve(conn)
+    try:
+        oid = json.loads(_req("POST", base + "/orgs", token="t", body={"name": "acme"})[1])["id"]
+        key = json.loads(_req("POST", base + "/apikeys", token="t",
+                              body={"label": "c", "org_id": oid})[1])["key"]
+        assert _req("PUT", base + f"/orgs/{oid}", token=key,
+                    body={"event_url": "https://h"})[0] == 401          # its own key is not root
+        assert _req("PUT", base + f"/orgs/{oid}", token="t",
+                    body={"event_url": "ftp://h"})[0] == 400
+        assert _req("PUT", base + f"/orgs/{oid}", token="t",
+                    body={"event_url": "https://h"})[0] == 200
+        orgs = {o["id"]: o for o in json.loads(_req("GET", base + "/orgs", token="t")[1])["orgs"]}
+        assert orgs[oid]["event_url"] == "https://h"
+        assert _req("PUT", base + "/orgs/4242", token="t", body={"event_url": "https://h"})[0] == 404
+        assert _req("PUT", base + f"/orgs/{oid}", token="t", body={"event_url": None})[0] == 200
+        orgs = {o["id"]: o for o in json.loads(_req("GET", base + "/orgs", token="t")[1])["orgs"]}
+        assert orgs[oid]["event_url"] is None                            # null clears it
+    finally:
+        httpd.shutdown()
+
+
+def test_agent_liveness_events_are_posted_to_the_orgs_event_url():
+    conn = _mem()
+    store.set_org_event_url(conn, store.DEFAULT_ORG, "https://hooks.example/x")
+    reg = store.register_agent(conn, "pc", "ak", [{"name": "Z", "can_pdf": False}])
+    sent = []
+    now = time.time()
+    server.deliver_agent_events(conn, lambda u, b: sent.append((u, b)), 60, now=now)
+    assert sent == []                                                    # still online
+    server.deliver_agent_events(conn, lambda u, b: sent.append((u, b)), 60, now=now + 300)
+    (url, body), = sent
+    assert url == "https://hooks.example/x"
+    assert body["event"] == "computer_offline" and body["computer_id"] == reg["computer_id"]
+    assert body["name"] == "pc" and body["org_id"] == store.DEFAULT_ORG
+    assert body["last_seen_at"] > 0
+
+
+def test_a_failing_event_post_does_not_abort_the_pass():
+    conn = _mem()
+    store.set_org_event_url(conn, store.DEFAULT_ORG, "https://down.example/x")
+    store.register_agent(conn, "pc", "ak", [])
+
+    def boom(url, body):
+        raise RuntimeError("connection refused")
+
+    server.deliver_agent_events(conn, boom, 60, now=time.time() + 300)   # must not raise

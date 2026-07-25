@@ -31,6 +31,9 @@ extracted, generalized OSS project.
     `queued | claimed | done | failed | cancelled`; `DELETE /jobs/{id}` — cancel while queued.
   - `GET /printers` — printers with online/offline + capabilities (papers/bins/duplex/color,
     reported best-effort by the agent at registration).
+  - `GET /computers` — agents with online/offline, last seen, printer count. Liveness *transitions*
+    are POSTed to the org's `event_url` (`PUT /orgs/{id}`, root) as `computer_online` /
+    `computer_offline` — once per edge, at-most-once (see `docs/api.md#computers-agents`).
   - `GET /metrics` — Prometheus text. `GET /health`.
 - Admin endpoints (bootstrap `PRINTAPI_TOKEN` only) — **per-client API keys**:
   - `POST /apikeys {label}` → issues a new random key (shown once); `GET /apikeys` lists labels;
@@ -60,7 +63,7 @@ extracted, generalized OSS project.
   (semicolon-separated — Windows printer names, or CUPS queue names on Linux).
 - Shipped in the homelab as a signed-Python install (see gotcha #2), autostart via Task Scheduler.
 
-**Tests:** 136, all green (`python -m pytest`). Real loopback HTTP servers (ThreadingHTTPServer),
+**Tests:** 155, all green (`python -m pytest`). Real loopback HTTP servers (ThreadingHTTPServer),
 real SQLite (:memory:), injected render fns / subprocess runners — no mocks, no real printers.
 
 **Model:** **poll** — agent opens a long-poll `GET /agent/jobs` to the server, receives jobs, prints,
@@ -110,7 +113,8 @@ multi-tenancy is now the active next step — see §5 and `docs/roadmap.md`.)*
 
 v1 is **published** (public repo, v1.0.0 release, GHCR image) and the post-v1 feature wave has
 shipped: dashboard, Linux/CUPS agent, per-client API keys, Docker, job copies, cancel, `/metrics`,
-webhooks, per-job print options, printer capability discovery, **multi-tenancy**. 148 tests green.
+webhooks, per-job print options, printer capability discovery, **multi-tenancy**, **computer status
++ liveness events** (roadmap #1). 155 tests green.
 A demand-research sweep (July 2026) produced the ranked v2 roadmap in `docs/roadmap.md` — read it
 before inventing features. Only non-code leftover: code-sign the Windows agent (needs a cert,
 gotcha #2).

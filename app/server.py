@@ -22,6 +22,7 @@ _JOB_ID = re.compile(r"^/jobs/(\d+)$")
 _AGENT_PAYLOAD = re.compile(r"^/agent/jobs/(\d+)/payload$")
 _AGENT_RESULT = re.compile(r"^/agent/jobs/(\d+)/result$")
 _APIKEY_ID = re.compile(r"^/apikeys/(\d+)$")
+_ORG_ID = re.compile(r"^/orgs/(\d+)$")
 
 # The dashboard is a static, secret-free Next.js export in app/web (source in web/, built with
 # `npm run build:app`). It prompts for the API token, keeps it in localStorage, and calls the JSON
@@ -217,6 +218,12 @@ def make_handler(*, conn, token, agent_auth=store.authenticate_agent, fetch_url=
                     return self._json(401, {"error": "unauthorized"})
                 return self._json(200,
                                   {"printers": store.list_printers(conn, online_window_s, org_id=org)})
+            if self.path == "/computers":
+                ok, org = self._client_org()
+                if not ok:
+                    return self._json(401, {"error": "unauthorized"})
+                return self._json(200,
+                                  {"computers": store.list_agents(conn, online_window_s, org_id=org)})
             if self.path == "/apikeys":
                 if not self._admin_ok():
                     return self._json(401, {"error": "unauthorized"})
@@ -349,6 +356,25 @@ def make_handler(*, conn, token, agent_auth=store.authenticate_agent, fetch_url=
                 return self._json(200, {"ok": True}) if ok else self._json(404, {"error": "not found"})
             self._json(404, {"error": "not found"})
 
+        def do_PUT(self):
+            mo = _ORG_ID.match(self.path)
+            if mo:
+                if not self._admin_ok():
+                    return self._json(401, {"error": "unauthorized"})
+                try:
+                    body = self._read_json()
+                except ValueError:
+                    return self._json(400, {"error": "bad json"})
+                try:
+                    # Same http(s) check as a job's callback_url; null/"" clears the URL.
+                    url = parse_callback_url({"callback_url": body.get("event_url")})
+                except DispatchError as e:
+                    return self._json(400, {"error": str(e).replace("callback_url", "event_url")})
+                if not store.set_org_event_url(conn, int(mo.group(1)), url):
+                    return self._json(404, {"error": "not found"})
+                return self._json(200, {"ok": True, "event_url": url})
+            self._json(404, {"error": "not found"})
+
         def do_DELETE(self):
             m = _APIKEY_ID.match(self.path)
             if m:
@@ -393,17 +419,34 @@ def deliver_webhooks(conn, post, max_attempts):
             store.mark_webhook_delivered(conn, job["job_id"])   # must not look like a POST failure
 
 
+def deliver_agent_events(conn, post, online_window_s, now=None):
+    """One pass of agent liveness events: POST `computer_offline` / `computer_online` to the
+    event_url of the agent's org (fleet operators watch customer-site machines with these).
+    # ponytail: at-most-once — the edge is consumed when it is claimed, so a failed POST is logged,
+    # not retried. Add an attempt counter like the job hooks if these ever need a guarantee."""
+    for ev in store.claim_agent_transitions(conn, online_window_s, now=now):
+        payload = {"event": f"computer_{ev['event']}", "computer_id": ev["agent_id"],
+                   "name": ev["name"], "org_id": ev["org_id"], "last_seen_at": ev["last_seen_at"]}
+        try:
+            post(ev["event_url"], payload)
+        except Exception as e:
+            print(f"agent event {payload['event']} for {ev['name']!r} -> {ev['event_url']} "
+                  f"failed: {e}", file=sys.stderr)
+
+
 def _hook_post(url, body):
     return _http_post(url, body, timeout=10)   # background sender: shorter than the 30s default
 
 
-def start_webhook_dispatcher(conn, *, post=_hook_post, interval_s=5, max_attempts=5):
+def start_webhook_dispatcher(conn, *, post=_hook_post, interval_s=5, max_attempts=5,
+                             online_window_s=60):
     # ponytail: one thread, sequential delivery — a slow callback delays the ones behind it (bounded
     # by the 10s timeout x attempt cap). A worker pool / async delivery only if hook volume grows.
     def loop():
         while True:
             try:
                 deliver_webhooks(conn, post, max_attempts)
+                deliver_agent_events(conn, post, online_window_s)
             except Exception as e:
                 print(f"webhook dispatcher error: {e}", file=sys.stderr)
             time.sleep(interval_s)

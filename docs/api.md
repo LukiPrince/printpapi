@@ -25,8 +25,10 @@ Token comparison is constant-time (`hmac.compare_digest`).
 | `GET /jobs/{id}` | client | One job's state: `queued` \| `claimed` \| `done` \| `failed` \| `cancelled` |
 | `DELETE /jobs/{id}` | client | Cancel a still-`queued` job (`409` once claimed, `404` if unknown) |
 | `GET /printers` | client | Registered printers + online/offline + capabilities |
+| `GET /computers` | client | Registered agents + online/offline + printer count |
 | `POST /orgs` | root | Create an org → `{id, name}` |
-| `GET /orgs` | root | List orgs |
+| `GET /orgs` | root | List orgs (with their `event_url`) |
+| `PUT /orgs/{id}` | root | Set/clear the org's `event_url` for agent liveness events |
 | `POST /apikeys` | root | Issue a client key → `{id, label, org_id, key}` (key shown once) |
 | `GET /apikeys` | root | List keys with their org (never the secret) |
 | `DELETE /apikeys/{id}` | root | Revoke a key |
@@ -109,6 +111,39 @@ Set `callback_url` on a job and the server POSTs this JSON once the job reaches 
   was lost, so it retries). Make your handler idempotent — dedupe on `job_id` + `state`.
 - The payload is **unsigned** and the URL is fetched server-side (`http(s)` only) — same trust model
   as the `*_uri` content types. Point it at a trusted endpoint.
+
+## Computers (agents)
+
+```bash
+curl -s localhost:3460/computers -H 'Authorization: Bearer <client-key>'
+# -> {"computers":[{"id":1,"name":"warehouse-pc","online":true,"last_seen_at":1753.., 
+#                  "created_at":1750..,"printers":2}]}
+```
+
+`online` means the agent polled or registered within the liveness window (60 s). Scoped to the
+key's org, like every other client list.
+
+### Agent liveness events
+
+An org can receive a POST whenever one of its agents crosses that window — the fleet-monitoring
+counterpart to per-job `callback_url` webhooks:
+
+```bash
+curl -s -X PUT localhost:3460/orgs/2 -H 'Authorization: Bearer <PRINTAPI_TOKEN>' \
+     -d '{"event_url":"https://ops.example/printpapi-events"}'    # null clears it
+```
+
+```json
+{"event":"computer_offline","computer_id":1,"name":"warehouse-pc","org_id":2,"last_seen_at":1753..}
+```
+
+- `computer_offline` fires once when the agent stops being seen, `computer_online` once when it
+  comes back. One POST per edge, never a repeat while the state holds.
+- **At-most-once, unlike job webhooks:** a failed POST is logged and dropped, not retried — the next
+  real transition fires again. Treat `GET /computers` as the source of truth.
+- `http(s)` only, unsigned, same trust model as `callback_url`.
+- An org that sets its `event_url` later starts from the *current* state; past transitions are not
+  replayed.
 
 ## Multi-tenancy
 

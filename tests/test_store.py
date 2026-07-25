@@ -1,4 +1,4 @@
-import os, tempfile
+import os, tempfile, time
 import pytest
 from app import store
 
@@ -419,3 +419,45 @@ def test_legacy_single_org_db_keeps_working_unchanged():
     assert len(store.list_printers(conn, 60, org_id=1)) == 1
     assert len(store.recent_jobs(conn, org_id=1)) == 1
     assert store.claim_job(conn, reg["computer_id"])["job_id"] == jid    # agent path untouched
+
+
+# --- computer status + liveness events ----------------------------------------------
+
+
+def test_list_agents_reports_liveness_printer_count_and_org_scope():
+    conn = _db()
+    other, a, b = _two_orgs(conn)
+    now = time.time()
+    conn.execute("UPDATE agents SET last_seen_at=? WHERE id=?", (now - 300, b["computer_id"]))
+    conn.commit()
+    scoped = store.list_agents(conn, 60, now=now, org_id=other)
+    assert [x["id"] for x in scoped] == [b["computer_id"]]
+    assert scoped[0]["online"] is False and scoped[0]["printers"] == 1 and scoped[0]["name"] == "pc"
+    root = {x["id"]: x for x in store.list_agents(conn, 60, now=now)}
+    assert len(root) == 2 and root[a["computer_id"]]["online"] is True
+
+
+def test_agent_transitions_fire_once_per_liveness_edge():
+    conn = _db()
+    store.set_org_event_url(conn, store.DEFAULT_ORG, "https://hooks.example/x")
+    reg = store.register_agent(conn, "pc", "k", [])
+    now = time.time()
+    assert store.claim_agent_transitions(conn, 60, now=now) == []      # just seen -> no edge
+    late = now + 300
+    evs = store.claim_agent_transitions(conn, 60, now=late)
+    assert [(e["agent_id"], e["event"], e["event_url"]) for e in evs] == [
+        (reg["computer_id"], "offline", "https://hooks.example/x")]
+    assert evs[0]["name"] == "pc" and evs[0]["org_id"] == store.DEFAULT_ORG
+    assert store.claim_agent_transitions(conn, 60, now=late) == []     # edge consumed, not repeated
+    store.register_agent(conn, "pc", "k", [])                          # agent comes back
+    assert [e["event"] for e in store.claim_agent_transitions(conn, 60)] == ["online"]
+
+
+def test_transitions_of_an_org_without_an_event_url_are_dropped_not_queued():
+    conn = _db()
+    store.register_agent(conn, "pc", "k", [])
+    late = time.time() + 300
+    assert store.claim_agent_transitions(conn, 60, now=late) == []     # nowhere to send it
+    store.set_org_event_url(conn, store.DEFAULT_ORG, "https://hooks.example/x")
+    assert store.claim_agent_transitions(conn, 60, now=late) == []     # and it is not replayed
+    assert store.set_org_event_url(conn, 4242, "https://h") is False   # unknown org

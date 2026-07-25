@@ -13,7 +13,8 @@ up and prints it — documents **and** label printers (Zebra/ZPL, Bixolon, therm
 - Print options per job (copies, duplex, paper size, tray, color, page ranges) +
   capability discovery per printer
 - Multi-tenant: orgs isolate API keys, agents, printers and jobs
-- MIT licensed · 148 tests
+- Fleet monitoring: `GET /computers` + online/offline webhooks, Prometheus `/metrics`
+- MIT licensed · 155 tests
 
 ## Get started
 

@@ -12,6 +12,9 @@ v1 is deliberately small (see [CONTRIBUTING.md](../CONTRIBUTING.md) for the YAGN
 - ~~**Printer capabilities**~~ ✅ agent reports papers/bins/duplex/color at registration, in `GET /printers`.
 - ~~**Multi-tenancy**~~ ✅ org-scoped keys, agents, printers and jobs; `POST/GET /orgs` (root only);
   foreign ids 404. See [api.md](api.md#multi-tenancy).
+- ~~**Computer status + liveness events**~~ ✅ `GET /computers`, and `computer_online`/
+  `computer_offline` POSTed to an org's `event_url` (`PUT /orgs/{id}`).
+  See [api.md](api.md#computers-agents).
 
 ## v2 candidates
 
@@ -19,9 +22,9 @@ Ranked by demand evidence from a broad research sweep (July 2026) across r/selfh
 issue tracker, PrintNode's feature surface, e-commerce/ERP forums, and OSS competitors. Roughly in
 order of pull:
 
-1. **Agent/computer status API + online/offline webhooks** — `GET /computers` with liveness, and
-   account-level webhook events when an agent goes offline (PrintNode fires these; fleet operators
-   monitor customer-site clients with them). We only have per-job callbacks and Prometheus.
+1. ~~**Agent/computer status API + online/offline webhooks**~~ ✅ **shipped** — `GET /computers`
+   with liveness + per-org `event_url` transitions. Still open on top: a dashboard view for it
+   (the UI only lists printers) and signed event payloads.
 2. **Idempotency keys + job expiration** — retry-safe `POST /jobs` (resubmit without double-print),
    and `expire_after` so a stale label job doesn't print hours later when an offline agent
    reconnects. Small, high operational value for order-printing integrations.

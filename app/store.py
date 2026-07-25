@@ -13,12 +13,13 @@ _LOCK = threading.Lock()  # ponytail: global lock; per-connection pool only if i
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS orgs(
-  id INTEGER PRIMARY KEY, name TEXT NOT NULL, created_at REAL NOT NULL);
+  id INTEGER PRIMARY KEY, name TEXT NOT NULL, event_url TEXT, created_at REAL NOT NULL);
 CREATE TABLE IF NOT EXISTS users(
   id INTEGER PRIMARY KEY, org_id INTEGER NOT NULL, name TEXT NOT NULL, created_at REAL NOT NULL);
 CREATE TABLE IF NOT EXISTS agents(
   id INTEGER PRIMARY KEY AUTOINCREMENT, org_id INTEGER NOT NULL, name TEXT NOT NULL,
-  api_key_hash TEXT NOT NULL UNIQUE, last_seen_at REAL, created_at REAL NOT NULL);
+  api_key_hash TEXT NOT NULL UNIQUE, last_seen_at REAL,
+  offline_notified INTEGER NOT NULL DEFAULT 0, created_at REAL NOT NULL);
 CREATE TABLE IF NOT EXISTS printers(
   id INTEGER PRIMARY KEY AUTOINCREMENT, org_id INTEGER NOT NULL, agent_id INTEGER NOT NULL,
   name TEXT NOT NULL, can_pdf INTEGER NOT NULL DEFAULT 0, state TEXT NOT NULL DEFAULT 'active',
@@ -54,7 +55,10 @@ def init_db(conn):
                         "ALTER TABLE jobs ADD COLUMN options TEXT",
                         "ALTER TABLE jobs ADD COLUMN callback_url TEXT",
                         "ALTER TABLE jobs ADD COLUMN hook_attempts INTEGER NOT NULL DEFAULT 0",
-                        "ALTER TABLE jobs ADD COLUMN hook_delivered_at REAL"):
+                        "ALTER TABLE jobs ADD COLUMN hook_delivered_at REAL",
+                        "ALTER TABLE orgs ADD COLUMN event_url TEXT",
+                        "ALTER TABLE agents ADD COLUMN offline_notified "
+                        "INTEGER NOT NULL DEFAULT 0"):
                 try:
                     conn.execute(ddl)
                 except sqlite3.OperationalError:
@@ -95,8 +99,20 @@ def create_org(conn, name):
 
 def list_orgs(conn):
     with _LOCK:
-        rows = conn.execute("SELECT id, name, created_at FROM orgs ORDER BY id").fetchall()
+        rows = conn.execute("SELECT id, name, event_url, created_at FROM orgs ORDER BY id").fetchall()
     return [dict(r) for r in rows]
+
+
+def set_org_event_url(conn, org_id, url):
+    """Where this org's agent liveness events go (None clears it). False if no such org."""
+    with _LOCK:
+        try:
+            cur = conn.execute("UPDATE orgs SET event_url=? WHERE id=?", (url, org_id))
+            conn.commit()
+            return cur.rowcount == 1
+        except Exception:
+            conn.rollback()
+            raise
 
 
 def org_exists(conn, org_id):
@@ -400,6 +416,52 @@ def metrics(conn, online_window_s, now=None, org_id=None):
     online = sum(1 for s in seen if s is not None and (now - s) <= online_window_s)
     return {"jobs": {r["state"]: r["c"] for r in jobrows},
             "agents_total": len(seen), "agents_online": online, "printers_total": printers}
+
+
+def list_agents(conn, online_window_s, now=None, org_id=None):
+    """Agents (PrintNode calls them computers) with liveness and how many printers each carries."""
+    now = time.time() if now is None else now
+    with _LOCK:
+        rows = conn.execute(
+            "SELECT a.id, a.name, a.last_seen_at, a.created_at, "
+            "(SELECT COUNT(*) FROM printers p WHERE p.agent_id = a.id) AS printers "
+            "FROM agents a WHERE (:org IS NULL OR a.org_id = :org) ORDER BY a.id",
+            {"org": org_id}).fetchall()
+    return [{"id": r["id"], "name": r["name"], "last_seen_at": r["last_seen_at"],
+             "created_at": r["created_at"], "printers": r["printers"],
+             "online": r["last_seen_at"] is not None and (now - r["last_seen_at"]) <= online_window_s}
+            for r in rows]
+
+
+def claim_agent_transitions(conn, online_window_s, now=None):
+    """Agents whose liveness flipped since the last call, marked as reported under the same lock so
+    each edge fires exactly once. Agents in an org with no event_url are marked but not returned —
+    an org that sets a URL later starts from the current state instead of replaying history."""
+    # ponytail: full scan of agents per pass (the table is one row per machine); index it if a
+    # deployment ever has thousands of agents.
+    now = time.time() if now is None else now
+    cutoff = now - online_window_s
+    out = []
+    with _LOCK:
+        try:
+            rows = conn.execute(
+                "SELECT a.id, a.name, a.org_id, a.last_seen_at, a.offline_notified, o.event_url "
+                "FROM agents a JOIN orgs o ON o.id = a.org_id ORDER BY a.id").fetchall()
+            for r in rows:
+                offline = r["last_seen_at"] is None or r["last_seen_at"] < cutoff
+                if offline == bool(r["offline_notified"]):
+                    continue                      # same state as last pass — no edge
+                conn.execute("UPDATE agents SET offline_notified=? WHERE id=?",
+                             (1 if offline else 0, r["id"]))
+                if r["event_url"]:
+                    out.append({"agent_id": r["id"], "name": r["name"], "org_id": r["org_id"],
+                                "last_seen_at": r["last_seen_at"], "event_url": r["event_url"],
+                                "event": "offline" if offline else "online"})
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+    return out
 
 
 def list_printers(conn, online_window_s, now=None, org_id=None):
