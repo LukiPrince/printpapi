@@ -110,14 +110,22 @@ def make_handler(*, conn, token, agent_auth=store.authenticate_agent, fetch_url=
             return auth[7:] if auth.startswith("Bearer ") else ""
 
         def _admin_ok(self):
-            # The bootstrap PRINTAPI_TOKEN is the root/admin credential (issues & revokes keys).
+            # The bootstrap PRINTAPI_TOKEN is the root/admin credential (orgs, keys) and the only
+            # credential that spans orgs.
             return hmac.compare_digest(self._presented_key(), token)
 
-        def _client_ok(self):
+        def _client_org(self):
+            """Resolve the presented key to the org this request may act in.
+
+            (True, None)  root — the bootstrap token: no org filter, sees and acts on every org.
+            (True, <id>)  an issued client key: confined to that org, foreign ids read as 404.
+            (False, None) no valid key.
+            """
             key = self._presented_key()
             if hmac.compare_digest(key, token):     # bootstrap token is always a valid client too
-                return True
-            return store.authenticate_client(conn, key) is not None   # or any active per-client key
+                return True, None
+            row = store.authenticate_client(conn, key)   # or any active per-client key
+            return (True, row["org_id"]) if row else (False, None)
 
         def _read_json(self):
             length = int(self.headers.get("Content-Length", 0))   # ValueError -> caller's 400
@@ -181,9 +189,10 @@ def make_handler(*, conn, token, agent_auth=store.authenticate_agent, fetch_url=
             if self.path == "/health":
                 return self._json(200, {"ok": True})
             if self.path == "/metrics":
-                if not self._client_ok():
+                ok, org = self._client_org()
+                if not ok:
                     return self._json(401, {"error": "unauthorized"})
-                body = _prometheus(store.metrics(conn, online_window_s)).encode()
+                body = _prometheus(store.metrics(conn, online_window_s, org_id=org)).encode()
                 self.send_response(200)
                 self.send_header("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
                 self.send_header("Content-Length", str(len(body)))
@@ -191,23 +200,31 @@ def make_handler(*, conn, token, agent_auth=store.authenticate_agent, fetch_url=
                 self.wfile.write(body)
                 return
             if self.path == "/jobs":
-                if not self._client_ok():
+                ok, org = self._client_org()
+                if not ok:
                     return self._json(401, {"error": "unauthorized"})
-                return self._json(200, {"jobs": store.recent_jobs(conn)})
+                return self._json(200, {"jobs": store.recent_jobs(conn, org_id=org)})
             m = _JOB_ID.match(self.path)
             if m:
-                if not self._client_ok():
+                ok, org = self._client_org()
+                if not ok:
                     return self._json(401, {"error": "unauthorized"})
-                job = store.get_job(conn, int(m.group(1)))
+                job = store.get_job(conn, int(m.group(1)), org_id=org)
                 return self._json(200, job) if job else self._json(404, {"error": "not found"})
             if self.path == "/printers":
-                if not self._client_ok():
+                ok, org = self._client_org()
+                if not ok:
                     return self._json(401, {"error": "unauthorized"})
-                return self._json(200, {"printers": store.list_printers(conn, online_window_s)})
+                return self._json(200,
+                                  {"printers": store.list_printers(conn, online_window_s, org_id=org)})
             if self.path == "/apikeys":
                 if not self._admin_ok():
                     return self._json(401, {"error": "unauthorized"})
                 return self._json(200, {"keys": store.list_api_keys(conn)})
+            if self.path == "/orgs":
+                if not self._admin_ok():
+                    return self._json(401, {"error": "unauthorized"})
+                return self._json(200, {"orgs": store.list_orgs(conn)})
             mp = _AGENT_PAYLOAD.match(self.path)
             if mp:
                 aid = self._agent_id()
@@ -244,7 +261,8 @@ def make_handler(*, conn, token, agent_auth=store.authenticate_agent, fetch_url=
 
         def do_POST(self):
             if self.path == "/jobs":
-                if not self._client_ok():
+                ok, org = self._client_org()
+                if not ok:
                     return self._json(401, {"error": "unauthorized"})
                 try:
                     body = self._read_json()
@@ -258,7 +276,8 @@ def make_handler(*, conn, token, agent_auth=store.authenticate_agent, fetch_url=
                     options = parse_options(body, mode)
                     jid = store.enqueue_job(conn, body.get("printer_id"), body.get("type"),
                                             mode, data, title=body.get("title"), copies=copies,
-                                            callback_url=callback_url, options=options)
+                                            callback_url=callback_url, options=options,
+                                            org_id=org)
                 except FetchError as e:
                     return self._json(502, {"error": f"downstream: {e}"})
                 except (DispatchError, store.UnknownPrinter) as e:
@@ -272,9 +291,23 @@ def make_handler(*, conn, token, agent_auth=store.authenticate_agent, fetch_url=
                 except ValueError:
                     return self._json(400, {"error": "bad json"})
                 label = (body.get("label") or "client").strip() or "client"
+                org_id = body.get("org_id") or store.DEFAULT_ORG
+                if not store.org_exists(conn, org_id):
+                    return self._json(400, {"error": "unknown org"})
                 key = secrets.token_urlsafe(32)
-                kid = store.add_api_key(conn, label, key)
-                return self._json(200, {"id": kid, "label": label, "key": key})
+                kid = store.add_api_key(conn, label, key, org_id=org_id)
+                return self._json(200, {"id": kid, "label": label, "org_id": org_id, "key": key})
+            if self.path == "/orgs":
+                if not self._admin_ok():
+                    return self._json(401, {"error": "unauthorized"})
+                try:
+                    body = self._read_json()
+                except ValueError:
+                    return self._json(400, {"error": "bad json"})
+                name = (body.get("name") or "").strip()
+                if not name:
+                    return self._json(400, {"error": "name required"})
+                return self._json(200, {"id": store.create_org(conn, name), "name": name})
             if self.path == "/agent/register":
                 try:
                     body = self._read_json()
@@ -282,10 +315,19 @@ def make_handler(*, conn, token, agent_auth=store.authenticate_agent, fetch_url=
                     return self._json(400, {"error": "bad json"})
                 auth = self.headers.get("Authorization", "")
                 key = auth[7:] if auth.startswith("Bearer ") else ""
+                # An agent enrolls into the org of the key it presents: an issued client key puts it
+                # in that org, anything else in the default org (the pre-multi-tenancy behaviour, so
+                # existing agents keep their key and their org).
+                # ponytail: the agent key doubles as that org's client key (issue one key per agent
+                # to keep the blast radius sane), and revoking it stops client calls but not an
+                # already-registered agent's polling — add an agent-only key kind, checked on every
+                # agent request, if either matters.
+                row = store.authenticate_client(conn, key)
                 # First contact binds name->key; re-register requires the same key.
                 try:
                     reg = store.register_agent(conn, body.get("name"), key,
-                                               body.get("printers", []))
+                                               body.get("printers", []),
+                                               org_id=row["org_id"] if row else store.DEFAULT_ORG)
                 except store.AuthError as e:
                     return self._json(401, {"error": str(e)})
                 except ValueError as e:
@@ -316,9 +358,10 @@ def make_handler(*, conn, token, agent_auth=store.authenticate_agent, fetch_url=
                 return self._json(200, {"ok": True}) if ok else self._json(404, {"error": "not found"})
             mj = _JOB_ID.match(self.path)
             if mj:
-                if not self._client_ok():
+                ok, org = self._client_org()
+                if not ok:
                     return self._json(401, {"error": "unauthorized"})
-                res = store.cancel_job(conn, int(mj.group(1)))
+                res = store.cancel_job(conn, int(mj.group(1)), org_id=org)
                 if res == "cancelled":
                     return self._json(200, {"ok": True, "state": "cancelled"})
                 if res == "not_found":

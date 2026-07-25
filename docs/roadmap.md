@@ -10,6 +10,8 @@ v1 is deliberately small (see [CONTRIBUTING.md](../CONTRIBUTING.md) for the YAGN
 - ~~**Job options**~~ ✅ `copies` + `options` on pdf jobs (`duplex`, `paper`, `bin`, `color`, `pages`),
   mapped to SumatraPDF `-print-settings` / CUPS `lp -o`. See [api.md](api.md#submitting-a-job).
 - ~~**Printer capabilities**~~ ✅ agent reports papers/bins/duplex/color at registration, in `GET /printers`.
+- ~~**Multi-tenancy**~~ ✅ org-scoped keys, agents, printers and jobs; `POST/GET /orgs` (root only);
+  foreign ids 404. See [api.md](api.md#multi-tenancy).
 
 ## v2 candidates
 
@@ -35,9 +37,9 @@ order of pull:
    label prints" is the strongest commercial demand found; today it's all paid SaaS wrapping
    PrintNode (Printus, BizPrint at $/print). Needs: a store app/plugin that POSTs to our API on
    order webhooks + document rendering (order → PDF). Prerequisite for any hosted/SaaS offering.
-6. **Multi-tenancy / child accounts** — org-scoped keys, printers, and jobs (schema already has
-   `org_id` everywhere; enforcement + provisioning API missing). PrintNode's commercial core for
-   ISVs, and the blocker for running printpapi as a hosted service.
+6. ~~**Multi-tenancy / child accounts**~~ ✅ **shipped** — org-scoped keys, printers and jobs, with
+   `POST/GET /orgs`. Still open on top of it: billing, quotas, per-org dashboard users/login,
+   org-scoped key self-management, org deletion.
 7. **PrintNode API compatibility layer** — same endpoints/JSON so the existing plugin ecosystem
    (Zapier/Make nodes, Odoo/WooCommerce/Business Central plugins, official PHP/Python SDKs) can
    point at a printpapi base URL unchanged. Big lever, needs careful surface mapping.

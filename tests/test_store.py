@@ -155,7 +155,7 @@ def test_get_job_and_list_printers_online_flag():
 def test_api_keys_add_authenticate_list_revoke():
     conn = _db()
     kid = store.add_api_key(conn, "n8n", "secret-key")
-    assert store.authenticate_client(conn, "secret-key") == kid
+    assert store.authenticate_client(conn, "secret-key")["id"] == kid
     assert store.authenticate_client(conn, "nope") is None
     keys = store.list_api_keys(conn)
     assert len(keys) == 1 and keys[0]["label"] == "n8n"
@@ -320,3 +320,102 @@ def test_copies_column_migration_is_idempotent():
     store.init_db(conn)  # run migration a second time — must not raise or duplicate
     cols = [r["name"] for r in conn.execute("PRAGMA table_info(jobs)").fetchall()]
     assert cols.count("copies") == 1
+
+
+# --- multi-tenancy -----------------------------------------------------------------
+
+
+def test_create_org_and_list_orgs():
+    conn = _db()
+    oid = store.create_org(conn, "acme")
+    assert oid != store.DEFAULT_ORG
+    assert {o["name"]: o["id"] for o in store.list_orgs(conn)} == {"default": store.DEFAULT_ORG,
+                                                                  "acme": oid}
+    assert store.org_exists(conn, oid) and not store.org_exists(conn, 4242)
+
+
+def test_api_key_resolves_to_its_org():
+    conn = _db()
+    oid = store.create_org(conn, "acme")
+    kid = store.add_api_key(conn, "acme", "k-acme", org_id=oid)
+    assert store.authenticate_client(conn, "k-acme") == {"id": kid, "org_id": oid}
+    assert store.authenticate_client(conn, "nope") is None
+    store.add_api_key(conn, "legacy", "k-legacy")          # no org -> the default one
+    assert store.authenticate_client(conn, "k-legacy")["org_id"] == store.DEFAULT_ORG
+
+
+def test_list_api_keys_filters_by_org_and_reports_it():
+    conn = _db()
+    oid = store.create_org(conn, "acme")
+    store.add_api_key(conn, "acme", "ka", org_id=oid)
+    store.add_api_key(conn, "legacy", "kd")
+    scoped = store.list_api_keys(conn, org_id=oid)
+    assert [k["label"] for k in scoped] == ["acme"] and scoped[0]["org_id"] == oid
+    assert len(store.list_api_keys(conn)) == 2             # unfiltered = root view
+    assert "key_hash" not in scoped[0]
+
+
+def _two_orgs(conn):
+    """Two orgs with an identically named agent + printer in each — proves nothing is global."""
+    other = store.create_org(conn, "acme")
+    a = store.register_agent(conn, "pc", "ka", [{"name": "Z", "can_pdf": False}])
+    b = store.register_agent(conn, "pc", "kb", [{"name": "Z", "can_pdf": False}], org_id=other)
+    return other, a, b
+
+
+def test_register_agent_scopes_name_and_printers_to_its_org():
+    conn = _db()
+    other, a, b = _two_orgs(conn)
+    assert a["computer_id"] != b["computer_id"]              # same name, different org -> two agents
+    assert a["printer_ids"]["Z"] != b["printer_ids"]["Z"]
+    orgs = {r["id"]: r["org_id"] for r in conn.execute("SELECT id, org_id FROM printers")}
+    assert orgs[a["printer_ids"]["Z"]] == store.DEFAULT_ORG
+    assert orgs[b["printer_ids"]["Z"]] == other
+
+
+def test_reads_and_writes_are_org_scoped_and_unfiltered_means_root():
+    conn = _db()
+    other, a, b = _two_orgs(conn)
+    ja = store.enqueue_job(conn, a["printer_ids"]["Z"], "raw_base64", "raw", b"a")
+    jb = store.enqueue_job(conn, b["printer_ids"]["Z"], "raw_base64", "raw", b"b")
+    assert conn.execute("SELECT org_id FROM jobs WHERE id=?", (jb,)).fetchone()["org_id"] == other
+
+    assert [p["id"] for p in store.list_printers(conn, 60, org_id=other)] == [b["printer_ids"]["Z"]]
+    assert len(store.list_printers(conn, 60)) == 2                       # root view
+    assert [j["id"] for j in store.recent_jobs(conn, org_id=other)] == [jb]
+    assert len(store.recent_jobs(conn)) == 2
+
+    assert store.get_job(conn, jb, org_id=store.DEFAULT_ORG) is None      # cross-org read denied
+    assert store.get_job(conn, jb, org_id=other)["state"] == "queued"
+    assert store.get_job(conn, jb) is not None                           # root sees it
+
+    assert store.metrics(conn, 60, org_id=other)["printers_total"] == 1
+    assert store.metrics(conn, 60, org_id=other)["jobs"]["queued"] == 1
+    assert store.metrics(conn, 60)["printers_total"] == 2
+
+    with pytest.raises(store.UnknownPrinter):                            # foreign printer
+        store.enqueue_job(conn, b["printer_ids"]["Z"], "raw_base64", "raw", b"x",
+                          org_id=store.DEFAULT_ORG)
+
+
+def test_cancel_of_a_foreign_job_is_not_found_and_leaves_it_alone():
+    conn = _db()
+    other, a, b = _two_orgs(conn)
+    jb = store.enqueue_job(conn, b["printer_ids"]["Z"], "raw_base64", "raw", b"b")
+    assert store.cancel_job(conn, jb, org_id=store.DEFAULT_ORG) == "not_found"
+    assert store.get_job(conn, jb)["state"] == "queued"
+    assert store.cancel_job(conn, jb, org_id=other) == "cancelled"
+
+
+def test_legacy_single_org_db_keeps_working_unchanged():
+    """A DB written before multi-tenancy has org_id=1 everywhere — org-1 callers still see it all."""
+    conn = _db()
+    reg = store.register_agent(conn, "old", "k", [{"name": "Z", "can_pdf": False}])
+    jid = store.enqueue_job(conn, reg["printer_ids"]["Z"], "raw_base64", "raw", b"x")
+    kid = store.add_api_key(conn, "legacy", "legacy-key")
+    assert conn.execute("SELECT org_id FROM jobs WHERE id=?", (jid,)).fetchone()["org_id"] == 1
+    assert store.authenticate_client(conn, "legacy-key") == {"id": kid, "org_id": 1}
+    assert store.get_job(conn, jid, org_id=1)["state"] == "queued"
+    assert len(store.list_printers(conn, 60, org_id=1)) == 1
+    assert len(store.recent_jobs(conn, org_id=1)) == 1
+    assert store.claim_job(conn, reg["computer_id"])["job_id"] == jid    # agent path untouched

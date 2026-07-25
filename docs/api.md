@@ -5,8 +5,10 @@ All endpoints speak JSON over HTTP. Authentication is a bearer token:
 
 **Roles:**
 
-- *client* — the bootstrap `PRINTAPI_TOKEN` **or** any active issued key (see [API keys](server.md#api-keys))
-- *admin* — the bootstrap `PRINTAPI_TOKEN` only
+- *client* — the bootstrap `PRINTAPI_TOKEN` **or** any active issued key (see [API keys](server.md#api-keys)).
+  An issued key only ever sees its own org; the bootstrap token spans all of them — see
+  [Multi-tenancy](#multi-tenancy).
+- *root* — the bootstrap `PRINTAPI_TOKEN` only (orgs and keys)
 - *agent* — the per-agent key (bound to the agent name on first contact)
 
 Token comparison is constant-time (`hmac.compare_digest`).
@@ -23,9 +25,11 @@ Token comparison is constant-time (`hmac.compare_digest`).
 | `GET /jobs/{id}` | client | One job's state: `queued` \| `claimed` \| `done` \| `failed` \| `cancelled` |
 | `DELETE /jobs/{id}` | client | Cancel a still-`queued` job (`409` once claimed, `404` if unknown) |
 | `GET /printers` | client | Registered printers + online/offline + capabilities |
-| `POST /apikeys` | admin | Issue a per-client key → `{id, label, key}` (key shown once) |
-| `GET /apikeys` | admin | List key labels (never the secret) |
-| `DELETE /apikeys/{id}` | admin | Revoke a key |
+| `POST /orgs` | root | Create an org → `{id, name}` |
+| `GET /orgs` | root | List orgs |
+| `POST /apikeys` | root | Issue a client key → `{id, label, org_id, key}` (key shown once) |
+| `GET /apikeys` | root | List keys with their org (never the secret) |
+| `DELETE /apikeys/{id}` | root | Revoke a key |
 | `POST /agent/register` | agent | Declare name + printers → `{computer_id, printer_ids}` |
 | `GET /agent/jobs` | agent | Long-poll for a job (204 on timeout) |
 | `GET /agent/jobs/{id}/payload` | agent | Download the job's bytes |
@@ -106,11 +110,52 @@ Set `callback_url` on a job and the server POSTs this JSON once the job reaches 
 - The payload is **unsigned** and the URL is fetched server-side (`http(s)` only) — same trust model
   as the `*_uri` content types. Point it at a trusted endpoint.
 
+## Multi-tenancy
+
+Every agent, printer, job, and key belongs to exactly one **org**. A key *is* the org: whatever
+key a request presents decides what it can see, and nothing else does.
+
+```bash
+# 1. root creates the org
+curl -s -X POST localhost:3460/orgs -H 'Authorization: Bearer <PRINTAPI_TOKEN>' \
+     -d '{"name":"acme"}'                       # -> {"id":2,"name":"acme"}
+
+# 2. root issues that org a key (one per agent / per integration)
+curl -s -X POST localhost:3460/apikeys -H 'Authorization: Bearer <PRINTAPI_TOKEN>' \
+     -d '{"label":"acme-agent","org_id":2}'     # -> {"id":1,"label":"acme-agent","org_id":2,"key":"…"}
+
+# 3. the agent puts that key in agent.ini and registers — it lands in org 2, and so do its
+#    printers and every job printed on them.
+```
+
+Rules:
+
+- **An org key never reaches another org.** `GET /jobs`, `GET /printers` and `GET /metrics` return
+  only that org's rows; a foreign job id is **`404`**, not `403` (a `403` would confirm it exists);
+  `DELETE /jobs/{id}` on a foreign job is `404` too, even if that job is claimed (which would
+  otherwise be `409`). Printing to a foreign `printer_id` is `400 unknown printer` — the same answer
+  a nonexistent printer gets.
+- **Root spans orgs.** The bootstrap `PRINTAPI_TOKEN` reads, submits and cancels across every org
+  (that's what the dashboard uses), and is the only credential that can manage orgs and keys.
+- **Agents inherit their key's org.** A key issued for org N puts the agent in org N. Any other key
+  (including the ones existing agents already use) enrolls into the default org `1`, so nothing
+  about a single-org install changes. Agent names are unique *per org*, not globally; an agent key
+  is still bound to its name on first contact.
+- `org_id` is optional on `POST /apikeys` and defaults to `1`. An unknown org → `400`.
+
+**Existing installs need no migration** — everything already lives in org `1`, root behaves as
+before, and every issued key resolves to org `1`.
+
+Deliberately out of scope for now (`# ponytail:` in the code): billing, quotas, per-org dashboard
+users, org-scoped key self-management, and org deletion. An agent key doubles as its org's client
+key, and revoking it stops client calls but not an already-registered agent's polling.
+
 ## Metrics
 
 `GET /metrics` returns Prometheus text (`text/plain; version=0.0.4`) — `printpapi_jobs{state=…}`
 (all five states, including zeros), `printpapi_agents_online`, `printpapi_agents_total`,
-`printpapi_printers_total`. It needs client auth, so point your scraper at it with a bearer token:
+`printpapi_printers_total`. The numbers cover the presented key's org (all orgs for the bootstrap
+token). It needs client auth, so point your scraper at it with a bearer token:
 
 ```yaml
 scrape_configs:

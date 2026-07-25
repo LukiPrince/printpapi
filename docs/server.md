@@ -102,8 +102,12 @@ keys. Keys are stored SHA-256-hashed; revoking one cuts access immediately.
 curl -s -X POST localhost:3460/apikeys \
      -H 'Authorization: Bearer <PRINTAPI_TOKEN>' -H 'Content-Type: application/json' \
      -d '{"label":"n8n"}'
-# -> {"id":1,"label":"n8n","key":"<shown once — store it>"}
+# -> {"id":1,"label":"n8n","org_id":1,"key":"<shown once — store it>"}
 ```
+
+Add `"org_id"` to put the key (and any agent registering with it) in another org — see
+[Multi-tenancy](api.md#multi-tenancy). Without it, everything stays in the single default org,
+which is what a plain self-hosted install wants.
 
 ## Queue behavior
 

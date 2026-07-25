@@ -75,11 +75,40 @@ class AuthError(Exception):
     pass
 
 
+# Multi-tenancy: every org-owning query carries an `org_id`, and `org_id=None` means *root* —
+# no filter, all orgs. Written as `(:org IS NULL OR x.org_id = :org)` so one statement serves
+# both without string-building. Legacy DBs are entirely org_id=1, so org-1 callers see exactly
+# what they saw before.
+
+
+def create_org(conn, name):
+    now = time.time()
+    with _LOCK:
+        try:
+            cur = conn.execute("INSERT INTO orgs(name, created_at) VALUES(?,?)", (name, now))
+            conn.commit()
+            return cur.lastrowid
+        except Exception:
+            conn.rollback()
+            raise
+
+
+def list_orgs(conn):
+    with _LOCK:
+        rows = conn.execute("SELECT id, name, created_at FROM orgs ORDER BY id").fetchall()
+    return [dict(r) for r in rows]
+
+
+def org_exists(conn, org_id):
+    with _LOCK:
+        return conn.execute("SELECT 1 FROM orgs WHERE id=?", (org_id,)).fetchone() is not None
+
+
 def _hash_key(api_key):
     return hashlib.sha256(api_key.encode()).hexdigest()
 
 
-def register_agent(conn, name, api_key, printers):
+def register_agent(conn, name, api_key, printers, org_id=DEFAULT_ORG):
     now = time.time()
     key_hash = _hash_key(api_key)
     for p in printers:
@@ -88,7 +117,7 @@ def register_agent(conn, name, api_key, printers):
     with _LOCK:
         try:
             row = conn.execute("SELECT id, api_key_hash FROM agents WHERE org_id=? AND name=?",
-                               (DEFAULT_ORG, name)).fetchone()
+                               (org_id, name)).fetchone()
             if row:
                 if not hmac.compare_digest(row["api_key_hash"], key_hash):
                     raise AuthError(f"agent name already registered with a different key: {name!r}")
@@ -97,7 +126,7 @@ def register_agent(conn, name, api_key, printers):
             else:
                 cur = conn.execute(
                     "INSERT INTO agents(org_id, name, api_key_hash, last_seen_at, created_at) "
-                    "VALUES(?,?,?,?,?)", (DEFAULT_ORG, name, key_hash, now, now))
+                    "VALUES(?,?,?,?,?)", (org_id, name, key_hash, now, now))
                 agent_id = cur.lastrowid
             printer_ids = {}
             for p in printers:
@@ -113,7 +142,7 @@ def register_agent(conn, name, api_key, printers):
                     cur = conn.execute(
                         "INSERT INTO printers(org_id, agent_id, name, can_pdf, capabilities, "
                         "created_at) VALUES(?,?,?,?,?,?)",
-                        (DEFAULT_ORG, agent_id, p["name"], can_pdf, caps, now))
+                        (org_id, agent_id, p["name"], can_pdf, caps, now))
                     pid = cur.lastrowid
                 printer_ids[p["name"]] = pid
             conn.commit()
@@ -147,20 +176,22 @@ def add_api_key(conn, label, key, org_id=DEFAULT_ORG):
 
 
 def authenticate_client(conn, key):
+    """Resolve a client key to {'id', 'org_id'} — the org every request with it is confined to."""
     if not key:
         return None
     key_hash = _hash_key(key)
     # High-entropy key; sha256 lookup has no practical timing oracle (see authenticate_agent).
     with _LOCK:
-        row = conn.execute("SELECT id FROM api_keys WHERE key_hash=? AND active=1",
+        row = conn.execute("SELECT id, org_id FROM api_keys WHERE key_hash=? AND active=1",
                            (key_hash,)).fetchone()
-    return row["id"] if row else None
+    return dict(row) if row else None
 
 
-def list_api_keys(conn):
+def list_api_keys(conn, org_id=None):
     with _LOCK:
         rows = conn.execute(
-            "SELECT id, label, active, created_at FROM api_keys ORDER BY id").fetchall()
+            "SELECT id, org_id, label, active, created_at FROM api_keys "
+            "WHERE (:org IS NULL OR org_id = :org) ORDER BY id", {"org": org_id}).fetchall()
     return [dict(r) for r in rows]
 
 
@@ -180,12 +211,14 @@ class UnknownPrinter(Exception):
 
 
 def enqueue_job(conn, printer_id, type_, mode, payload, user_id=DEFAULT_USER, title=None, copies=1,
-                callback_url=None, options=None):
+                callback_url=None, options=None, org_id=None):
     now = time.time()
     with _LOCK:
         try:
-            p = conn.execute("SELECT org_id, agent_id FROM printers WHERE id=?",
-                             (printer_id,)).fetchone()
+            # A foreign printer is simply unknown — same error as a nonexistent one, no leak.
+            p = conn.execute("SELECT org_id, agent_id FROM printers "
+                             "WHERE id=:pid AND (:org IS NULL OR org_id = :org)",
+                             {"pid": printer_id, "org": org_id}).fetchone()
             if p is None:
                 raise UnknownPrinter(f"unknown printer: {printer_id}")
             cur = conn.execute(
@@ -268,20 +301,23 @@ def requeue_stale(conn, timeout_s, max_retries, now=None):
             raise
 
 
-def cancel_job(conn, job_id):
+def cancel_job(conn, job_id, org_id=None):
     """Cancel a job while it is still 'queued' (before any agent claims it).
     Returns 'cancelled' | 'not_cancellable' (already claimed/finished) | 'not_found'.
-    The UPDATE is state-guarded so a claim racing the cancel can't be undone."""
+    The UPDATE is state-guarded so a claim racing the cancel can't be undone.
+    Another org's job is 'not_found' — the existence check is org-filtered too."""
     now = time.time()
     with _LOCK:
         try:
             cur = conn.execute(
-                "UPDATE jobs SET state='cancelled', finished_at=? WHERE id=? AND state='queued'",
-                (now, job_id))
+                "UPDATE jobs SET state='cancelled', finished_at=:now "
+                "WHERE id=:jid AND state='queued' AND (:org IS NULL OR org_id = :org)",
+                {"now": now, "jid": job_id, "org": org_id})
             if cur.rowcount == 1:
                 conn.commit()
                 return "cancelled"
-            row = conn.execute("SELECT 1 FROM jobs WHERE id=?", (job_id,)).fetchone()
+            row = conn.execute("SELECT 1 FROM jobs WHERE id=:jid AND (:org IS NULL OR org_id = :org)",
+                               {"jid": job_id, "org": org_id}).fetchone()
             conn.commit()
             return "not_found" if row is None else "not_cancellable"
         except Exception:
@@ -328,44 +364,52 @@ def bump_webhook_attempt(conn, job_id):
             raise
 
 
-def get_job(conn, job_id):
+def get_job(conn, job_id, org_id=None):
     with _LOCK:
         row = conn.execute(
-            "SELECT state, error, printer_id, created_at, finished_at FROM jobs WHERE id=?",
-            (job_id,)).fetchone()
+            "SELECT state, error, printer_id, created_at, finished_at FROM jobs "
+            "WHERE id=:jid AND (:org IS NULL OR org_id = :org)",
+            {"jid": job_id, "org": org_id}).fetchone()
     return dict(row) if row else None
 
 
-def recent_jobs(conn, limit=50):
+def recent_jobs(conn, limit=50, org_id=None):
     with _LOCK:
         rows = conn.execute(
             "SELECT j.id, j.printer_id, p.name AS printer_name, a.name AS agent_name, j.title, "
             "j.state, j.type, j.mode, j.error, j.created_at, j.finished_at "
             "FROM jobs j JOIN printers p ON p.id = j.printer_id "
             "JOIN agents a ON a.id = j.agent_id "
-            "ORDER BY j.id DESC LIMIT ?", (limit,)).fetchall()
+            "WHERE (:org IS NULL OR j.org_id = :org) "
+            "ORDER BY j.id DESC LIMIT :limit", {"limit": limit, "org": org_id}).fetchall()
     return [dict(r) for r in rows]
 
 
-def metrics(conn, online_window_s, now=None):
+def metrics(conn, online_window_s, now=None, org_id=None):
     """Aggregate snapshot for /metrics: job counts by state, agent liveness, printer count."""
     now = time.time() if now is None else now
+    org = {"org": org_id}
     with _LOCK:
-        jobrows = conn.execute("SELECT state, COUNT(*) c FROM jobs GROUP BY state").fetchall()
-        seen = [r["last_seen_at"] for r in conn.execute("SELECT last_seen_at FROM agents").fetchall()]
-        printers = conn.execute("SELECT COUNT(*) c FROM printers").fetchone()["c"]
+        jobrows = conn.execute("SELECT state, COUNT(*) c FROM jobs "
+                               "WHERE (:org IS NULL OR org_id = :org) GROUP BY state",
+                               org).fetchall()
+        seen = [r["last_seen_at"] for r in conn.execute(
+            "SELECT last_seen_at FROM agents WHERE (:org IS NULL OR org_id = :org)", org).fetchall()]
+        printers = conn.execute("SELECT COUNT(*) c FROM printers "
+                                "WHERE (:org IS NULL OR org_id = :org)", org).fetchone()["c"]
     online = sum(1 for s in seen if s is not None and (now - s) <= online_window_s)
     return {"jobs": {r["state"]: r["c"] for r in jobrows},
             "agents_total": len(seen), "agents_online": online, "printers_total": printers}
 
 
-def list_printers(conn, online_window_s, now=None):
+def list_printers(conn, online_window_s, now=None, org_id=None):
     now = time.time() if now is None else now
     with _LOCK:
         rows = conn.execute(
             "SELECT p.id, p.name, p.agent_id, p.can_pdf, p.capabilities, "
             "a.name AS agent_name, a.last_seen_at "
-            "FROM printers p JOIN agents a ON a.id = p.agent_id ORDER BY p.id").fetchall()
+            "FROM printers p JOIN agents a ON a.id = p.agent_id "
+            "WHERE (:org IS NULL OR p.org_id = :org) ORDER BY p.id", {"org": org_id}).fetchall()
     out = []
     for r in rows:
         seen = r["last_seen_at"]

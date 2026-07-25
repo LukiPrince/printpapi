@@ -106,40 +106,34 @@ webhooks, a full print-options matrix (copies/tray/duplex/rotate), deep capabili
 *(v1 has shipped; webhooks, print options, and capabilities have since landed as v2 work, and
 multi-tenancy is now the active next step — see §5 and `docs/roadmap.md`.)*
 
-## 5. Current state & the active next step: multi-tenancy
+## 5. Current state & what's next
 
 v1 is **published** (public repo, v1.0.0 release, GHCR image) and the post-v1 feature wave has
 shipped: dashboard, Linux/CUPS agent, per-client API keys, Docker, job copies, cancel, `/metrics`,
-webhooks, per-job print options, printer capability discovery. 136 tests green. A demand-research
-sweep (July 2026) produced the ranked v2 roadmap in `docs/roadmap.md` — read it before inventing
-features. Only non-code leftover: code-sign the Windows agent (needs a cert, see gotcha #2).
+webhooks, per-job print options, printer capability discovery, **multi-tenancy**. 148 tests green.
+A demand-research sweep (July 2026) produced the ranked v2 roadmap in `docs/roadmap.md` — read it
+before inventing features. Only non-code leftover: code-sign the Windows agent (needs a cert,
+gotcha #2).
 
-**Active next step: multi-tenancy (roadmap #6).** Strategic context: the repo owner wants to offer
-a cheap hosted SaaS ("Shopify/WooCommerce order comes in → label/packing slip prints") undercutting
-the paid PrintNode-wrapper plugins. Org isolation is the technical blocker; the store app and
-document rendering (roadmap #5) come after.
+**Multi-tenancy (roadmap #6) is done** — see `docs/api.md#multi-tenancy` for the contract. Shape:
 
-What exists today (design for it, don't re-derive):
+- A key *is* the org. `authenticate_client` resolves a key to `{id, org_id}`; every store query
+  takes `org_id=None` (= root, no filter) or an id, written as `(:org IS NULL OR x.org_id = :org)`.
+- Root = the bootstrap `PRINTAPI_TOKEN`: spans every org, sole manager of `/orgs` and `/apikeys`.
+- Agents enroll into the org of the key they present (an issued client key → its org, anything
+  else → `DEFAULT_ORG`, which is what every pre-existing agent does). Printers/jobs inherit.
+  Agent names are unique per org. Agent endpoints need no org filter — they key off `agent_id`.
+- Invariant, tested: a foreign job id is `404` (never `403`/`409`), a foreign printer is
+  `400 unknown printer`, and lists/metrics only ever carry the caller's own org.
+- Legacy DBs (everything `org_id=1`) keep working untouched — no schema change was needed.
+- Still open on top: billing, quotas, per-org dashboard users/login, org-scoped key
+  self-management, org deletion; and an agent key doubling as its org's client key (see the
+  `# ponytail:` note in `server.py`'s `/agent/register`).
 
-- Every table (`agents`, `printers`, `jobs`, `api_keys`) already carries `org_id`, but **nothing
-  enforces it** — everything runs as `DEFAULT_ORG=1`, queries don't filter by org.
-- Client keys are flat: `authenticate_client` returns the key id and ignores org. The bootstrap
-  `PRINTAPI_TOKEN` is global root (admin endpoints + always a valid client).
-- Agent keys bind name↔key on first contact (`register_agent`); agents currently always land in
-  `DEFAULT_ORG`.
-
-Target shape (PrintNode's "child accounts" is the model, but YAGNI hard):
-
-- Root token manages orgs: `POST /orgs {name}` → `{org_id}`, `GET /orgs`, plus issuing org-scoped
-  client/agent keys (extend `/apikeys` with an org, don't invent a parallel key system).
-- Auth resolves presented key → `org_id`; every store read/write filters by it. Agents register
-  into their key's org; printers/jobs inherit. **Invariant: no cross-org reads, ever** — a client
-  key of org A must 404 (not 401) on org B's job/printer ids.
-- Root keeps working roughly as today (decide and test its cross-org semantics explicitly).
-- OUT for now: billing, per-org dashboard users, quotas, delegated auth. Mark ceilings with
-  `# ponytail:` comments.
-- Migration: existing DBs are single-org (`org_id=1` everywhere) and must keep working unchanged;
-  the ALTER-based idempotent pattern in `store.init_db` is the house style for schema changes.
+**Strategic context for what comes next:** the repo owner wants a cheap hosted SaaS
+("Shopify/WooCommerce order comes in → label/packing slip prints") undercutting the paid
+PrintNode-wrapper plugins. Org isolation was the technical blocker; the store app and document
+rendering (roadmap #5) are what's left before that's possible.
 
 ## 6. Reference
 

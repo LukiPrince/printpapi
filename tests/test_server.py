@@ -579,6 +579,140 @@ def test_webhook_dispatcher_retries_then_gives_up():
     assert store.get_job(conn, a)["state"] == "failed"           # job state untouched by hook failure
 
 
+# --- multi-tenancy -----------------------------------------------------------------
+
+
+def test_orgs_are_created_and_listed_by_the_root_token_only():
+    conn = _mem()
+    httpd, base = _serve(conn)
+    try:
+        assert _req("POST", base + "/orgs", body={"name": "acme"})[0] == 401
+        code, raw = _req("POST", base + "/orgs", token="t", body={"name": "acme"})
+        assert code == 200
+        oid = json.loads(raw)["id"]
+        assert oid != store.DEFAULT_ORG
+        orgs = json.loads(_req("GET", base + "/orgs", token="t")[1])["orgs"]
+        assert {o["name"] for o in orgs} == {"default", "acme"}
+        # an org's own client key is not root: it can neither list nor create orgs
+        key = json.loads(_req("POST", base + "/apikeys", token="t",
+                              body={"label": "c", "org_id": oid})[1])["key"]
+        assert _req("GET", base + "/orgs", token=key)[0] == 401
+        assert _req("POST", base + "/orgs", token=key, body={"name": "x"})[0] == 401
+        assert _req("POST", base + "/orgs", token="t", body={"name": "  "})[0] == 400
+    finally:
+        httpd.shutdown()
+
+
+def test_apikeys_are_issued_into_an_org_and_unknown_orgs_are_rejected():
+    conn = _mem()
+    httpd, base = _serve(conn)
+    try:
+        oid = json.loads(_req("POST", base + "/orgs", token="t", body={"name": "acme"})[1])["id"]
+        code, raw = _req("POST", base + "/apikeys", token="t", body={"label": "c", "org_id": oid})
+        assert code == 200 and json.loads(raw)["org_id"] == oid
+        keys = json.loads(_req("GET", base + "/apikeys", token="t")[1])["keys"]
+        assert keys[0]["org_id"] == oid
+        assert _req("POST", base + "/apikeys", token="t",
+                    body={"label": "c", "org_id": 4242})[0] == 400      # no such org
+        # no org given -> the default org, exactly as before multi-tenancy
+        code, raw = _req("POST", base + "/apikeys", token="t", body={"label": "legacy"})
+        assert json.loads(raw)["org_id"] == store.DEFAULT_ORG
+    finally:
+        httpd.shutdown()
+
+
+def _two_org_fixture(conn):
+    """org 1 with printer Z + a queued job, 'acme' with printer Y and its own client key."""
+    other = store.create_org(conn, "acme")
+    a = store.register_agent(conn, "pc", "ka", [{"name": "Z", "can_pdf": False}])
+    b = store.register_agent(conn, "pc", "kb", [{"name": "Y", "can_pdf": False}], org_id=other)
+    store.add_api_key(conn, "acme", "acme-key", org_id=other)
+    ja = store.enqueue_job(conn, a["printer_ids"]["Z"], "raw_base64", "raw", b"a")
+    return other, a, b, ja
+
+
+def test_client_key_is_confined_to_its_own_org():
+    conn = _mem()
+    other, a, b, ja = _two_org_fixture(conn)
+    httpd, base = _serve(conn)
+    try:
+        # a foreign job id is 404 — never 200, never 403 (which would confirm it exists)
+        assert _req("GET", base + f"/jobs/{ja}", token="acme-key")[0] == 404
+        jb = json.loads(_req("POST", base + "/jobs", token="acme-key",
+                             body={"printer_id": b["printer_ids"]["Y"], "type": "raw_base64",
+                                   "content": "QUJD"})[1])["job_id"]
+        assert _req("GET", base + f"/jobs/{jb}", token="acme-key")[0] == 200
+        # printing to a foreign printer is "unknown printer" (400), same as a nonexistent one
+        assert _req("POST", base + "/jobs", token="acme-key",
+                    body={"printer_id": a["printer_ids"]["Z"], "type": "raw_base64",
+                          "content": "QUJD"})[0] == 400
+        # lists carry only the org's own rows
+        printers = json.loads(_req("GET", base + "/printers", token="acme-key")[1])["printers"]
+        assert [p["name"] for p in printers] == ["Y"]
+        jobs = json.loads(_req("GET", base + "/jobs", token="acme-key")[1])["jobs"]
+        assert [j["id"] for j in jobs] == [jb]
+        assert "printpapi_printers_total 1" in _req("GET", base + "/metrics",
+                                                    token="acme-key")[1].decode()
+        # cancelling someone else's job is a 404 and leaves it untouched
+        assert _dreq("DELETE", base + f"/jobs/{ja}", token="acme-key")[0] == 404
+        assert store.get_job(conn, ja)["state"] == "queued"
+        # key management stays root-only
+        assert _req("GET", base + "/apikeys", token="acme-key")[0] == 401
+    finally:
+        httpd.shutdown()
+
+
+def test_root_token_spans_all_orgs():
+    conn = _mem()
+    other, a, b, ja = _two_org_fixture(conn)
+    jb = store.enqueue_job(conn, b["printer_ids"]["Y"], "raw_base64", "raw", b"b", org_id=other)
+    httpd, base = _serve(conn)
+    try:
+        printers = json.loads(_req("GET", base + "/printers", token="t")[1])["printers"]
+        assert {p["name"] for p in printers} == {"Z", "Y"}
+        jobs = json.loads(_req("GET", base + "/jobs", token="t")[1])["jobs"]
+        assert {j["id"] for j in jobs} == {ja, jb}
+        assert "printpapi_printers_total 2" in _req("GET", base + "/metrics", token="t")[1].decode()
+        assert _req("GET", base + f"/jobs/{jb}", token="t")[0] == 200      # reads any org's job
+        assert _dreq("DELETE", base + f"/jobs/{jb}", token="t")[0] == 200  # and cancels it
+        # and prints to any org's printer
+        assert _req("POST", base + "/jobs", token="t",
+                    body={"printer_id": b["printer_ids"]["Y"], "type": "raw_base64",
+                          "content": "QUJD"})[0] == 200
+    finally:
+        httpd.shutdown()
+
+
+def test_agent_registers_into_the_org_of_its_key():
+    conn = _mem()
+    oid = store.create_org(conn, "acme")
+    store.add_api_key(conn, "acme-agent", "acme-agent-key", org_id=oid)
+    httpd, base = _serve(conn)
+    try:
+        code, raw = _areq("POST", base + "/agent/register", "acme-agent-key",
+                          {"name": "pc", "printers": [{"name": "Z"}]})
+        assert code == 200
+        pid = json.loads(raw)["printer_ids"]["Z"]
+        assert conn.execute("SELECT org_id FROM printers WHERE id=?",
+                            (pid,)).fetchone()["org_id"] == oid
+        # a key that is not an issued client key still enrolls into the default org (legacy path)
+        code, raw = _areq("POST", base + "/agent/register", "plain-key",
+                          {"name": "old", "printers": [{"name": "Y"}]})
+        assert code == 200
+        pid2 = json.loads(raw)["printer_ids"]["Y"]
+        assert conn.execute("SELECT org_id FROM printers WHERE id=?",
+                            (pid2,)).fetchone()["org_id"] == store.DEFAULT_ORG
+        # the org's key sees its own printer only, and its jobs reach that agent
+        printers = json.loads(_req("GET", base + "/printers", token="acme-agent-key")[1])["printers"]
+        assert [p["name"] for p in printers] == ["Z"]
+        jid = json.loads(_req("POST", base + "/jobs", token="acme-agent-key",
+                              body={"printer_id": pid, "type": "raw_base64",
+                                    "content": "QUJD"})[1])["job_id"]
+        assert json.loads(_areq("GET", base + "/agent/jobs", "acme-agent-key")[1])["job_id"] == jid
+    finally:
+        httpd.shutdown()
+
+
 def test_job_title_roundtrips_through_http():
     conn = _mem()
     reg = store.register_agent(conn, "pc", "ak", [{"name": "Z", "can_pdf": False}])
