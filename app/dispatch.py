@@ -126,6 +126,34 @@ def parse_options(body, mode):
     return dict(o)
 
 
+_MAX_EXPIRE_AFTER = 30 * 24 * 3600     # 30 days — past that, "expiring" is not what you want
+_MAX_IDEMPOTENCY_KEY = 128
+
+
+def parse_expire_after(body):
+    """Optional 'expire_after' seconds -> int, or None (never expires).
+    A job past its deadline is failed instead of printed — a stale shipping label must not come out
+    of the printer hours later when an offline agent reconnects."""
+    v = body.get("expire_after")
+    if v is None:
+        return None
+    if type(v) is not int or not (1 <= v <= _MAX_EXPIRE_AFTER):
+        raise DispatchError(f"expire_after must be an integer 1..{_MAX_EXPIRE_AFTER} (seconds)")
+    return v
+
+
+def parse_idempotency_key(body):
+    """Optional 'idempotency_key' -> trimmed string, or None. Resubmitting the same key in the same
+    org returns the original job instead of printing again (safe POST /jobs retries)."""
+    v = body.get("idempotency_key")
+    if v is None or v == "":
+        return None
+    if type(v) is not str or len(v) > _MAX_IDEMPOTENCY_KEY:
+        raise DispatchError(f"idempotency_key must be a string of at most "
+                            f"{_MAX_IDEMPOTENCY_KEY} chars")
+    return v.strip() or None
+
+
 def parse_callback_url(body):
     """Optional 'callback_url' -> validated http(s) URL, or None if absent/empty.
     The server POSTs job-state changes here (see the webhook dispatcher). http(s)-only.

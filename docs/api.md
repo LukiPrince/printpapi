@@ -56,6 +56,15 @@ Out of range or non-integer → `400`.
 `callback_url` is optional (`http(s)` only) — the server POSTs the job's outcome there once it
 reaches a terminal state. See [Webhooks](#webhooks). A non-`http(s)` scheme → `400`.
 
+`idempotency_key` is optional (string, ≤128 chars) — **retry-safe submits**. Resubmitting the same
+key inside the same org returns the *original* `job_id` and prints nothing extra, so a timed-out or
+retried `POST /jobs` (order webhook redelivery, flaky network) can never double-print. Keys are
+scoped per org and never expire; use something stable like the order id.
+
+`expire_after` is optional (integer seconds, `1`–`2592000`) — **a deadline for the job**. Past it
+the job is failed (`state: failed`, `error: "expired"`) instead of printed, so a stale shipping
+label doesn't come out hours later when an offline agent reconnects. Without it, jobs wait forever.
+
 `options` is optional and **pdf jobs only** (raw ZPL/ESC-POS carries its own layout — `400` on a
 raw job). The agent maps them onto its backend's native flags (SumatraPDF `-print-settings` on
 Windows, `lp -o` on CUPS):
@@ -204,6 +213,10 @@ scrape_configs:
 `queued` → agent claims it (`claimed`) → agent reports → `done` or `failed`.
 If an agent claims a job and never reports (crash, network), the visibility-timeout reaper
 requeues it — after a bounded number of retries the job is marked `failed`.
+
+A job with `expire_after` whose deadline passes is never handed to an agent (the claim query skips
+it) and is failed with `error: "expired"` by the same reaper — a terminal state, so its webhook
+fires like any other outcome.
 
 `DELETE /jobs/{id}` moves a job from `queued` to `cancelled` (a terminal state the agent never
 claims). The cancel is state-guarded: once an agent has claimed the job it returns `409` — there

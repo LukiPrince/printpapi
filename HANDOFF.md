@@ -26,7 +26,9 @@ extracted, generalized OSS project.
 - Client endpoints (bearer auth — the bootstrap `PRINTAPI_TOKEN` or any issued per-client key):
   - `POST /jobs` — submit a job `{printer_id, type, content|url}` → `{job_id}`. Optional: `title`,
     `copies` (1–100), `callback_url` (webhook on terminal state), `options` (pdf only: duplex,
-    paper, bin, color, pages — agent maps to Sumatra `-print-settings` / `lp -o`).
+    paper, bin, color, pages — agent maps to Sumatra `-print-settings` / `lp -o`),
+    `idempotency_key` (per-org; a resubmit returns the original job, never a second print),
+    `expire_after` (seconds; past the deadline the job fails as `expired` instead of printing).
   - `GET /jobs` — recent job history; `GET /jobs/{id}` — job state:
     `queued | claimed | done | failed | cancelled`; `DELETE /jobs/{id}` — cancel while queued.
   - `GET /printers` — printers with online/offline + capabilities (papers/bins/duplex/color,
@@ -45,7 +47,8 @@ extracted, generalized OSS project.
   - `GET /agent/jobs/{id}/payload` — raw bytes of the job payload.
   - `POST /agent/jobs/{id}/result` — agent reports `{ok, error}`.
 - SQLite job store (`PRINT_DB`, default `printpapi.db`), WAL mode, global write lock.
-- Visibility-timeout reaper: stale claimed jobs requeued (up to `max_retries`), then failed.
+- Visibility-timeout reaper: stale claimed jobs requeued (up to `max_retries`), then failed;
+  same loop expires deadline-passed jobs.
 - Content types: `raw_base64`, `pdf_base64`, `raw_uri`, `raw_uri_post`, `pdf_uri_post`.
 - `app/dispatch.py` pure logic (injectable fetchers); `app/store.py` SQLite store; `app/server.py` HTTP.
 - Env vars: `PRINTAPI_TOKEN` (required), `PRINT_DB` (default `printpapi.db`), `PRINT_PORT` (default `3460`).
@@ -63,7 +66,7 @@ extracted, generalized OSS project.
   (semicolon-separated — Windows printer names, or CUPS queue names on Linux).
 - Shipped in the homelab as a signed-Python install (see gotcha #2), autostart via Task Scheduler.
 
-**Tests:** 155, all green (`python -m pytest`). Real loopback HTTP servers (ThreadingHTTPServer),
+**Tests:** 168, all green (`python -m pytest`). Real loopback HTTP servers (ThreadingHTTPServer),
 real SQLite (:memory:), injected render fns / subprocess runners — no mocks, no real printers.
 
 **Model:** **poll** — agent opens a long-poll `GET /agent/jobs` to the server, receives jobs, prints,
@@ -114,7 +117,8 @@ multi-tenancy is now the active next step — see §5 and `docs/roadmap.md`.)*
 v1 is **published** (public repo, v1.0.0 release, GHCR image) and the post-v1 feature wave has
 shipped: dashboard, Linux/CUPS agent, per-client API keys, Docker, job copies, cancel, `/metrics`,
 webhooks, per-job print options, printer capability discovery, **multi-tenancy**, **computer status
-+ liveness events** (roadmap #1). 155 tests green.
++ liveness events** (roadmap #1), **idempotency keys + job expiry** (roadmap #2).
+168 tests green.
 A demand-research sweep (July 2026) produced the ranked v2 roadmap in `docs/roadmap.md` — read it
 before inventing features. Only non-code leftover: code-sign the Windows agent (needs a cert,
 gotcha #2).
@@ -133,6 +137,18 @@ gotcha #2).
 - Still open on top: billing, quotas, per-org dashboard users/login, org-scoped key
   self-management, org deletion; and an agent key doubling as its org's client key (see the
   `# ponytail:` note in `server.py`'s `/agent/register`).
+
+**Roadmap #1 + #2 are done** (`docs/api.md#computers-agents`, `#submitting-a-job`):
+
+- `GET /computers` mirrors `GET /printers` (org-scoped, same 60 s liveness window). Liveness
+  *edges* are claimed-and-marked in one lock (`store.claim_agent_transitions`) so each fires once,
+  and delivered by the existing webhook-dispatcher thread. At-most-once on purpose — an org that
+  sets its `event_url` later starts from the current state, no replay.
+- `idempotency_key` dedupes per `(org_id, key)` — a UNIQUE index plus a lookup inside
+  `enqueue_job`'s transaction; `expire_after` writes `jobs.expires_at`, the claim query skips
+  deadline-passed jobs (that is what guarantees no late print) and the reaper fails them as
+  `expired`. No new job state — the error string carries the reason.
+- Left open: the dashboard still has no computers view, and event payloads are unsigned.
 
 **Strategic context for what comes next:** the repo owner wants a cheap hosted SaaS
 ("Shopify/WooCommerce order comes in → label/packing slip prints") undercutting the paid

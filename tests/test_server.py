@@ -133,6 +133,7 @@ def test_reaper_logs_failures(capsys, monkeypatch):
             time.sleep(3600)   # park the leaked daemon thread (no stop handle by design)
         calls.append(1)
         raise RuntimeError("db gone")
+    monkeypatch.setattr(store, "expire_jobs", lambda *a, **k: 0)   # the pass under test is requeue
     monkeypatch.setattr(store, "requeue_stale", boom)
     server.start_reaper(None, interval_s=0.01)
     for _ in range(100):
@@ -792,3 +793,51 @@ def test_a_failing_event_post_does_not_abort_the_pass():
         raise RuntimeError("connection refused")
 
     server.deliver_agent_events(conn, boom, 60, now=time.time() + 300)   # must not raise
+
+
+def test_idempotency_key_makes_a_resubmitted_job_a_no_op():
+    conn = _mem()
+    reg = store.register_agent(conn, "pc", "ak", [{"name": "Z", "can_pdf": False}])
+    body = {"printer_id": reg["printer_ids"]["Z"], "type": "raw_base64", "content": "QUJD",
+            "idempotency_key": "order-42"}
+    httpd, base = _serve(conn)
+    try:
+        first = json.loads(_req("POST", base + "/jobs", token="t", body=body)[1])["job_id"]
+        again = json.loads(_req("POST", base + "/jobs", token="t", body=body)[1])["job_id"]
+        assert again == first                                   # retry, not a second print
+        assert len(json.loads(_req("GET", base + "/jobs", token="t")[1])["jobs"]) == 1
+        assert _req("POST", base + "/jobs", token="t",
+                    body={**body, "idempotency_key": 42})[0] == 400
+    finally:
+        httpd.shutdown()
+
+
+def test_expire_after_stores_a_deadline_and_is_validated():
+    conn = _mem()
+    reg = store.register_agent(conn, "pc", "ak", [{"name": "Z", "can_pdf": False}])
+    body = {"printer_id": reg["printer_ids"]["Z"], "type": "raw_base64", "content": "QUJD"}
+    httpd, base = _serve(conn)
+    try:
+        jid = json.loads(_req("POST", base + "/jobs", token="t",
+                              body={**body, "expire_after": 120})[1])["job_id"]
+        exp = conn.execute("SELECT expires_at FROM jobs WHERE id=?", (jid,)).fetchone()["expires_at"]
+        assert 110 < exp - time.time() <= 120
+        jid2 = json.loads(_req("POST", base + "/jobs", token="t", body=body)[1])["job_id"]
+        assert conn.execute("SELECT expires_at FROM jobs WHERE id=?",
+                            (jid2,)).fetchone()["expires_at"] is None      # opt-in only
+        assert _req("POST", base + "/jobs", token="t", body={**body, "expire_after": 0})[0] == 400
+    finally:
+        httpd.shutdown()
+
+
+def test_reaper_expires_deadline_passed_jobs():
+    conn = _mem()
+    reg = store.register_agent(conn, "pc", "ak", [{"name": "Z", "can_pdf": False}])
+    jid = store.enqueue_job(conn, reg["printer_ids"]["Z"], "raw_base64", "raw", b"a",
+                            expire_after=-1)     # a deadline already in the past
+    server.start_reaper(conn, timeout_s=300, max_retries=2, interval_s=0.02)
+    for _ in range(100):
+        if store.get_job(conn, jid)["state"] != "queued":
+            break
+        time.sleep(0.01)
+    assert store.get_job(conn, jid)["error"] == "expired"

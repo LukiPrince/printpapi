@@ -1,5 +1,6 @@
 import base64
 import pytest
+from app import dispatch
 from app.dispatch import (decode_payload, agent_mode, parse_copies, parse_callback_url,
                           parse_options, DispatchError)
 
@@ -245,3 +246,36 @@ def test_pdf_uri_uses_injected_fetcher_and_is_pdf_mode():
     assert decode_payload({"type": "pdf_uri", "url": "https://x/a.pdf"}, fetch_url=fake) == b"%PDF-bytes"
     assert seen["url"] == "https://x/a.pdf"
     assert agent_mode("pdf_uri") == "pdf"
+
+
+def test_parse_expire_after_absent_or_null_is_none():
+    assert dispatch.parse_expire_after({}) is None
+    assert dispatch.parse_expire_after({"expire_after": None}) is None
+
+
+def test_parse_expire_after_accepts_a_positive_second_count():
+    assert dispatch.parse_expire_after({"expire_after": 1}) == 1
+    assert dispatch.parse_expire_after({"expire_after": 2592000}) == 2592000   # 30d, inclusive cap
+
+
+def test_parse_expire_after_rejects_zero_negative_over_cap_and_non_int():
+    for v in (0, -5, 2592001, "60", 60.0, True):
+        with pytest.raises(DispatchError):
+            dispatch.parse_expire_after({"expire_after": v})
+
+
+def test_parse_idempotency_key_absent_or_empty_is_none():
+    assert dispatch.parse_idempotency_key({}) is None
+    assert dispatch.parse_idempotency_key({"idempotency_key": None}) is None
+    assert dispatch.parse_idempotency_key({"idempotency_key": ""}) is None
+
+
+def test_parse_idempotency_key_accepts_a_bounded_string():
+    assert dispatch.parse_idempotency_key({"idempotency_key": " order-42 "}) == "order-42"
+    assert dispatch.parse_idempotency_key({"idempotency_key": "x" * 128}) == "x" * 128
+
+
+def test_parse_idempotency_key_rejects_non_string_and_over_long():
+    for v in (42, ["a"], "x" * 129):
+        with pytest.raises(DispatchError):
+            dispatch.parse_idempotency_key({"idempotency_key": v})

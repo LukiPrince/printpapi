@@ -14,7 +14,8 @@ from urllib.parse import unquote
 
 from app import store
 from app.dispatch import (decode_payload, agent_mode, parse_copies, parse_callback_url,
-                          parse_options, DispatchError, FetchError, _http_get, _http_post)
+                          parse_options, parse_expire_after, parse_idempotency_key,
+                          DispatchError, FetchError, _http_get, _http_post)
 
 _MAX_BODY = 32 * 1024 * 1024  # ponytail: flat 32 MB body cap; make env-tunable if someone needs bigger
 
@@ -276,15 +277,20 @@ def make_handler(*, conn, token, agent_auth=store.authenticate_agent, fetch_url=
                 except ValueError:
                     return self._json(400, {"error": "bad json"})
                 try:
-                    data = decode_payload(body, fetch_url=fetch)
                     mode = agent_mode(body.get("type"))
+                    # Validate before decode_payload: a bad field must 400 without first fetching
+                    # a URL (and a retried submit must not re-fetch it either).
                     copies = parse_copies(body)
                     callback_url = parse_callback_url(body)
                     options = parse_options(body, mode)
+                    idem = parse_idempotency_key(body)
+                    expire_after = parse_expire_after(body)
+                    data = decode_payload(body, fetch_url=fetch)
                     jid = store.enqueue_job(conn, body.get("printer_id"), body.get("type"),
                                             mode, data, title=body.get("title"), copies=copies,
                                             callback_url=callback_url, options=options,
-                                            org_id=org)
+                                            org_id=org, idempotency_key=idem,
+                                            expire_after=expire_after)
                 except FetchError as e:
                     return self._json(502, {"error": f"downstream: {e}"})
                 except (DispatchError, store.UnknownPrinter) as e:
@@ -459,6 +465,7 @@ def start_reaper(conn, *, timeout_s=300, max_retries=2, interval_s=30):
     def loop():
         while True:
             try:
+                store.expire_jobs(conn)
                 store.requeue_stale(conn, timeout_s, max_retries)
             except Exception as e:
                 print(f"reaper error: {e}", file=sys.stderr)

@@ -30,7 +30,10 @@ CREATE TABLE IF NOT EXISTS jobs(
   state TEXT NOT NULL DEFAULT 'queued', payload BLOB NOT NULL, error TEXT, title TEXT,
   copies INTEGER NOT NULL DEFAULT 1, options TEXT,
   callback_url TEXT, hook_attempts INTEGER NOT NULL DEFAULT 0, hook_delivered_at REAL,
+  idempotency_key TEXT, expires_at REAL,
   retries INTEGER NOT NULL DEFAULT 0, created_at REAL NOT NULL, claimed_at REAL, finished_at REAL);
+-- NULLs are distinct in SQLite, so jobs without a key are unconstrained.
+CREATE UNIQUE INDEX IF NOT EXISTS jobs_idem ON jobs(org_id, idempotency_key);
 CREATE TABLE IF NOT EXISTS api_keys(
   id INTEGER PRIMARY KEY AUTOINCREMENT, org_id INTEGER NOT NULL, label TEXT NOT NULL,
   key_hash TEXT NOT NULL UNIQUE, active INTEGER NOT NULL DEFAULT 1, created_at REAL NOT NULL);
@@ -56,6 +59,10 @@ def init_db(conn):
                         "ALTER TABLE jobs ADD COLUMN callback_url TEXT",
                         "ALTER TABLE jobs ADD COLUMN hook_attempts INTEGER NOT NULL DEFAULT 0",
                         "ALTER TABLE jobs ADD COLUMN hook_delivered_at REAL",
+                        "ALTER TABLE jobs ADD COLUMN idempotency_key TEXT",
+                        "ALTER TABLE jobs ADD COLUMN expires_at REAL",
+                        "CREATE UNIQUE INDEX IF NOT EXISTS jobs_idem "
+                        "ON jobs(org_id, idempotency_key)",
                         "ALTER TABLE orgs ADD COLUMN event_url TEXT",
                         "ALTER TABLE agents ADD COLUMN offline_notified "
                         "INTEGER NOT NULL DEFAULT 0"):
@@ -227,7 +234,8 @@ class UnknownPrinter(Exception):
 
 
 def enqueue_job(conn, printer_id, type_, mode, payload, user_id=DEFAULT_USER, title=None, copies=1,
-                callback_url=None, options=None, org_id=None):
+                callback_url=None, options=None, org_id=None, idempotency_key=None,
+                expire_after=None):
     now = time.time()
     with _LOCK:
         try:
@@ -237,13 +245,22 @@ def enqueue_job(conn, printer_id, type_, mode, payload, user_id=DEFAULT_USER, ti
                              {"pid": printer_id, "org": org_id}).fetchone()
             if p is None:
                 raise UnknownPrinter(f"unknown printer: {printer_id}")
+            if idempotency_key is not None:
+                # A retried submit returns the original job — the same key never prints twice in an
+                # org. The lookup is safe under the global write lock; the UNIQUE index enforces it.
+                row = conn.execute("SELECT id FROM jobs WHERE org_id=? AND idempotency_key=?",
+                                   (p["org_id"], idempotency_key)).fetchone()
+                if row:
+                    conn.commit()
+                    return row["id"]
             cur = conn.execute(
                 "INSERT INTO jobs(org_id, user_id, printer_id, agent_id, type, mode, state, "
-                "payload, title, copies, options, callback_url, created_at) "
-                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                "payload, title, copies, options, callback_url, idempotency_key, expires_at, "
+                "created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (p["org_id"], user_id, printer_id, p["agent_id"], type_, mode, "queued",
                  sqlite3.Binary(payload), title, copies,
-                 json.dumps(options) if options else None, callback_url, now))
+                 json.dumps(options) if options else None, callback_url, idempotency_key,
+                 None if expire_after is None else now + expire_after, now))
             conn.commit()
             return cur.lastrowid
         except Exception:
@@ -251,16 +268,18 @@ def enqueue_job(conn, printer_id, type_, mode, payload, user_id=DEFAULT_USER, ti
             raise
 
 
-def claim_job(conn, agent_id):
-    now = time.time()
+def claim_job(conn, agent_id, now=None):
+    now = time.time() if now is None else now
     with _LOCK:
         try:
             conn.execute("UPDATE agents SET last_seen_at=? WHERE id=?", (now, agent_id))
             # ponytail: no index on jobs(agent_id, state); add one if claim throughput ever demands it.
+            # Past its deadline the job is skipped here and failed by the reaper's expire_jobs —
+            # the skip is what guarantees it never prints, whatever the reaper's tick is doing.
             row = conn.execute(
                 "SELECT id, printer_id, mode, copies, options FROM jobs "
-                "WHERE agent_id=? AND state='queued' "
-                "ORDER BY created_at, id LIMIT 1", (agent_id,)).fetchone()
+                "WHERE agent_id=? AND state='queued' AND (expires_at IS NULL OR expires_at > ?) "
+                "ORDER BY created_at, id LIMIT 1", (agent_id, now)).fetchone()
             if row is None:
                 conn.commit()
                 return None
@@ -310,6 +329,25 @@ def requeue_stale(conn, timeout_s, max_retries, now=None):
                 "UPDATE jobs SET state='queued', retries=retries+1, claimed_at=NULL "
                 "WHERE state='claimed' AND claimed_at < ? AND retries < ?",
                 (cutoff, max_retries))
+            conn.commit()
+            return cur.rowcount
+        except Exception:
+            conn.rollback()
+            raise
+
+
+def expire_jobs(conn, now=None):
+    """Fail every queued job whose expire_after deadline has passed. `failed` + error 'expired' —
+    terminal, so the webhook dispatcher reports it like any other outcome.
+    # ponytail: no separate 'expired' state (it would have to be threaded through metrics, the
+    # dashboard and every client); the error string carries the reason."""
+    now = time.time() if now is None else now
+    with _LOCK:
+        try:
+            cur = conn.execute(
+                "UPDATE jobs SET state='failed', error='expired', finished_at=:now "
+                "WHERE state='queued' AND expires_at IS NOT NULL AND expires_at <= :now",
+                {"now": now})
             conn.commit()
             return cur.rowcount
         except Exception:

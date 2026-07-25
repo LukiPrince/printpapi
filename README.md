@@ -14,7 +14,8 @@ up and prints it — documents **and** label printers (Zebra/ZPL, Bixolon, therm
   capability discovery per printer
 - Multi-tenant: orgs isolate API keys, agents, printers and jobs
 - Fleet monitoring: `GET /computers` + online/offline webhooks, Prometheus `/metrics`
-- MIT licensed · 155 tests
+- Retry-safe submits (`idempotency_key`) and job deadlines (`expire_after`)
+- MIT licensed · 168 tests
 
 ## Get started
 

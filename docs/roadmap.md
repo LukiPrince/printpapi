@@ -15,6 +15,8 @@ v1 is deliberately small (see [CONTRIBUTING.md](../CONTRIBUTING.md) for the YAGN
 - ~~**Computer status + liveness events**~~ ✅ `GET /computers`, and `computer_online`/
   `computer_offline` POSTed to an org's `event_url` (`PUT /orgs/{id}`).
   See [api.md](api.md#computers-agents).
+- ~~**Idempotency + expiry**~~ ✅ `idempotency_key` and `expire_after` on `POST /jobs`.
+  See [api.md](api.md#submitting-a-job).
 
 ## v2 candidates
 
@@ -25,9 +27,8 @@ order of pull:
 1. ~~**Agent/computer status API + online/offline webhooks**~~ ✅ **shipped** — `GET /computers`
    with liveness + per-org `event_url` transitions. Still open on top: a dashboard view for it
    (the UI only lists printers) and signed event payloads.
-2. **Idempotency keys + job expiration** — retry-safe `POST /jobs` (resubmit without double-print),
-   and `expire_after` so a stale label job doesn't print hours later when an offline agent
-   reconnects. Small, high operational value for order-printing integrations.
+2. ~~**Idempotency keys + job expiration**~~ ✅ **shipped** — `idempotency_key` (per-org, returns
+   the original job) and `expire_after` (deadline-passed jobs fail as `expired`, never print).
 3. **macOS agent** — it's CUPS underneath, so likely test + docs (plus macOS raw-printing quirks).
    Closest OSS competitor (print-relay) ships macOS/Linux but no Windows; we're the inverse.
 4. **Docs as a feature** — service install (systemd / Windows `sc`/NSSM via signed Python),

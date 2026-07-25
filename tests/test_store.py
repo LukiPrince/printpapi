@@ -461,3 +461,53 @@ def test_transitions_of_an_org_without_an_event_url_are_dropped_not_queued():
     store.set_org_event_url(conn, store.DEFAULT_ORG, "https://hooks.example/x")
     assert store.claim_agent_transitions(conn, 60, now=late) == []     # and it is not replayed
     assert store.set_org_event_url(conn, 4242, "https://h") is False   # unknown org
+
+
+# --- idempotency + expiry ------------------------------------------------------------
+
+
+def test_same_idempotency_key_enqueues_once_and_returns_the_first_job():
+    conn = _db()
+    reg = store.register_agent(conn, "pc", "k", [{"name": "Z", "can_pdf": False}])
+    pid = reg["printer_ids"]["Z"]
+    first = store.enqueue_job(conn, pid, "raw_base64", "raw", b"a", idempotency_key="order-42")
+    again = store.enqueue_job(conn, pid, "raw_base64", "raw", b"a", idempotency_key="order-42")
+    assert again == first
+    assert len(store.recent_jobs(conn)) == 1                      # no second print
+    other = store.enqueue_job(conn, pid, "raw_base64", "raw", b"a", idempotency_key="order-43")
+    assert other != first
+    assert store.enqueue_job(conn, pid, "raw_base64", "raw", b"a") != first   # no key -> no dedupe
+
+
+def test_idempotency_keys_are_scoped_to_the_org():
+    conn = _db()
+    other, a, b = _two_orgs(conn)
+    ja = store.enqueue_job(conn, a["printer_ids"]["Z"], "raw_base64", "raw", b"a",
+                           idempotency_key="order-42")
+    jb = store.enqueue_job(conn, b["printer_ids"]["Z"], "raw_base64", "raw", b"b",
+                           idempotency_key="order-42", org_id=other)
+    assert ja != jb                                               # same key, different orgs
+
+
+def test_an_expired_job_is_never_claimed_and_the_reaper_fails_it():
+    conn = _db()
+    reg = store.register_agent(conn, "pc", "k", [{"name": "Z", "can_pdf": False}])
+    aid, pid = reg["computer_id"], reg["printer_ids"]["Z"]
+    stale = store.enqueue_job(conn, pid, "raw_base64", "raw", b"a", expire_after=60)
+    fresh = store.enqueue_job(conn, pid, "raw_base64", "raw", b"b")
+    later = time.time() + 61
+    assert store.claim_job(conn, aid, now=later)["job_id"] == fresh    # skips the expired one
+    assert store.expire_jobs(conn, now=later) == 1
+    job = store.get_job(conn, stale)
+    assert job["state"] == "failed" and job["error"] == "expired"
+    assert store.expire_jobs(conn, now=later) == 0                     # already terminal
+    assert store.get_job(conn, fresh)["state"] == "claimed"            # untouched
+
+
+def test_a_job_inside_its_window_still_prints():
+    conn = _db()
+    reg = store.register_agent(conn, "pc", "k", [{"name": "Z", "can_pdf": False}])
+    aid, pid = reg["computer_id"], reg["printer_ids"]["Z"]
+    jid = store.enqueue_job(conn, pid, "raw_base64", "raw", b"a", expire_after=3600)
+    assert store.expire_jobs(conn) == 0
+    assert store.claim_job(conn, aid)["job_id"] == jid
