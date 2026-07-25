@@ -12,7 +12,8 @@ up and prints it — documents **and** label printers (Zebra/ZPL, Bixolon, therm
 - Cross-platform agent: Windows (`win32print` + SumatraPDF) and Linux (CUPS)
 - Print options per job (copies, duplex, paper size, tray, color, page ranges) +
   capability discovery per printer
-- MIT licensed · 136 tests
+- Multi-tenant: orgs isolate API keys, agents, printers and jobs
+- MIT licensed · 148 tests
 
 ## Get started
 
