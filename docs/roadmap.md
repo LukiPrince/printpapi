@@ -21,6 +21,8 @@ v1 is deliberately small (see [CONTRIBUTING.md](../CONTRIBUTING.md) for the YAGN
   Task Scheduler) documented in [agent.md](agent.md#macos).
 - ~~**Docs as a feature**~~ ✅ automation recipes ([recipes.md](recipes.md)), printer-family setup
   guides, and a "why not QZ Tray / PrintNode" comparison in the README.
+- ~~**E-commerce auto-print**~~ ✅ `POST /orders` + packing-slip renderer, WooCommerce plugin,
+  Shopify webhook. See [ecommerce.md](ecommerce.md).
 
 ## v2 candidates
 
@@ -43,10 +45,12 @@ order of pull:
    ([recipes.md](recipes.md)), per-family printer setup (Zebra/ZPL, DYMO, ESC/POS —
    [agent.md](agent.md#printer-setup-by-family)), and the QZ Tray / PrintNode comparison in the
    README. Left open: screenshots/GIF of the dashboard, and a hosted demo.
-5. **E-commerce auto-print integration (Shopify/WooCommerce)** — "order comes in → packing slip /
-   label prints" is the strongest commercial demand found; today it's all paid SaaS wrapping
-   PrintNode (Printus, BizPrint at $/print). Needs: a store app/plugin that POSTs to our API on
-   order webhooks + document rendering (order → PDF). Prerequisite for any hosted/SaaS offering.
+5. ~~**E-commerce auto-print integration (Shopify/WooCommerce)**~~ ✅ **shipped** —
+   `POST /orders` renders an order as a packing slip (stdlib PDF writer, no dependency) and
+   queues it; a WooCommerce plugin (`integrations/woocommerce`) and an HMAC-verified Shopify
+   order webhook feed it. See [ecommerce.md](ecommerce.md). Still open on top: a designed/
+   templated document (logo, layout), carrier label pass-through as a first-class option, and
+   the hosted SaaS this unblocks.
 6. ~~**Multi-tenancy / child accounts**~~ ✅ **shipped** — org-scoped keys, printers and jobs, with
    `POST/GET /orgs`. Still open on top of it: billing, quotas, per-org dashboard users/login,
    org-scoped key self-management, org deletion.

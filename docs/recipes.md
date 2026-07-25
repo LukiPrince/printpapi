@@ -60,6 +60,9 @@ Body (expressions in `{{ }}` as usual):
 Wire it behind a **Webhook** node (Shopify/WooCommerce order webhook) and the flow is:
 order → HTTP Request → printed. Nothing else needed.
 
+Printing a **packing slip** rather than an existing document? Skip the automation tool: the
+WooCommerce plugin and the Shopify webhook do it end-to-end — see [ecommerce.md](ecommerce.md).
+
 Already holding the file as binary in n8n? Its base64 lives in `$binary.<property>.data`, so
 `"type": "pdf_base64", "content": "{{ $binary.data.data }}"` works — but prefer the URL form.
 

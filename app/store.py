@@ -13,7 +13,8 @@ _LOCK = threading.Lock()  # ponytail: global lock; per-connection pool only if i
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS orgs(
-  id INTEGER PRIMARY KEY, name TEXT NOT NULL, event_url TEXT, created_at REAL NOT NULL);
+  id INTEGER PRIMARY KEY, name TEXT NOT NULL, event_url TEXT, shopify_secret TEXT,
+  created_at REAL NOT NULL);
 CREATE TABLE IF NOT EXISTS users(
   id INTEGER PRIMARY KEY, org_id INTEGER NOT NULL, name TEXT NOT NULL, created_at REAL NOT NULL);
 CREATE TABLE IF NOT EXISTS agents(
@@ -64,6 +65,7 @@ def init_db(conn):
                         "CREATE UNIQUE INDEX IF NOT EXISTS jobs_idem "
                         "ON jobs(org_id, idempotency_key)",
                         "ALTER TABLE orgs ADD COLUMN event_url TEXT",
+                        "ALTER TABLE orgs ADD COLUMN shopify_secret TEXT",
                         "ALTER TABLE agents ADD COLUMN offline_notified "
                         "INTEGER NOT NULL DEFAULT 0"):
                 try:
@@ -105,21 +107,44 @@ def create_org(conn, name):
 
 
 def list_orgs(conn):
+    """Orgs for the root listing. The Shopify webhook secret is reported as a flag, never echoed —
+    it is the one credential here that has to be stored in plaintext (HMAC needs it)."""
     with _LOCK:
-        rows = conn.execute("SELECT id, name, event_url, created_at FROM orgs ORDER BY id").fetchall()
-    return [dict(r) for r in rows]
+        rows = conn.execute("SELECT id, name, event_url, shopify_secret, created_at "
+                            "FROM orgs ORDER BY id").fetchall()
+    return [{"id": r["id"], "name": r["name"], "event_url": r["event_url"],
+             "shopify_secret_set": bool(r["shopify_secret"]), "created_at": r["created_at"]}
+            for r in rows]
 
 
-def set_org_event_url(conn, org_id, url):
-    """Where this org's agent liveness events go (None clears it). False if no such org."""
+def get_org(conn, org_id):
+    """Full org row including secrets — for server-side use (HMAC verification), not for output."""
+    with _LOCK:
+        row = conn.execute("SELECT id, name, event_url, shopify_secret, created_at FROM orgs "
+                           "WHERE id=?", (org_id,)).fetchone()
+    return dict(row) if row else None
+
+
+def _set_org_field(conn, org_id, column, value):
+    # `column` is one of this module's own literals, never client input.
     with _LOCK:
         try:
-            cur = conn.execute("UPDATE orgs SET event_url=? WHERE id=?", (url, org_id))
+            cur = conn.execute(f"UPDATE orgs SET {column}=? WHERE id=?", (value, org_id))
             conn.commit()
             return cur.rowcount == 1
         except Exception:
             conn.rollback()
             raise
+
+
+def set_org_event_url(conn, org_id, url):
+    """Where this org's agent liveness events go (None clears it). False if no such org."""
+    return _set_org_field(conn, org_id, "event_url", url)
+
+
+def set_org_shopify_secret(conn, org_id, secret):
+    """The org's Shopify webhook signing secret (None clears it). False if no such org."""
+    return _set_org_field(conn, org_id, "shopify_secret", secret)
 
 
 def org_exists(conn, org_id):
@@ -231,6 +256,15 @@ def revoke_api_key(conn, key_id):
 
 class UnknownPrinter(Exception):
     pass
+
+
+def get_printer(conn, printer_id, org_id=None):
+    """One printer, org-filtered — another org's printer reads as missing, never as a 403."""
+    with _LOCK:
+        row = conn.execute("SELECT id, name, org_id, agent_id, can_pdf FROM printers "
+                           "WHERE id=:pid AND (:org IS NULL OR org_id = :org)",
+                           {"pid": printer_id, "org": org_id}).fetchone()
+    return dict(row, can_pdf=bool(row["can_pdf"])) if row else None
 
 
 def enqueue_job(conn, printer_id, type_, mode, payload, user_id=DEFAULT_USER, title=None, copies=1,

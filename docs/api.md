@@ -21,14 +21,16 @@ Token comparison is constant-time (`hmac.compare_digest`).
 | `GET /health` | none | Liveness check |
 | `GET /metrics` | client | Prometheus text: job counts by state, agent/printer liveness |
 | `POST /jobs` | client | Submit a job → `{job_id}` |
+| `POST /orders` | client | Render an order as a packing slip and print it → `{job_id}` ([e-commerce](ecommerce.md)) |
+| `POST /integrations/shopify/orders` | HMAC | Shopify order webhook (key in the URL, signature in the header) |
 | `GET /jobs` | client | Recent job history |
 | `GET /jobs/{id}` | client | One job's state: `queued` \| `claimed` \| `done` \| `failed` \| `cancelled` |
 | `DELETE /jobs/{id}` | client | Cancel a still-`queued` job (`409` once claimed, `404` if unknown) |
 | `GET /printers` | client | Registered printers + online/offline + capabilities |
 | `GET /computers` | client | Registered agents + online/offline + printer count |
 | `POST /orgs` | root | Create an org → `{id, name}` |
-| `GET /orgs` | root | List orgs (with their `event_url`) |
-| `PUT /orgs/{id}` | root | Set/clear the org's `event_url` for agent liveness events |
+| `GET /orgs` | root | List orgs (`event_url`, `shopify_secret_set` — never the secret itself) |
+| `PUT /orgs/{id}` | root | Set/clear the org's `event_url` and/or `shopify_secret` |
 | `POST /apikeys` | root | Issue a client key → `{id, label, org_id, key}` (key shown once) |
 | `GET /apikeys` | root | List keys with their org (never the secret) |
 | `DELETE /apikeys/{id}` | root | Revoke a key |

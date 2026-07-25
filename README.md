@@ -12,10 +12,11 @@ up and prints it — documents **and** label printers (Zebra/ZPL, Bixolon, therm
 - Cross-platform agent: Windows (`win32print` + SumatraPDF), Linux and macOS (CUPS)
 - Print options per job (copies, duplex, paper size, tray, color, page ranges) +
   capability discovery per printer
+- **Shop order → packing slip**: WooCommerce plugin, Shopify webhook, built-in PDF renderer
 - Multi-tenant: orgs isolate API keys, agents, printers and jobs
 - Fleet monitoring: `GET /computers` + online/offline webhooks, Prometheus `/metrics`
 - Retry-safe submits (`idempotency_key`) and job deadlines (`expire_after`)
-- MIT licensed · 168 tests
+- MIT licensed · 187 tests
 
 ## Get started
 
@@ -86,6 +87,7 @@ It has things we don't (scales, a hosted SLA, an official plugin ecosystem — s
 | [Agent](docs/agent.md) | install, `agent.ini`, printer syntax, labels vs PDF, per-printer setup, service install |
 | [HTTP API](docs/api.md) | endpoints, auth, content types, job lifecycle |
 | [Recipes](docs/recipes.md) | print from n8n, Zapier, Make, curl — in one HTTP node |
+| [E-commerce](docs/ecommerce.md) | WooCommerce plugin, Shopify webhook, `POST /orders` |
 | [Roadmap](docs/roadmap.md) | what's planned for v2 |
 
 Contributions welcome — see [CONTRIBUTING.md](CONTRIBUTING.md).

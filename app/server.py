@@ -1,4 +1,6 @@
 # printpapi — self-hosted PrintNode alternative. MIT License (see LICENSE).
+import base64
+import hashlib
 import hmac
 import json
 import os
@@ -10,12 +12,14 @@ import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import unquote
+from urllib.parse import parse_qs, unquote, urlparse
 
 from app import store
 from app.dispatch import (decode_payload, agent_mode, parse_copies, parse_callback_url,
                           parse_options, parse_expire_after, parse_idempotency_key,
                           DispatchError, FetchError, _http_get, _http_post)
+from app.orders import OrderError, normalize_order
+from app.packing_slip import render_packing_slip
 
 _MAX_BODY = 32 * 1024 * 1024  # ponytail: flat 32 MB body cap; make env-tunable if someone needs bigger
 
@@ -129,15 +133,78 @@ def make_handler(*, conn, token, agent_auth=store.authenticate_agent, fetch_url=
             row = store.authenticate_client(conn, key)   # or any active per-client key
             return (True, row["org_id"]) if row else (False, None)
 
-        def _read_json(self):
+        def _read_body(self):
             length = int(self.headers.get("Content-Length", 0))   # ValueError -> caller's 400
             if length < 0 or length > _MAX_BODY:
                 raise ValueError("bad content-length")
-            return json.loads(self.rfile.read(length) or b"{}")
+            return self.rfile.read(length)
+
+        def _read_json(self):
+            return json.loads(self._read_body() or b"{}")
 
         def _agent_id(self):
             key = self._presented_key()
             return agent_auth(conn, key) if key else None
+
+        def _enqueue_order(self, payload, fmt, opts, org, *, idem=None, shop=None):
+            """Render a store order as a packing slip and queue it as a pdf job. `opts` carries the
+            same job knobs POST /jobs takes (printer_id, copies, title, expire_after, …)."""
+            try:
+                order = normalize_order(payload, fmt)
+                copies = parse_copies(opts)
+                callback_url = parse_callback_url(opts)
+                expire_after = parse_expire_after(opts)
+                idem = idem or parse_idempotency_key(opts)
+            except (OrderError, DispatchError) as e:
+                return self._json(400, {"error": str(e)})
+            if shop and not order.get("shop"):
+                order["shop"] = shop
+            printer = store.get_printer(conn, opts.get("printer_id"), org_id=org)
+            if printer is None:
+                return self._json(400, {"error": f"unknown printer: {opts.get('printer_id')}"})
+            if not printer["can_pdf"]:
+                # gotcha #1: a label printer form-feeds blanks on a PDF. Refuse before printing.
+                return self._json(400, {"error": "printer is raw-only; a packing slip needs a "
+                                                 "PDF-capable printer"})
+            jid = store.enqueue_job(conn, printer["id"], "order", "pdf",
+                                    render_packing_slip(order),
+                                    title=opts.get("title") or f"Packing slip {order['number']}",
+                                    copies=copies, callback_url=callback_url, org_id=org,
+                                    idempotency_key=idem, expire_after=expire_after)
+            return self._json(200, {"job_id": jid})
+
+        def _shopify_webhook(self):
+            """Shopify's order webhook. It cannot send an Authorization header, so the org comes
+            from `key` in the URL and *authenticity* from Shopify's HMAC over the raw body — the
+            key alone is never enough to print here."""
+            q = parse_qs(urlparse(self.path).query)
+            try:
+                raw = self._read_body()          # read first: an unread body poisons keep-alive
+            except ValueError:
+                return self._json(400, {"error": "bad content-length"})
+            row = store.authenticate_client(conn, (q.get("key") or [""])[0])
+            if row is None:                      # an issued client key only — root has no org
+                return self._json(401, {"error": "unauthorized"})
+            org = row["org_id"]
+            secret = (store.get_org(conn, org) or {}).get("shopify_secret")
+            if not secret:
+                return self._json(400, {"error": "shopify_secret not configured for this org "
+                                                 "(PUT /orgs/{id})"})
+            digest = base64.b64encode(
+                hmac.new(secret.encode(), raw, hashlib.sha256).digest()).decode()
+            if not hmac.compare_digest(digest, self.headers.get("X-Shopify-Hmac-Sha256", "")):
+                return self._json(401, {"error": "bad signature"})
+            try:
+                payload = json.loads(raw or b"{}")
+                printer_id = int((q.get("printer_id") or [""])[0])
+            except ValueError:
+                return self._json(400, {"error": "bad json or missing printer_id"})
+            # Shopify retries a webhook it considers undelivered, so dedupe on the order id:
+            # a redelivery returns the original job instead of printing a second slip.
+            sid = payload.get("id") or payload.get("name") if isinstance(payload, dict) else None
+            return self._enqueue_order(payload, "shopify", {"printer_id": printer_id}, org,
+                                       idem=f"shopify-{sid}" if sid else None,
+                                       shop=self.headers.get("X-Shopify-Shop-Domain"))
 
         def _html(self, code, html, body=True):
             data = html.encode()
@@ -296,6 +363,17 @@ def make_handler(*, conn, token, agent_auth=store.authenticate_agent, fetch_url=
                 except (DispatchError, store.UnknownPrinter) as e:
                     return self._json(400, {"error": str(e)})
                 return self._json(200, {"job_id": jid})
+            if self.path == "/orders":
+                ok, org = self._client_org()
+                if not ok:
+                    return self._json(401, {"error": "unauthorized"})
+                try:
+                    body = self._read_json()
+                except ValueError:
+                    return self._json(400, {"error": "bad json"})
+                return self._enqueue_order(body.get("order"), body.get("format"), body, org)
+            if self.path.split("?", 1)[0] == "/integrations/shopify/orders":
+                return self._shopify_webhook()
             if self.path == "/apikeys":
                 if not self._admin_ok():
                     return self._json(401, {"error": "unauthorized"})
@@ -371,14 +449,29 @@ def make_handler(*, conn, token, agent_auth=store.authenticate_agent, fetch_url=
                     body = self._read_json()
                 except ValueError:
                     return self._json(400, {"error": "bad json"})
-                try:
-                    # Same http(s) check as a job's callback_url; null/"" clears the URL.
-                    url = parse_callback_url({"callback_url": body.get("event_url")})
-                except DispatchError as e:
-                    return self._json(400, {"error": str(e).replace("callback_url", "event_url")})
-                if not store.set_org_event_url(conn, int(mo.group(1)), url):
-                    return self._json(404, {"error": "not found"})
-                return self._json(200, {"ok": True, "event_url": url})
+                oid, applied = int(mo.group(1)), {}
+                if "event_url" in body:
+                    try:
+                        # Same http(s) check as a job's callback_url; null/"" clears the URL.
+                        url = parse_callback_url({"callback_url": body.get("event_url")})
+                    except DispatchError as e:
+                        return self._json(400,
+                                          {"error": str(e).replace("callback_url", "event_url")})
+                    if not store.set_org_event_url(conn, oid, url):
+                        return self._json(404, {"error": "not found"})
+                    applied["event_url"] = url
+                if "shopify_secret" in body:
+                    secret = body.get("shopify_secret")     # null clears it
+                    if secret is not None and not (isinstance(secret, str) and secret.strip()):
+                        return self._json(400, {"error": "shopify_secret must be a string or null"})
+                    if not store.set_org_shopify_secret(conn, oid, secret):
+                        return self._json(404, {"error": "not found"})
+                    applied["shopify_secret_set"] = secret is not None   # never echo the secret
+                if not applied:
+                    if not store.org_exists(conn, oid):
+                        return self._json(404, {"error": "not found"})
+                    return self._json(400, {"error": "nothing to update"})
+                return self._json(200, {"ok": True, **applied})
             self._json(404, {"error": "not found"})
 
         def do_DELETE(self):

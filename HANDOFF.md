@@ -36,6 +36,15 @@ extracted, generalized OSS project.
   - `GET /computers` — agents with online/offline, last seen, printer count. Liveness *transitions*
     are POSTed to the org's `event_url` (`PUT /orgs/{id}`, root) as `computer_online` /
     `computer_offline` — once per edge, at-most-once (see `docs/api.md#computers-agents`).
+  - `POST /orders` — a shop order in, a **packing slip** out: `{printer_id, order, format?}` where
+    `format` is `shopify`/`woocommerce` (map that store's own JSON) or absent (already normalized).
+    Renders with `app/packing_slip.py` (stdlib PDF writer) and queues it as a pdf job. A raw-only
+    printer is a `400` — gotcha #1 enforced server-side.
+  - `POST /integrations/shopify/orders?key=…&printer_id=…` — Shopify's order webhook. Shopify can
+    send no auth header, so the URL key names the org and the `X-Shopify-Hmac-Sha256` signature
+    (checked against the org's `shopify_secret`) proves authenticity. Redeliveries dedupe on the
+    order id. The WooCommerce side is a real WP plugin in `integrations/woocommerce` that calls
+    `POST /orders` with a client key.
   - `GET /metrics` — Prometheus text. `GET /health`.
 - Admin endpoints (bootstrap `PRINTAPI_TOKEN` only) — **per-client API keys**:
   - `POST /apikeys {label}` → issues a new random key (shown once); `GET /apikeys` lists labels;
@@ -121,15 +130,21 @@ shipped: dashboard, Linux/CUPS agent, per-client API keys, Docker, job copies, c
 webhooks, per-job print options, printer capability discovery, **multi-tenancy**, **computer status
 + liveness events** (roadmap #1), **idempotency keys + job expiry** (roadmap #2), **macOS support**
 (roadmap #3), **docs as a feature** (roadmap #4: service install, `docs/recipes.md` for
-n8n/Zapier/Make, per-printer-family setup, QZ Tray/PrintNode comparison in the README).
-168 tests green.
+n8n/Zapier/Make, per-printer-family setup, QZ Tray/PrintNode comparison in the README), and
+**e-commerce auto-print** (roadmap #5: `POST /orders`, packing-slip renderer, WooCommerce plugin,
+Shopify webhook — `docs/ecommerce.md`).
+187 tests green.
 A demand-research sweep (July 2026) produced the ranked v2 roadmap in `docs/roadmap.md` — read it
-before inventing features. Roadmap #1–#4 and #6 are done, so **#5 (e-commerce auto-print:
-Shopify/WooCommerce order → packing slip/label) is the next one with real pull** — and it is the
-prerequisite for the hosted SaaS in the strategic note below. It needs two pieces: a store-side
-app/plugin that POSTs to `/jobs` on an order webhook (the HTTP contract for that already exists —
-`docs/recipes.md`), and order → PDF rendering, which is the part we do not have at all.
-Non-code leftover: code-sign the Windows agent (needs a cert, gotcha #2).
+before inventing features. Roadmap #1–#6 are done. What is left on the ranked list: **#7 the
+PrintNode API compatibility layer** (biggest lever — the existing plugin/SDK ecosystem points at
+our base URL unchanged), then #8 file backend, #9 Star CloudPRNT, #10 scales, #11 ESC/POS
+templating. Non-code leftover: code-sign the Windows agent (needs a cert, gotcha #2).
+
+On the e-commerce work specifically, the deliberate ceilings are: the packing slip is plain
+(Helvetica, no logo, no template — `# ponytail:` note at the top of `app/packing_slip.py`),
+carrier labels are not first-class (submit them as `pdf_uri`/`raw_uri`), and the Shopify path
+needs the client key in the webhook URL because Shopify cannot send an auth header — the HMAC is
+what actually authorizes the print.
 
 **Multi-tenancy (roadmap #6) is done** — see `docs/api.md#multi-tenancy` for the contract. Shape:
 

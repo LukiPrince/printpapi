@@ -22,9 +22,11 @@ gotchas, and the v1 plan. Don't re-derive; build on it.
 
 ```
 app/        server: dispatch.py (pure logic) + store.py (SQLite) + server.py (HTTP + static serve)
+            orders.py (shop payload -> order dict) + packing_slip.py (order dict -> PDF), both pure
 app/web/    built dashboard bundle — generated, committed, never hand-edited
 web/        dashboard source (Next.js). `npm run build:app` builds + syncs into app/web
-agent/      cross-platform agent (Windows + Linux/CUPS): print_agent.py + tests
+agent/      cross-platform agent (Windows + Linux/macOS/CUPS): print_agent.py + tests
+integrations/  store-side plugins that call the API (woocommerce/: a WordPress plugin, PHP)
 tests/      server/dispatch/integration tests
 docs/       design-v0-homelab.md (the original homelab design)
 ```
