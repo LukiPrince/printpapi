@@ -1,6 +1,7 @@
 import base64
 import pytest
-from app.dispatch import decode_payload, agent_mode, parse_copies, parse_callback_url, DispatchError
+from app.dispatch import (decode_payload, agent_mode, parse_copies, parse_callback_url,
+                          parse_options, DispatchError)
 
 
 def test_raw_base64_decodes():
@@ -176,6 +177,64 @@ def test_parse_callback_url_rejects_non_string():
     for v in (123, 1.5, True, ["https://x"], {"u": "https://x"}):
         with pytest.raises(DispatchError):
             parse_callback_url({"callback_url": v})
+
+
+def test_parse_options_absent_null_or_empty_is_none():
+    assert parse_options({}, "pdf") is None
+    assert parse_options({"options": None}, "pdf") is None
+    assert parse_options({"options": {}}, "pdf") is None
+    assert parse_options({"options": {}}, "raw") is None   # empty options never error
+
+
+def test_parse_options_valid_full_set_roundtrips():
+    o = {"duplex": "long-edge", "paper": "A4", "bin": "Tray 1", "color": False, "pages": "1-3,5"}
+    assert parse_options({"options": o}, "pdf") == o
+    assert parse_options({"options": {"duplex": "short-edge"}}, "pdf") == {"duplex": "short-edge"}
+    assert parse_options({"options": {"duplex": "one-sided"}}, "pdf") == {"duplex": "one-sided"}
+
+
+def test_parse_options_rejected_on_raw_jobs():
+    # ZPL/ESC-POS carries its own layout; duplex/paper/bin only mean something to a renderer
+    with pytest.raises(DispatchError):
+        parse_options({"options": {"duplex": "long-edge"}}, "raw")
+
+
+def test_parse_options_rejects_non_dict():
+    for v in ("duplex", 1, ["duplex"], True, ""):
+        with pytest.raises(DispatchError):
+            parse_options({"options": v}, "pdf")
+
+
+def test_parse_options_rejects_unknown_keys():
+    with pytest.raises(DispatchError):
+        parse_options({"options": {"stapler": True}}, "pdf")
+
+
+def test_parse_options_rejects_bad_duplex():
+    for v in ("both", 1, None, "duplexlong"):
+        with pytest.raises(DispatchError):
+            parse_options({"options": {"duplex": v}}, "pdf")
+
+
+def test_parse_options_rejects_bad_paper_and_bin_values():
+    # a comma would smuggle extra entries into Sumatra's comma-separated -print-settings
+    for v in ("A4,monochrome", "", 4, None, "x" * 65):
+        with pytest.raises(DispatchError):
+            parse_options({"options": {"paper": v}}, "pdf")
+        with pytest.raises(DispatchError):
+            parse_options({"options": {"bin": v}}, "pdf")
+
+
+def test_parse_options_rejects_non_bool_color():
+    for v in ("yes", 1, 0):
+        with pytest.raises(DispatchError):
+            parse_options({"options": {"color": v}}, "pdf")
+
+
+def test_parse_options_rejects_bad_pages():
+    for v in ("", "abc", "1-", "1,,2", "1-3,", 5, True):
+        with pytest.raises(DispatchError):
+            parse_options({"options": {"pages": v}}, "pdf")
 
 
 def test_pdf_uri_uses_injected_fetcher_and_is_pdf_mode():

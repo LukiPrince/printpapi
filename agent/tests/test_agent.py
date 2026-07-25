@@ -110,6 +110,89 @@ def test_run_once_defaults_copies_to_one_for_old_server():
     assert sends == [b"D"]
 
 
+def test_sumatra_settings_maps_all_options():
+    s = print_agent._sumatra_settings({"duplex": "long-edge", "paper": "A4", "bin": "Tray 1",
+                                       "color": False, "pages": "1-3,5"})
+    assert s == "1-3,5,duplexlong,paper=A4,bin=Tray 1,monochrome"
+    assert print_agent._sumatra_settings({"duplex": "short-edge"}) == "duplexshort"
+    assert print_agent._sumatra_settings({"duplex": "one-sided", "color": True}) == "simplex,color"
+
+
+def test_pdf_to_printer_passes_print_settings():
+    calls = []
+    print_agent.pdf_to_printer("HP", b"%PDF", options={"duplex": "short-edge"},
+                               run=lambda argv, **kw: calls.append(argv))
+    argv = calls[0]
+    assert argv[:3] == ["SumatraPDF.exe", "-print-to", "HP"]
+    assert argv[argv.index("-print-settings") + 1] == "duplexshort"
+
+
+def test_pdf_to_printer_no_options_no_print_settings():
+    calls = []
+    print_agent.pdf_to_printer("HP", b"%PDF", run=lambda argv, **kw: calls.append(argv))
+    assert "-print-settings" not in calls[0]
+
+
+def test_cups_pdf_maps_options_to_lp_o():
+    calls = []
+    print_agent.pdf_to_printer_cups(
+        "HP", b"%PDF",
+        options={"duplex": "long-edge", "paper": "A4", "bin": "Tray1",
+                 "color": True, "pages": "1-2"},
+        run=lambda argv, **kw: calls.append(argv))
+    argv = calls[0]
+    assert argv[:3] == ["lp", "-d", "HP"]
+    for o in ("sides=two-sided-long-edge", "media=A4", "InputSlot=Tray1",
+              "print-color-mode=color", "page-ranges=1-2"):
+        assert o in argv
+
+
+def test_cups_pdf_rejects_whitespace_option_values():
+    # lp parses one -o value space-separated: "A4 raw" would smuggle an extra option in
+    with pytest.raises(ValueError, match="whitespace"):
+        print_agent.pdf_to_printer_cups("HP", b"%PDF", options={"paper": "A4 raw"},
+                                        run=lambda argv, **kw: None)
+
+
+def test_print_job_passes_options_to_pdf_fn():
+    seen = {}
+    entry = {"name": "HP", "can_pdf": True, "target": "HP"}
+    print_agent.print_job("pdf", entry, b"%PDF", options={"duplex": "long-edge"},
+                          raw_fn=lambda *a: None,
+                          pdf_fn=lambda t, d, o: seen.update(t=t, o=o))
+    assert seen == {"t": "HP", "o": {"duplex": "long-edge"}}
+
+
+def test_print_job_without_options_calls_two_arg_pdf_fn():
+    # no options -> old-style 2-arg pdf_fn keeps working (old server, plain jobs)
+    seen = {}
+    print_agent.print_job("pdf", {"name": "HP", "can_pdf": True, "target": "HP"}, b"%PDF",
+                          raw_fn=lambda *a: None, pdf_fn=lambda t, d: seen.update(t=t))
+    assert seen == {"t": "HP"}
+
+
+def test_run_once_passes_job_options_to_pdf():
+    http = FakeHTTP({"job_id": 3, "printer_id": 1, "mode": "pdf",
+                     "options": {"paper": "A4"}}, b"%PDF")
+    seen = []
+    print_agent.run_once("http://x", "k", {1: {"name": "HP", "can_pdf": True, "target": "HP"}},
+                         http_get=http.get, http_get_bytes=http.get_bytes, http_post=http.post,
+                         raw_fn=lambda *a: None, pdf_fn=lambda t, d, o: seen.append(o))
+    assert seen == [{"paper": "A4"}]
+    assert http.posts[-1][1] == {"ok": True, "error": None}
+
+
+def test_select_backend_windows_pdf_forwards_options(monkeypatch):
+    seen = {}
+    monkeypatch.setattr(
+        print_agent, "pdf_to_printer",
+        lambda p, d, options=None, sumatra=None, run=None: seen.update(
+            p=p, options=options, sumatra=sumatra))
+    _, pdf_w = print_agent.select_backend(platform="win32", sumatra="S.exe")
+    pdf_w("HP", b"%PDF", {"paper": "A4"})
+    assert seen == {"p": "HP", "options": {"paper": "A4"}, "sumatra": "S.exe"}
+
+
 def test_print_job_bad_mode_raises():
     entry = {"name": "P", "can_pdf": False, "target": "P"}
     with pytest.raises(ValueError, match="bad mode"):

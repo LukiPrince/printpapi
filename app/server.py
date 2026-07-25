@@ -14,7 +14,7 @@ from urllib.parse import unquote
 
 from app import store
 from app.dispatch import (decode_payload, agent_mode, parse_copies, parse_callback_url,
-                          DispatchError, FetchError, _http_get, _http_post)
+                          parse_options, DispatchError, FetchError, _http_get, _http_post)
 
 _MAX_BODY = 32 * 1024 * 1024  # ponytail: flat 32 MB body cap; make env-tunable if someone needs bigger
 
@@ -255,9 +255,10 @@ def make_handler(*, conn, token, agent_auth=store.authenticate_agent, fetch_url=
                     mode = agent_mode(body.get("type"))
                     copies = parse_copies(body)
                     callback_url = parse_callback_url(body)
+                    options = parse_options(body, mode)
                     jid = store.enqueue_job(conn, body.get("printer_id"), body.get("type"),
                                             mode, data, title=body.get("title"), copies=copies,
-                                            callback_url=callback_url)
+                                            callback_url=callback_url, options=options)
                 except FetchError as e:
                     return self._json(502, {"error": f"downstream: {e}"})
                 except (DispatchError, store.UnknownPrinter) as e:

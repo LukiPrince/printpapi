@@ -1,6 +1,7 @@
 # printpapi — self-hosted PrintNode alternative. MIT License (see LICENSE).
 import hashlib
 import hmac
+import json
 import sqlite3
 import threading
 import time
@@ -26,7 +27,7 @@ CREATE TABLE IF NOT EXISTS jobs(
   id INTEGER PRIMARY KEY AUTOINCREMENT, org_id INTEGER NOT NULL, user_id INTEGER NOT NULL,
   printer_id INTEGER NOT NULL, agent_id INTEGER NOT NULL, type TEXT NOT NULL, mode TEXT NOT NULL,
   state TEXT NOT NULL DEFAULT 'queued', payload BLOB NOT NULL, error TEXT, title TEXT,
-  copies INTEGER NOT NULL DEFAULT 1,
+  copies INTEGER NOT NULL DEFAULT 1, options TEXT,
   callback_url TEXT, hook_attempts INTEGER NOT NULL DEFAULT 0, hook_delivered_at REAL,
   retries INTEGER NOT NULL DEFAULT 0, created_at REAL NOT NULL, claimed_at REAL, finished_at REAL);
 CREATE TABLE IF NOT EXISTS api_keys(
@@ -49,6 +50,7 @@ def init_db(conn):
             conn.executescript(_SCHEMA)
             for ddl in ("ALTER TABLE jobs ADD COLUMN title TEXT",
                         "ALTER TABLE jobs ADD COLUMN copies INTEGER NOT NULL DEFAULT 1",
+                        "ALTER TABLE jobs ADD COLUMN options TEXT",
                         "ALTER TABLE jobs ADD COLUMN callback_url TEXT",
                         "ALTER TABLE jobs ADD COLUMN hook_attempts INTEGER NOT NULL DEFAULT 0",
                         "ALTER TABLE jobs ADD COLUMN hook_delivered_at REAL"):
@@ -174,7 +176,7 @@ class UnknownPrinter(Exception):
 
 
 def enqueue_job(conn, printer_id, type_, mode, payload, user_id=DEFAULT_USER, title=None, copies=1,
-                callback_url=None):
+                callback_url=None, options=None):
     now = time.time()
     with _LOCK:
         try:
@@ -184,9 +186,11 @@ def enqueue_job(conn, printer_id, type_, mode, payload, user_id=DEFAULT_USER, ti
                 raise UnknownPrinter(f"unknown printer: {printer_id}")
             cur = conn.execute(
                 "INSERT INTO jobs(org_id, user_id, printer_id, agent_id, type, mode, state, "
-                "payload, title, copies, callback_url, created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+                "payload, title, copies, options, callback_url, created_at) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (p["org_id"], user_id, printer_id, p["agent_id"], type_, mode, "queued",
-                 sqlite3.Binary(payload), title, copies, callback_url, now))
+                 sqlite3.Binary(payload), title, copies,
+                 json.dumps(options) if options else None, callback_url, now))
             conn.commit()
             return cur.lastrowid
         except Exception:
@@ -201,7 +205,8 @@ def claim_job(conn, agent_id):
             conn.execute("UPDATE agents SET last_seen_at=? WHERE id=?", (now, agent_id))
             # ponytail: no index on jobs(agent_id, state); add one if claim throughput ever demands it.
             row = conn.execute(
-                "SELECT id, printer_id, mode, copies FROM jobs WHERE agent_id=? AND state='queued' "
+                "SELECT id, printer_id, mode, copies, options FROM jobs "
+                "WHERE agent_id=? AND state='queued' "
                 "ORDER BY created_at, id LIMIT 1", (agent_id,)).fetchone()
             if row is None:
                 conn.commit()
@@ -209,7 +214,8 @@ def claim_job(conn, agent_id):
             conn.execute("UPDATE jobs SET state='claimed', claimed_at=? WHERE id=?", (now, row["id"]))
             conn.commit()
             return {"job_id": row["id"], "printer_id": row["printer_id"], "mode": row["mode"],
-                    "copies": row["copies"]}
+                    "copies": row["copies"],
+                    "options": json.loads(row["options"]) if row["options"] else None}
         except Exception:
             conn.rollback()
             raise

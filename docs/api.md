@@ -50,6 +50,28 @@ Out of range or non-integer → `400`.
 `callback_url` is optional (`http(s)` only) — the server POSTs the job's outcome there once it
 reaches a terminal state. See [Webhooks](#webhooks). A non-`http(s)` scheme → `400`.
 
+`options` is optional and **pdf jobs only** (raw ZPL/ESC-POS carries its own layout — `400` on a
+raw job). The agent maps them onto its backend's native flags (SumatraPDF `-print-settings` on
+Windows, `lp -o` on CUPS):
+
+```json
+{"printer_id": 2, "type": "pdf_base64", "content": "<base64 PDF>",
+ "options": {"duplex": "long-edge", "paper": "A4", "bin": "Tray 1",
+             "color": false, "pages": "1-3,5"}}
+```
+
+| Key | Values | Maps to (Windows / CUPS) |
+|---|---|---|
+| `duplex` | `long-edge` \| `short-edge` \| `one-sided` | `duplexlong`… / `sides=two-sided-long-edge`… |
+| `paper` | paper name, e.g. `A4`, `Letter` | `paper=` / `media=` |
+| `bin` | tray name (driver-specific) | `bin=` / `InputSlot=` |
+| `color` | `true` \| `false` | `color`/`monochrome` / `print-color-mode=` |
+| `pages` | ranges like `1-3,5` | print settings / `page-ranges=` |
+
+Unknown keys or invalid values → `400`. Values are what the printer driver understands — there is
+no capability discovery yet (see the [roadmap](roadmap.md)); an option the driver doesn't support
+is silently ignored by it. On CUPS, `bin`/`paper` values must not contain spaces.
+
 ## Content types
 
 | `type` | Payload | The server… |

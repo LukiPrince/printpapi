@@ -2,6 +2,7 @@
 import base64
 import binascii
 import json
+import re
 import urllib.request
 from urllib.parse import urlparse
 
@@ -85,6 +86,44 @@ def parse_copies(body):
     if type(c) is not int or not (1 <= c <= _MAX_COPIES):
         raise DispatchError(f"copies must be an integer 1..{_MAX_COPIES}")
     return c
+
+
+_OPTION_KEYS = ("duplex", "paper", "bin", "color", "pages")
+_OPTION_DUPLEX = ("long-edge", "short-edge", "one-sided")
+# No comma: paper/bin land in Sumatra's comma-separated -print-settings list, so a comma in a
+# value would smuggle extra settings past validation. \w covers letters/digits/_.
+_OPTION_VALUE = re.compile(r"^[\w. -]{1,64}$")
+_OPTION_PAGES = re.compile(r"^\d+(-\d+)?(,\d+(-\d+)?)*$")
+
+
+def parse_options(body, mode):
+    """Optional 'options' from a job body -> validated dict, or None if absent/empty.
+    pdf jobs only — raw payloads (ZPL/ESC-POS) carry their own layout, a renderer never sees them.
+    Keys: duplex ('long-edge'|'short-edge'|'one-sided'), paper (e.g. 'A4'), bin (tray name),
+    color (bool), pages (e.g. '1-3,5'). The agent maps these onto SumatraPDF -print-settings
+    (Windows) or lp -o (CUPS)."""
+    o = body.get("options")
+    if o is None:
+        return None
+    if type(o) is not dict:
+        raise DispatchError("options must be an object")
+    if not o:
+        return None
+    if mode != "pdf":
+        raise DispatchError("options are only supported on pdf jobs")
+    unknown = sorted(set(o) - set(_OPTION_KEYS))
+    if unknown:
+        raise DispatchError(f"unknown option(s): {', '.join(unknown)}")
+    if "duplex" in o and o["duplex"] not in _OPTION_DUPLEX:
+        raise DispatchError(f"duplex must be one of {', '.join(_OPTION_DUPLEX)}")
+    for k in ("paper", "bin"):
+        if k in o and (type(o[k]) is not str or not _OPTION_VALUE.match(o[k])):
+            raise DispatchError(f"{k} must be 1-64 chars of letters/digits/space/._-")
+    if "color" in o and type(o["color"]) is not bool:
+        raise DispatchError("color must be a boolean")
+    if "pages" in o and (type(o["pages"]) is not str or not _OPTION_PAGES.match(o["pages"])):
+        raise DispatchError("pages must be ranges like '1-3,5'")
+    return dict(o)
 
 
 def parse_callback_url(body):

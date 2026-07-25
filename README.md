@@ -10,7 +10,8 @@ up and prints it — documents **and** label printers (Zebra/ZPL, Bixolon, therm
 - Server is Python **standard library only** — no framework, nothing to install
 - React dashboard (live queue, job history, test print, API keys), REST API, SQLite job queue
 - Cross-platform agent: Windows (`win32print` + SumatraPDF) and Linux (CUPS)
-- MIT licensed · 106 tests
+- Print options per job: copies, duplex, paper size, tray, color, page ranges
+- MIT licensed · 127 tests
 
 ## Get started
 

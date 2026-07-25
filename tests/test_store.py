@@ -106,6 +106,23 @@ def test_reaper_requeues_then_fails_after_limit():
     assert conn.execute("SELECT state FROM jobs WHERE id=?", (jid,)).fetchone()["state"] == "failed"
 
 
+def test_enqueue_and_claim_roundtrip_options():
+    conn = _db()
+    reg = store.register_agent(conn, "a", "k", [{"name": "HP", "can_pdf": True}])
+    opts = {"duplex": "long-edge", "paper": "A4", "bin": "Tray 1"}
+    jid = store.enqueue_job(conn, reg["printer_ids"]["HP"], "pdf_base64", "pdf", b"%PDF",
+                            options=opts)
+    c = store.claim_job(conn, reg["computer_id"])
+    assert c["job_id"] == jid and c["options"] == opts
+
+
+def test_claim_without_options_is_none():
+    conn = _db()
+    reg = store.register_agent(conn, "a", "k", [{"name": "Z", "can_pdf": False}])
+    store.enqueue_job(conn, reg["printer_ids"]["Z"], "raw_base64", "raw", b"x")
+    assert store.claim_job(conn, reg["computer_id"])["options"] is None
+
+
 def test_get_job_and_list_printers_online_flag():
     conn = _db()
     reg = store.register_agent(conn, "win-1", "k", [{"name": "Z", "can_pdf": True}])

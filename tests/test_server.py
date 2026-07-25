@@ -437,6 +437,32 @@ def test_copies_roundtrip_and_validation_via_http():
         httpd.shutdown()
 
 
+def test_options_roundtrip_and_validation_via_http():
+    conn = _mem()
+    reg = store.register_agent(conn, "pc", "ak", [{"name": "HP", "can_pdf": True}])
+    pid = reg["printer_ids"]["HP"]
+    httpd, base = _serve(conn)
+    try:
+        # submit with options, agent claim carries them (JVBERg== == base64 "%PDF")
+        opts = {"duplex": "long-edge", "paper": "A4", "bin": "Tray 1"}
+        code, _ = _req("POST", base + "/jobs", token="t",
+                       body={"printer_id": pid, "type": "pdf_base64", "content": "JVBERg==",
+                             "options": opts})
+        assert code == 200
+        claim = json.loads(_areq("GET", base + "/agent/jobs", "ak")[1])
+        assert claim["options"] == opts
+        # options on a raw job -> 400; bad option value -> 400; neither enqueues anything
+        assert _req("POST", base + "/jobs", token="t",
+                    body={"printer_id": pid, "type": "raw_base64", "content": "QUJD",
+                          "options": opts})[0] == 400
+        assert _req("POST", base + "/jobs", token="t",
+                    body={"printer_id": pid, "type": "pdf_base64", "content": "JVBERg==",
+                          "options": {"duplex": "both"}})[0] == 400
+        assert _areq("GET", base + "/agent/jobs", "ak")[0] == 204
+    finally:
+        httpd.shutdown()
+
+
 def test_cancel_job_via_http_states_and_auth():
     conn = _mem()
     reg = store.register_agent(conn, "pc", "ak", [{"name": "Z", "can_pdf": False}])

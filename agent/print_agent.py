@@ -26,12 +26,60 @@ def raw_to_printer(printer, data):
         win32print.ClosePrinter(h)
 
 
-def pdf_to_printer(printer, data, sumatra="SumatraPDF.exe"):
+# Job 'options' (duplex/paper/bin/color/pages, validated by the server) map onto each
+# backend's native flags: SumatraPDF -print-settings on Windows, lp -o on CUPS.
+_SUMATRA_DUPLEX = {"long-edge": "duplexlong", "short-edge": "duplexshort", "one-sided": "simplex"}
+_CUPS_DUPLEX = {"long-edge": "two-sided-long-edge", "short-edge": "two-sided-short-edge",
+                "one-sided": "one-sided"}
+
+
+def _sumatra_settings(options):
+    """options dict -> SumatraPDF -print-settings value (comma-separated list)."""
+    parts = []
+    if "pages" in options:
+        parts.append(options["pages"])
+    if "duplex" in options:
+        parts.append(_SUMATRA_DUPLEX[options["duplex"]])
+    if "paper" in options:
+        parts.append(f"paper={options['paper']}")
+    if "bin" in options:
+        parts.append(f"bin={options['bin']}")
+    if "color" in options:
+        parts.append("color" if options["color"] else "monochrome")
+    return ",".join(parts)
+
+
+def _lp_options(options):
+    """options dict -> ['-o', 'k=v', ...] for lp. lp splits one -o value on spaces, so a
+    value with whitespace could smuggle extra options (e.g. 'raw') in — refuse those."""
+    pairs = []
+    if "duplex" in options:
+        pairs.append(("sides", _CUPS_DUPLEX[options["duplex"]]))
+    if "paper" in options:
+        pairs.append(("media", options["paper"]))
+    if "bin" in options:
+        pairs.append(("InputSlot", options["bin"]))
+    if "color" in options:
+        pairs.append(("print-color-mode", "color" if options["color"] else "monochrome"))
+    if "pages" in options:
+        pairs.append(("page-ranges", options["pages"]))
+    out = []
+    for k, v in pairs:
+        if any(c.isspace() for c in v):
+            raise ValueError(f"option {k} value must not contain whitespace: {v!r}")
+        out += ["-o", f"{k}={v}"]
+    return out
+
+
+def pdf_to_printer(printer, data, options=None, sumatra="SumatraPDF.exe", run=subprocess.run):
     fd, path = tempfile.mkstemp(suffix=".pdf")
     try:
         with os.fdopen(fd, "wb") as f:
             f.write(data)
-        subprocess.run([sumatra, "-print-to", printer, "-silent", path], check=True, timeout=60)
+        cmd = [sumatra, "-print-to", printer]
+        if options:
+            cmd += ["-print-settings", _sumatra_settings(options)]
+        run(cmd + ["-silent", path], check=True, timeout=60)
     finally:
         try:
             os.remove(path)
@@ -44,9 +92,10 @@ def raw_to_printer_cups(printer, data, run=subprocess.run):
     run(["lp", "-d", printer, "-o", "raw"], input=data, check=True, timeout=60)
 
 
-def pdf_to_printer_cups(printer, data, run=subprocess.run):
+def pdf_to_printer_cups(printer, data, options=None, run=subprocess.run):
     # CUPS renders PDF through its own filter chain (gotcha #1: never send PDF as raw).
-    run(["lp", "-d", printer], input=data, check=True, timeout=60)
+    run(["lp", "-d", printer] + (_lp_options(options) if options else []),
+        input=data, check=True, timeout=60)
 
 
 def raw_to_socket(target, data, connect=socket.create_connection, timeout=30):
@@ -61,7 +110,7 @@ def raw_to_socket(target, data, connect=socket.create_connection, timeout=30):
 def select_backend(platform=sys.platform, sumatra="SumatraPDF.exe"):
     """(raw_fn, pdf_fn) for the host OS. Windows: win32print + SumatraPDF; else CUPS lp."""
     if platform.startswith("win"):
-        return raw_to_printer, lambda p, d: pdf_to_printer(p, d, sumatra=sumatra)
+        return raw_to_printer, lambda p, d, o=None: pdf_to_printer(p, d, options=o, sumatra=sumatra)
     return raw_to_printer_cups, pdf_to_printer_cups
 
 
@@ -152,8 +201,8 @@ def _report_with_retry(base, key, job_id, ok, error=None, *, http_post=_post,
     return False  # ponytail: after 5 tries we drop the result; reaper requeues -> possible dup
 
 
-def print_job(mode, entry, data, copies=1, raw_fn=raw_to_printer, pdf_fn=pdf_to_printer,
-              socket_fn=raw_to_socket):
+def print_job(mode, entry, data, copies=1, options=None, raw_fn=raw_to_printer,
+              pdf_fn=pdf_to_printer, socket_fn=raw_to_socket):
     target = entry["target"]
     # ponytail: loop the whole send per copy — correct on every backend without a per-driver
     # copies flag (win32/Sumatra/CUPS/socket differ). Native flags (lp -n, Sumatra "Nx") would
@@ -165,7 +214,8 @@ def print_job(mode, entry, data, copies=1, raw_fn=raw_to_printer, pdf_fn=pdf_to_
     elif mode == "raw":
         send = lambda: raw_fn(target, data)
     elif mode == "pdf":
-        send = lambda: pdf_fn(target, data)
+        # 3-arg call only when options are set: plain jobs keep working with 2-arg pdf fns
+        send = (lambda: pdf_fn(target, data, options)) if options else (lambda: pdf_fn(target, data))
     else:
         raise ValueError(f"bad mode: {mode}")
     for _ in range(copies):
@@ -185,7 +235,7 @@ def run_once(base, key, printer_by_id, *, http_get=_get, http_get_bytes=_get_byt
         if printer is None:
             raise ValueError(f"unknown printer id: {job['printer_id']}")
         print_job(job["mode"], printer, data, copies=job.get("copies", 1),
-                  raw_fn=raw_fn, pdf_fn=pdf_fn)
+                  options=job.get("options"), raw_fn=raw_fn, pdf_fn=pdf_fn)
     except Exception as e:
         _report_with_retry(base, key, job_id, False, str(e), http_post=http_post,
                            sleep=report_sleep)
