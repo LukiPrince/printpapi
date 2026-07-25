@@ -10,6 +10,7 @@ Candidates for v2, roughly in order of pull:
   (per-job `callback_url`; best-effort retried delivery on terminal states; unsigned).
 - ~~**Job cancel** — `DELETE /jobs/{id}` while still queued.~~ ✅ shipped (`cancelled` state;
   `409` once claimed, no mid-print interrupt).
-- **Printer capabilities** — agent reports paper sizes / duplex support at registration.
+- ~~**Printer capabilities**~~ ✅ shipped: agent reports papers/bins/duplex/color at registration
+  (Windows `DeviceCapabilities`, CUPS `lpoptions -l`; best-effort), exposed in `GET /printers`.
 - ~~**`/metrics`** — Prometheus text format for queue depth, job outcomes, agent liveness.~~ ✅ shipped.
 - **Code-signed Windows agent installer** — the one blocker that needs a certificate, not code.

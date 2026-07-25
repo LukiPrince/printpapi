@@ -106,6 +106,21 @@ def test_reaper_requeues_then_fails_after_limit():
     assert conn.execute("SELECT state FROM jobs WHERE id=?", (jid,)).fetchone()["state"] == "failed"
 
 
+def test_register_stores_capabilities_and_list_printers_returns_them():
+    conn = _db()
+    caps = {"papers": ["A4", "Letter"], "bins": ["Tray 1"], "duplex": True, "color": False}
+    store.register_agent(conn, "a", "k", [{"name": "HP", "can_pdf": True, "capabilities": caps},
+                                          {"name": "Z", "can_pdf": False}])
+    ps = {p["name"]: p for p in store.list_printers(conn, online_window_s=60)}
+    assert ps["HP"]["capabilities"] == caps
+    assert ps["Z"]["capabilities"] is None
+    # re-register updates capabilities in place
+    caps2 = dict(caps, duplex=False)
+    store.register_agent(conn, "a", "k", [{"name": "HP", "can_pdf": True, "capabilities": caps2}])
+    ps = {p["name"]: p for p in store.list_printers(conn, online_window_s=60)}
+    assert ps["HP"]["capabilities"] == caps2
+
+
 def test_enqueue_and_claim_roundtrip_options():
     conn = _db()
     reg = store.register_agent(conn, "a", "k", [{"name": "HP", "can_pdf": True}])

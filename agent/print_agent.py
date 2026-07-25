@@ -107,6 +107,73 @@ def raw_to_socket(target, data, connect=socket.create_connection, timeout=30):
         s.sendall(data)
 
 
+# --- printer capabilities (best-effort discovery, reported at registration) ---------------------
+# Shape: {"papers": [...], "bins": [...], "duplex": bool, "color": bool} — any subset. A driver
+# quirk or missing tool must never block registration: collectors return None on any failure.
+
+def _caps_from_lpoptions(text):
+    """Parse `lpoptions -p <queue> -l` output -> capabilities dict, or None if nothing useful."""
+    caps = {}
+    for line in text.splitlines():
+        head, sep, choices = line.partition(":")
+        if not sep:
+            continue
+        key = head.split("/", 1)[0].strip()
+        vals = [c.lstrip("*") for c in choices.split()]
+        if key == "PageSize":
+            caps["papers"] = vals
+        elif key == "InputSlot":
+            caps["bins"] = vals
+        elif key == "Duplex":
+            caps["duplex"] = any(v != "None" for v in vals)
+        elif key == "ColorModel":
+            caps["color"] = any(v.lower() not in ("gray", "grayscale") for v in vals)
+    return caps or None
+
+
+def collect_capabilities_cups(printer, run=subprocess.run):
+    try:
+        r = run(["lpoptions", "-p", printer, "-l"], capture_output=True, check=True, timeout=10)
+        return _caps_from_lpoptions(r.stdout.decode(errors="replace"))
+    except Exception:
+        return None
+
+
+def collect_capabilities_windows(printer, wp=None):
+    try:
+        if wp is None:
+            import win32print as wp
+        h = wp.OpenPrinter(printer)
+        try:
+            port = wp.GetPrinter(h, 2)["pPortName"]
+        finally:
+            wp.ClosePrinter(h)
+        papers = wp.DeviceCapabilities(printer, port, 16)   # DC_PAPERNAMES
+        bins = wp.DeviceCapabilities(printer, port, 12)     # DC_BINNAMES
+        duplex = wp.DeviceCapabilities(printer, port, 7)    # DC_DUPLEX
+        color = wp.DeviceCapabilities(printer, port, 32)    # DC_COLORDEVICE
+        return {"papers": [p.strip("\x00 ") for p in papers or []],
+                "bins": [b.strip("\x00 ") for b in bins or []],
+                "duplex": bool(duplex), "color": bool(color)}
+    except Exception:
+        return None
+
+
+def select_caps_collector(platform=sys.platform):
+    return collect_capabilities_windows if platform.startswith("win") else collect_capabilities_cups
+
+
+def add_capabilities(printers, caps_fn):
+    """Attach discovered capabilities to parse_printers() entries. socket:// targets have no
+    driver/queue to ask; a None result (collector failed) just leaves the entry as-is."""
+    for p in printers:
+        if not p["target"].startswith("socket://"):
+            caps = caps_fn(p["target"])
+            if caps:
+                p["capabilities"] = caps
+    return printers
+
+
 def select_backend(platform=sys.platform, sumatra="SumatraPDF.exe"):
     """(raw_fn, pdf_fn) for the host OS. Windows: win32print + SumatraPDF; else CUPS lp."""
     if platform.startswith("win"):
@@ -264,6 +331,7 @@ def main():
     sumatra = bundled if os.path.exists(bundled) else "SumatraPDF.exe"
     raw_fn, pdf_fn = select_backend(sumatra=sumatra)
     printers = parse_printers(agent_cfg["printers"])
+    add_capabilities(printers, select_caps_collector())
     reg = register(base, key, name, printers)
     entry_by_name = {p["name"]: p for p in printers}
     printer_by_id = {pid: entry_by_name[pname] for pname, pid in reg["printer_ids"].items()}

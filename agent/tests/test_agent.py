@@ -193,6 +193,69 @@ def test_select_backend_windows_pdf_forwards_options(monkeypatch):
     assert seen == {"p": "HP", "options": {"paper": "A4"}, "sumatra": "S.exe"}
 
 
+def test_caps_from_lpoptions_parses_pagesize_inputslot_duplex_color():
+    text = ("PageSize/Media Size: *A4 Letter Legal Custom.WIDTHxHEIGHT\n"
+            "InputSlot/Media Source: *Tray1 Tray2 Manual\n"
+            "Duplex/2-Sided Printing: *None DuplexNoTumble DuplexTumble\n"
+            "ColorModel/Color Model: *Gray RGB\n")
+    assert print_agent._caps_from_lpoptions(text) == {
+        "papers": ["A4", "Letter", "Legal", "Custom.WIDTHxHEIGHT"],
+        "bins": ["Tray1", "Tray2", "Manual"],
+        "duplex": True, "color": True}
+
+
+def test_caps_from_lpoptions_mono_no_duplex_and_empty():
+    text = "Duplex/2-Sided Printing: *None\nColorModel/Output Mode: *Gray\n"
+    assert print_agent._caps_from_lpoptions(text) == {"duplex": False, "color": False}
+    assert print_agent._caps_from_lpoptions("") is None
+
+
+def test_collect_capabilities_cups_runs_lpoptions_and_survives_errors():
+    def fake_run(argv, **kw):
+        assert argv == ["lpoptions", "-p", "HP", "-l"]
+
+        class R:
+            stdout = b"PageSize/Media Size: *A4\n"
+        return R()
+    assert print_agent.collect_capabilities_cups("HP", run=fake_run) == {"papers": ["A4"]}
+
+    def boom(argv, **kw):
+        raise OSError("no lpoptions")
+    assert print_agent.collect_capabilities_cups("HP", run=boom) is None
+
+
+def test_collect_capabilities_windows_via_fake_win32print():
+    class FakeWP:
+        def OpenPrinter(self, name): return "h"
+        def GetPrinter(self, h, level): return {"pPortName": "USB001"}
+        def ClosePrinter(self, h): pass
+        def DeviceCapabilities(self, dev, port, cap):
+            return {16: ["A4\x00", "Letter"], 12: ["Tray 1"], 7: 1, 32: 0}[cap]
+    assert print_agent.collect_capabilities_windows("HP", wp=FakeWP()) == {
+        "papers": ["A4", "Letter"], "bins": ["Tray 1"], "duplex": True, "color": False}
+
+
+def test_collect_capabilities_windows_errors_return_none():
+    class Boom:
+        def OpenPrinter(self, name): raise RuntimeError("no driver")
+    assert print_agent.collect_capabilities_windows("HP", wp=Boom()) is None
+
+
+def test_add_capabilities_skips_socket_targets_and_failures():
+    printers = [{"name": "HP", "can_pdf": True, "target": "HP"},
+                {"name": "netz", "can_pdf": False, "target": "socket://10.0.0.5:9100"},
+                {"name": "Z", "can_pdf": False, "target": "Z"}]
+    out = print_agent.add_capabilities(
+        printers, lambda t: {"papers": ["A4"]} if t == "HP" else None)
+    assert out[0]["capabilities"] == {"papers": ["A4"]}
+    assert "capabilities" not in out[1] and "capabilities" not in out[2]
+
+
+def test_select_caps_collector_by_platform():
+    assert print_agent.select_caps_collector("win32") is print_agent.collect_capabilities_windows
+    assert print_agent.select_caps_collector("linux") is print_agent.collect_capabilities_cups
+
+
 def test_print_job_bad_mode_raises():
     entry = {"name": "P", "can_pdf": False, "target": "P"}
     with pytest.raises(ValueError, match="bad mode"):

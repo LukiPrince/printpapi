@@ -22,7 +22,7 @@ CREATE TABLE IF NOT EXISTS agents(
 CREATE TABLE IF NOT EXISTS printers(
   id INTEGER PRIMARY KEY AUTOINCREMENT, org_id INTEGER NOT NULL, agent_id INTEGER NOT NULL,
   name TEXT NOT NULL, can_pdf INTEGER NOT NULL DEFAULT 0, state TEXT NOT NULL DEFAULT 'active',
-  created_at REAL NOT NULL, UNIQUE(agent_id, name));
+  capabilities TEXT, created_at REAL NOT NULL, UNIQUE(agent_id, name));
 CREATE TABLE IF NOT EXISTS jobs(
   id INTEGER PRIMARY KEY AUTOINCREMENT, org_id INTEGER NOT NULL, user_id INTEGER NOT NULL,
   printer_id INTEGER NOT NULL, agent_id INTEGER NOT NULL, type TEXT NOT NULL, mode TEXT NOT NULL,
@@ -48,7 +48,8 @@ def init_db(conn):
     with _LOCK:
         try:
             conn.executescript(_SCHEMA)
-            for ddl in ("ALTER TABLE jobs ADD COLUMN title TEXT",
+            for ddl in ("ALTER TABLE printers ADD COLUMN capabilities TEXT",
+                        "ALTER TABLE jobs ADD COLUMN title TEXT",
                         "ALTER TABLE jobs ADD COLUMN copies INTEGER NOT NULL DEFAULT 1",
                         "ALTER TABLE jobs ADD COLUMN options TEXT",
                         "ALTER TABLE jobs ADD COLUMN callback_url TEXT",
@@ -101,15 +102,18 @@ def register_agent(conn, name, api_key, printers):
             printer_ids = {}
             for p in printers:
                 can_pdf = 1 if p.get("can_pdf") else 0
+                caps = json.dumps(p["capabilities"]) if p.get("capabilities") else None
                 r = conn.execute("SELECT id FROM printers WHERE agent_id=? AND name=?",
                                  (agent_id, p["name"])).fetchone()
                 if r:
                     pid = r["id"]
-                    conn.execute("UPDATE printers SET can_pdf=? WHERE id=?", (can_pdf, pid))
+                    conn.execute("UPDATE printers SET can_pdf=?, capabilities=? WHERE id=?",
+                                 (can_pdf, caps, pid))
                 else:
                     cur = conn.execute(
-                        "INSERT INTO printers(org_id, agent_id, name, can_pdf, created_at) "
-                        "VALUES(?,?,?,?,?)", (DEFAULT_ORG, agent_id, p["name"], can_pdf, now))
+                        "INSERT INTO printers(org_id, agent_id, name, can_pdf, capabilities, "
+                        "created_at) VALUES(?,?,?,?,?,?)",
+                        (DEFAULT_ORG, agent_id, p["name"], can_pdf, caps, now))
                     pid = cur.lastrowid
                 printer_ids[p["name"]] = pid
             conn.commit()
@@ -359,7 +363,8 @@ def list_printers(conn, online_window_s, now=None):
     now = time.time() if now is None else now
     with _LOCK:
         rows = conn.execute(
-            "SELECT p.id, p.name, p.agent_id, p.can_pdf, a.name AS agent_name, a.last_seen_at "
+            "SELECT p.id, p.name, p.agent_id, p.can_pdf, p.capabilities, "
+            "a.name AS agent_name, a.last_seen_at "
             "FROM printers p JOIN agents a ON a.id = p.agent_id ORDER BY p.id").fetchall()
     out = []
     for r in rows:
@@ -367,6 +372,7 @@ def list_printers(conn, online_window_s, now=None):
         out.append({
             "id": r["id"], "name": r["name"], "agent_id": r["agent_id"],
             "agent_name": r["agent_name"], "can_pdf": bool(r["can_pdf"]),
+            "capabilities": json.loads(r["capabilities"]) if r["capabilities"] else None,
             "online": seen is not None and (now - seen) <= online_window_s,
         })
     return out

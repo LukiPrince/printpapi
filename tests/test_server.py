@@ -437,6 +437,21 @@ def test_copies_roundtrip_and_validation_via_http():
         httpd.shutdown()
 
 
+def test_register_capabilities_visible_in_printers_via_http():
+    conn = _mem()
+    httpd, base = _serve(conn)
+    try:
+        caps = {"papers": ["A4"], "bins": ["Tray 1"], "duplex": True, "color": True}
+        code, _ = _areq("POST", base + "/agent/register", "ak",
+                        {"name": "pc", "printers": [{"name": "HP", "can_pdf": True,
+                                                     "capabilities": caps}]})
+        assert code == 200
+        code, raw = _req("GET", base + "/printers", token="t")
+        assert code == 200 and json.loads(raw)["printers"][0]["capabilities"] == caps
+    finally:
+        httpd.shutdown()
+
+
 def test_options_roundtrip_and_validation_via_http():
     conn = _mem()
     reg = store.register_agent(conn, "pc", "ak", [{"name": "HP", "can_pdf": True}])

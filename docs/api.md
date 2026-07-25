@@ -22,7 +22,7 @@ Token comparison is constant-time (`hmac.compare_digest`).
 | `GET /jobs` | client | Recent job history |
 | `GET /jobs/{id}` | client | One job's state: `queued` \| `claimed` \| `done` \| `failed` \| `cancelled` |
 | `DELETE /jobs/{id}` | client | Cancel a still-`queued` job (`409` once claimed, `404` if unknown) |
-| `GET /printers` | client | Registered printers + online/offline |
+| `GET /printers` | client | Registered printers + online/offline + capabilities |
 | `POST /apikeys` | admin | Issue a per-client key → `{id, label, key}` (key shown once) |
 | `GET /apikeys` | admin | List key labels (never the secret) |
 | `DELETE /apikeys/{id}` | admin | Revoke a key |
@@ -68,9 +68,11 @@ Windows, `lp -o` on CUPS):
 | `color` | `true` \| `false` | `color`/`monochrome` / `print-color-mode=` |
 | `pages` | ranges like `1-3,5` | print settings / `page-ranges=` |
 
-Unknown keys or invalid values → `400`. Values are what the printer driver understands — there is
-no capability discovery yet (see the [roadmap](roadmap.md)); an option the driver doesn't support
-is silently ignored by it. On CUPS, `bin`/`paper` values must not contain spaces.
+Unknown keys or invalid values → `400`. Values are what the printer driver understands — check
+the printer's `capabilities` in `GET /printers` (`papers`, `bins`, `duplex`, `color`; reported
+best-effort by the agent at registration via the Windows driver or CUPS `lpoptions`, `null` when
+unavailable) for what it supports. An option the driver doesn't support is silently ignored by
+it. On CUPS, `bin`/`paper` values must not contain spaces.
 
 ## Content types
 
