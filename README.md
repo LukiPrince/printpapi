@@ -54,13 +54,38 @@ Prefer to build it yourself? `docker build -t printpapi .`
 
 First print: dashboard → **Devices** → **Test print**.
 
+## Why not QZ Tray or PrintNode?
+
+**[QZ Tray](https://qz.io/)** prints from the *browser*: JavaScript in your page talks to a Java
+app on the same desktop over a localhost WebSocket. Different architecture, different trade-offs:
+
+|  | QZ Tray | printpapi |
+|---|---|---|
+| Trigger | browser JS on the operator's machine | any HTTP client — backend, n8n/Zapier, cron |
+| Silent printing | needs a **code-signing certificate** per deployment (self-signed → a prompt on every print) | nothing to sign; the agent prints what the server queues |
+| Transport | `wss://localhost` from the page ([Chrome's Local Network Access](https://developer.chrome.com/blog/local-network-access) tightens this) | agent **polls outbound**, no listener, no localhost anything |
+| Headless / service | [open since 2016](https://github.com/qzind/tray/issues/116) | systemd / launchd / Task Scheduler ([docs](docs/agent.md#run-as-a-service)) |
+| Queue when the PC is off | none — [cloud queue open since 2021](https://github.com/qzind/tray/issues/825) | jobs wait in SQLite, print on reconnect (or expire) |
+| Direct USB/HID, scales | yes | no — printers only |
+
+QZ Tray is the better fit if the print *must* start from the user's browser session with no server
+in the loop. If printing is something your **backend or automation** does, printpapi's model is
+simpler: no certificates, no browser, one HTTP call.
+
+**[PrintNode](https://www.printnode.com/)** is the closest match feature-wise — printpapi is a
+self-hosted alternative to it: same poll-from-behind-NAT model, same job/printer/computer API
+shape, without the per-printer monthly fee or sending your documents through someone else's cloud.
+It has things we don't (scales, a hosted SLA, an official plugin ecosystem — see the
+[roadmap](docs/roadmap.md)).
+
 ## Documentation
 
 | | |
 |---|---|
 | [Server](docs/server.md) | how it works, configuration, Docker, dashboard (+ rebuilding it), API keys, security |
-| [Agent](docs/agent.md) | install, `agent.ini`, printer syntax, labels vs PDF |
+| [Agent](docs/agent.md) | install, `agent.ini`, printer syntax, labels vs PDF, per-printer setup, service install |
 | [HTTP API](docs/api.md) | endpoints, auth, content types, job lifecycle |
+| [Recipes](docs/recipes.md) | print from n8n, Zapier, Make, curl — in one HTTP node |
 | [Roadmap](docs/roadmap.md) | what's planned for v2 |
 
 Contributions welcome — see [CONTRIBUTING.md](CONTRIBUTING.md).

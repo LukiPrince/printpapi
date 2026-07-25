@@ -119,12 +119,17 @@ multi-tenancy is now the active next step — see §5 and `docs/roadmap.md`.)*
 v1 is **published** (public repo, v1.0.0 release, GHCR image) and the post-v1 feature wave has
 shipped: dashboard, Linux/CUPS agent, per-client API keys, Docker, job copies, cancel, `/metrics`,
 webhooks, per-job print options, printer capability discovery, **multi-tenancy**, **computer status
-+ liveness events** (roadmap #1), **idempotency keys + job expiry** (roadmap #2), **macOS support
-+ service-install docs** (roadmap #3, half of #4).
++ liveness events** (roadmap #1), **idempotency keys + job expiry** (roadmap #2), **macOS support**
+(roadmap #3), **docs as a feature** (roadmap #4: service install, `docs/recipes.md` for
+n8n/Zapier/Make, per-printer-family setup, QZ Tray/PrintNode comparison in the README).
 168 tests green.
 A demand-research sweep (July 2026) produced the ranked v2 roadmap in `docs/roadmap.md` — read it
-before inventing features. Only non-code leftover: code-sign the Windows agent (needs a cert,
-gotcha #2).
+before inventing features. Roadmap #1–#4 and #6 are done, so **#5 (e-commerce auto-print:
+Shopify/WooCommerce order → packing slip/label) is the next one with real pull** — and it is the
+prerequisite for the hosted SaaS in the strategic note below. It needs two pieces: a store-side
+app/plugin that POSTs to `/jobs` on an order webhook (the HTTP contract for that already exists —
+`docs/recipes.md`), and order → PDF rendering, which is the part we do not have at all.
+Non-code leftover: code-sign the Windows agent (needs a cert, gotcha #2).
 
 **Multi-tenancy (roadmap #6) is done** — see `docs/api.md#multi-tenancy` for the contract. Shape:
 

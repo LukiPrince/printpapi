@@ -46,6 +46,50 @@ printpapi keeps the paths separate: `raw` jobs (ZPL/ESC-POS) go straight to the 
 `pdf` jobs are rendered first (SumatraPDF on Windows, CUPS on Linux). Mark only real document
 printers with `|pdf`.
 
+## Printer setup by family
+
+Which path a printer takes follows from **who renders**: a printer with its own page language
+(Zebra/ZPL, ESC/POS) takes `raw` and needs no rendering; everything else needs a driver and takes
+`pdf`. Get that wrong and you print blanks (gotcha #1).
+
+### Zebra and other ZPL printers — `raw`
+
+The printer parses ZPL itself, so the driver is almost irrelevant.
+
+- **Network model (the easy one):** don't install anything. Point the agent straight at the
+  printer: `warehouse-label = socket://192.168.1.50:9100`. No driver, no queue, no spooler — works
+  the same on Windows, Linux and macOS.
+- **USB model:** install Zebra's driver (*Zebra Setup Utilities* / ZDesigner on Windows,
+  `lpadmin -m raw` or the Zebra CUPS driver elsewhere) so the OS has a printer object; the agent
+  writes RAW bytes into it, the driver never re-renders. List it **without** `|pdf`.
+- **Test it** before wiring up printpapi —
+  `printf '^XA^FO50,50^A0N,40,40^FDprintpapi ok^FS^XZ' | lp -d Zebra -o raw` (Linux/macOS), or on
+  Windows just use the dashboard's *Devices → Test print*, which sends the equivalent one-line
+  ZPL label (`^XA^FO40,40^ADN,36,20^FDprintpapi test^FS^XZ`) to any raw-only printer.
+- Label geometry lives **on the printer**, not in the job: `^PW` (width), `^LL` (length), `~SD`
+  (darkness), and `~JC` to recalibrate the media sensor after a roll change.
+
+### DYMO LabelWriter — `pdf`, not raw
+
+A LabelWriter does **not** speak ZPL. It is a raster device driven entirely by its driver, so it
+belongs on the PDF path:
+
+1. Install the driver — *DYMO Connect* (Windows/macOS), `dymo-cups-drivers` (Linux).
+2. In `agent.ini` mark it PDF-capable: `DYMO LabelWriter 550|pdf`.
+3. Send a PDF whose page size *is* the label (e.g. 89 × 36 mm for an address label) — scaling a
+   sheet-sized PDF onto a label is what produces the tiny-print-in-the-corner classic.
+4. Pick the label via `options.paper`. Don't guess the name: `GET /printers` reports the driver's
+   own `capabilities.papers`, and only those values are accepted by the driver.
+
+Brother QL and other raster label printers work the same way — driver + `|pdf`.
+
+### ESC/POS receipt printers — `raw`
+
+Same as Zebra: the printer interprets the byte stream. Network models take
+`socket://IP:9100`; USB models go through the vendor driver as a RAW target. printpapi passes the
+bytes through — building the ESC/POS stream (text, cuts, QR) is your job, any `escpos` library
+does it.
+
 ## macOS
 
 macOS printing *is* CUPS, so the agent takes the same path as Linux — `select_backend()` picks

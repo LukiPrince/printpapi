@@ -19,6 +19,8 @@ v1 is deliberately small (see [CONTRIBUTING.md](../CONTRIBUTING.md) for the YAGN
   See [api.md](api.md#submitting-a-job).
 - ~~**macOS agent**~~ ✅ CUPS path, macOS raw-printing traps + service install (systemd, launchd,
   Task Scheduler) documented in [agent.md](agent.md#macos).
+- ~~**Docs as a feature**~~ ✅ automation recipes ([recipes.md](recipes.md)), printer-family setup
+  guides, and a "why not QZ Tray / PrintNode" comparison in the README.
 
 ## v2 candidates
 
@@ -35,13 +37,12 @@ order of pull:
    every non-Windows platform, now tested for `darwin`); the setup traps that are macOS-specific
    (driverless queues mangling raw ZPL, `lpadmin -m raw`, `socket://` as the reliable way out) are
    documented in [agent.md](agent.md#macos).
-4. **Docs as a feature** — service install ✅ ([agent.md](agent.md#run-as-a-service): systemd,
-   launchd, Task Scheduler/NSSM via signed Python). Still open:
-   "print from n8n/Zapier in one HTTP node" recipe, Zebra/DYMO driver setup guides, and a
-   "why not QZ Tray" section (no per-machine certs, no $-per-year signing, no browser→localhost
-   websocket → immune to Chrome's Local Network Access change, runs headless as a service —
-   [qzind/tray#116](https://github.com/qzind/tray/issues/116) open since 2016,
-   [#825 cloud queue](https://github.com/qzind/tray/issues/825) open since 2021).
+4. ~~**Docs as a feature**~~ ✅ **shipped** — service install
+   ([agent.md](agent.md#run-as-a-service): systemd, launchd, Task Scheduler/NSSM via signed
+   Python), the "one HTTP node" automation recipes for n8n/Zapier/Make
+   ([recipes.md](recipes.md)), per-family printer setup (Zebra/ZPL, DYMO, ESC/POS —
+   [agent.md](agent.md#printer-setup-by-family)), and the QZ Tray / PrintNode comparison in the
+   README. Left open: screenshots/GIF of the dashboard, and a hosted demo.
 5. **E-commerce auto-print integration (Shopify/WooCommerce)** — "order comes in → packing slip /
    label prints" is the strongest commercial demand found; today it's all paid SaaS wrapping
    PrintNode (Printus, BizPrint at $/print). Needs: a store app/plugin that POSTs to our API on
