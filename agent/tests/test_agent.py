@@ -254,6 +254,7 @@ def test_add_capabilities_skips_socket_targets_and_failures():
 def test_select_caps_collector_by_platform():
     assert print_agent.select_caps_collector("win32") is print_agent.collect_capabilities_windows
     assert print_agent.select_caps_collector("linux") is print_agent.collect_capabilities_cups
+    assert print_agent.select_caps_collector("darwin") is print_agent.collect_capabilities_cups
 
 
 def test_print_job_bad_mode_raises():
@@ -283,9 +284,10 @@ def test_cups_pdf_pipes_data_without_raw_option():
 def test_select_backend_by_platform():
     raw_w, _ = print_agent.select_backend(platform="win32")
     assert raw_w is print_agent.raw_to_printer          # Windows: win32print RAW
-    raw_l, pdf_l = print_agent.select_backend(platform="linux")
-    assert raw_l is print_agent.raw_to_printer_cups     # non-Windows: CUPS lp
-    assert pdf_l is print_agent.pdf_to_printer_cups
+    for unixish in ("linux", "darwin"):                 # macOS is CUPS underneath, same path
+        raw_u, pdf_u = print_agent.select_backend(platform=unixish)
+        assert raw_u is print_agent.raw_to_printer_cups
+        assert pdf_u is print_agent.pdf_to_printer_cups
 
 
 def test_parse_printers_pdf_is_opt_in_default_raw():

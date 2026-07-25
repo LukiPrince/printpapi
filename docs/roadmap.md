@@ -17,6 +17,8 @@ v1 is deliberately small (see [CONTRIBUTING.md](../CONTRIBUTING.md) for the YAGN
   See [api.md](api.md#computers-agents).
 - ~~**Idempotency + expiry**~~ ✅ `idempotency_key` and `expire_after` on `POST /jobs`.
   See [api.md](api.md#submitting-a-job).
+- ~~**macOS agent**~~ ✅ CUPS path, macOS raw-printing traps + service install (systemd, launchd,
+  Task Scheduler) documented in [agent.md](agent.md#macos).
 
 ## v2 candidates
 
@@ -29,9 +31,12 @@ order of pull:
    on top: signed event payloads.
 2. ~~**Idempotency keys + job expiration**~~ ✅ **shipped** — `idempotency_key` (per-org, returns
    the original job) and `expire_after` (deadline-passed jobs fail as `expired`, never print).
-3. **macOS agent** — it's CUPS underneath, so likely test + docs (plus macOS raw-printing quirks).
-   Closest OSS competitor (print-relay) ships macOS/Linux but no Windows; we're the inverse.
-4. **Docs as a feature** — service install (systemd / Windows `sc`/NSSM via signed Python),
+3. ~~**macOS agent**~~ ✅ **shipped** — macOS takes the existing CUPS path (`select_backend` covers
+   every non-Windows platform, now tested for `darwin`); the setup traps that are macOS-specific
+   (driverless queues mangling raw ZPL, `lpadmin -m raw`, `socket://` as the reliable way out) are
+   documented in [agent.md](agent.md#macos).
+4. **Docs as a feature** — service install ✅ ([agent.md](agent.md#run-as-a-service): systemd,
+   launchd, Task Scheduler/NSSM via signed Python). Still open:
    "print from n8n/Zapier in one HTTP node" recipe, Zebra/DYMO driver setup guides, and a
    "why not QZ Tray" section (no per-machine certs, no $-per-year signing, no browser→localhost
    websocket → immune to Chrome's Local Network Access change, runs headless as a service —

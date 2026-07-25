@@ -53,15 +53,17 @@ extracted, generalized OSS project.
 - `app/dispatch.py` pure logic (injectable fetchers); `app/store.py` SQLite store; `app/server.py` HTTP.
 - Env vars: `PRINTAPI_TOKEN` (required), `PRINT_DB` (default `printpapi.db`), `PRINT_PORT` (default `3460`).
 
-**Agent** (`agent/print_agent.py`, **cross-platform** — Windows + Linux/CUPS):
+**Agent** (`agent/print_agent.py`, **cross-platform** — Windows + Linux/macOS via CUPS):
 
 - Registers its printers on startup, then loops: `run_once` → long-poll → download payload → print →
   report result.
 - `select_backend()` picks the print path by OS at startup:
   - **Windows:** `raw` → `win32print` RAW (ZPL/ESC-POS straight to the spooler); `pdf` → SumatraPDF
     silent-print via the installed driver.
-  - **Linux/CUPS:** `raw` → `lp -d <queue> -o raw` (already-rendered bytes, CUPS must not re-render);
-    `pdf` → `lp -d <queue>` (CUPS filter chain renders it).
+  - **Linux + macOS/CUPS:** `raw` → `lp -d <queue> -o raw` (already-rendered bytes, CUPS must not
+    re-render); `pdf` → `lp -d <queue>` (CUPS filter chain renders it). macOS needs no code of its
+    own — but a driverless/AirPrint queue mangles raw ZPL, so `docs/agent.md#macos` tells operators
+    to use `socket://IP:9100` or an `lpadmin -m raw` queue for label printers.
 - Configured via `agent.ini` (next to the script): `server_url`, `api_key`, `name`, `printers`
   (semicolon-separated — Windows printer names, or CUPS queue names on Linux).
 - Shipped in the homelab as a signed-Python install (see gotcha #2), autostart via Task Scheduler.
@@ -117,7 +119,8 @@ multi-tenancy is now the active next step — see §5 and `docs/roadmap.md`.)*
 v1 is **published** (public repo, v1.0.0 release, GHCR image) and the post-v1 feature wave has
 shipped: dashboard, Linux/CUPS agent, per-client API keys, Docker, job copies, cancel, `/metrics`,
 webhooks, per-job print options, printer capability discovery, **multi-tenancy**, **computer status
-+ liveness events** (roadmap #1), **idempotency keys + job expiry** (roadmap #2).
++ liveness events** (roadmap #1), **idempotency keys + job expiry** (roadmap #2), **macOS support
++ service-install docs** (roadmap #3, half of #4).
 168 tests green.
 A demand-research sweep (July 2026) produced the ranked v2 roadmap in `docs/roadmap.md` — read it
 before inventing features. Only non-code leftover: code-sign the Windows agent (needs a cert,

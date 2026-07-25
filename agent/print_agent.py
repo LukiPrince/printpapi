@@ -175,7 +175,8 @@ def add_capabilities(printers, caps_fn):
 
 
 def select_backend(platform=sys.platform, sumatra="SumatraPDF.exe"):
-    """(raw_fn, pdf_fn) for the host OS. Windows: win32print + SumatraPDF; else CUPS lp."""
+    """(raw_fn, pdf_fn) for the host OS. Windows: win32print + SumatraPDF; else CUPS lp
+    (Linux and macOS — macOS is CUPS underneath, see docs/agent.md#macos)."""
     if platform.startswith("win"):
         return raw_to_printer, lambda p, d, o=None: pdf_to_printer(p, d, options=o, sumatra=sumatra)
     return raw_to_printer_cups, pdf_to_printer_cups

@@ -9,7 +9,7 @@ up and prints it — documents **and** label printers (Zebra/ZPL, Bixolon, therm
 - Agent **polls outbound** — printers behind NAT/firewall work with **no inbound ports**
 - Server is Python **standard library only** — no framework, nothing to install
 - React dashboard (live queue, job history, test print, API keys), REST API, SQLite job queue
-- Cross-platform agent: Windows (`win32print` + SumatraPDF) and Linux (CUPS)
+- Cross-platform agent: Windows (`win32print` + SumatraPDF), Linux and macOS (CUPS)
 - Print options per job (copies, duplex, paper size, tray, color, page ranges) +
   capability discovery per printer
 - Multi-tenant: orgs isolate API keys, agents, printers and jobs
@@ -39,7 +39,7 @@ Prefer to build it yourself? `docker build -t printpapi .`
 **Agent** — on the machine with the printers:
 
 1. Copy `agent/print_agent.py` there (Windows also needs `pywin32` + SumatraPDF for PDF;
-   Linux uses CUPS).
+   Linux and macOS use CUPS — on macOS read the [raw-printing note](docs/agent.md#macos)).
 2. Create `agent.ini` next to it:
 
    ```ini
