@@ -24,10 +24,14 @@ extracted, generalized OSS project.
   printers, a ZPL label otherwise (gotcha #1). Static serving is confined to `app/web`
   (traversal 404s); `/_next/static/` is immutable-cached, HTML is `no-cache`.
 - Client endpoints (bearer auth — the bootstrap `PRINTAPI_TOKEN` or any issued per-client key):
-  - `POST /jobs` — submit a job `{printer_id, type, content|url}` → `{job_id}`.
-  - `GET /jobs` — recent job history; `GET /jobs/{id}` — job state: `queued | claimed | done | failed`.
-  - `GET /printers` — list registered printers with online/offline status.
-  - `GET /health`.
+  - `POST /jobs` — submit a job `{printer_id, type, content|url}` → `{job_id}`. Optional: `title`,
+    `copies` (1–100), `callback_url` (webhook on terminal state), `options` (pdf only: duplex,
+    paper, bin, color, pages — agent maps to Sumatra `-print-settings` / `lp -o`).
+  - `GET /jobs` — recent job history; `GET /jobs/{id}` — job state:
+    `queued | claimed | done | failed | cancelled`; `DELETE /jobs/{id}` — cancel while queued.
+  - `GET /printers` — printers with online/offline + capabilities (papers/bins/duplex/color,
+    reported best-effort by the agent at registration).
+  - `GET /metrics` — Prometheus text. `GET /health`.
 - Admin endpoints (bootstrap `PRINTAPI_TOKEN` only) — **per-client API keys**:
   - `POST /apikeys {label}` → issues a new random key (shown once); `GET /apikeys` lists labels;
     `DELETE /apikeys/{id}` revokes. Keys are stored sha256-hashed; revoked keys stop authorizing.
@@ -56,7 +60,7 @@ extracted, generalized OSS project.
   (semicolon-separated — Windows printer names, or CUPS queue names on Linux).
 - Shipped in the homelab as a signed-Python install (see gotcha #2), autostart via Task Scheduler.
 
-**Tests:** 106, all green (`python -m pytest`). Real loopback HTTP servers (ThreadingHTTPServer),
+**Tests:** 136, all green (`python -m pytest`). Real loopback HTTP servers (ThreadingHTTPServer),
 real SQLite (:memory:), injected render fns / subprocess runners — no mocks, no real printers.
 
 **Model:** **poll** — agent opens a long-poll `GET /agent/jobs` to the server, receives jobs, prints,
@@ -99,24 +103,43 @@ reports status back. This is the #1 piece of rework and everything else hangs of
 
 **Explicitly OUT of v1** (resist the urge): multi-user/multi-tenant orgs, queue/worker scaling,
 webhooks, a full print-options matrix (copies/tray/duplex/rotate), deep capability modeling, billing.
+*(v1 has shipped; webhooks, print options, and capabilities have since landed as v2 work, and
+multi-tenancy is now the active next step — see §5 and `docs/roadmap.md`.)*
 
-## 5. Suggested next steps
+## 5. Current state & the active next step: multi-tenancy
 
-The v1 poll engine plus the full v1 feature set is complete and tested (106 tests):
+v1 is **published** (public repo, v1.0.0 release, GHCR image) and the post-v1 feature wave has
+shipped: dashboard, Linux/CUPS agent, per-client API keys, Docker, job copies, cancel, `/metrics`,
+webhooks, per-job print options, printer capability discovery. 136 tests green. A demand-research
+sweep (July 2026) produced the ranked v2 roadmap in `docs/roadmap.md` — read it before inventing
+features. Only non-code leftover: code-sign the Windows agent (needs a cert, see gotcha #2).
 
-- ✅ **Web dashboard** (`GET /`) — Next.js static export in `app/web`: overview, devices,
-  history, keys, downloads.
-- ✅ **Linux/CUPS agent** — `lp -d <queue>` raw + PDF path; backend auto-selected per OS.
-- ✅ **Per-client API keys** — issue/list/revoke via `/apikeys`; multi-key auth in the store.
-- ✅ **Docker image** — `Dockerfile` (node stage builds the UI, python:3.12-slim + cups-client
-  runs it); the server needs no Python deps.
+**Active next step: multi-tenancy (roadmap #6).** Strategic context: the repo owner wants to offer
+a cheap hosted SaaS ("Shopify/WooCommerce order comes in → label/packing slip prints") undercutting
+the paid PrintNode-wrapper plugins. Org isolation is the technical blocker; the store app and
+document rendering (roadmap #5) come after.
 
-Remaining before a public release (ops/admin, not code — see `RELEASE_CHECKLIST.md`):
+What exists today (design for it, don't re-derive):
 
-1. ~~Pick a final name~~ → **printpapi** (GitHub repo exists).
-2. Publish with a clean history (the old history carries pre-sanitization docs — squash, see checklist).
-3. **Code-sign the Windows agent installer** (Azure Trusted Signing or OV/EV cert — see gotcha #2).
-   This is the one piece that can't be done from the repo — it needs a real cert and a Windows host.
+- Every table (`agents`, `printers`, `jobs`, `api_keys`) already carries `org_id`, but **nothing
+  enforces it** — everything runs as `DEFAULT_ORG=1`, queries don't filter by org.
+- Client keys are flat: `authenticate_client` returns the key id and ignores org. The bootstrap
+  `PRINTAPI_TOKEN` is global root (admin endpoints + always a valid client).
+- Agent keys bind name↔key on first contact (`register_agent`); agents currently always land in
+  `DEFAULT_ORG`.
+
+Target shape (PrintNode's "child accounts" is the model, but YAGNI hard):
+
+- Root token manages orgs: `POST /orgs {name}` → `{org_id}`, `GET /orgs`, plus issuing org-scoped
+  client/agent keys (extend `/apikeys` with an org, don't invent a parallel key system).
+- Auth resolves presented key → `org_id`; every store read/write filters by it. Agents register
+  into their key's org; printers/jobs inherit. **Invariant: no cross-org reads, ever** — a client
+  key of org A must 404 (not 401) on org B's job/printer ids.
+- Root keeps working roughly as today (decide and test its cross-org semantics explicitly).
+- OUT for now: billing, per-org dashboard users, quotas, delegated auth. Mark ceilings with
+  `# ponytail:` comments.
+- Migration: existing DBs are single-org (`org_id=1` everywhere) and must keep working unchanged;
+  the ALTER-based idempotent pattern in `store.init_db` is the house style for schema changes.
 
 ## 6. Reference
 
