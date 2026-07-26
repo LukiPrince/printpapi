@@ -31,7 +31,10 @@ jobs:
           tags: |
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
-            type=raw,value=latest
+            # Final releases only. metadata-action already skips {{major}}.{{minor}} and its own
+            # latest flavor for a prerelease tag (v2.5.0-rc.1), but a raw tag bypasses that rule —
+            # and an -rc image must never be what a plain `docker pull` hands out.
+            type=raw,value=latest,enable=${{ !contains(github.ref_name, '-') }}
       - uses: docker/build-push-action@v6
         with:
           context: .
