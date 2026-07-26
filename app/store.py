@@ -1,4 +1,4 @@
-# printpapi — self-hosted PrintNode alternative. MIT License (see LICENSE).
+# printpapi — self-hosted PrintNode alternative. Elastic License 2.0 (see LICENSE).
 import hashlib
 import hmac
 import json

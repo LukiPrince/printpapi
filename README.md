@@ -2,7 +2,7 @@
 
 # printpapi
 
-**Self-hosted, open-source alternative to [PrintNode](https://www.printnode.com/).** Submit a
+**Self-hosted, source-available alternative to [PrintNode](https://www.printnode.com/).** Submit a
 print job to a small HTTP API from anywhere; an agent on the machine with the printer picks it
 up and prints it — documents **and** label printers (Zebra/ZPL, Bixolon, thermal).
 
@@ -16,7 +16,7 @@ up and prints it — documents **and** label printers (Zebra/ZPL, Bixolon, therm
 - Multi-tenant: orgs isolate API keys, agents, printers and jobs
 - Fleet monitoring: `GET /computers` + online/offline webhooks, Prometheus `/metrics`
 - Retry-safe submits (`idempotency_key`) and job deadlines (`expire_after`)
-- MIT licensed · 187 tests
+- Source available ([Elastic License 2.0](#license): self-host freely, don't resell it as a service) · 187 tests
 
 ## Get started
 
@@ -94,4 +94,22 @@ Contributions welcome — see [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## License
 
-[MIT](LICENSE).
+[Elastic License 2.0](LICENSE) — **source available**, not OSI open source. In plain terms:
+
+- ✅ Run it for yourself, your company, or your clients' printing — free of charge, commercial use
+  included. Read it, modify it, redistribute it.
+- ✅ An IT service provider, integrator or agency may operate it **for an identified client** and
+  charge for installation, hosting, administration and support (an explicit additional permission
+  on top of ELv2 — see the top of [LICENSE](LICENSE)).
+- ❌ Offering it to the public as your own hosted or managed print service. That is the part the
+  author intends to offer.
+
+Two scope notes:
+
+- **Everything up to and including v1.4.0 was released under the MIT License and stays MIT**
+  ([LICENSE-MIT](LICENSE-MIT)). The current license applies to later versions.
+- The [WooCommerce plugin](integrations/woocommerce) is **GPL-2.0-or-later**, because WordPress
+  plugins must be GPL-compatible. It only calls the HTTP API.
+
+Not sure whether your use is covered? [Open an issue](https://github.com/LukiPrince/printpapi/issues)
+and ask — the answer is almost always yes.

@@ -27,7 +27,11 @@ Prints a packing slip on your own printer when an order comes in, through a self
 - Writes the outcome into the order notes: the job id on success, the server's error otherwise.
 - Declares HPOS (custom order tables) compatibility — it only uses the order CRUD getters.
 
-Requires WooCommerce, PHP 7.4+, WordPress 6.0+. MIT licensed, like the rest of the project.
+Requires WooCommerce, PHP 7.4+, WordPress 6.0+.
+
+**Licensed GPL-2.0-or-later** (see `printpapi/LICENSE`), unlike the server, which is under the
+Elastic License 2.0. WordPress plugins must be GPL-compatible, and this plugin only talks to the
+server over HTTP — it is not a derivative of it.
 
 Full setup notes, including the Shopify equivalent and the raw `POST /orders` API:
 [docs/ecommerce.md](../../docs/ecommerce.md).

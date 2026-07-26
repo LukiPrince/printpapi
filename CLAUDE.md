@@ -1,7 +1,8 @@
-# CLAUDE.md — printpapi (OSS self-hosted PrintNode alternative)
+# CLAUDE.md — printpapi (self-hosted PrintNode alternative, source available)
 
-Open-source print bridge: HTTP API + agent that prints jobs on a remote machine (documents **and**
-label printers). Extracted from a working homelab deployment; now being grown into a general OSS tool.
+Print bridge: HTTP API + agent that prints jobs on a remote machine (documents **and** label
+printers). Extracted from a working homelab deployment; now a public, source-available project
+(Elastic License 2.0 — self-hosting free, reselling it as a hosted service is not; see `LICENSE`).
 
 **Read [`HANDOFF.md`](HANDOFF.md) first** — it has the full origin story, what works (v0), the hard-won
 gotchas, and the v1 plan. Don't re-derive; build on it.
@@ -44,7 +45,10 @@ commit both. It is committed so a Node-less `python -m app.server` checkout stil
   fifty. Mark deliberate shortcuts with a `# ponytail:` comment naming the ceiling.
 - **Security at trust boundaries stays:** bearer/API-key auth on every endpoint, constant-time token
   compare (`hmac.compare_digest`), `http(s)`-only URL fetches, no `shell=True`, temp-file cleanup.
-- **MIT.** Add a short license header to new source files when the project goes public.
+- **Elastic License 2.0** (source available, since after v1.4.0 — v1.0.0–v1.4.0 stay MIT). New
+  source files get the one-line header: `Elastic License 2.0 (see LICENSE)`. The WooCommerce
+  plugin in `integrations/woocommerce/` is the one exception: GPL-2.0-or-later, because
+  wordpress.org requires it. Never re-license a file without checking `LICENSE` first.
 - **Cross-platform from v1 on:** don't hard-code Windows assumptions in the server; the agent is the
   platform-specific part.
 

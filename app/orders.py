@@ -1,4 +1,4 @@
-# printpapi — self-hosted PrintNode alternative. MIT License (see LICENSE).
+# printpapi — self-hosted PrintNode alternative. Elastic License 2.0 (see LICENSE).
 """Store order payloads -> the normalized order dict `packing_slip.render_packing_slip` prints.
 
 Pure logic, no IO — the mapping is the part that differs per shop system, and the part most

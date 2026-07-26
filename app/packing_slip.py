@@ -1,4 +1,4 @@
-# printpapi — self-hosted PrintNode alternative. MIT License (see LICENSE).
+# printpapi — self-hosted PrintNode alternative. Elastic License 2.0 (see LICENSE).
 """Order dict -> packing-slip PDF, stdlib only (the server has no dependencies).
 
 # ponytail: a deliberately small PDF writer — Helvetica/WinAnsi text and hairlines, no images,

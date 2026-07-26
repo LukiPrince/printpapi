@@ -1,6 +1,7 @@
 # HANDOFF — printpapi
 
-Continuation notes for building the OSS self-hosted PrintNode alternative. If you are a fresh
+Continuation notes for building the self-hosted PrintNode alternative (public and source
+available — Elastic License 2.0 since after v1.4.0, see `LICENSE`). If you are a fresh
 session: read this top to bottom, then `CLAUDE.md`, then `docs/design-v0-homelab.md`. The code in
 `app/` + `agent/` already works in production — it is your starting point, not a blank page.
 

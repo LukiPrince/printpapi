@@ -11,7 +11,9 @@ Thanks for helping! The bar for merging is low ceremony, high discipline:
 - **YAGNI.** Prefer the standard library, native platform features, and short diffs. Deliberate
   shortcuts are marked with a `# ponytail:` comment naming the ceiling and the upgrade path.
 - **Security invariants stay:** bearer auth on every endpoint, constant-time token compare
-  (`hmac.compare_digest`), hashed keys at rest, `http(s)`-only URL fetches, no `shell=True`.
+  (`hmac.compare_digest`), hashed keys at rest, `http(s)`-only URL fetches, no `shell=True`. The
+  one documented exception is the Shopify webhook, which cannot send a bearer header: there the
+  HMAC over the raw body is what authorizes the print.
 - **`app/web` is build output, never hand-edited.** The dashboard source is `web/` (Next.js). It is
   committed as a static export so a Node-less checkout still has a UI — see
   [docs/server.md](docs/server.md#dashboard).
@@ -23,6 +25,18 @@ Thanks for helping! The bar for merging is low ceremony, high discipline:
 3. Touched `web/`? Run `cd web && npm run build:app` and commit the regenerated `app/web` with it —
    CI fails the PR otherwise, and self-hosters would keep serving the old dashboard.
 4. Open a PR with a short description of the *why*.
+
+## Licensing of contributions
+
+printpapi is **source available** under the [Elastic License 2.0](LICENSE) — self-hosting is free,
+including commercially; offering it to the public as a hosted service is not. The WooCommerce
+plugin is GPL-2.0-or-later instead, because wordpress.org requires that.
+
+By opening a pull request you confirm that your contribution is licensed under the same license as
+the files it touches, and you grant the author a perpetual, worldwide, irrevocable, royalty-free
+right to use, modify and **re-license** it — including under different terms. That is what keeps a
+future license change or a commercial license possible without tracking down every contributor. If
+your employer owns your work, get their sign-off first.
 
 ## Test conventions
 
