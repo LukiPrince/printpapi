@@ -16,8 +16,10 @@ Plain-language summary (the terms below govern, not this summary):
 Two notes on scope:
 
   - Versions up to and including v1.4.0 were released under the MIT License and
-    remain available under those terms; the MIT text is kept in LICENSE-MIT.
-    This license applies to everything after v1.4.0.
+    remain available under those terms; that text is kept in
+    docs/licenses/MIT-until-v1.4.0.txt (out of the repository root, so that it
+    is not mistaken for the license of the current version). This license
+    applies to everything after v1.4.0.
   - The WooCommerce plugin in integrations/woocommerce/printpapi/ is licensed
     separately under the GNU General Public License v2 or later (see the LICENSE
     file in that directory), because WordPress plugins must be GPL-compatible.

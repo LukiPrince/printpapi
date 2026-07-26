@@ -107,7 +107,8 @@ Contributions welcome — see [CONTRIBUTING.md](CONTRIBUTING.md).
 Two scope notes:
 
 - **Everything up to and including v1.4.0 was released under the MIT License and stays MIT**
-  ([LICENSE-MIT](LICENSE-MIT)). The current license applies to later versions.
+  ([docs/licenses/MIT-until-v1.4.0.txt](docs/licenses/MIT-until-v1.4.0.txt)). The current license
+  applies to later versions.
 - The [WooCommerce plugin](integrations/woocommerce) is **GPL-2.0-or-later**, because WordPress
   plugins must be GPL-compatible. It only calls the HTTP API.
 
