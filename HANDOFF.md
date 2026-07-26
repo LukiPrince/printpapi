@@ -59,6 +59,18 @@ extracted, generalized OSS project.
   Their unknown option keys are dropped rather than rejected (a client sends its whole option set);
   options on raw jobs are dropped whole. See `docs/printnode-compat.md` for the mapping tables and
   the trademark disclaimer that has to stay.
+- **Star CloudPRNT** (`app/cloudprnt.py`, roadmap #9) — Star's printers poll an HTTP URL by
+  themselves, so at a site with one there is **no agent to install**. `POST|GET|DELETE
+  /cloudprnt/{client-key}` (or the bare path with the key as HTTP Basic user) answers their three
+  methods: the poll claims a job and offers it as `{"jobReady": true, "mediaTypes": […],
+  "jobToken": …}`, the GET serves the bytes under the media type the printer's `Accept` says it
+  speaks, the DELETE carries its status code and finishes the job. A device enrols itself by MAC as
+  a one-printer pseudo-agent (`store.register_cloudprnt`), **raw-only** — gotcha #1 again: a pdf
+  job to one is failed on the next poll instead of feeding blanks. An unconfirmed job is re-offered
+  (`store.claimed_job`) instead of being replaced, and a printer reporting `printingInProgress` is
+  offered nothing. Everything else is the ordinary path: quota, history, webhooks, dashboard. See
+  `docs/cloudprnt.md` for the setup, the ceilings (DELETE-only confirm, no MQTT, no peripherals, no
+  capability discovery) and the trademark disclaimer that has to stay.
 - **Org accounts** (`app/auth.py` + `users`/`sessions` in the store) — a person signs in with
   e-mail + password (`POST /login`) and gets a **session token** carried in the same
   `Authorization: Bearer` header. Three credential kinds, one header: *root* (bootstrap token,
@@ -126,7 +138,7 @@ extracted, generalized OSS project.
   (semicolon-separated — Windows printer names, or CUPS queue names on Linux).
 - Shipped in the homelab as a signed-Python install (see gotcha #2), autostart via Task Scheduler.
 
-**Tests:** 269, all green (`python -m pytest`). Real loopback HTTP servers (ThreadingHTTPServer),
+**Tests:** 282, all green (`python -m pytest`). Real loopback HTTP servers (ThreadingHTTPServer),
 real SQLite (:memory:), injected render fns / subprocess runners — no mocks, no real printers.
 
 **Model:** **poll** — agent opens a long-poll `GET /agent/jobs` to the server, receives jobs, prints,
@@ -187,12 +199,14 @@ Shopify webhook — `docs/ecommerce.md`), and the **PrintNode API compatibility 
 and **org accounts** on top of multi-tenancy (e-mail/password login, session tokens, org-scoped
 key and user self-management — `app/auth.py`, `docs/api.md#accounts-and-login`), and the
 **hosted-service plumbing** on top of those (self-signup, password reset by e-mail, user removal,
-org settings in the dashboard, monthly job quotas — `app/mail.py`, `docs/api.md#self-signup`).
-269 tests green.
+org settings in the dashboard, monthly job quotas — `app/mail.py`, `docs/api.md#self-signup`), and
+**Star CloudPRNT** (roadmap #9: the printer polls us itself, no agent at the site —
+`app/cloudprnt.py`, `docs/cloudprnt.md`).
+282 tests green.
 A demand-research sweep (July 2026) produced the ranked v2 roadmap in `docs/roadmap.md` — read it
-before inventing features. Roadmap #1–#8 are done. What is left on the ranked list: #9 Star
-CloudPRNT (the printer itself polls — no agent install), #10 scales (agent-side USB HID), #11
-ESC/POS templating. Non-code leftover: code-sign the Windows agent (needs a cert, gotcha #2).
+before inventing features. Roadmap #1–#9 are done. What is left on the ranked list: #10 scales
+(agent-side USB HID), #11 ESC/POS templating. Non-code leftover: code-sign the Windows agent (needs
+a cert, gotcha #2). And for a paid deployment, **billing** is still the one missing product piece.
 
 On the PrintNode compat layer specifically, the deliberate ceilings are: a job's state *history* is
 a single entry (we store the current state only), `capabilities.papers` carries names with `null`

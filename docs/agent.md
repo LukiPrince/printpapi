@@ -93,6 +93,13 @@ Same as Zebra: the printer interprets the byte stream. Network models take
 bytes through — building the ESC/POS stream (text, cuts, QR) is your job, any `escpos` library
 does it.
 
+### Star CloudPRNT models — no agent at all
+
+Star's network printers (mC-Print2/3, TSP100IV, mC-Label3, HI01X/HI02X) can poll the server
+themselves, so they need no agent on any machine: point the printer's CloudPRNT setting at
+`https://your-server/cloudprnt/<client-key>` and it enrols itself as a raw-only printer. See
+[cloudprnt.md](cloudprnt.md).
+
 ## File output (virtual print server)
 
 A `file://` target makes the printer a **directory**: the job is written to disk instead of paper.

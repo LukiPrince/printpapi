@@ -54,6 +54,7 @@ Token comparison is constant-time (`hmac.compare_digest`).
 | `GET /agent/jobs` | agent | Long-poll for a job (204 on timeout) |
 | `GET /agent/jobs/{id}/payload` | agent | Download the job's bytes |
 | `POST /agent/jobs/{id}/result` | agent | Report `{ok, error?}` |
+| `POST\|GET\|DELETE /cloudprnt/{key}` | client key | [Star CloudPRNT](cloudprnt.md): the printer polls, downloads and confirms here itself |
 
 Request bodies are capped at 32 MB.
 

@@ -14,7 +14,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlparse
 
-from app import auth, mail, printnode, store
+from app import auth, cloudprnt, mail, printnode, store
 from app.dispatch import (decode_payload, agent_mode, parse_copies, parse_callback_url,
                           parse_options, parse_expire_after, parse_idempotency_key,
                           DispatchError, FetchError, _http_get, _http_post)
@@ -37,6 +37,10 @@ _DUMMY_HASH = auth.hash_password("no such user, no such password")
 # PrintNode-compat paths: a collection addressed by id set ("5", "5,7", "5-9"), optionally with a
 # sub-resource. Only reachable with HTTP Basic auth — see _printnode_get.
 _PN_SET = re.compile(r"^/(computers|printers|printjobs)/([\d,\- ]+)(/printers|/states)?$")
+# Star CloudPRNT: one URL answers all three of its methods. The client key rides in the path
+# because the printer appends its own query string to whatever URL it was configured with; a
+# printer that can fill in its "User Name" setting instead sends the key as HTTP Basic.
+_CLOUDPRNT = re.compile(r"^/cloudprnt(?:/([A-Za-z0-9_-]+))?$")
 _PN_COLLECTIONS = ("/whoami", "/computers", "/printers", "/printjobs")
 
 # The dashboard is a static, secret-free Next.js export in app/web (source in web/, built with
@@ -513,6 +517,92 @@ def make_handler(*, conn, token, agent_auth=store.authenticate_agent, fetch_url=
             self._json(200, sum(store.cancel_job(conn, i, org_id=org) == "cancelled" for i in ids))
             return True
 
+        # --- Star CloudPRNT ------------------------------------------------------------------
+        # The printer itself is the agent here: it POSTs its status on a timer, GETs the job data
+        # when we offer one, and DELETEs with the result once it has printed. That maps onto the
+        # ordinary queue — poll = claim_job, GET = get_payload, DELETE = finish_job — so these jobs
+        # carry the same quota, history and dashboard as an agent's. Shapes live in app/cloudprnt.py.
+        def _cloudprnt_device(self, path_key, mac):
+            """Resolve a request to its enrolled device, answering 401/400 itself and returning
+            None when it cannot. Every request re-touches the device, which is its liveness."""
+            key = path_key or printnode.basic_key(self.headers.get("Authorization", ""))
+            row = store.authenticate_client(conn, key)
+            if row is None:
+                # An issued client key only: the root token belongs to no org, so it has no place
+                # to enrol a printer into.
+                self._json(401, {"error": "unauthorized"})
+                return None
+            if not (mac or "").strip():
+                self._json(400, {"error": "mac required"})
+                return None
+            return store.register_cloudprnt(conn, row["org_id"], cloudprnt.device_name(mac))
+
+        def _cloudprnt_poll(self, path_key):
+            try:
+                body = self._read_json()
+            except ValueError:
+                return self._json(400, {"error": "bad json"})
+            if not isinstance(body, dict):
+                body = {}
+            dev = self._cloudprnt_device(path_key, body.get("printerMAC"))
+            if dev is None:
+                return
+            job = None
+            if not body.get("printingInProgress"):
+                # A printer that is mid-print gets offered nothing — it has not confirmed the job it
+                # holds yet, and re-offering it invites a second copy. Otherwise re-offer what it
+                # already holds before claiming anything new: a poll response lost on the way must
+                # not burn the next job in the queue.
+                job = (store.claimed_job(conn, dev["agent_id"])
+                       or store.claim_job(conn, dev["agent_id"]))
+            if job is not None and job["mode"] != "raw":
+                # gotcha #1: no renderer in the printer, so a PDF would come out as blank feed.
+                # Fail it here — the dashboard then says why — instead of handing it over.
+                # ponytail: one such job per poll; the next poll takes the next one.
+                store.finish_job(conn, job["job_id"], dev["agent_id"], False,
+                                 "CloudPRNT printers cannot render PDF — send raw Star commands")
+                job = None
+            return self._json(200, cloudprnt.poll_response(
+                job, cloudprnt.media_type(self.headers.get("Accept"))))
+
+        def _cloudprnt_payload(self, path_key):
+            q = parse_qs(urlparse(self.path).query)
+            dev = self._cloudprnt_device(path_key, (q.get("mac") or [""])[0])
+            if dev is None:
+                return
+            media = (q.get("type") or [""])[0] or cloudprnt.media_type(self.headers.get("Accept"))
+            if media not in cloudprnt.MEDIA_TYPES:
+                # We hand over the submitted bytes unchanged, so a type we cannot honestly label
+                # them with is their 415, not a silent mislabel.
+                return self._json(415, {"error": f"cannot serve {media}"})
+            job = store.claimed_job(conn, dev["agent_id"])
+            token = (q.get("token") or [""])[0]
+            if job is None or (token and token != str(job["job_id"])):
+                return self._json(404, {"error": "no job"})     # their "no data available"
+            data = (store.get_payload(conn, job["job_id"], dev["agent_id"]) or b"")
+            copies = job["copies"]       # nothing in this protocol counts copies — repeat the stream
+            self.send_response(200)
+            self.send_header("Content-Type", media)
+            self.send_header("Content-Length", str(len(data) * copies))
+            self.end_headers()
+            for _ in range(copies):      # written in passes, so 100 copies of a 32 MB job is not 3 GB of RAM
+                self.wfile.write(data)
+
+        def _cloudprnt_confirm(self, path_key):
+            q = parse_qs(urlparse(self.path).query)
+            dev = self._cloudprnt_device(path_key, (q.get("mac") or [""])[0])
+            if dev is None:
+                return
+            job = store.claimed_job(conn, dev["agent_id"])
+            if job is not None:
+                code = (q.get("code") or [""])[0]
+                ok = cloudprnt.job_ok(code)
+                store.finish_job(conn, job["job_id"], dev["agent_id"], ok,
+                                 None if ok else f"printer reported {code or 'no status'}")
+            # ponytail: no `deleteMethod` — the printer confirms with DELETE, which is the default.
+            # Offer the GET form if a deployment ever sits behind a proxy that blocks DELETE.
+            return self._empty(200)                             # their DELETE answer: 200, no body
+
         def _html(self, code, html, body=True):
             data = html.encode()
             self.send_response(code)
@@ -562,6 +652,9 @@ def make_handler(*, conn, token, agent_auth=store.authenticate_agent, fetch_url=
         def do_GET(self):
             if self._is_basic() and self._printnode_get():
                 return
+            mc = _CLOUDPRNT.match(self.path.split("?", 1)[0])
+            if mc:
+                return self._cloudprnt_payload(mc.group(1))
             if self.path in ("/", "/index.html"):
                 return None if self._serve_dashboard() else self._json(404, {"error": "not found"})
             if self.path == "/health":
@@ -679,6 +772,9 @@ def make_handler(*, conn, token, agent_auth=store.authenticate_agent, fetch_url=
         def do_POST(self):
             if self._is_basic() and self._printnode_post():
                 return
+            mc = _CLOUDPRNT.match(self.path.split("?", 1)[0])
+            if mc:
+                return self._cloudprnt_poll(mc.group(1))
             if self.path == "/jobs":
                 p = self._principal()
                 if p is None:
@@ -888,6 +984,9 @@ def make_handler(*, conn, token, agent_auth=store.authenticate_agent, fetch_url=
         def do_DELETE(self):
             if self._is_basic() and self._printnode_delete():
                 return
+            mc = _CLOUDPRNT.match(self.path.split("?", 1)[0])
+            if mc:
+                return self._cloudprnt_confirm(mc.group(1))
             m = _APIKEY_ID.match(self.path)
             if m:
                 p = self._manager()

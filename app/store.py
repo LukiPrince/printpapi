@@ -3,6 +3,7 @@ import datetime
 import hashlib
 import hmac
 import json
+import secrets
 import sqlite3
 import threading
 import time
@@ -246,6 +247,39 @@ def register_agent(conn, name, api_key, printers, org_id=DEFAULT_ORG):
             conn.rollback()
             raise
     return {"computer_id": agent_id, "printer_ids": printer_ids}
+
+
+def register_cloudprnt(conn, org_id, name):
+    """Enrol (or re-touch) a printer that polls us itself with the Star CloudPRNT protocol.
+
+    Such a printer is its own agent: one pseudo-agent row carrying exactly one raw-only printer
+    (gotcha #1 — the device has no renderer), so its jobs take the ordinary queue, quota, history
+    and dashboard path. `api_key_hash` is a random opaque value with no preimage: the device proves
+    itself with its org's client key on every request, and nothing can hand this row's "key" to the
+    agent endpoints. Returns {'agent_id', 'printer_id'}; a poll is what keeps it online."""
+    now = time.time()
+    with _LOCK:
+        try:
+            row = conn.execute("SELECT id FROM agents WHERE org_id=? AND name=?",
+                               (org_id, name)).fetchone()
+            if row:
+                agent_id = row["id"]
+                conn.execute("UPDATE agents SET last_seen_at=? WHERE id=?", (now, agent_id))
+            else:
+                agent_id = conn.execute(
+                    "INSERT INTO agents(org_id, name, api_key_hash, last_seen_at, created_at) "
+                    "VALUES(?,?,?,?,?)",
+                    (org_id, name, "cloudprnt:" + secrets.token_hex(32), now, now)).lastrowid
+            p = conn.execute("SELECT id FROM printers WHERE agent_id=? AND name=?",
+                             (agent_id, name)).fetchone()
+            printer_id = p["id"] if p else conn.execute(
+                "INSERT INTO printers(org_id, agent_id, name, can_pdf, created_at) "
+                "VALUES(?,?,?,0,?)", (org_id, agent_id, name, now)).lastrowid
+            conn.commit()
+            return {"agent_id": agent_id, "printer_id": printer_id}
+        except Exception:
+            conn.rollback()
+            raise
 
 
 def authenticate_agent(conn, api_key):
@@ -598,6 +632,19 @@ def claim_job(conn, agent_id, now=None):
         except Exception:
             conn.rollback()
             raise
+
+
+def claimed_job(conn, agent_id):
+    """The job this agent already has in flight, if any — {'job_id', 'mode', 'copies'}.
+
+    A CloudPRNT printer is re-offered its claimed job until it confirms the result, so a poll
+    response lost on the way costs a re-download instead of burning the next job in the queue."""
+    with _LOCK:
+        row = conn.execute("SELECT id, mode, copies FROM jobs "
+                           "WHERE agent_id=? AND state='claimed' ORDER BY claimed_at, id LIMIT 1",
+                           (agent_id,)).fetchone()
+    return None if row is None else {"job_id": row["id"], "mode": row["mode"],
+                                     "copies": row["copies"]}
 
 
 def get_payload(conn, job_id, agent_id):

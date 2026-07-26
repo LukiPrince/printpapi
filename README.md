@@ -23,7 +23,9 @@ up and prints it — documents **and** label printers (Zebra/ZPL, Bixolon, therm
 - Retry-safe submits (`idempotency_key`) and job deadlines (`expire_after`)
 - **PrintNode-compatible API layer** — point an existing SDK/integration at your server
   ([docs](docs/printnode-compat.md))
-- Source available ([Elastic License 2.0](#license): self-host freely, don't resell it as a service) · 269 tests
+- **Star CloudPRNT**: Star receipt/label printers poll the server themselves — no agent, nothing
+  installed at the site ([docs](docs/cloudprnt.md))
+- Source available ([Elastic License 2.0](#license): self-host freely, don't resell it as a service) · 282 tests
 
 ## Get started
 
@@ -99,6 +101,7 @@ sponsored by PrintNode.*
 | [Agent](docs/agent.md) | install, `agent.ini`, printer syntax, labels vs PDF, per-printer setup, service install |
 | [HTTP API](docs/api.md) | endpoints, auth, content types, job lifecycle |
 | [PrintNode-compatible API](docs/printnode-compat.md) | point an existing PrintNode client at printpapi |
+| [Star CloudPRNT](docs/cloudprnt.md) | Star printers polling the server directly, without an agent |
 | [Recipes](docs/recipes.md) | print from n8n, Zapier, Make, curl — in one HTTP node |
 | [E-commerce](docs/ecommerce.md) | WooCommerce plugin, Shopify webhook, `POST /orders` |
 | [Roadmap](docs/roadmap.md) | what's planned for v2 |

@@ -155,5 +155,11 @@ The [PrintNode-compatible layer](printnode-compat.md) accepts HTTP **Basic** aut
 rides in the username, so it is the same secret with the same org scope, but base64 in a header is
 not encryption: put TLS in front of it, as you should for the bearer token anyway.
 
+[Star CloudPRNT](cloudprnt.md) printers carry the client key in their polling URL
+(`/cloudprnt/<key>`), because the printer appends its own query string to whatever URL it is given.
+A key in a URL ends up in access logs and proxy history — prefer the printer's Basic-auth
+**User Name** field where the model offers one, and revoke the key
+(`DELETE /apikeys/{id}`) if a device is lost.
+
 The server speaks plain HTTP — put your own reverse proxy / TLS in front for anything beyond
 the LAN. Vulnerability reports: see [SECURITY.md](../SECURITY.md).
