@@ -5,6 +5,14 @@ boards) can poll an HTTP URL on their own. printpapi speaks that protocol, so at
 printer there is **nothing to install** — no agent, no PC, no service. Configure the printer with
 your server URL and it enrols itself.
 
+> **Not yet verified on hardware.** This endpoint was built and tested against the published
+> protocol specification, not against a physical printer — no Star device has printed through it.
+> The parts most likely to need a fix are firmware-dependent: the optional `jobToken` and
+> `printingInProgress` fields, and the exact status code a given model confirms with. If you have
+> one of these printers, run the server with `LOG_REQUESTS=1` and
+> [open an issue](https://github.com/LukiPrince/printpapi/issues) with what it actually sends — that
+> is the one thing missing here.
+
 > *Star, CloudPRNT and Star Micronics are trademarks of Star Micronics Co., Ltd. printpapi is not
 > affiliated with, endorsed by, or sponsored by Star Micronics.* This endpoint was implemented from
 > the publicly documented protocol. No Star code or documentation text is contained in it.
@@ -74,6 +82,31 @@ job ([job lifecycle](api.md#job-lifecycle)).
 Everything else is the ordinary pipeline: the job counts against the org's
 [quota](api.md#quotas), shows up in the history and on the dashboard, fires its `callback_url`
 webhook, and honours `idempotency_key` / `expire_after`.
+
+**Failures read back.** The confirmation code is the whole diagnostic for a device with no agent and
+no log of its own, so it lands in the job's `error`: any `2xx` counts as printed (`201` output paper
+taken and `211` paper low are successful prints carrying a warning), everything else fails the job
+with the code and, where the protocol documents one, a reason — `410 (out of paper)`,
+`420 (cover open)`, `521 (job too large …)`.
+
+**A missing confirmation** is not a failure yet: the job stays `claimed` and is re-offered until the
+reaper's visibility timeout requeues it (5 minutes, then `max_retries`), so a printer that loses
+power mid-job prints it on its next poll.
+
+## Limits worth knowing
+
+- **Job size.** The protocol caps a job at **512 KB**, or **2 MB** on mC-Label3 and the
+  HI01X/HI02X boards. Larger and the printer aborts the download and confirms `521` — the job then
+  reads `failed` with that code. printpapi does not cut jobs down; keep receipts small.
+- **Poll interval vs. liveness.** A device counts as online for 60 s after its last request. Star's
+  own guidance for a server is `2 × poll interval + 5 s`, so set the printer's *Polling time* to
+  **25 s or less** — a slower interval makes the dashboard flap between online and offline.
+- **Setting request.** MQTT-capable models ask once for `…/cloudprnt-setting.json` at power-on. We
+  answer `404`, which is the documented signal for "this server speaks CloudPRNT HTTP only", and
+  the printer proceeds to poll normally.
+- **Latency.** A job is picked up on the next poll — there is no push. Star's firmware polls
+  immediately after an event (a finished print, a scanned barcode), so a queue drains at poll
+  speed, not one job per interval.
 
 ## Ceilings
 

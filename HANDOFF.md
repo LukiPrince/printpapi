@@ -68,9 +68,13 @@ extracted, generalized OSS project.
   a one-printer pseudo-agent (`store.register_cloudprnt`), **raw-only** — gotcha #1 again: a pdf
   job to one is failed on the next poll instead of feeding blanks. An unconfirmed job is re-offered
   (`store.claimed_job`) instead of being replaced, and a printer reporting `printingInProgress` is
-  offered nothing. Everything else is the ordinary path: quota, history, webhooks, dashboard. See
-  `docs/cloudprnt.md` for the setup, the ceilings (DELETE-only confirm, no MQTT, no peripherals, no
-  capability discovery) and the trademark disclaimer that has to stay.
+  offered nothing. A confirmation code of `2xx` is a printed job (`201`/`211` are successes with a
+  warning); anything else fails it with the code and, where documented, a reason
+  (`cloudprnt.status_text`). See `docs/cloudprnt.md` for the setup, the ceilings (DELETE-only
+  confirm, no MQTT, no peripherals, no capability discovery) and the trademark disclaimer that has
+  to stay. **Caveat: built from the published spec, never run against a physical printer** — the
+  firmware-dependent parts (optional `jobToken` / `printingInProgress`, the exact confirmation code)
+  are where it will need a fix, and the docs say so out loud.
 - **Org accounts** (`app/auth.py` + `users`/`sessions` in the store) — a person signs in with
   e-mail + password (`POST /login`) and gets a **session token** carried in the same
   `Authorization: Bearer` header. Three credential kinds, one header: *root* (bootstrap token,
@@ -201,8 +205,8 @@ key and user self-management — `app/auth.py`, `docs/api.md#accounts-and-login`
 **hosted-service plumbing** on top of those (self-signup, password reset by e-mail, user removal,
 org settings in the dashboard, monthly job quotas — `app/mail.py`, `docs/api.md#self-signup`), and
 **Star CloudPRNT** (roadmap #9: the printer polls us itself, no agent at the site —
-`app/cloudprnt.py`, `docs/cloudprnt.md`).
-282 tests green.
+`app/cloudprnt.py`, `docs/cloudprnt.md`; spec-complete but unverified on hardware).
+284 tests green.
 A demand-research sweep (July 2026) produced the ranked v2 roadmap in `docs/roadmap.md` — read it
 before inventing features. Roadmap #1–#9 are done. What is left on the ranked list: #10 scales
 (agent-side USB HID), #11 ESC/POS templating. Non-code leftover: code-sign the Windows agent (needs

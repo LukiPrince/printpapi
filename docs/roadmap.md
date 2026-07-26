@@ -30,7 +30,8 @@ v1 is deliberately small (see [CONTRIBUTING.md](../CONTRIBUTING.md) for the YAGN
 - ~~**Org accounts**~~ ✅ e-mail/password login, session tokens, org-scoped key and user
   self-management. See [api.md](api.md#accounts-and-login).
 - ~~**Star CloudPRNT**~~ ✅ Star printers poll `/cloudprnt/<client-key>` themselves — the printer is
-  the agent, nothing is installed at the site. See [cloudprnt.md](cloudprnt.md).
+  the agent, nothing is installed at the site. See [cloudprnt.md](cloudprnt.md). Built against the
+  published protocol; **no physical printer has printed through it yet**.
 - ~~**Hosted-service plumbing**~~ ✅ opt-in self-signup, password reset by e-mail (SMTP, stderr
   fallback), account removal, a Settings page for the org's own knobs, and per-org monthly job
   quotas answering `402`. See [api.md](api.md#self-signup).
@@ -84,8 +85,11 @@ order of pull:
 9. ~~**Star CloudPRNT protocol endpoint**~~ ✅ **shipped** — `/cloudprnt/<client-key>` answers their
    POST poll / GET job / DELETE confirm, so the printer *is* the agent and nothing is installed at
    the site. Enrols itself by MAC as a raw-only printer; jobs take the ordinary queue, quota,
-   history and webhooks. See [cloudprnt.md](cloudprnt.md). Left open: DELETE-only confirmation (no
-   `deleteMethod: GET`), no MQTT transport, no peripherals/client actions, no capability discovery.
+   history and webhooks. See [cloudprnt.md](cloudprnt.md). Left open: **verification on real
+   hardware** (it was built from the spec, and the firmware-dependent bits — optional `jobToken`,
+   `printingInProgress`, the exact confirmation code — are where it will need a fix), DELETE-only
+   confirmation (no `deleteMethod: GET`), no MQTT transport, no peripherals/client actions, no
+   capability discovery.
 10. **Scales API** — USB HID scales at packing stations (NetSuite/Dynamics workflows read weight
     through PrintNode's client). Biggest hardware gap, but niche; needs agent-side HID + a push channel.
 11. **ESC/POS receipt rendering/templating** — images/QR/receiptline-style markdown → ESC-POS. Where

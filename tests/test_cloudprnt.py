@@ -28,9 +28,20 @@ def test_poll_response_shapes():
 def test_job_ok_reads_the_printers_status_code():
     assert cloudprnt.job_ok("200 OK") is True
     assert cloudprnt.job_ok("OK") is True
-    assert cloudprnt.job_ok("402 Cover Open") is False
+    # every 2xx means the printer is online and printed — including the ones that carry a warning
+    assert cloudprnt.job_ok("201 Output paper taken") is True
+    assert cloudprnt.job_ok("211 Paper low") is True
+    assert cloudprnt.job_ok("420 Cover open") is False
+    assert cloudprnt.job_ok("521") is False
     assert cloudprnt.job_ok("") is False        # no status is not a success
     assert cloudprnt.job_ok(None) is False
+
+
+def test_status_text_explains_the_codes_an_operator_can_act_on():
+    assert cloudprnt.status_text("410 Out of paper") == "410 Out of paper (out of paper)"
+    assert "too large" in cloudprnt.status_text("521")
+    assert cloudprnt.status_text("999 whatever") == "999 whatever"   # unknown passes through
+    assert cloudprnt.status_text("") == "no status"
 
 
 def test_device_name_is_stable_across_mac_spelling():
@@ -170,9 +181,9 @@ def test_printer_error_code_fails_the_job():
                                     "content": "QUJD"})[1])["job_id"]
         _cp("POST", url, POLL)
         _cp("GET", url + f"?mac={MAC}")
-        assert _cp("DELETE", url + f"?mac={MAC}&code=402%20Cover%20Open")[0] == 200
+        assert _cp("DELETE", url + f"?mac={MAC}&code=420%20Cover%20open")[0] == 200
         job = json.loads(_req("GET", base + f"/jobs/{jid}", token="cpkey")[1])
-        assert job["state"] == "failed" and "402" in job["error"]
+        assert job["state"] == "failed" and "420" in job["error"] and "cover open" in job["error"]
     finally:
         httpd.shutdown()
 
@@ -268,6 +279,22 @@ def test_auth_mac_and_media_type_errors():
         # confirming without a code is not a success
         assert _cp("DELETE", url + f"?mac={MAC}")[0] == 200
         assert json.loads(_req("GET", base + f"/jobs/{jid}", token="cpkey")[1])["state"] == "failed"
+    finally:
+        httpd.shutdown()
+
+
+def test_server_setting_request_is_a_404_so_the_printer_falls_back_to_http():
+    # An MQTT-capable printer asks for <cloudprnt path>/cloudprnt-setting.json once at power-on.
+    # A server that speaks only CloudPRNT HTTP answers 404 to it — and then the printer polls.
+    conn = _mem()
+    _org_with_key(conn)
+    httpd, base = _serve(conn)
+    try:
+        assert _cp("GET", base + "/cloudprnt/cloudprnt-setting.json"
+                          f"?mac={MAC}&replaced_path=cpkey")[0] == 404
+        assert _cp("GET", base + f"/cloudprnt-setting.json?mac={MAC}", basic="cpkey")[0] == 404
+        # ... and nothing was enrolled by it
+        assert json.loads(_req("GET", base + "/printers", token="cpkey")[1])["printers"] == []
     finally:
         httpd.shutdown()
 

@@ -49,11 +49,32 @@ def poll_response(job, media=MEDIA_DEFAULT):
 def job_ok(code):
     """Did the printer's confirmation code report a successful print?
 
-    It sends its ASB status ("200 OK", "402 Cover Open", …); the guide's own example of a plain
-    success is the bare "OK". Anything else — including no code at all — is a failed print, because
-    reporting a job as printed when it was not is the worse mistake here."""
+    It sends its ASB status ("200 OK", "420 Cover open", …), and per the guide *every* code
+    beginning with 2 means the printer is online and printed — 201 (output paper taken) and 211
+    (paper low) are successful prints carrying a warning, not failures. The guide's own example of
+    a plain success is the bare "OK". Anything else — including no code at all — is a failed print,
+    because reporting a job as printed when it was not is the worse mistake here."""
     c = (code or "").strip()
-    return c.upper() == "OK" or c.startswith("200")
+    return c.upper() == "OK" or c.startswith("2")
+
+
+# The documented status codes an operator can actually act on. Anything else passes through as the
+# printer sent it — a half-guessed description would be worse than the bare number.
+_STATUS_TEXT = {
+    "410": "out of paper", "411": "paper jam", "412": "roll position error", "420": "cover open",
+    "511": "image conversion failed", "520": "job download failed",
+    "521": "job too large (512 KB, or 2 MB on mC-Label3/HI01X/HI02X)",
+}
+
+
+def status_text(code):
+    """The printer's confirmation code, with a plain-language reason where we know one. This is the
+    only diagnostic an operator gets for a device with no agent and no log of its own."""
+    c = (code or "").strip()
+    if not c:
+        return "no status"
+    desc = _STATUS_TEXT.get(c.split()[0])
+    return f"{c} ({desc})" if desc else c
 
 
 def device_name(mac):

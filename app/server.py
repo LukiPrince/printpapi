@@ -598,7 +598,7 @@ def make_handler(*, conn, token, agent_auth=store.authenticate_agent, fetch_url=
                 code = (q.get("code") or [""])[0]
                 ok = cloudprnt.job_ok(code)
                 store.finish_job(conn, job["job_id"], dev["agent_id"], ok,
-                                 None if ok else f"printer reported {code or 'no status'}")
+                                 None if ok else f"printer reported {cloudprnt.status_text(code)}")
             # ponytail: no `deleteMethod` — the printer confirms with DELETE, which is the default.
             # Offer the GET form if a deployment ever sits behind a proxy that blocks DELETE.
             return self._empty(200)                             # their DELETE answer: 200, no body

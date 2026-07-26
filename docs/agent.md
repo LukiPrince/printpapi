@@ -97,8 +97,8 @@ does it.
 
 Star's network printers (mC-Print2/3, TSP100IV, mC-Label3, HI01X/HI02X) can poll the server
 themselves, so they need no agent on any machine: point the printer's CloudPRNT setting at
-`https://your-server/cloudprnt/<client-key>` and it enrols itself as a raw-only printer. See
-[cloudprnt.md](cloudprnt.md).
+`https://your-server/cloudprnt/<client-key>` and it enrols itself as a raw-only printer. Built to
+the published protocol but not yet verified on a device — see [cloudprnt.md](cloudprnt.md).
 
 ## File output (virtual print server)
 
