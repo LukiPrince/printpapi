@@ -60,9 +60,10 @@ is copied into the runtime image — there is no Node at runtime.
 
 `GET /` serves a static, secret-free React dashboard: a live overview (queue counters,
 job-outcome breakdown, activity feed), printers online/offline, searchable job history with
-cancel, one-click test print, API-key management, agent install instructions, light/dark
-theme and a ⌘K command palette. You paste the token once; it's kept in `localStorage` and
-sent as a bearer header — nothing sensitive lives in the served files. The test print sends a
+cancel, one-click test print, API-key management, a **Team** page (add the people who may sign
+in, change your own password), agent install instructions, light/dark theme and a ⌘K command
+palette. You sign in with an account — or paste a token; either way the credential is kept in
+`localStorage` and sent as a bearer header — nothing sensitive lives in the served files. The test print sends a
 PDF only to PDF-capable printers and a ZPL label to everything else.
 
 **Where it comes from.** The source is a Next.js app in [`web/`](../web) (App Router,

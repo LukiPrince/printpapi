@@ -1,4 +1,4 @@
-import { Download, Gauge, History, KeyRound, Printer, Send } from "lucide-react";
+import { Download, Gauge, History, KeyRound, Printer, Send, Users } from "lucide-react";
 
 export type NavItem = {
   href: string;
@@ -42,7 +42,14 @@ export const NAV: NavItem[] = [
     label: "API Keys",
     eyebrow: "Access",
     icon: KeyRound,
-    help: "Per-client API keys — one per integration. The key is shown once, so copy it then. Revoking cuts access instantly. Needs the bootstrap PRINTAPI_TOKEN.",
+    help: "Per-client API keys — one per integration. The key is shown once, so copy it then. Revoking cuts access instantly. Needs an account login or the bootstrap PRINTAPI_TOKEN.",
+  },
+  {
+    href: "/users",
+    label: "Team",
+    eyebrow: "Accounts",
+    icon: Users,
+    help: "The people who can sign in to this org. They get their own e-mail and password instead of sharing the bootstrap token, and can manage the org's keys and people. Changing your own password signs out every browser.",
   },
   {
     href: "/downloads",

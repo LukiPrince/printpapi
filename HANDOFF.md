@@ -20,7 +20,8 @@ extracted, generalized OSS project.
 - `GET /` — **web dashboard**: a Next.js **static export** (source in `web/`, built bundle committed
   to `app/web`), served straight off disk by the stdlib server. Live overview (queue counters,
   outcome breakdown, activity feed), devices, searchable job history with cancel, API keys,
-  agent setup, light/dark, ⌘K palette. Secret-free shell — it prompts for the token and calls the
+  **Team** (org users + own password change), agent setup, light/dark, ⌘K palette. Sign-in takes
+  an account (e-mail + password) or a pasted token. Secret-free shell — it prompts for the token and calls the
   JSON endpoints with it, so all data stays behind auth. Test print picks a PDF for PDF-capable
   printers, a ZPL label otherwise (gotcha #1). Static serving is confined to `app/web`
   (traversal 404s); `/_next/static/` is immutable-cached, HTML is `no-cache`.
@@ -201,8 +202,9 @@ what actually authorizes the print.
   password reset by e-mail, org deletion; and an agent key doubling as its org's client key (see
   the `# ponytail:` note in `server.py`'s `/agent/register`). Known ceilings of the accounts work:
   the login throttle is per process and in memory (no IP dimension), the session token lives in
-  the browser's localStorage (XSS-readable — as the root token already was), and the dashboard has
-  no users/org-settings page yet (those endpoints are API-only).
+  the browser's localStorage (XSS-readable — as the root token already was), the dashboard's Team
+  page covers users and the own-password change but not org settings (`event_url`/`shopify_secret`
+  stay API-only), and there is no endpoint to remove a user.
 
 **Roadmap #1 + #2 are done** (`docs/api.md#computers-agents`, `#submitting-a-job`):
 
