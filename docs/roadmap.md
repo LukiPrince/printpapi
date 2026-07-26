@@ -23,6 +23,10 @@ v1 is deliberately small (see [CONTRIBUTING.md](../CONTRIBUTING.md) for the YAGN
   guides, and a "why not QZ Tray / PrintNode" comparison in the README.
 - ~~**E-commerce auto-print**~~ ✅ `POST /orders` + packing-slip renderer, WooCommerce plugin,
   Shopify webhook. See [ecommerce.md](ecommerce.md).
+- ~~**PrintNode-compatible API**~~ ✅ the same endpoints in PrintNode's JSON shapes, selected by
+  HTTP Basic auth. See [printnode-compat.md](printnode-compat.md).
+- ~~**File backend**~~ ✅ a `file://` printer target writes the job to a directory instead of
+  printing it. See [agent.md](agent.md#file-output-virtual-print-server).
 
 ## v2 candidates
 
@@ -60,8 +64,11 @@ order of pull:
    line changed. See [printnode-compat.md](printnode-compat.md). Left open: plugins that hardcode
    their hostname still need a proxy/DNS override, state *history* is single-entry, and scales /
    credits / child accounts are not portable.
-8. **File backend ("virtual print server")** — a printer target that writes the rendered job to
-   disk as PDF instead of paper (two independent r/selfhosted asks; archival/paperless workflows).
+8. ~~**File backend ("virtual print server")**~~ ✅ **shipped** — a `file:///path/to/dir` printer
+   target in `agent.ini`: the agent writes the job to disk (`job-<id>.pdf` / `.prn`) instead of
+   printing it, for archival and Paperless-style consume folders. Agent-only change — the server
+   sees a normal printer. See [agent.md](agent.md#file-output-virtual-print-server). Left open:
+   no filename template (job id only) and no retention/rotation.
 9. **Star CloudPRNT protocol endpoint** — Star kitchen/receipt printers poll a server URL natively;
    speaking their protocol makes the printer itself the agent, zero software installed.
 10. **Scales API** — USB HID scales at packing stations (NetSuite/Dynamics workflows read weight

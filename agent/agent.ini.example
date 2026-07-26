@@ -18,4 +18,7 @@ name = office-pc
 ;                              printer is never sent a PDF by accident (it would print blanks).
 ;   = socket://host:port    -> the agent opens a raw TCP socket, e.g. a network label printer's
 ;                              :9100. Always raw-only — a bare socket has no renderer.
+;   = file:///path/to/dir   -> "virtual print server": the job is written into that directory
+;                              (job-<id>.pdf / .prn) instead of printed. Takes pdf and raw.
+;                              Windows: file:///C:/printpapi/out
 printers = Zebra GK420d ; HP LaserJet|pdf ; warehouse-label = socket://192.168.1.50:9100

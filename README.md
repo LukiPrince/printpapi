@@ -13,12 +13,14 @@ up and prints it — documents **and** label printers (Zebra/ZPL, Bixolon, therm
 - Print options per job (copies, duplex, paper size, tray, color, page ranges) +
   capability discovery per printer
 - **Shop order → packing slip**: WooCommerce plugin, Shopify webhook, built-in PDF renderer
+- **Virtual print server**: a `file://` printer archives the job to a directory instead of paper
+  ([docs](docs/agent.md#file-output-virtual-print-server))
 - Multi-tenant: orgs isolate API keys, agents, printers and jobs
 - Fleet monitoring: `GET /computers` + online/offline webhooks, Prometheus `/metrics`
 - Retry-safe submits (`idempotency_key`) and job deadlines (`expire_after`)
 - **PrintNode-compatible API layer** — point an existing SDK/integration at your server
   ([docs](docs/printnode-compat.md))
-- Source available ([Elastic License 2.0](#license): self-host freely, don't resell it as a service) · 199 tests
+- Source available ([Elastic License 2.0](#license): self-host freely, don't resell it as a service) · 209 tests
 
 ## Get started
 

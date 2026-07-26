@@ -49,7 +49,8 @@ server_url = ${origin}
 api_key = <your agent key>
 name = office-pc
 ; printers: semicolon-separated. Append |pdf for document printers.
-; A CUPS queue / Windows printer name, or socket://IP:PORT for a raw network printer.
+; A CUPS queue / Windows printer name, socket://IP:PORT for a raw network printer,
+; or file:///path/to/dir to write the job to disk instead of printing it.
 printers = Zebra GK420d ; HP LaserJet|pdf ; netz-bixolon = socket://192.168.1.50:9100`;
 
   return (
@@ -99,7 +100,9 @@ printers = Zebra GK420d ; HP LaserJet|pdf ; netz-bixolon = socket://192.168.1.50
           </div>
           <p className="mt-3 text-sm text-muted-foreground">
             <code className="font-mono">socket://</code> printers are raw-only — a network printer
-            cannot render a PDF, so send it ZPL or ESC-POS.
+            cannot render a PDF, so send it ZPL or ESC-POS. A{" "}
+            <code className="font-mono">file:///dir</code> printer archives the job to that
+            directory instead of printing it.
           </p>
         </CardContent>
       </Card>

@@ -25,7 +25,8 @@ server_url = http://yourserver:3460
 api_key    = your-agent-key
 name       = office-pc
 ; printers: semicolon-separated. Append |pdf for document printers.
-; A CUPS queue / Windows printer name, or socket://IP:PORT for a raw network printer.
+; A CUPS queue / Windows printer name, socket://IP:PORT for a raw network printer,
+; or file:///path/to/dir to archive the job to disk instead of printing it.
 printers   = Zebra GK420d ; HP LaserJet|pdf ; warehouse-label = socket://192.168.1.50:9100
 ```
 
@@ -38,6 +39,8 @@ printers   = Zebra GK420d ; HP LaserJet|pdf ; warehouse-label = socket://192.168
   never sent a PDF by accident.
 - `= socket://host:port` → the agent opens a raw TCP socket (e.g. a network label printer's
   `:9100`). Always raw-only — a bare socket has no renderer.
+- `= file:///path/to/dir` → the agent writes the job into that directory instead of printing it
+  (see [File output](#file-output-virtual-print-server)). Always takes both `pdf` and `raw`.
 
 ## Labels vs documents (the one rule)
 
@@ -89,6 +92,27 @@ Same as Zebra: the printer interprets the byte stream. Network models take
 `socket://IP:9100`; USB models go through the vendor driver as a RAW target. printpapi passes the
 bytes through — building the ESC/POS stream (text, cuts, QR) is your job, any `escpos` library
 does it.
+
+## File output (virtual print server)
+
+A `file://` target makes the printer a **directory**: the job is written to disk instead of paper.
+For archival (keep a copy of every label), for feeding a document pipeline (drop the PDF into
+Paperless-ngx's consume folder), and for testing an integration without burning a roll of labels.
+
+```ini
+printers = Zebra GK420d ; archive = file:///srv/paperless/consume
+```
+
+- Windows spelling: `archive = file:///C:/printpapi/out` (forward slashes, drive letter after
+  `file:///`). `%20` escapes are decoded, so a path with spaces works.
+- The directory is created if missing.
+- One file per job, named after the job id: `job-42.pdf` for a `pdf` job, `job-42.prn` for a `raw`
+  one (the exact bytes you submitted — ZPL, ESC/POS). `copies=3` writes `job-42.pdf`,
+  `job-42-2.pdf`, `job-42-3.pdf`.
+- A file printer accepts **both** modes and needs no `|pdf` tag — a directory has no renderer to
+  get wrong. Print `options` (duplex/tray/…) are hardware settings and are ignored here.
+- Nothing changes server-side: it is a normal printer on the Devices page, jobs report `done` when
+  the file is written, and a write error (permissions, disk full) fails the job with the OS error.
 
 ## macOS
 

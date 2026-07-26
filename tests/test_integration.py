@@ -47,3 +47,33 @@ def test_register_submit_poll_print_result_end_to_end():
         assert json.loads(raw)["state"] == "done"
     finally:
         httpd.shutdown()
+
+
+def test_file_printer_end_to_end_writes_pdf_to_disk(tmp_path):
+    """A file:// printer ("virtual print server") registers like any other, and a pdf job to it
+    ends up on disk with the job reported done — no server-side knowledge of file targets."""
+    conn = store.connect(":memory:")
+    store.init_db(conn)
+    httpd = server.create_server(conn, "clienttoken", port=0,
+                                 long_poll_timeout=2.0, poll_interval=0.05)
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    base = f"http://127.0.0.1:{httpd.server_address[1]}"
+    try:
+        entry = print_agent.parse_printers(f"archive = {(tmp_path / 'inbox').as_uri()}")[0]
+        reg = print_agent.register(base, "agentkey", "nas-1", [entry])
+        pid = reg["printer_ids"]["archive"]
+
+        # the server accepts a pdf job because parse_printers reported the target pdf-capable
+        code, raw = _req("POST", base + "/jobs", token="clienttoken",
+                         body={"printer_id": pid, "type": "pdf_base64",
+                               "content": base64.b64encode(b"%PDF-1.4 fake").decode()})
+        assert code == 200
+        jid = json.loads(raw)["job_id"]
+
+        assert print_agent.run_once(base, "agentkey", {pid: entry}) is True
+        assert (tmp_path / "inbox" / f"job-{jid}.pdf").read_bytes() == b"%PDF-1.4 fake"
+
+        code, raw = _req("GET", base + f"/jobs/{jid}", token="clienttoken")
+        assert json.loads(raw)["state"] == "done"
+    finally:
+        httpd.shutdown()

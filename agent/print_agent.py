@@ -107,6 +107,27 @@ def raw_to_socket(target, data, connect=socket.create_connection, timeout=30):
         s.sendall(data)
 
 
+def file_target_dir(target):
+    """`file:///srv/inbox` -> `/srv/inbox` (and `file:///C:/inbox` -> `C:\\inbox` on Windows).
+    url2pathname does the drive-letter and %20 handling so we don't."""
+    return urllib.request.url2pathname(target[len("file://"):])
+
+
+def write_to_file(target, data, *, mode="raw", job_id=None, index=1):
+    """"Virtual print server": drop the job in a directory instead of on paper — archival and
+    paperless workflows. A pdf job's payload already *is* a PDF, so nothing renders here; raw
+    payloads (ZPL/ESC-POS) are written verbatim as `.prn`. Returns the path written."""
+    directory = file_target_dir(target)
+    os.makedirs(directory, exist_ok=True)
+    stem = f"job-{job_id}" if job_id is not None else "job"
+    if index > 1:
+        stem += f"-{index}"        # copies of one job must not overwrite each other
+    path = os.path.join(directory, stem + (".pdf" if mode == "pdf" else ".prn"))
+    with open(path, "wb") as f:
+        f.write(data)
+    return path
+
+
 # --- printer capabilities (best-effort discovery, reported at registration) ---------------------
 # Shape: {"papers": [...], "bins": [...], "duplex": bool, "color": bool} — any subset. A driver
 # quirk or missing tool must never block registration: collectors return None on any failure.
@@ -164,10 +185,10 @@ def select_caps_collector(platform=sys.platform):
 
 
 def add_capabilities(printers, caps_fn):
-    """Attach discovered capabilities to parse_printers() entries. socket:// targets have no
-    driver/queue to ask; a None result (collector failed) just leaves the entry as-is."""
+    """Attach discovered capabilities to parse_printers() entries. socket:// and file:// targets
+    have no driver/queue to ask; a None result (collector failed) just leaves the entry as-is."""
     for p in printers:
-        if not p["target"].startswith("socket://"):
+        if not p["target"].startswith(("socket://", "file://")):
             caps = caps_fn(p["target"])
             if caps:
                 p["capabilities"] = caps
@@ -187,8 +208,10 @@ def parse_printers(spec):
     Grammar: name [|pdf] [= target].
       - no '='  -> target is the name (a CUPS queue / Windows printer).
       - '= socket://host:port' -> agent opens a raw TCP socket to it.
+      - '= file:///path/to/dir' -> agent writes the job into that directory (no paper).
     Append '|pdf' to declare a document printer PDF-capable; default is raw-only so a label
-    printer is never auto-sent a PDF (gotcha #1). A socket:// target is always raw-only."""
+    printer is never auto-sent a PDF (gotcha #1). A socket:// target is always raw-only, a
+    file:// target always takes both (a directory cannot misrender anything)."""
     out = []
     for entry in spec.split(";"):
         left, _, target = entry.partition("=")
@@ -205,6 +228,11 @@ def parse_printers(spec):
             if not host or not sep or not port.isdigit():
                 raise ValueError(
                     f"invalid socket printer target {target!r} for {name!r}: expected socket://host:port")
+        elif target.startswith("file://"):
+            can_pdf = True  # a directory takes pdf and raw alike
+            if not file_target_dir(target).strip():
+                raise ValueError(
+                    f"invalid file printer target {target!r} for {name!r}: expected file:///path/to/dir")
         out.append({"name": name, "can_pdf": can_pdf, "target": target})
     return out
 
@@ -270,24 +298,28 @@ def _report_with_retry(base, key, job_id, ok, error=None, *, http_post=_post,
 
 
 def print_job(mode, entry, data, copies=1, options=None, raw_fn=raw_to_printer,
-              pdf_fn=pdf_to_printer, socket_fn=raw_to_socket):
+              pdf_fn=pdf_to_printer, socket_fn=raw_to_socket, file_fn=write_to_file,
+              job_id=None):
     target = entry["target"]
+    if mode not in ("raw", "pdf"):
+        raise ValueError(f"bad mode: {mode}")
     # ponytail: loop the whole send per copy — correct on every backend without a per-driver
     # copies flag (win32/Sumatra/CUPS/socket differ). Native flags (lp -n, Sumatra "Nx") would
     # be one call instead of N; not worth the branching for the small copy counts labels use.
     if target.startswith("socket://"):
         if mode != "raw":
             raise ValueError("network socket printer is raw-only (cannot render PDF)")
-        send = lambda: socket_fn(target, data)
+        send = lambda i: socket_fn(target, data)
+    elif target.startswith("file://"):
+        # options are print-hardware settings (tray/duplex/…) — nothing to apply to a file
+        send = lambda i: file_fn(target, data, mode=mode, job_id=job_id, index=i)
     elif mode == "raw":
-        send = lambda: raw_fn(target, data)
-    elif mode == "pdf":
-        # 3-arg call only when options are set: plain jobs keep working with 2-arg pdf fns
-        send = (lambda: pdf_fn(target, data, options)) if options else (lambda: pdf_fn(target, data))
+        send = lambda i: raw_fn(target, data)
     else:
-        raise ValueError(f"bad mode: {mode}")
-    for _ in range(copies):
-        send()
+        # 3-arg call only when options are set: plain jobs keep working with 2-arg pdf fns
+        send = (lambda i: pdf_fn(target, data, options)) if options else (lambda i: pdf_fn(target, data))
+    for i in range(1, copies + 1):
+        send(i)
 
 
 def run_once(base, key, printer_by_id, *, http_get=_get, http_get_bytes=_get_bytes,
@@ -303,7 +335,7 @@ def run_once(base, key, printer_by_id, *, http_get=_get, http_get_bytes=_get_byt
         if printer is None:
             raise ValueError(f"unknown printer id: {job['printer_id']}")
         print_job(job["mode"], printer, data, copies=job.get("copies", 1),
-                  options=job.get("options"), raw_fn=raw_fn, pdf_fn=pdf_fn)
+                  options=job.get("options"), raw_fn=raw_fn, pdf_fn=pdf_fn, job_id=job_id)
     except Exception as e:
         _report_with_retry(base, key, job_id, False, str(e), http_post=http_post,
                            sleep=report_sleep)

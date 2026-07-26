@@ -405,6 +405,80 @@ def test_run_once_survives_report_failure():
     assert ret is True and printed == [b"DATA"]   # printed, and no exception escaped
 
 
+# --- file:// backend ("virtual print server": job lands on disk instead of paper) --------------
+
+def test_parse_printers_file_target_is_pdf_capable():
+    # a directory has no renderer to get wrong (gotcha #1 is about hardware), and the payload of a
+    # pdf job already *is* a PDF -> a file target takes both modes without needing |pdf
+    ps = print_agent.parse_printers("archive = file:///srv/paperless/inbox")
+    assert ps == [{"name": "archive", "can_pdf": True,
+                   "target": "file:///srv/paperless/inbox"}]
+
+
+def test_parse_printers_file_target_requires_a_path():
+    with pytest.raises(ValueError, match="file"):
+        print_agent.parse_printers("archive = file://")
+
+
+def test_file_target_dir_strips_scheme_and_decodes_escapes():
+    assert print_agent.file_target_dir("file:///srv/my%20inbox").endswith("my inbox")
+
+
+def test_write_to_file_writes_pdf_named_after_the_job(tmp_path):
+    target = (tmp_path / "inbox").as_uri()          # dir does not exist yet
+    path = print_agent.write_to_file(target, b"%PDF-1.4", mode="pdf", job_id=42)
+    assert (tmp_path / "inbox" / "job-42.pdf").read_bytes() == b"%PDF-1.4"
+    assert path.endswith("job-42.pdf")
+
+
+def test_write_to_file_raw_uses_prn_and_copies_do_not_overwrite(tmp_path):
+    target = tmp_path.as_uri()
+    print_agent.write_to_file(target, b"^XA^XZ", mode="raw", job_id=7)
+    print_agent.write_to_file(target, b"^XA^XZ", mode="raw", job_id=7, index=2)
+    assert (tmp_path / "job-7.prn").read_bytes() == b"^XA^XZ"
+    assert (tmp_path / "job-7-2.prn").exists()
+
+
+def test_print_job_file_target_routes_to_file_fn_once_per_copy():
+    calls = []
+    entry = {"name": "archive", "can_pdf": True, "target": "file:///srv/inbox"}
+    print_agent.print_job(
+        "pdf", entry, b"%PDF", copies=2, job_id=3,
+        file_fn=lambda t, d, **kw: calls.append((t, d, kw)),
+        raw_fn=lambda *a: (_ for _ in ()).throw(AssertionError("raw not expected")),
+        pdf_fn=lambda *a: (_ for _ in ()).throw(AssertionError("pdf not expected")))
+    assert [kw["index"] for _, _, kw in calls] == [1, 2]
+    assert calls[0] == ("file:///srv/inbox", b"%PDF",
+                        {"mode": "pdf", "job_id": 3, "index": 1})
+
+
+def test_print_job_file_target_rejects_unknown_mode():
+    entry = {"name": "archive", "can_pdf": True, "target": "file:///srv/inbox"}
+    with pytest.raises(ValueError, match="bad mode"):
+        print_agent.print_job("docx", entry, b"x", file_fn=lambda *a, **kw: None)
+
+
+def test_add_capabilities_skips_file_targets():
+    # no queue and no driver to interrogate behind a directory
+    printers = [{"name": "archive", "can_pdf": True, "target": "file:///srv/inbox"}]
+    out = print_agent.add_capabilities(
+        printers, lambda t: (_ for _ in ()).throw(AssertionError("collector not expected")))
+    assert "capabilities" not in out[0]
+
+
+def test_run_once_writes_a_file_job_to_disk(tmp_path):
+    http = FakeHTTP({"job_id": 11, "printer_id": 1, "mode": "pdf"}, b"%PDF-1.7")
+    handled = print_agent.run_once(
+        "http://x", "k",
+        {1: {"name": "archive", "can_pdf": True, "target": (tmp_path / "out").as_uri()}},
+        http_get=http.get, http_get_bytes=http.get_bytes, http_post=http.post,
+        raw_fn=lambda *a: None, pdf_fn=lambda *a: None)
+    assert handled is True
+    assert (tmp_path / "out" / "job-11.pdf").read_bytes() == b"%PDF-1.7"
+    url, body = http.posts[-1]
+    assert url.endswith("/agent/jobs/11/result") and body == {"ok": True, "error": None}
+
+
 def test_load_config_missing_file(tmp_path):
     with pytest.raises(SystemExit, match="agent.ini"):
         print_agent.load_config(str(tmp_path))

@@ -83,11 +83,16 @@ extracted, generalized OSS project.
     re-render); `pdf` → `lp -d <queue>` (CUPS filter chain renders it). macOS needs no code of its
     own — but a driverless/AirPrint queue mangles raw ZPL, so `docs/agent.md#macos` tells operators
     to use `socket://IP:9100` or an `lpadmin -m raw` queue for label printers.
+  - **File target** (`= file:///path/to/dir`, roadmap #8 — "virtual print server"): writes the job
+    into that directory as `job-<id>.pdf` (pdf) or `job-<id>.prn` (raw, verbatim bytes) instead of
+    printing it — archival, Paperless consume folders, testing without burning labels. Takes both
+    modes (`can_pdf` forced true: a directory cannot misrender), copies get a `-N` suffix, print
+    options are ignored. Agent-only — the server sees an ordinary printer.
 - Configured via `agent.ini` (next to the script): `server_url`, `api_key`, `name`, `printers`
   (semicolon-separated — Windows printer names, or CUPS queue names on Linux).
 - Shipped in the homelab as a signed-Python install (see gotcha #2), autostart via Task Scheduler.
 
-**Tests:** 199, all green (`python -m pytest`). Real loopback HTTP servers (ThreadingHTTPServer),
+**Tests:** 209, all green (`python -m pytest`). Real loopback HTTP servers (ThreadingHTTPServer),
 real SQLite (:memory:), injected render fns / subprocess runners — no mocks, no real printers.
 
 **Model:** **poll** — agent opens a long-poll `GET /agent/jobs` to the server, receives jobs, prints,
@@ -143,13 +148,13 @@ webhooks, per-job print options, printer capability discovery, **multi-tenancy**
 n8n/Zapier/Make, per-printer-family setup, QZ Tray/PrintNode comparison in the README), and
 **e-commerce auto-print** (roadmap #5: `POST /orders`, packing-slip renderer, WooCommerce plugin,
 Shopify webhook — `docs/ecommerce.md`), and the **PrintNode API compatibility layer** (roadmap #7:
-`app/printnode.py`, Basic-auth-selected — `docs/printnode-compat.md`).
-199 tests green.
+`app/printnode.py`, Basic-auth-selected — `docs/printnode-compat.md`), and the **file backend**
+(roadmap #8: a `file:///dir` printer target in the agent — `docs/agent.md#file-output-virtual-print-server`).
+209 tests green.
 A demand-research sweep (July 2026) produced the ranked v2 roadmap in `docs/roadmap.md` — read it
-before inventing features. Roadmap #1–#7 are done. What is left on the ranked list: **#8 file
-backend** ("virtual print server" — write the rendered job to disk as PDF), then #9 Star CloudPRNT,
-#10 scales, #11 ESC/POS templating. Non-code leftover: code-sign the Windows agent (needs a cert,
-gotcha #2).
+before inventing features. Roadmap #1–#8 are done. What is left on the ranked list: #9 Star
+CloudPRNT (the printer itself polls — no agent install), #10 scales (agent-side USB HID), #11
+ESC/POS templating. Non-code leftover: code-sign the Windows agent (needs a cert, gotcha #2).
 
 On the PrintNode compat layer specifically, the deliberate ceilings are: a job's state *history* is
 a single entry (we store the current state only), `capabilities.papers` carries names with `null`
