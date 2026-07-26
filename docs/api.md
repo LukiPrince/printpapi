@@ -5,10 +5,14 @@ All endpoints speak JSON over HTTP. Authentication is a bearer token:
 
 **Roles:**
 
-- *client* — the bootstrap `PRINTAPI_TOKEN` **or** any active issued key (see [API keys](server.md#api-keys)).
-  An issued key only ever sees its own org; the bootstrap token spans all of them — see
+- *client* — the bootstrap `PRINTAPI_TOKEN`, any active issued key (see
+  [API keys](server.md#api-keys)), **or** a session token from `POST /login`. An issued key and a
+  session only ever see their own org; the bootstrap token spans all of them — see
   [Multi-tenancy](#multi-tenancy).
-- *root* — the bootstrap `PRINTAPI_TOKEN` only (orgs and keys)
+- *manage* — root **or** a session (an account login): the org's keys, users and settings. A
+  machine key is deliberately excluded, so a leaked integration key cannot issue itself a
+  successor — see [Accounts and login](#accounts-and-login).
+- *root* — the bootstrap `PRINTAPI_TOKEN` only (orgs, and the first user of an org)
 - *agent* — the per-agent key (bound to the agent name on first contact)
 
 Token comparison is constant-time (`hmac.compare_digest`).
@@ -28,12 +32,19 @@ Token comparison is constant-time (`hmac.compare_digest`).
 | `DELETE /jobs/{id}` | client | Cancel a still-`queued` job (`409` once claimed, `404` if unknown) |
 | `GET /printers` | client | Registered printers + online/offline + capabilities |
 | `GET /computers` | client | Registered agents + online/offline + printer count |
+| `POST /login` | none | E-mail + password → `{token, expires_at, org_id, user_id}` |
+| `POST /logout` | session | End this session server-side |
+| `GET /me` | any | `{kind: root\|session\|key, org_id}` (+ `email`, `user_id` for a session) |
+| `PUT /me/password` | session | `{current, new}` — changes it and logs every browser out |
+| `POST /users` | manage | Add a user to the caller's own org → `{id, email, org_id}` |
+| `GET /users` | manage | Users of the caller's org (root: all orgs) |
+| `POST /orgs/{id}/users` | root | Create an org's first user |
 | `POST /orgs` | root | Create an org → `{id, name}` |
 | `GET /orgs` | root | List orgs (`event_url`, `shopify_secret_set` — never the secret itself) |
-| `PUT /orgs/{id}` | root | Set/clear the org's `event_url` and/or `shopify_secret` |
-| `POST /apikeys` | root | Issue a client key → `{id, label, org_id, key}` (key shown once) |
-| `GET /apikeys` | root | List keys with their org (never the secret) |
-| `DELETE /apikeys/{id}` | root | Revoke a key |
+| `PUT /orgs/{id}` | manage | Set/clear the org's `event_url` and/or `shopify_secret` |
+| `POST /apikeys` | manage | Issue a client key → `{id, label, org_id, key}` (key shown once) |
+| `GET /apikeys` | manage | List keys with their org (never the secret) |
+| `DELETE /apikeys/{id}` | manage | Revoke a key |
 | `POST /agent/register` | agent | Declare name + printers → `{computer_id, printer_ids}` |
 | `GET /agent/jobs` | agent | Long-poll for a job (204 on timeout) |
 | `GET /agent/jobs/{id}/payload` | agent | Download the job's bytes |
@@ -197,9 +208,50 @@ Rules:
 **Existing installs need no migration** — everything already lives in org `1`, root behaves as
 before, and every issued key resolves to org `1`.
 
-Deliberately out of scope for now (`# ponytail:` in the code): billing, quotas, per-org dashboard
-users, org-scoped key self-management, and org deletion. An agent key doubles as its org's client
-key, and revoking it stops client calls but not an already-registered agent's polling.
+Deliberately out of scope for now (`# ponytail:` in the code): billing, quotas, and org deletion.
+An agent key doubles as its org's client key, and revoking it stops client calls but not an
+already-registered agent's polling.
+
+## Accounts and login
+
+An org's people sign in with an **e-mail and password** instead of pasting the root token. The
+login mints a **session token** carried in the same `Authorization: Bearer` header as everything
+else, so nothing else about the API changes.
+
+```bash
+# 1. root seeds the org's first user (there is no self-signup)
+curl -s -X POST localhost:3460/orgs/2/users -H 'Authorization: Bearer <PRINTAPI_TOKEN>' \
+     -d '{"email":"ops@acme.example","password":"a long passphrase"}'
+
+# 2. that user logs in and gets a session
+curl -s -X POST localhost:3460/login \
+     -d '{"email":"ops@acme.example","password":"a long passphrase"}'
+# -> {"token":"sess_…","expires_at":1787…,"org_id":2,"user_id":2}
+
+# 3. the session acts inside org 2 — and may manage it
+curl -s -X POST localhost:3460/apikeys -H 'Authorization: Bearer sess_…' -d '{"label":"n8n"}'
+curl -s -X POST localhost:3460/users   -H 'Authorization: Bearer sess_…' \
+     -d '{"email":"packer@acme.example","password":"another passphrase"}'
+```
+
+What holds:
+
+- **Three kinds of credential, one header.** Root manages every org; a session manages its own
+  org; a machine key prints and reads and nothing more (`401` on `/apikeys`, `/users`,
+  `PUT /orgs/{id}`). Which table the credential resolves in *is* the permission — there is no role
+  column and no roles.
+- **Sessions expire** after 30 days and can be ended early (`POST /logout`, or the reaper once
+  expired). Tokens are stored sha256-hashed, like every other credential here.
+- **Passwords** are `scrypt` hashes (stdlib, salted per user), minimum 8 characters. Changing a
+  password deletes that user's sessions — a stolen session dies with the password it came from.
+- **Login is throttled** per e-mail (10 failures / 15 minutes → `429`), and a wrong address costs
+  the same time as a wrong password, so the endpoint does not enumerate accounts.
+- **E-mails are unique across the whole server** (login carries no org), lower-cased and trimmed.
+
+Not built yet: self-signup, password reset by e-mail (root sets a new one), and per-user roles.
+The throttle counters are per process, in memory and bounded (several server processes count
+separately, and a large enough spray of invented addresses evicts counters instead of growing
+memory). Passwords over 1024 characters are rejected rather than hashed.
 
 ## Metrics
 

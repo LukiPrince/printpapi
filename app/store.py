@@ -16,7 +16,14 @@ CREATE TABLE IF NOT EXISTS orgs(
   id INTEGER PRIMARY KEY, name TEXT NOT NULL, event_url TEXT, shopify_secret TEXT,
   created_at REAL NOT NULL);
 CREATE TABLE IF NOT EXISTS users(
-  id INTEGER PRIMARY KEY, org_id INTEGER NOT NULL, name TEXT NOT NULL, created_at REAL NOT NULL);
+  id INTEGER PRIMARY KEY, org_id INTEGER NOT NULL, name TEXT NOT NULL, created_at REAL NOT NULL,
+  email TEXT, password_hash TEXT);
+-- users_email (UNIQUE) is created with the migrations below, not here: on a pre-accounts DB the
+-- column does not exist yet when this script runs. NULLs are distinct in SQLite, so the seeded
+-- legacy user (no e-mail) is unconstrained.
+CREATE TABLE IF NOT EXISTS sessions(
+  id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL,
+  token_hash TEXT NOT NULL UNIQUE, created_at REAL NOT NULL, expires_at REAL NOT NULL);
 CREATE TABLE IF NOT EXISTS agents(
   id INTEGER PRIMARY KEY AUTOINCREMENT, org_id INTEGER NOT NULL, name TEXT NOT NULL,
   api_key_hash TEXT NOT NULL UNIQUE, last_seen_at REAL,
@@ -67,7 +74,10 @@ def init_db(conn):
                         "ALTER TABLE orgs ADD COLUMN event_url TEXT",
                         "ALTER TABLE orgs ADD COLUMN shopify_secret TEXT",
                         "ALTER TABLE agents ADD COLUMN offline_notified "
-                        "INTEGER NOT NULL DEFAULT 0"):
+                        "INTEGER NOT NULL DEFAULT 0",
+                        "ALTER TABLE users ADD COLUMN email TEXT",
+                        "ALTER TABLE users ADD COLUMN password_hash TEXT",
+                        "CREATE UNIQUE INDEX IF NOT EXISTS users_email ON users(email)"):
                 try:
                     conn.execute(ddl)
                 except sqlite3.OperationalError:
@@ -243,12 +253,129 @@ def list_api_keys(conn, org_id=None):
     return [dict(r) for r in rows]
 
 
-def revoke_api_key(conn, key_id):
+def revoke_api_key(conn, key_id, org_id=None):
+    """Org-filtered like every other id lookup: another org's key is simply not found."""
     with _LOCK:
         try:
-            cur = conn.execute("UPDATE api_keys SET active=0 WHERE id=?", (key_id,))
+            cur = conn.execute(
+                "UPDATE api_keys SET active=0 "
+                "WHERE id=:kid AND (:org IS NULL OR org_id = :org)",
+                {"kid": key_id, "org": org_id})
             conn.commit()
             return cur.rowcount == 1
+        except Exception:
+            conn.rollback()
+            raise
+
+
+# --- users + browser sessions ---------------------------------------------------------------
+# A user belongs to exactly one org and logs in with e-mail + password; a session token is that
+# login carried in the same `Authorization: Bearer` header the API keys use. Sessions are stored
+# hashed (like every other credential here) and expire — logout deletes the row, the reaper
+# purges the rest. Machine keys stay in api_keys: what may manage an org is decided by *which*
+# table the presented credential resolves in, not by a role column.
+
+
+def _email(value):
+    return (value or "").strip().lower()
+
+
+def create_user(conn, org_id, email, password_hash):
+    """Raises sqlite3.IntegrityError if the e-mail is taken (globally — login is by e-mail alone)."""
+    now = time.time()
+    addr = _email(email)
+    with _LOCK:
+        try:
+            cur = conn.execute(
+                "INSERT INTO users(org_id, name, email, password_hash, created_at) "
+                "VALUES(?,?,?,?,?)", (org_id, addr, addr, password_hash, now))
+            conn.commit()
+            return cur.lastrowid
+        except Exception:
+            conn.rollback()
+            raise
+
+
+def get_user_by_email(conn, email):
+    """The login lookup — the only place the password hash leaves the DB."""
+    addr = _email(email)
+    if not addr:
+        return None
+    with _LOCK:
+        row = conn.execute("SELECT id, org_id, email, password_hash FROM users WHERE email=?",
+                           (addr,)).fetchone()
+    return dict(row) if row else None
+
+
+def list_users(conn, org_id=None):
+    with _LOCK:
+        rows = conn.execute(
+            "SELECT id, org_id, email, created_at FROM users "
+            "WHERE email IS NOT NULL AND (:org IS NULL OR org_id = :org) ORDER BY id",
+            {"org": org_id}).fetchall()
+    return [dict(r) for r in rows]
+
+
+def set_user_password(conn, user_id, password_hash):
+    """Changing the password logs that user's browsers out — a stolen session dies with the
+    password it was minted from. False if there is no such user."""
+    with _LOCK:
+        try:
+            cur = conn.execute("UPDATE users SET password_hash=? WHERE id=?",
+                               (password_hash, user_id))
+            conn.execute("DELETE FROM sessions WHERE user_id=?", (user_id,))
+            conn.commit()
+            return cur.rowcount == 1
+        except Exception:
+            conn.rollback()
+            raise
+
+
+def create_session(conn, user_id, token, ttl_s, now=None):
+    now = time.time() if now is None else now
+    expires_at = now + ttl_s
+    with _LOCK:
+        try:
+            conn.execute(
+                "INSERT INTO sessions(user_id, token_hash, created_at, expires_at) VALUES(?,?,?,?)",
+                (user_id, _hash_key(token), now, expires_at))
+            conn.commit()
+            return expires_at
+        except Exception:
+            conn.rollback()
+            raise
+
+
+def authenticate_session(conn, token, now=None):
+    """Resolve a session token to {'user_id', 'org_id', 'email'}; None if unknown or expired."""
+    if not token:
+        return None
+    now = time.time() if now is None else now
+    with _LOCK:
+        row = conn.execute(
+            "SELECT s.user_id, u.org_id, u.email FROM sessions s JOIN users u ON u.id = s.user_id "
+            "WHERE s.token_hash=? AND s.expires_at > ?", (_hash_key(token), now)).fetchone()
+    return dict(row) if row else None
+
+
+def delete_session(conn, token):
+    with _LOCK:
+        try:
+            cur = conn.execute("DELETE FROM sessions WHERE token_hash=?", (_hash_key(token),))
+            conn.commit()
+            return cur.rowcount == 1
+        except Exception:
+            conn.rollback()
+            raise
+
+
+def purge_expired_sessions(conn, now=None):
+    now = time.time() if now is None else now
+    with _LOCK:
+        try:
+            cur = conn.execute("DELETE FROM sessions WHERE expires_at <= ?", (now,))
+            conn.commit()
+            return cur.rowcount
         except Exception:
             conn.rollback()
             raise

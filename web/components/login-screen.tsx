@@ -6,31 +6,47 @@ import { ArrowRight, Eye, EyeOff, Loader2, ShieldCheck } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Barcode, Logo } from "@/components/brand";
-import { checkToken } from "@/lib/api";
+import { ApiError, checkToken, login } from "@/lib/api";
+
+const LABEL =
+  "font-mono text-[0.68rem] font-semibold tracking-[0.14em] text-muted-foreground uppercase";
 
 export function LoginScreen({ onSignIn }: { onSignIn: (token: string) => void }) {
+  // Two ways in: an account (e-mail + password, minting a session) or a raw token pasted in
+  // — the bootstrap PRINTAPI_TOKEN and per-client keys have no password to type.
+  const [mode, setMode] = useState<"account" | "token">("account");
+  const [email, setEmail] = useState("");
+  const [password, setPassword] = useState("");
   const [value, setValue] = useState("");
   const [reveal, setReveal] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
   const [shake, setShake] = useState(0);
 
+  function fail(message: string) {
+    setError(message);
+    setShake((n) => n + 1);
+  }
+
   async function submit(e: React.FormEvent) {
     e.preventDefault();
-    const token = value.trim();
-    if (!token || busy) return;
+    if (busy) return;
     setBusy(true);
     setError("");
     try {
-      if (await checkToken(token)) {
-        onSignIn(token);
+      if (mode === "account") {
+        if (!email.trim() || !password) return;
+        onSignIn((await login(email.trim(), password)).token);
       } else {
-        setError("That token was rejected.");
-        setShake((n) => n + 1);
+        const token = value.trim();
+        if (!token) return;
+        if (await checkToken(token)) onSignIn(token);
+        else fail("That token was rejected.");
       }
-    } catch {
-      setError("Cannot reach the server.");
-      setShake((n) => n + 1);
+    } catch (err) {
+      if (err instanceof ApiError && err.status === 401) fail("Wrong e-mail or password.");
+      else if (err instanceof ApiError && err.status === 429) fail("Too many attempts. Wait a bit.");
+      else fail("Cannot reach the server.");
     } finally {
       setBusy(false);
     }
@@ -72,35 +88,92 @@ export function LoginScreen({ onSignIn }: { onSignIn: (token: string) => void })
 
         <Barcode className="my-4 h-4 text-foreground" />
 
-        <label htmlFor="token" className="font-mono text-[0.68rem] font-semibold tracking-[0.14em] text-muted-foreground uppercase">
-          API token
-        </label>
-        <div className="mt-1.5 flex gap-1.5">
-          <Input
-            id="token"
-            autoFocus
-            type={reveal ? "text" : "password"}
-            autoComplete="off"
-            placeholder="PRINTAPI_TOKEN or a client key"
-            value={value}
-            onChange={(e) => setValue(e.target.value)}
-            aria-invalid={!!error}
-            className="font-mono"
-          />
-          <Button
-            type="button"
-            variant="outline"
-            size="icon"
-            aria-label={reveal ? "Hide token" : "Show token"}
-            onClick={() => setReveal((r) => !r)}
-          >
-            {reveal ? <EyeOff /> : <Eye />}
-          </Button>
-        </div>
+        {mode === "account" ? (
+          <>
+            <label htmlFor="email" className={LABEL}>
+              E-mail
+            </label>
+            <Input
+              id="email"
+              autoFocus
+              type="email"
+              autoComplete="username"
+              placeholder="you@yourshop.example"
+              value={email}
+              onChange={(e) => setEmail(e.target.value)}
+              aria-invalid={!!error}
+              className="mt-1.5 font-mono"
+            />
+            <label htmlFor="password" className={`${LABEL} mt-3 block`}>
+              Password
+            </label>
+            <div className="mt-1.5 flex gap-1.5">
+              <Input
+                id="password"
+                type={reveal ? "text" : "password"}
+                autoComplete="current-password"
+                value={password}
+                onChange={(e) => setPassword(e.target.value)}
+                aria-invalid={!!error}
+                className="font-mono"
+              />
+              <Button
+                type="button"
+                variant="outline"
+                size="icon"
+                aria-label={reveal ? "Hide password" : "Show password"}
+                onClick={() => setReveal((r) => !r)}
+              >
+                {reveal ? <EyeOff /> : <Eye />}
+              </Button>
+            </div>
+          </>
+        ) : (
+          <>
+            <label htmlFor="token" className={LABEL}>
+              API token
+            </label>
+            <div className="mt-1.5 flex gap-1.5">
+              <Input
+                id="token"
+                autoFocus
+                type={reveal ? "text" : "password"}
+                autoComplete="off"
+                placeholder="PRINTAPI_TOKEN or a client key"
+                value={value}
+                onChange={(e) => setValue(e.target.value)}
+                aria-invalid={!!error}
+                className="font-mono"
+              />
+              <Button
+                type="button"
+                variant="outline"
+                size="icon"
+                aria-label={reveal ? "Hide token" : "Show token"}
+                onClick={() => setReveal((r) => !r)}
+              >
+                {reveal ? <EyeOff /> : <Eye />}
+              </Button>
+            </div>
+          </>
+        )}
 
         <Button type="submit" variant="brand" size="lg" className="mt-4 w-full font-mono" disabled={busy}>
           {busy ? <Loader2 className="animate-spin" /> : <ArrowRight />}
-          {busy ? "CONNECTING" : "CONNECT"}
+          {busy ? "CONNECTING" : mode === "account" ? "SIGN IN" : "CONNECT"}
+        </Button>
+
+        <Button
+          type="button"
+          variant="ghost"
+          size="xs"
+          className="mt-2 w-full font-mono"
+          onClick={() => {
+            setMode((m) => (m === "account" ? "token" : "account"));
+            setError("");
+          }}
+        >
+          {mode === "account" ? "Use an API token instead" : "Sign in with an account"}
         </Button>
 
         {error ? (

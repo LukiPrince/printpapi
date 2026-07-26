@@ -109,6 +109,22 @@ Add `"org_id"` to put the key (and any agent registering with it) in another org
 [Multi-tenancy](api.md#multi-tenancy). Without it, everything stays in the single default org,
 which is what a plain self-hosted install wants.
 
+## Accounts
+
+So nobody has to paste the root token into a browser, an org's people can sign in with an e-mail
+and password. Root seeds the first user, that user invites the rest and manages the org's keys:
+
+```bash
+curl -s -X POST localhost:3460/orgs/1/users \
+     -H 'Authorization: Bearer <PRINTAPI_TOKEN>' -H 'Content-Type: application/json' \
+     -d '{"email":"ops@yourshop.example","password":"a long passphrase"}'
+```
+
+The dashboard's sign-in screen then takes those credentials (the token field is still there for
+root and for machine keys). Passwords are salted `scrypt` hashes, sessions expire after 30 days,
+and a machine key can never manage keys or users — see
+[Accounts and login](api.md#accounts-and-login).
+
 ## Queue behavior
 
 SQLite in WAL mode with an atomic claim. A visibility-timeout reaper requeues jobs whose agent
@@ -118,7 +134,8 @@ stderr.
 ## Security
 
 Enforced at every trust boundary: bearer auth on every endpoint, constant-time token compare,
-SHA-256-hashed agent and client keys, `http(s)`-only URL fetches, 32 MB request-body cap,
+SHA-256-hashed agent, client and session credentials, salted `scrypt` password hashes with a
+throttled and non-enumerating login, `http(s)`-only URL fetches, 32 MB request-body cap,
 no `shell=True`, agent temp-file cleanup, and job payloads scoped so an agent can only touch
 its own jobs.
 

@@ -45,8 +45,8 @@ export default function KeysPage() {
       <Card>
         <EmptyState
           icon={Lock}
-          title="Admin token required"
-          hint="Issuing and revoking keys needs the bootstrap PRINTAPI_TOKEN, not a per-client key. Sign out and connect with it."
+          title="An account is required"
+          hint="Issuing and revoking keys needs an account login or the bootstrap PRINTAPI_TOKEN — a per-client key cannot manage keys. Sign out and connect with one of those."
         />
       </Card>
     );

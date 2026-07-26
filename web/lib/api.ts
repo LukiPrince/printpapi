@@ -46,6 +46,21 @@ export type ApiKey = {
   created_at: number;
 };
 
+/** Who the stored credential belongs to. `session` is an account login, `key` a machine key. */
+export type Me = {
+  kind: "root" | "session" | "key";
+  org_id: number | null;
+  email?: string;
+  user_id?: number;
+};
+
+export type OrgUser = {
+  id: number;
+  org_id: number;
+  email: string;
+  created_at: number;
+};
+
 export type Metrics = {
   jobs: Record<JobState, number>;
   agents_online: number;
@@ -105,9 +120,10 @@ async function request(path: string, init: RequestInit = {}, token = getToken())
     headers: { ...init.headers, Authorization: `Bearer ${token}` },
   });
   if (res.status === 401) {
-    // /apikeys is admin-only, so a 401 there is "wrong token for this page", not
-    // "session dead". Only a rejected token on a client endpoint signs you out.
-    if (!path.startsWith("/apikeys")) {
+    // /apikeys and /users need an account (or the bootstrap token), so a 401 there is "this
+    // credential cannot manage the org", not "session dead". Only a rejected token on a client
+    // endpoint signs you out.
+    if (!path.startsWith("/apikeys") && !path.startsWith("/users")) {
       window.dispatchEvent(new CustomEvent(UNAUTHORIZED_EVENT));
     }
     throw new ApiError(401, "unauthorized");
@@ -141,6 +157,39 @@ export async function checkToken(token: string): Promise<boolean> {
   // must not be mistaken for a good token — otherwise you get "signed in" to nothing.
   return res.ok;
 }
+
+/** Exchange e-mail + password for a session token. Sent without a bearer header — it *is* the
+ *  call that mints one. A wrong password throws ApiError(401). */
+export async function login(email: string, password: string) {
+  const res = await fetch("/login", jsonBody({ email, password }));
+  const body = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    throw new ApiError(res.status, body?.error ?? `login failed (${res.status})`);
+  }
+  return body as { token: string; expires_at: number; org_id: number; user_id: number };
+}
+
+/** Best-effort server-side session teardown. Raw fetch: a 401 here must not trigger the
+ *  global unauthorized handler — signing out is exactly what the caller is already doing. */
+export async function logout() {
+  const token = getToken();
+  if (!token.startsWith("sess_")) return;
+  await fetch("/logout", { method: "POST", headers: { Authorization: `Bearer ${token}` } }).catch(
+    () => {},
+  );
+}
+
+export const getMe = () => getJSON<Me>("/me");
+
+export const listUsers = () => getJSON<{ users: OrgUser[] }>("/users").then((r) => r.users ?? []);
+
+export const createUser = (email: string, password: string) =>
+  request("/users", jsonBody({ email, password })).then(
+    (r) => r.json() as Promise<{ id: number; email: string; org_id: number }>,
+  );
+
+export const changePassword = (current: string, next: string) =>
+  request("/me/password", { ...jsonBody({ current, new: next }), method: "PUT" });
 
 export const listPrinters = () =>
   getJSON<{ printers: Printer[] }>("/printers").then((r) => r.printers ?? []);

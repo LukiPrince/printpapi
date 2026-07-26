@@ -56,9 +56,21 @@ extracted, generalized OSS project.
   Their unknown option keys are dropped rather than rejected (a client sends its whole option set);
   options on raw jobs are dropped whole. See `docs/printnode-compat.md` for the mapping tables and
   the trademark disclaimer that has to stay.
-- Admin endpoints (bootstrap `PRINTAPI_TOKEN` only) — **per-client API keys**:
+- **Org accounts** (`app/auth.py` + `users`/`sessions` in the store) — a person signs in with
+  e-mail + password (`POST /login`) and gets a **session token** carried in the same
+  `Authorization: Bearer` header. Three credential kinds, one header: *root* (bootstrap token,
+  every org), *session* (one org, may manage it), *key* (one org, print + read only — a leaked
+  integration key cannot issue itself a successor). Which table the credential resolves in *is*
+  the permission; there is no role column. `POST /logout`, `GET /me`, `PUT /me/password`
+  (invalidates that user's sessions), `POST|GET /users`, and root-only `POST /orgs/{id}/users`
+  for an org's first user. Passwords are stdlib `scrypt`, sessions expire after 30 days and are
+  stored hashed, login is throttled per e-mail and does not enumerate accounts.
+  See `docs/api.md#accounts-and-login`.
+- Management endpoints — **per-client API keys** (root *or* a session, never a machine key):
   - `POST /apikeys {label}` → issues a new random key (shown once); `GET /apikeys` lists labels;
     `DELETE /apikeys/{id}` revokes. Keys are stored sha256-hashed; revoked keys stop authorizing.
+    A session is confined to its own org here — a foreign key id is `404`, and `PUT /orgs/{id}`
+    on a foreign org is `404` too.
 - Agent endpoints (per-agent key, hashed in DB):
   - `POST /agent/register` — agent declares its name and printer list; server upserts and returns
     `{computer_id, printer_ids}`. Name is bound to the key on first contact (no hijack).
@@ -92,7 +104,7 @@ extracted, generalized OSS project.
   (semicolon-separated — Windows printer names, or CUPS queue names on Linux).
 - Shipped in the homelab as a signed-Python install (see gotcha #2), autostart via Task Scheduler.
 
-**Tests:** 209, all green (`python -m pytest`). Real loopback HTTP servers (ThreadingHTTPServer),
+**Tests:** 243, all green (`python -m pytest`). Real loopback HTTP servers (ThreadingHTTPServer),
 real SQLite (:memory:), injected render fns / subprocess runners — no mocks, no real printers.
 
 **Model:** **poll** — agent opens a long-poll `GET /agent/jobs` to the server, receives jobs, prints,
@@ -149,8 +161,10 @@ n8n/Zapier/Make, per-printer-family setup, QZ Tray/PrintNode comparison in the R
 **e-commerce auto-print** (roadmap #5: `POST /orders`, packing-slip renderer, WooCommerce plugin,
 Shopify webhook — `docs/ecommerce.md`), and the **PrintNode API compatibility layer** (roadmap #7:
 `app/printnode.py`, Basic-auth-selected — `docs/printnode-compat.md`), and the **file backend**
-(roadmap #8: a `file:///dir` printer target in the agent — `docs/agent.md#file-output-virtual-print-server`).
-209 tests green.
+(roadmap #8: a `file:///dir` printer target in the agent — `docs/agent.md#file-output-virtual-print-server`),
+and **org accounts** on top of multi-tenancy (e-mail/password login, session tokens, org-scoped
+key and user self-management — `app/auth.py`, `docs/api.md#accounts-and-login`).
+243 tests green.
 A demand-research sweep (July 2026) produced the ranked v2 roadmap in `docs/roadmap.md` — read it
 before inventing features. Roadmap #1–#8 are done. What is left on the ranked list: #9 Star
 CloudPRNT (the printer itself polls — no agent install), #10 scales (agent-side USB HID), #11
@@ -182,9 +196,13 @@ what actually authorizes the print.
 - Invariant, tested: a foreign job id is `404` (never `403`/`409`), a foreign printer is
   `400 unknown printer`, and lists/metrics only ever carry the caller's own org.
 - Legacy DBs (everything `org_id=1`) keep working untouched — no schema change was needed.
-- Still open on top: billing, quotas, per-org dashboard users/login, org-scoped key
-  self-management, org deletion; and an agent key doubling as its org's client key (see the
-  `# ponytail:` note in `server.py`'s `/agent/register`).
+- **Org accounts are done on top of it** (see §2): per-org users with a password login, session
+  tokens, and org-scoped key/user self-management. Still open: billing, quotas, self-signup,
+  password reset by e-mail, org deletion; and an agent key doubling as its org's client key (see
+  the `# ponytail:` note in `server.py`'s `/agent/register`). Known ceilings of the accounts work:
+  the login throttle is per process and in memory (no IP dimension), the session token lives in
+  the browser's localStorage (XSS-readable — as the root token already was), and the dashboard has
+  no users/org-settings page yet (those endpoints are API-only).
 
 **Roadmap #1 + #2 are done** (`docs/api.md#computers-agents`, `#submitting-a-job`):
 

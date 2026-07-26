@@ -1,6 +1,6 @@
-import os, tempfile, time
+import os, sqlite3, tempfile, time
 import pytest
-from app import store
+from app import auth, store
 
 
 def _db():
@@ -511,3 +511,126 @@ def test_a_job_inside_its_window_still_prints():
     jid = store.enqueue_job(conn, pid, "raw_base64", "raw", b"a", expire_after=3600)
     assert store.expire_jobs(conn) == 0
     assert store.claim_job(conn, aid)["job_id"] == jid
+
+
+# --- users + sessions ----------------------------------------------------------------
+
+
+def _user(conn, email="ops@shop.test", pw="hunter2hunter2", org_id=store.DEFAULT_ORG):
+    return store.create_user(conn, org_id, email, auth.hash_password(pw))
+
+
+def test_user_lookup_is_case_and_whitespace_insensitive():
+    conn = _db()
+    uid = _user(conn, "Ops@Shop.TEST")
+    row = store.get_user_by_email(conn, "  ops@shop.test ")
+    assert row["id"] == uid and row["org_id"] == store.DEFAULT_ORG
+    assert auth.verify_password("hunter2hunter2", row["password_hash"])
+    assert store.get_user_by_email(conn, "nobody@shop.test") is None
+
+
+def test_a_second_user_with_the_same_email_is_refused():
+    conn = _db()
+    _user(conn, "ops@shop.test")
+    other = store.create_org(conn, "other")
+    with pytest.raises(sqlite3.IntegrityError):
+        _user(conn, "OPS@shop.test", org_id=other)       # even across orgs — login is by e-mail
+
+
+def test_listing_users_is_org_scoped_and_never_carries_the_hash():
+    conn = _db()
+    other = store.create_org(conn, "other")
+    _user(conn, "a@shop.test")
+    _user(conn, "b@other.test", org_id=other)
+    mine = store.list_users(conn, org_id=store.DEFAULT_ORG)
+    assert [u["email"] for u in mine] == ["a@shop.test"]
+    assert "password_hash" not in mine[0]
+    assert len(store.list_users(conn)) == 2               # root sees every org
+    assert store.list_users(conn, org_id=other)[0]["email"] == "b@other.test"
+
+
+def test_the_seeded_legacy_user_has_no_password_and_cannot_be_found_by_email():
+    conn = _db()
+    row = conn.execute("SELECT email, password_hash FROM users WHERE id=?",
+                       (store.DEFAULT_USER,)).fetchone()
+    assert row["email"] is None and row["password_hash"] is None
+    assert store.get_user_by_email(conn, "") is None
+
+
+def test_a_session_authenticates_until_it_expires():
+    conn = _db()
+    uid = _user(conn)
+    token = auth.new_session_token()
+    now = time.time()
+    expires = store.create_session(conn, uid, token, ttl_s=3600, now=now)
+    assert expires == pytest.approx(now + 3600)
+    sess = store.authenticate_session(conn, token, now=now + 60)
+    assert sess["user_id"] == uid and sess["org_id"] == store.DEFAULT_ORG
+    assert sess["email"] == "ops@shop.test"
+    assert store.authenticate_session(conn, token, now=now + 3601) is None   # expired
+    assert store.authenticate_session(conn, "sess_nope", now=now) is None
+
+
+def test_logout_drops_the_session_row():
+    conn = _db()
+    token = auth.new_session_token()
+    store.create_session(conn, _user(conn), token, ttl_s=3600)
+    assert store.delete_session(conn, token) is True
+    assert store.authenticate_session(conn, token) is None
+    assert store.delete_session(conn, token) is False
+
+
+def test_changing_a_password_invalidates_that_users_sessions_only():
+    conn = _db()
+    mine, theirs = _user(conn, "a@shop.test"), _user(conn, "b@shop.test")
+    t_mine, t_theirs = auth.new_session_token(), auth.new_session_token()
+    store.create_session(conn, mine, t_mine, ttl_s=3600)
+    store.create_session(conn, theirs, t_theirs, ttl_s=3600)
+    assert store.set_user_password(conn, mine, auth.hash_password("new password!")) is True
+    assert store.authenticate_session(conn, t_mine) is None
+    assert store.authenticate_session(conn, t_theirs) is not None
+    assert auth.verify_password("new password!", store.get_user_by_email(
+        conn, "a@shop.test")["password_hash"])
+    assert store.set_user_password(conn, 4242, auth.hash_password("whatever!")) is False
+
+
+def test_the_reaper_purges_only_expired_sessions():
+    conn = _db()
+    uid = _user(conn)
+    old, live = auth.new_session_token(), auth.new_session_token()
+    now = time.time()
+    store.create_session(conn, uid, old, ttl_s=10, now=now)
+    store.create_session(conn, uid, live, ttl_s=3600, now=now)
+    assert store.purge_expired_sessions(conn, now=now + 60) == 1
+    assert store.authenticate_session(conn, live, now=now + 60) is not None
+
+
+def test_users_and_sessions_are_added_to_a_pre_accounts_database():
+    # A v2.2 deployment's DB: users without the account columns, no sessions table at all.
+    fd, path = tempfile.mkstemp(suffix=".db")
+    os.close(fd)
+    conn = store.connect(path)
+    conn.executescript(
+        "CREATE TABLE orgs(id INTEGER PRIMARY KEY, name TEXT NOT NULL, created_at REAL NOT NULL);"
+        "CREATE TABLE users(id INTEGER PRIMARY KEY, org_id INTEGER NOT NULL, name TEXT NOT NULL,"
+        " created_at REAL NOT NULL);"
+        "INSERT INTO orgs(id,name,created_at) VALUES(1,'default',0);"
+        "INSERT INTO users(id,org_id,name,created_at) VALUES(1,1,'default',0);")
+    conn.commit()
+    store.init_db(conn)
+    uid = _user(conn)
+    token = auth.new_session_token()
+    store.create_session(conn, uid, token, ttl_s=3600)
+    assert store.authenticate_session(conn, token)["user_id"] == uid
+
+
+def test_revoking_a_key_is_org_scoped():
+    conn = _db()
+    other = store.create_org(conn, "other")
+    mine = store.add_api_key(conn, "mine", "k1")
+    theirs = store.add_api_key(conn, "theirs", "k2", org_id=other)
+    assert store.revoke_api_key(conn, theirs, org_id=store.DEFAULT_ORG) is False   # not mine
+    assert store.authenticate_client(conn, "k2") is not None                       # still valid
+    assert store.revoke_api_key(conn, mine, org_id=store.DEFAULT_ORG) is True
+    assert store.authenticate_client(conn, "k1") is None
+    assert store.revoke_api_key(conn, theirs) is True                              # root: no filter

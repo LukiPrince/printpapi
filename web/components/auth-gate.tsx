@@ -2,7 +2,14 @@
 
 import { createContext, useCallback, useContext, useEffect, useSyncExternalStore } from "react";
 import { AnimatePresence, motion } from "motion/react";
-import { UNAUTHORIZED_EVENT, clearToken, getToken, setToken, subscribeToken } from "@/lib/api";
+import {
+  UNAUTHORIZED_EVENT,
+  clearToken,
+  getToken,
+  logout,
+  setToken,
+  subscribeToken,
+} from "@/lib/api";
 import { LoginScreen } from "@/components/login-screen";
 import { AppShell } from "@/components/app-shell";
 import { Logo } from "@/components/brand";
@@ -17,7 +24,12 @@ const NOT_HYDRATED = () => undefined;
 export function AuthGate({ children }: { children: React.ReactNode }) {
   const token = useSyncExternalStore(subscribeToken, getToken, NOT_HYDRATED);
 
-  const signOut = useCallback(() => clearToken(), []);
+  // Drop the server-side session too, so signing out on a shared machine really ends it.
+  // Fire-and-forget: the local token goes either way.
+  const signOut = useCallback(() => {
+    void logout();
+    clearToken();
+  }, []);
   const signIn = useCallback((value: string) => setToken(value), []);
 
   useEffect(() => {

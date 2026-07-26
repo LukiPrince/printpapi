@@ -27,6 +27,8 @@ v1 is deliberately small (see [CONTRIBUTING.md](../CONTRIBUTING.md) for the YAGN
   HTTP Basic auth. See [printnode-compat.md](printnode-compat.md).
 - ~~**File backend**~~ ✅ a `file://` printer target writes the job to a directory instead of
   printing it. See [agent.md](agent.md#file-output-virtual-print-server).
+- ~~**Org accounts**~~ ✅ e-mail/password login, session tokens, org-scoped key and user
+  self-management. See [api.md](api.md#accounts-and-login).
 
 ## v2 candidates
 
@@ -56,8 +58,10 @@ order of pull:
    templated document (logo, layout), carrier label pass-through as a first-class option, and
    the hosted SaaS this unblocks.
 6. ~~**Multi-tenancy / child accounts**~~ ✅ **shipped** — org-scoped keys, printers and jobs, with
-   `POST/GET /orgs`. Still open on top of it: billing, quotas, per-org dashboard users/login,
-   org-scoped key self-management, org deletion.
+   `POST/GET /orgs`; and since then **org accounts**: e-mail/password users per org, `POST /login`
+   with expiring session tokens, org-scoped key and user self-management, and a dashboard sign-in
+   that no longer needs the root token. See [Accounts and login](api.md#accounts-and-login).
+   Still open on top of it: billing, quotas, self-signup, password reset, org deletion.
 7. ~~**PrintNode API compatibility layer**~~ ✅ **shipped** — `/whoami`, `/computers`, `/printers`,
    `POST|GET|DELETE /printjobs` and `/printjobs/{set}/states` in their JSON shapes, selected by auth
    scheme (HTTP Basic → compat, `Bearer` → ours), so a client with a configurable base URL needs one

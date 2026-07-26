@@ -14,7 +14,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlparse
 
-from app import printnode, store
+from app import auth, printnode, store
 from app.dispatch import (decode_payload, agent_mode, parse_copies, parse_callback_url,
                           parse_options, parse_expire_after, parse_idempotency_key,
                           DispatchError, FetchError, _http_get, _http_post)
@@ -28,6 +28,11 @@ _AGENT_PAYLOAD = re.compile(r"^/agent/jobs/(\d+)/payload$")
 _AGENT_RESULT = re.compile(r"^/agent/jobs/(\d+)/result$")
 _APIKEY_ID = re.compile(r"^/apikeys/(\d+)$")
 _ORG_ID = re.compile(r"^/orgs/(\d+)$")
+_ORG_USERS = re.compile(r"^/orgs/(\d+)/users$")
+
+# Compared against when no user matches the e-mail, so a wrong address and a wrong password cost
+# the same ~50 ms — the login answer alone must not reveal which accounts exist.
+_DUMMY_HASH = auth.hash_password("no such user, no such password")
 # PrintNode-compat paths: a collection addressed by id set ("5", "5,7", "5-9"), optionally with a
 # sub-resource. Only reachable with HTTP Basic auth — see _printnode_get.
 _PN_SET = re.compile(r"^/(computers|printers|printjobs)/([\d,\- ]+)(/printers|/states)?$")
@@ -99,8 +104,10 @@ def _prometheus(m):
 
 
 def make_handler(*, conn, token, agent_auth=store.authenticate_agent, fetch_url=None,
-                 long_poll_timeout=25.0, poll_interval=1.0, online_window_s=60):
+                 long_poll_timeout=25.0, poll_interval=1.0, online_window_s=60,
+                 session_ttl_s=auth.SESSION_TTL_S, max_login_fails=10, login_window_s=900):
     fetch = fetch_url or _http_get
+    limiter = auth.LoginLimiter(max_fails=max_login_fails, window_s=login_window_s)
 
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, fmt, *args):
@@ -124,18 +131,83 @@ def make_handler(*, conn, token, agent_auth=store.authenticate_agent, fetch_url=
             # credential that spans orgs.
             return hmac.compare_digest(self._presented_key(), token)
 
-        def _client_org(self):
-            """Resolve the presented key to the org this request may act in.
+        def _principal(self):
+            """Who is calling, resolved from the one Bearer header. None = no valid credential.
 
-            (True, None)  root — the bootstrap token: no org filter, sees and acts on every org.
-            (True, <id>)  an issued client key: confined to that org, foreign ids read as 404.
-            (False, None) no valid key.
+            kind='root'     the bootstrap token: no org filter, may act in and manage every org.
+            kind='session'  a browser login (POST /login): one org, and may manage it — keys,
+                            users, org settings.
+            kind='key'      a machine credential: one org, print and read only. A leaked
+                            integration key must not be able to issue itself a successor.
+
+            Which table the credential resolves in *is* the permission — no role column.
             """
             key = self._presented_key()
-            if hmac.compare_digest(key, token):     # bootstrap token is always a valid client too
-                return True, None
-            row = store.authenticate_client(conn, key)   # or any active per-client key
-            return (True, row["org_id"]) if row else (False, None)
+            if hmac.compare_digest(key, token):
+                return {"kind": "root", "org_id": None, "user_id": None, "manage": True}
+            if key.startswith("sess_"):             # never looked up as a machine key
+                s = store.authenticate_session(conn, key)
+                return None if s is None else {
+                    "kind": "session", "org_id": s["org_id"], "user_id": s["user_id"],
+                    "email": s["email"], "manage": True}
+            row = store.authenticate_client(conn, key)
+            return None if row is None else {
+                "kind": "key", "org_id": row["org_id"], "user_id": None, "manage": False}
+
+        def _client_org(self):
+            """The print/read gate: (ok, org_id) — org_id None means root, no filter."""
+            p = self._principal()
+            return (True, p["org_id"]) if p else (False, None)
+
+        def _manager(self):
+            """The gate for key/user/org administration: root or a browser session, never a
+            machine key. Answers 401 itself and returns None if the caller may not manage."""
+            p = self._principal()
+            if p is None or not p["manage"]:
+                self._json(401, {"error": "unauthorized"})
+                return None
+            return p
+
+        def _foreign_org(self, p, org_id):
+            """True if this principal may not touch `org_id` (root may touch every one)."""
+            return p["org_id"] is not None and org_id != p["org_id"]
+
+        def _create_user(self, org_id, body):
+            email = (body.get("email") or "").strip().lower()
+            if "@" not in email:
+                return self._json(400, {"error": "email required"})
+            try:
+                pw_hash = auth.hash_password(body.get("password"))
+            except ValueError as e:
+                return self._json(400, {"error": str(e)})
+            try:
+                uid = store.create_user(conn, org_id, email, pw_hash)
+            except sqlite3.IntegrityError:
+                return self._json(409, {"error": "email already registered"})
+            return self._json(200, {"id": uid, "email": email, "org_id": org_id})
+
+        def _login(self):
+            try:
+                body = self._read_json()
+            except ValueError:
+                return self._json(400, {"error": "bad json"})
+            email = (body.get("email") or "").strip().lower()
+            if not limiter.allow(email):
+                return self._json(429, {"error": "too many failed logins, try again later"})
+            user = store.get_user_by_email(conn, email)
+            # Verify even when there is no such user (against a dummy hash): same work, same
+            # timing, and one shared "invalid credentials" answer for both cases.
+            ok = auth.verify_password(body.get("password"),
+                                      user["password_hash"] if user else _DUMMY_HASH)
+            if user is None or not ok:
+                limiter.fail(email)
+                return self._json(401, {"error": "invalid credentials"})
+            limiter.succeed(email)
+            tok = auth.new_session_token()
+            expires_at = store.create_session(conn, user["id"], tok, session_ttl_s)
+            return self._json(200, {"token": tok, "expires_at": expires_at,
+                                    "org_id": user["org_id"], "user_id": user["id"],
+                                    "email": user["email"]})
 
         def _read_body(self):
             length = int(self.headers.get("Content-Length", 0))   # ValueError -> caller's 400
@@ -150,7 +222,7 @@ def make_handler(*, conn, token, agent_auth=store.authenticate_agent, fetch_url=
             key = self._presented_key()
             return agent_auth(conn, key) if key else None
 
-        def _submit_job(self, body, org):
+        def _submit_job(self, body, org, user_id=None):
             """The POST /jobs core: validate, fetch the payload, enqueue. Returns the job id and
             raises DispatchError / FetchError / store.UnknownPrinter for the caller to map — the
             PrintNode compat layer submits through here too, so there is one validation path."""
@@ -164,11 +236,12 @@ def make_handler(*, conn, token, agent_auth=store.authenticate_agent, fetch_url=
             expire_after = parse_expire_after(body)
             data = decode_payload(body, fetch_url=fetch)
             return store.enqueue_job(conn, body.get("printer_id"), body.get("type"), mode, data,
+                                     user_id=user_id or store.DEFAULT_USER,
                                      title=body.get("title"), copies=copies,
                                      callback_url=callback_url, options=options, org_id=org,
                                      idempotency_key=idem, expire_after=expire_after)
 
-        def _enqueue_order(self, payload, fmt, opts, org, *, idem=None, shop=None):
+        def _enqueue_order(self, payload, fmt, opts, org, *, idem=None, shop=None, user_id=None):
             """Render a store order as a packing slip and queue it as a pdf job. `opts` carries the
             same job knobs POST /jobs takes (printer_id, copies, title, expire_after, …)."""
             try:
@@ -190,6 +263,7 @@ def make_handler(*, conn, token, agent_auth=store.authenticate_agent, fetch_url=
                                                  "PDF-capable printer"})
             jid = store.enqueue_job(conn, printer["id"], "order", "pdf",
                                     render_packing_slip(order),
+                                    user_id=user_id or store.DEFAULT_USER,
                                     title=opts.get("title") or f"Packing slip {order['number']}",
                                     copies=copies, callback_url=callback_url, org_id=org,
                                     idempotency_key=idem, expire_after=expire_after)
@@ -435,10 +509,21 @@ def make_handler(*, conn, token, agent_auth=store.authenticate_agent, fetch_url=
                     return self._json(401, {"error": "unauthorized"})
                 return self._json(200,
                                   {"computers": store.list_agents(conn, online_window_s, org_id=org)})
-            if self.path == "/apikeys":
-                if not self._admin_ok():
+            if self.path == "/me":
+                p = self._principal()
+                if p is None:
                     return self._json(401, {"error": "unauthorized"})
-                return self._json(200, {"keys": store.list_api_keys(conn)})
+                me = {"kind": p["kind"], "org_id": p["org_id"]}
+                if p["kind"] == "session":
+                    me.update(email=p["email"], user_id=p["user_id"])
+                return self._json(200, me)
+            if self.path == "/apikeys":
+                p = self._manager()
+                return p and self._json(200, {"keys": store.list_api_keys(conn,
+                                                                          org_id=p["org_id"])})
+            if self.path == "/users":
+                p = self._manager()
+                return p and self._json(200, {"users": store.list_users(conn, org_id=p["org_id"])})
             if self.path == "/orgs":
                 if not self._admin_ok():
                     return self._json(401, {"error": "unauthorized"})
@@ -481,40 +566,76 @@ def make_handler(*, conn, token, agent_auth=store.authenticate_agent, fetch_url=
             if self._is_basic() and self._printnode_post():
                 return
             if self.path == "/jobs":
-                ok, org = self._client_org()
-                if not ok:
+                p = self._principal()
+                if p is None:
                     return self._json(401, {"error": "unauthorized"})
+                org = p["org_id"]
                 try:
                     body = self._read_json()
                 except ValueError:
                     return self._json(400, {"error": "bad json"})
                 try:
-                    jid = self._submit_job(body, org)
+                    jid = self._submit_job(body, org, user_id=p["user_id"])
                 except FetchError as e:
                     return self._json(502, {"error": f"downstream: {e}"})
                 except (DispatchError, store.UnknownPrinter) as e:
                     return self._json(400, {"error": str(e)})
                 return self._json(200, {"job_id": jid})
             if self.path == "/orders":
-                ok, org = self._client_org()
-                if not ok:
+                p = self._principal()
+                if p is None:
                     return self._json(401, {"error": "unauthorized"})
                 try:
                     body = self._read_json()
                 except ValueError:
                     return self._json(400, {"error": "bad json"})
-                return self._enqueue_order(body.get("order"), body.get("format"), body, org)
+                return self._enqueue_order(body.get("order"), body.get("format"), body,
+                                           p["org_id"], user_id=p["user_id"])
             if self.path.split("?", 1)[0] == "/integrations/shopify/orders":
                 return self._shopify_webhook()
-            if self.path == "/apikeys":
-                if not self._admin_ok():
+            if self.path == "/login":
+                return self._login()
+            if self.path == "/logout":
+                p = self._principal()
+                if p is None or p["kind"] != "session":
                     return self._json(401, {"error": "unauthorized"})
+                store.delete_session(conn, self._presented_key())
+                return self._json(200, {"ok": True})
+            if self.path == "/users":
+                p = self._manager()
+                if p is None:
+                    return
+                if p["org_id"] is None:      # root belongs to no org — it must name one
+                    return self._json(400, {"error": "root has no org; use POST /orgs/{id}/users"})
+                try:
+                    body = self._read_json()
+                except ValueError:
+                    return self._json(400, {"error": "bad json"})
+                return self._create_user(p["org_id"], body)
+            mu = _ORG_USERS.match(self.path)
+            if mu:
+                if not self._admin_ok():     # seeding an org's first user is root's job
+                    return self._json(401, {"error": "unauthorized"})
+                try:
+                    body = self._read_json()
+                except ValueError:
+                    return self._json(400, {"error": "bad json"})
+                oid = int(mu.group(1))
+                if not store.org_exists(conn, oid):
+                    return self._json(404, {"error": "not found"})
+                return self._create_user(oid, body)
+            if self.path == "/apikeys":
+                p = self._manager()
+                if p is None:
+                    return
                 try:
                     body = self._read_json()
                 except ValueError:
                     return self._json(400, {"error": "bad json"})
                 label = (body.get("label") or "client").strip() or "client"
-                org_id = body.get("org_id") or store.DEFAULT_ORG
+                org_id = body.get("org_id") or p["org_id"] or store.DEFAULT_ORG
+                if self._foreign_org(p, org_id):
+                    return self._json(400, {"error": "org_id not allowed"})
                 if not store.org_exists(conn, org_id):
                     return self._json(400, {"error": "unknown org"})
                 key = secrets.token_urlsafe(32)
@@ -573,15 +694,37 @@ def make_handler(*, conn, token, agent_auth=store.authenticate_agent, fetch_url=
             self._json(404, {"error": "not found"})
 
         def do_PUT(self):
-            mo = _ORG_ID.match(self.path)
-            if mo:
-                if not self._admin_ok():
+            if self.path == "/me/password":
+                p = self._principal()
+                if p is None or p["kind"] != "session":
                     return self._json(401, {"error": "unauthorized"})
                 try:
                     body = self._read_json()
                 except ValueError:
                     return self._json(400, {"error": "bad json"})
+                user = store.get_user_by_email(conn, p["email"])
+                if not auth.verify_password(body.get("current"), user["password_hash"]):
+                    return self._json(401, {"error": "current password does not match"})
+                try:
+                    pw_hash = auth.hash_password(body.get("new"))
+                except ValueError as e:
+                    return self._json(400, {"error": str(e)})
+                # Drops every session of this user, including the one making the call — a stolen
+                # session dies with the password it was minted from.
+                store.set_user_password(conn, p["user_id"], pw_hash)
+                return self._json(200, {"ok": True})
+            mo = _ORG_ID.match(self.path)
+            if mo:
+                p = self._manager()
+                if p is None:
+                    return
+                try:
+                    body = self._read_json()
+                except ValueError:
+                    return self._json(400, {"error": "bad json"})
                 oid, applied = int(mo.group(1)), {}
+                if self._foreign_org(p, oid):
+                    return self._json(404, {"error": "not found"})
                 if "event_url" in body:
                     try:
                         # Same http(s) check as a job's callback_url; null/"" clears the URL.
@@ -611,9 +754,10 @@ def make_handler(*, conn, token, agent_auth=store.authenticate_agent, fetch_url=
                 return
             m = _APIKEY_ID.match(self.path)
             if m:
-                if not self._admin_ok():
-                    return self._json(401, {"error": "unauthorized"})
-                ok = store.revoke_api_key(conn, int(m.group(1)))
+                p = self._manager()
+                if p is None:
+                    return
+                ok = store.revoke_api_key(conn, int(m.group(1)), org_id=p["org_id"])
                 return self._json(200, {"ok": True}) if ok else self._json(404, {"error": "not found"})
             mj = _JOB_ID.match(self.path)
             if mj:
@@ -694,6 +838,7 @@ def start_reaper(conn, *, timeout_s=300, max_retries=2, interval_s=30):
             try:
                 store.expire_jobs(conn)
                 store.requeue_stale(conn, timeout_s, max_retries)
+                store.purge_expired_sessions(conn)
             except Exception as e:
                 print(f"reaper error: {e}", file=sys.stderr)
             time.sleep(interval_s)
@@ -704,6 +849,10 @@ def start_reaper(conn, *, timeout_s=300, max_retries=2, interval_s=30):
 
 def main():
     token = os.environ["PRINTAPI_TOKEN"]
+    if not token.strip():
+        # An empty bootstrap token would compare_digest-equal every missing Authorization header,
+        # making the whole API root-writable.
+        raise SystemExit("PRINTAPI_TOKEN must not be empty")
     db_path = os.environ.get("PRINT_DB", "printpapi.db")
     port = int(os.environ.get("PRINT_PORT", "3460"))
     conn = store.connect(db_path)
