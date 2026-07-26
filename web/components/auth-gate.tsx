@@ -50,10 +50,15 @@ export function AuthGate({ children }: { children: React.ReactNode }) {
     );
   }
 
+  // A reset mail links to /?reset=<token>. Show the reset form even in a browser that is still
+  // signed in as somebody, or clicking the link would just open the dashboard. Safe to read
+  // window here: past the splash above, hydration has happened.
+  const resetting = new URLSearchParams(window.location.search).has("reset");
+
   return (
     <AuthContext.Provider value={{ signOut }}>
       <AnimatePresence mode="wait" initial={false}>
-        {token ? (
+        {token && !resetting ? (
           <motion.div
             key="app"
             initial={{ opacity: 0 }}

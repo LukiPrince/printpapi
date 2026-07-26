@@ -634,3 +634,127 @@ def test_revoking_a_key_is_org_scoped():
     assert store.revoke_api_key(conn, mine, org_id=store.DEFAULT_ORG) is True
     assert store.authenticate_client(conn, "k1") is None
     assert store.revoke_api_key(conn, theirs) is True                              # root: no filter
+
+
+# --- self-signup, user removal, password resets, quotas ---------------------------------------
+
+
+def test_signup_creates_an_org_and_its_first_user_in_one_transaction():
+    conn = _db()
+    r = store.signup(conn, "Shop GmbH", "Owner@Shop.test", auth.hash_password("hunter2hunter2"))
+    assert r["org_id"] != store.DEFAULT_ORG and r["user_id"] != store.DEFAULT_USER
+    assert store.get_org(conn, r["org_id"])["name"] == "Shop GmbH"
+    user = store.get_user_by_email(conn, "owner@shop.test")
+    assert user["org_id"] == r["org_id"] and user["id"] == r["user_id"]
+
+
+def test_signup_with_a_taken_email_leaves_no_orphan_org():
+    conn = _db()
+    store.signup(conn, "First", "owner@shop.test", auth.hash_password("hunter2hunter2"))
+    before = len(store.list_orgs(conn))
+    with pytest.raises(sqlite3.IntegrityError):
+        store.signup(conn, "Second", "Owner@shop.TEST", auth.hash_password("hunter2hunter2"))
+    assert len(store.list_orgs(conn)) == before      # the org went back with the failed user
+
+
+def test_delete_user_is_org_scoped_and_drops_that_users_sessions():
+    conn = _db()
+    other = store.create_org(conn, "other")
+    mine = _user(conn, "a@shop.test")
+    _user(conn, "b@shop.test")                       # so `mine` is not the last one
+    theirs = _user(conn, "c@other.test", org_id=other)
+    token = auth.new_session_token()
+    store.create_session(conn, mine, token, ttl_s=3600)
+    assert store.delete_user(conn, theirs, org_id=store.DEFAULT_ORG) == "not_found"
+    assert store.delete_user(conn, 999999, org_id=None) == "not_found"
+    assert store.delete_user(conn, mine, org_id=store.DEFAULT_ORG) == "deleted"
+    assert store.get_user_by_email(conn, "a@shop.test") is None
+    assert store.authenticate_session(conn, token) is None       # the session died with the user
+
+
+def test_an_org_cannot_delete_its_last_account():
+    conn = _db()
+    only = _user(conn, "solo@shop.test")
+    assert store.delete_user(conn, only, org_id=store.DEFAULT_ORG) == "last_user"
+    assert store.delete_user(conn, only) == "last_user"          # root cannot lock an org out either
+    assert store.get_user_by_email(conn, "solo@shop.test") is not None
+
+
+def test_a_password_reset_token_sets_the_password_once_and_kills_sessions():
+    conn = _db()
+    uid = _user(conn, "ops@shop.test")
+    session = auth.new_session_token()
+    store.create_session(conn, uid, session, ttl_s=3600)
+    token = auth.new_session_token()
+    store.create_password_reset(conn, uid, token, ttl_s=3600)
+    new_hash = auth.hash_password("brandnewpassword")
+    assert store.consume_password_reset(conn, token, new_hash) == uid
+    assert auth.verify_password("brandnewpassword", store.get_user_by_email(
+        conn, "ops@shop.test")["password_hash"])
+    assert store.authenticate_session(conn, session) is None     # sessions die with the reset
+    assert store.consume_password_reset(conn, token, new_hash) is None    # single use
+
+
+def test_an_expired_or_unknown_reset_token_does_nothing():
+    conn = _db()
+    uid = _user(conn, "ops@shop.test")
+    token = auth.new_session_token()
+    now = time.time()
+    store.create_password_reset(conn, uid, token, ttl_s=60, now=now)
+    kept = store.get_user_by_email(conn, "ops@shop.test")["password_hash"]
+    assert store.consume_password_reset(conn, token, auth.hash_password("x" * 12),
+                                        now=now + 61) is None
+    assert store.consume_password_reset(conn, "sess_nonesuch", auth.hash_password("x" * 12)) is None
+    assert store.get_user_by_email(conn, "ops@shop.test")["password_hash"] == kept
+    assert store.purge_expired_resets(conn, now=now + 61) == 1
+
+
+def test_a_new_reset_request_supersedes_the_previous_token():
+    conn = _db()
+    uid = _user(conn, "ops@shop.test")
+    first, second = auth.new_session_token(), auth.new_session_token()
+    store.create_password_reset(conn, uid, first, ttl_s=3600)
+    store.create_password_reset(conn, uid, second, ttl_s=3600)
+    assert store.consume_password_reset(conn, first, auth.hash_password("x" * 12)) is None
+    assert store.consume_password_reset(conn, second, auth.hash_password("y" * 12)) == uid
+
+
+def test_a_job_quota_caps_an_orgs_prints_for_the_month():
+    conn = _db()
+    pid = store.register_agent(conn, "a", "k", [{"name": "Z"}])["printer_ids"]["Z"]
+    assert store.set_org_quota(conn, store.DEFAULT_ORG, 2) is True
+    store.enqueue_job(conn, pid, "raw_base64", "raw", b"a")
+    store.enqueue_job(conn, pid, "raw_base64", "raw", b"b")
+    with pytest.raises(store.QuotaExceeded):
+        store.enqueue_job(conn, pid, "raw_base64", "raw", b"c")
+    assert store.org_usage(conn, store.DEFAULT_ORG) == 2
+    assert store.get_org(conn, store.DEFAULT_ORG)["job_quota"] == 2
+    store.set_org_quota(conn, store.DEFAULT_ORG, None)           # None = unlimited again
+    assert store.enqueue_job(conn, pid, "raw_base64", "raw", b"d") > 0
+
+
+def test_quota_counts_only_this_month_and_only_this_org():
+    conn = _db()
+    other = store.create_org(conn, "other")
+    pid = store.register_agent(conn, "a", "k", [{"name": "Z"}])["printer_ids"]["Z"]
+    opid = store.register_agent(conn, "b", "k2", [{"name": "Z"}],
+                                org_id=other)["printer_ids"]["Z"]
+    store.set_org_quota(conn, store.DEFAULT_ORG, 1)
+    store.enqueue_job(conn, pid, "raw_base64", "raw", b"a")
+    store.enqueue_job(conn, opid, "raw_base64", "raw", b"b")     # another org, own budget
+    store.enqueue_job(conn, opid, "raw_base64", "raw", b"c")
+    with pytest.raises(store.QuotaExceeded):
+        store.enqueue_job(conn, pid, "raw_base64", "raw", b"d")
+    conn.execute("UPDATE jobs SET created_at=? WHERE printer_id=?",
+                 (store.month_start() - 1, pid))                  # last month's job
+    conn.commit()
+    assert store.org_usage(conn, store.DEFAULT_ORG) == 0
+    assert store.enqueue_job(conn, pid, "raw_base64", "raw", b"e") > 0   # budget rolled over
+
+
+def test_an_idempotent_resubmit_does_not_spend_quota():
+    conn = _db()
+    pid = store.register_agent(conn, "a", "k", [{"name": "Z"}])["printer_ids"]["Z"]
+    store.set_org_quota(conn, store.DEFAULT_ORG, 1)
+    jid = store.enqueue_job(conn, pid, "raw_base64", "raw", b"a", idempotency_key="order-7")
+    assert store.enqueue_job(conn, pid, "raw_base64", "raw", b"a", idempotency_key="order-7") == jid

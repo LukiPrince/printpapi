@@ -1,4 +1,4 @@
-import { Download, Gauge, History, KeyRound, Printer, Send, Users } from "lucide-react";
+import { Download, Gauge, History, KeyRound, Printer, Send, SlidersHorizontal, Users } from "lucide-react";
 
 export type NavItem = {
   href: string;
@@ -50,6 +50,13 @@ export const NAV: NavItem[] = [
     eyebrow: "Accounts",
     icon: Users,
     help: "The people who can sign in to this org. They get their own e-mail and password instead of sharing the bootstrap token, and can manage the org's keys and people. Changing your own password signs out every browser.",
+  },
+  {
+    href: "/settings",
+    label: "Settings",
+    eyebrow: "This org",
+    icon: SlidersHorizontal,
+    help: "Your org's own settings: how many jobs it has printed this month against its quota, where agent online/offline events are POSTed, and the Shopify webhook secret. The quota is the operator's to set — the bootstrap token can change it, an account cannot.",
   },
   {
     href: "/downloads",

@@ -20,8 +20,10 @@ extracted, generalized OSS project.
 - `GET /` — **web dashboard**: a Next.js **static export** (source in `web/`, built bundle committed
   to `app/web`), served straight off disk by the stdlib server. Live overview (queue counters,
   outcome breakdown, activity feed), devices, searchable job history with cancel, API keys,
-  **Team** (org users + own password change), agent setup, light/dark, ⌘K palette. Sign-in takes
-  an account (e-mail + password) or a pasted token. Secret-free shell — it prompts for the token and calls the
+  **Team** (org users, add/remove, own password change), **Settings** (quota + usage, `event_url`,
+  Shopify secret), agent setup, light/dark, ⌘K palette. Sign-in takes an account (e-mail +
+  password) or a pasted token, and offers self-signup / "forgot password" where the server
+  reports them on `/health`. Secret-free shell — it prompts for the token and calls the
   JSON endpoints with it, so all data stays behind auth. Test print picks a PDF for PDF-capable
   printers, a ZPL label otherwise (gotcha #1). Static serving is confined to `app/web`
   (traversal 404s); `/_next/static/` is immutable-cached, HTML is `no-cache`.
@@ -67,6 +69,25 @@ extracted, generalized OSS project.
   for an org's first user. Passwords are stdlib `scrypt`, sessions expire after 30 days and are
   stored hashed, login is throttled per e-mail and does not enumerate accounts.
   See `docs/api.md#accounts-and-login`.
+- **Hosted-service plumbing** on top of the accounts — what a paid deployment needs and a private
+  box must not get by default:
+  - `POST /signup {email, password, org_name?}` — org + first user + session in one call. **Off
+    unless `PRINTAPI_SIGNUP=open`**; throttled by client address (an org sprayer picks a fresh
+    e-mail each time, so counting addresses bounds nothing).
+  - `POST /password/reset` / `/password/reset/confirm` — a one-shot, hour-long, hashed token,
+    superseded by the next request, mailed over SMTP (`app/mail.py`, stdlib `smtplib`). No
+    `SMTP_HOST` ⇒ the mail goes to stderr, so a self-host still works. The mail carries a **link
+    only if `PUBLIC_URL` is set** — deriving it from the `Host` header would let anyone mail a
+    valid token pointing at their own host.
+  - `DELETE /users/{id}` — never yourself, never an org's last account, foreign ids `404`.
+  - `GET /orgs/{id}` — one org's settings + `job_quota` + `jobs_this_month` (a session may read
+    its own; root any).
+  - **Quotas**: `orgs.job_quota` (NULL = unlimited) capped per UTC calendar month, enforced inside
+    `enqueue_job` so `POST /jobs`, `/orders`, the Shopify webhook and the PrintNode layer are all
+    covered by one guard; a spent quota is `402`, an idempotent resubmit spends nothing. **Root
+    sets it, a session cannot** — a tenant that could raise its own cap has no cap.
+  - `GET /health` reports `signup` and `password_reset` so the sign-in screen only offers doors
+    that exist. See `docs/api.md#self-signup`, `#password-reset`, `#quotas`.
 - Management endpoints — **per-client API keys** (root *or* a session, never a machine key):
   - `POST /apikeys {label}` → issues a new random key (shown once); `GET /apikeys` lists labels;
     `DELETE /apikeys/{id}` revokes. Keys are stored sha256-hashed; revoked keys stop authorizing.
@@ -105,7 +126,7 @@ extracted, generalized OSS project.
   (semicolon-separated — Windows printer names, or CUPS queue names on Linux).
 - Shipped in the homelab as a signed-Python install (see gotcha #2), autostart via Task Scheduler.
 
-**Tests:** 243, all green (`python -m pytest`). Real loopback HTTP servers (ThreadingHTTPServer),
+**Tests:** 269, all green (`python -m pytest`). Real loopback HTTP servers (ThreadingHTTPServer),
 real SQLite (:memory:), injected render fns / subprocess runners — no mocks, no real printers.
 
 **Model:** **poll** — agent opens a long-poll `GET /agent/jobs` to the server, receives jobs, prints,
@@ -164,8 +185,10 @@ Shopify webhook — `docs/ecommerce.md`), and the **PrintNode API compatibility 
 `app/printnode.py`, Basic-auth-selected — `docs/printnode-compat.md`), and the **file backend**
 (roadmap #8: a `file:///dir` printer target in the agent — `docs/agent.md#file-output-virtual-print-server`),
 and **org accounts** on top of multi-tenancy (e-mail/password login, session tokens, org-scoped
-key and user self-management — `app/auth.py`, `docs/api.md#accounts-and-login`).
-243 tests green.
+key and user self-management — `app/auth.py`, `docs/api.md#accounts-and-login`), and the
+**hosted-service plumbing** on top of those (self-signup, password reset by e-mail, user removal,
+org settings in the dashboard, monthly job quotas — `app/mail.py`, `docs/api.md#self-signup`).
+269 tests green.
 A demand-research sweep (July 2026) produced the ranked v2 roadmap in `docs/roadmap.md` — read it
 before inventing features. Roadmap #1–#8 are done. What is left on the ranked list: #9 Star
 CloudPRNT (the printer itself polls — no agent install), #10 scales (agent-side USB HID), #11
@@ -200,11 +223,14 @@ what actually authorizes the print.
 - **Org accounts are done on top of it** (see §2): per-org users with a password login, session
   tokens, and org-scoped key/user self-management. Still open: billing, quotas, self-signup,
   password reset by e-mail, org deletion; and an agent key doubling as its org's client key (see
-  the `# ponytail:` note in `server.py`'s `/agent/register`). Known ceilings of the accounts work:
-  the login throttle is per process and in memory (no IP dimension), the session token lives in
-  the browser's localStorage (XSS-readable — as the root token already was), the dashboard's Team
-  page covers users and the own-password change but not org settings (`event_url`/`shopify_secret`
-  stay API-only), and there is no endpoint to remove a user.
+  the `# ponytail:` note in `server.py`'s `/agent/register`). Since then **self-signup, password
+  reset, user removal, org settings in the dashboard and monthly job quotas have shipped** (§2) —
+  what is still open for a hosted offering is **billing** (a quota is enforced, nothing charges
+  for it), plans/tiers, and org deletion. Known ceilings: the login/signup/reset throttles are per
+  process and in memory (the signup one keys on the socket peer, so behind a reverse proxy every
+  signup shares one counter — rate-limit in the proxy there), the session token lives in the
+  browser's localStorage (XSS-readable — as the root token already was), quota usage is a `COUNT`
+  per submit, and a reset mail links only when `PUBLIC_URL` is set.
 
 **Roadmap #1 + #2 are done** (`docs/api.md#computers-agents`, `#submitting-a-job`):
 
@@ -223,8 +249,9 @@ what actually authorizes the print.
 
 **Strategic context for what comes next:** the repo owner wants a cheap hosted SaaS
 ("Shopify/WooCommerce order comes in → label/packing slip prints") undercutting the paid
-PrintNode-wrapper plugins. Org isolation was the technical blocker; the store app and document
-rendering (roadmap #5) are what's left before that's possible.
+PrintNode-wrapper plugins. Org isolation, document rendering (roadmap #5) and the account
+plumbing (signup, reset, quotas) are done — **billing is the last piece of product** before a
+paid deployment: a quota is enforced but nothing charges for exceeding or raising it.
 
 ## 6. Reference
 

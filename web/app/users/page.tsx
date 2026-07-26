@@ -2,9 +2,9 @@
 
 import { useCallback, useState } from "react";
 import { toast } from "sonner";
-import { KeyRound, Loader2, Lock, UserPlus, Users } from "lucide-react";
+import { KeyRound, Loader2, Lock, Trash2, UserPlus, Users } from "lucide-react";
 import { usePoll } from "@/hooks/use-poll";
-import { changePassword, createUser, getMe, listUsers } from "@/lib/api";
+import { changePassword, createUser, deleteUser, getMe, listUsers } from "@/lib/api";
 import { fmtTime } from "@/lib/format";
 import { useAuth } from "@/components/auth-gate";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
@@ -20,6 +20,17 @@ import {
   TableHeader,
   TableRow,
 } from "@/components/ui/table";
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+  AlertDialogTrigger,
+} from "@/components/ui/alert-dialog";
 import { EmptyState, FieldLabel } from "@/components/bits";
 
 const message = (err: unknown) => (err instanceof Error ? err.message : String(err));
@@ -60,6 +71,16 @@ export default function UsersPage() {
       toast.error("Could not add that person", { description: message(err) });
     } finally {
       setBusy(false);
+    }
+  }
+
+  async function remove(id: number, who: string) {
+    try {
+      await deleteUser(id);
+      toast.success(`Removed ${who}`);
+      refresh();
+    } catch (err) {
+      toast.error("Could not remove that person", { description: message(err) });
     }
   }
 
@@ -147,6 +168,7 @@ export default function UsersPage() {
                   <TableHead>E-mail</TableHead>
                   {me?.kind === "root" && <TableHead>Org</TableHead>}
                   <TableHead className="text-right">Added</TableHead>
+                  <TableHead className="w-0" />
                 </TableRow>
               </TableHeader>
               <TableBody>
@@ -165,6 +187,36 @@ export default function UsersPage() {
                     )}
                     <TableCell className="text-right text-muted-foreground">
                       {fmtTime(u.created_at)}
+                    </TableCell>
+                    <TableCell className="text-right">
+                      {/* Not for yourself: the server refuses it, and someone has to stay in. */}
+                      {me?.user_id === u.id ? (
+                        <span className="text-xs text-muted-foreground">—</span>
+                      ) : (
+                        <AlertDialog>
+                          <AlertDialogTrigger asChild>
+                            <Button variant="ghost" size="icon" aria-label={`Remove ${u.email}`}>
+                              <Trash2 />
+                            </Button>
+                          </AlertDialogTrigger>
+                          <AlertDialogContent>
+                            <AlertDialogHeader>
+                              <AlertDialogTitle>Remove {u.email}?</AlertDialogTitle>
+                              <AlertDialogDescription>
+                                They lose access at once and every browser they are signed in on
+                                is signed out. Their past jobs stay in the history. API keys are
+                                not affected — revoke those separately.
+                              </AlertDialogDescription>
+                            </AlertDialogHeader>
+                            <AlertDialogFooter>
+                              <AlertDialogCancel>Keep them</AlertDialogCancel>
+                              <AlertDialogAction onClick={() => remove(u.id, u.email)}>
+                                Remove
+                              </AlertDialogAction>
+                            </AlertDialogFooter>
+                          </AlertDialogContent>
+                        </AlertDialog>
+                      )}
                     </TableCell>
                   </TableRow>
                 ))}

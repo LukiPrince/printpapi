@@ -29,6 +29,9 @@ v1 is deliberately small (see [CONTRIBUTING.md](../CONTRIBUTING.md) for the YAGN
   printing it. See [agent.md](agent.md#file-output-virtual-print-server).
 - ~~**Org accounts**~~ ✅ e-mail/password login, session tokens, org-scoped key and user
   self-management. See [api.md](api.md#accounts-and-login).
+- ~~**Hosted-service plumbing**~~ ✅ opt-in self-signup, password reset by e-mail (SMTP, stderr
+  fallback), account removal, a Settings page for the org's own knobs, and per-org monthly job
+  quotas answering `402`. See [api.md](api.md#self-signup).
 
 ## v2 candidates
 
@@ -61,7 +64,10 @@ order of pull:
    `POST/GET /orgs`; and since then **org accounts**: e-mail/password users per org, `POST /login`
    with expiring session tokens, org-scoped key and user self-management, and a dashboard sign-in
    that no longer needs the root token. See [Accounts and login](api.md#accounts-and-login).
-   Still open on top of it: billing, quotas, self-signup, password reset, org deletion.
+   And since then the plumbing a paid deployment needs: opt-in
+   [self-signup](api.md#self-signup), [password reset](api.md#password-reset) by e-mail, account
+   removal, an org Settings page, and monthly [job quotas](api.md#quotas). Still open on top of
+   it: **billing** (the quota is enforced, nothing charges for it), plans/tiers, org deletion.
 7. ~~**PrintNode API compatibility layer**~~ ✅ **shipped** — `/whoami`, `/computers`, `/printers`,
    `POST|GET|DELETE /printjobs` and `/printjobs/{set}/states` in their JSON shapes, selected by auth
    scheme (HTTP Basic → compat, `Bearer` → ours), so a client with a configurable base URL needs one

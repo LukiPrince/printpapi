@@ -14,7 +14,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlparse
 
-from app import auth, printnode, store
+from app import auth, mail, printnode, store
 from app.dispatch import (decode_payload, agent_mode, parse_copies, parse_callback_url,
                           parse_options, parse_expire_after, parse_idempotency_key,
                           DispatchError, FetchError, _http_get, _http_post)
@@ -29,6 +29,7 @@ _AGENT_RESULT = re.compile(r"^/agent/jobs/(\d+)/result$")
 _APIKEY_ID = re.compile(r"^/apikeys/(\d+)$")
 _ORG_ID = re.compile(r"^/orgs/(\d+)$")
 _ORG_USERS = re.compile(r"^/orgs/(\d+)/users$")
+_USER_ID = re.compile(r"^/users/(\d+)$")
 
 # Compared against when no user matches the e-mail, so a wrong address and a wrong password cost
 # the same ~50 ms — the login answer alone must not reveal which accounts exist.
@@ -105,9 +106,17 @@ def _prometheus(m):
 
 def make_handler(*, conn, token, agent_auth=store.authenticate_agent, fetch_url=None,
                  long_poll_timeout=25.0, poll_interval=1.0, online_window_s=60,
-                 session_ttl_s=auth.SESSION_TTL_S, max_login_fails=10, login_window_s=900):
+                 session_ttl_s=auth.SESSION_TTL_S, max_login_fails=10, login_window_s=900,
+                 signup="closed", send_mail=None, public_url=None, reset_ttl_s=3600,
+                 reset_enabled=None):
     fetch = fetch_url or _http_get
     limiter = auth.LoginLimiter(max_fails=max_login_fails, window_s=login_window_s)
+    # Signup is off unless the operator turns it on: a self-hosted box on the open internet must
+    # not hand an org to whoever finds it. Only the hosted deployment sets PRINTAPI_SIGNUP=open.
+    signup_open = signup == "open"
+    send_mail = send_mail or mail.send
+    reset_enabled = mail.configured() if reset_enabled is None else bool(reset_enabled)
+    public_url = (public_url or "").rstrip("/")
 
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, fmt, *args):
@@ -209,6 +218,84 @@ def make_handler(*, conn, token, agent_auth=store.authenticate_agent, fetch_url=
                                     "org_id": user["org_id"], "user_id": user["id"],
                                     "email": user["email"]})
 
+        def _signup(self):
+            """Self-serve: a new org, its first user, and a session in one call — the hosted
+            deployment's front door. Off by default (see signup_open)."""
+            if not signup_open:
+                return self._json(403, {"error": "signup is disabled on this server"})
+            try:
+                body = self._read_json()
+            except ValueError:
+                return self._json(400, {"error": "bad json"})
+            # Throttled by client address, not by e-mail: an org sprayer picks a fresh address
+            # every time, so counting addresses would bound nothing.
+            # ponytail: the address is the socket peer — behind a reverse proxy every signup shares
+            # one key. Read X-Forwarded-For (and pin the trusted proxy) if that becomes the setup.
+            slot = f"signup:{self.client_address[0]}"
+            if not limiter.allow(slot):
+                return self._json(429, {"error": "too many signups, try again later"})
+            email = (body.get("email") or "").strip().lower()
+            if "@" not in email:
+                return self._json(400, {"error": "email required"})
+            try:
+                pw_hash = auth.hash_password(body.get("password"))
+            except ValueError as e:
+                return self._json(400, {"error": str(e)})
+            name = (body.get("org_name") or "").strip() or email.split("@", 1)[1]
+            limiter.fail(slot)          # a *successful* signup spends a slot too — that is the cap
+            try:
+                new = store.signup(conn, name, email, pw_hash)
+            except sqlite3.IntegrityError:
+                return self._json(409, {"error": "email already registered"})
+            tok = auth.new_session_token()
+            expires_at = store.create_session(conn, new["user_id"], tok, session_ttl_s)
+            return self._json(200, {"token": tok, "expires_at": expires_at,
+                                    "org_id": new["org_id"], "user_id": new["user_id"],
+                                    "email": email})
+
+        def _password_reset(self):
+            """Always 200, whether or not the address exists — the answer must not enumerate
+            accounts. A mail goes out only for a real one."""
+            try:
+                body = self._read_json()
+            except ValueError:
+                return self._json(400, {"error": "bad json"})
+            email = (body.get("email") or "").strip().lower()
+            slot = f"reset:{email}"
+            if not limiter.allow(slot):
+                return self._json(429, {"error": "too many reset requests, try again later"})
+            limiter.fail(slot)          # counted for every address, so a 429 leaks nothing either
+            user = store.get_user_by_email(conn, email)
+            if user is not None:
+                tok = auth.new_session_token()
+                store.create_password_reset(conn, user["id"], tok, reset_ttl_s)
+                # The link is built from PUBLIC_URL only. Deriving it from the Host header would
+                # let anyone who can send this server a request mail a *valid* token pointing at
+                # their own host; without the env var the mail carries the bare token instead.
+                link = (f"\nOpen {public_url}/?reset={tok}\n" if public_url else "")
+                try:
+                    send_mail(email, "Reset your printpapi password",
+                              f"Someone asked to reset the printpapi password for {email}.\n"
+                              f"{link}\ntoken: {tok}\n\n"
+                              f"It is valid for {reset_ttl_s // 60} minutes and works once. "
+                              f"If this was not you, ignore this message.\n")
+                except Exception as e:      # a broken mail server must not answer differently
+                    print(f"password reset mail to {email} failed: {e}", file=sys.stderr)
+            return self._json(200, {"ok": True})
+
+        def _password_reset_confirm(self):
+            try:
+                body = self._read_json()
+            except ValueError:
+                return self._json(400, {"error": "bad json"})
+            try:
+                pw_hash = auth.hash_password(body.get("password"))
+            except ValueError as e:
+                return self._json(400, {"error": str(e)})
+            if store.consume_password_reset(conn, body.get("token"), pw_hash) is None:
+                return self._json(400, {"error": "invalid or expired token"})
+            return self._json(200, {"ok": True})
+
         def _read_body(self):
             length = int(self.headers.get("Content-Length", 0))   # ValueError -> caller's 400
             if length < 0 or length > _MAX_BODY:
@@ -261,12 +348,15 @@ def make_handler(*, conn, token, agent_auth=store.authenticate_agent, fetch_url=
                 # gotcha #1: a label printer form-feeds blanks on a PDF. Refuse before printing.
                 return self._json(400, {"error": "printer is raw-only; a packing slip needs a "
                                                  "PDF-capable printer"})
-            jid = store.enqueue_job(conn, printer["id"], "order", "pdf",
-                                    render_packing_slip(order),
-                                    user_id=user_id or store.DEFAULT_USER,
-                                    title=opts.get("title") or f"Packing slip {order['number']}",
-                                    copies=copies, callback_url=callback_url, org_id=org,
-                                    idempotency_key=idem, expire_after=expire_after)
+            try:
+                jid = store.enqueue_job(conn, printer["id"], "order", "pdf",
+                                        render_packing_slip(order),
+                                        user_id=user_id or store.DEFAULT_USER,
+                                        title=opts.get("title") or f"Packing slip {order['number']}",
+                                        copies=copies, callback_url=callback_url, org_id=org,
+                                        idempotency_key=idem, expire_after=expire_after)
+            except store.QuotaExceeded as e:
+                return self._json(402, {"error": str(e)})
             return self._json(200, {"job_id": jid})
 
         def _shopify_webhook(self):
@@ -397,6 +487,8 @@ def make_handler(*, conn, token, agent_auth=store.authenticate_agent, fetch_url=
                 jid = self._submit_job(printnode.job_body(body), org)
             except FetchError as e:
                 self._pn_error(502, "DownstreamError", str(e))
+            except store.QuotaExceeded as e:
+                self._pn_error(402, "QuotaExceeded", str(e))
             except (printnode.CompatError, DispatchError, store.UnknownPrinter) as e:
                 self._pn_error(400, "BadRequest", str(e))
             else:
@@ -473,7 +565,12 @@ def make_handler(*, conn, token, agent_auth=store.authenticate_agent, fetch_url=
             if self.path in ("/", "/index.html"):
                 return None if self._serve_dashboard() else self._json(404, {"error": "not found"})
             if self.path == "/health":
-                return self._json(200, {"ok": True})
+                # Unauthenticated on purpose: the sign-in screen reads it to decide whether to
+                # offer "create an account" and "forgot password" at all. Both are booleans about
+                # the server's configuration, not about any account.
+                return self._json(200, {"ok": True,
+                                        "signup": "open" if signup_open else "closed",
+                                        "password_reset": reset_enabled})
             if self.path == "/metrics":
                 ok, org = self._client_org()
                 if not ok:
@@ -528,6 +625,23 @@ def make_handler(*, conn, token, agent_auth=store.authenticate_agent, fetch_url=
                 if not self._admin_ok():
                     return self._json(401, {"error": "unauthorized"})
                 return self._json(200, {"orgs": store.list_orgs(conn)})
+            mo = _ORG_ID.match(self.path)
+            if mo:
+                # One org's own settings, readable by a session so the dashboard can show them —
+                # the root-only GET /orgs above stays the cross-org listing.
+                p = self._manager()
+                if p is None:
+                    return
+                oid = int(mo.group(1))
+                org = None if self._foreign_org(p, oid) else store.get_org(conn, oid)
+                if org is None:
+                    return self._json(404, {"error": "not found"})
+                return self._json(200, {
+                    "id": org["id"], "name": org["name"], "event_url": org["event_url"],
+                    "shopify_secret_set": bool(org["shopify_secret"]),   # never echo the secret
+                    "job_quota": org["job_quota"],
+                    "jobs_this_month": store.org_usage(conn, oid),
+                    "created_at": org["created_at"]})
             mp = _AGENT_PAYLOAD.match(self.path)
             if mp:
                 aid = self._agent_id()
@@ -578,6 +692,8 @@ def make_handler(*, conn, token, agent_auth=store.authenticate_agent, fetch_url=
                     jid = self._submit_job(body, org, user_id=p["user_id"])
                 except FetchError as e:
                     return self._json(502, {"error": f"downstream: {e}"})
+                except store.QuotaExceeded as e:
+                    return self._json(402, {"error": str(e)})
                 except (DispatchError, store.UnknownPrinter) as e:
                     return self._json(400, {"error": str(e)})
                 return self._json(200, {"job_id": jid})
@@ -595,6 +711,12 @@ def make_handler(*, conn, token, agent_auth=store.authenticate_agent, fetch_url=
                 return self._shopify_webhook()
             if self.path == "/login":
                 return self._login()
+            if self.path == "/signup":
+                return self._signup()
+            if self.path == "/password/reset":
+                return self._password_reset()
+            if self.path == "/password/reset/confirm":
+                return self._password_reset_confirm()
             if self.path == "/logout":
                 p = self._principal()
                 if p is None or p["kind"] != "session":
@@ -735,6 +857,20 @@ def make_handler(*, conn, token, agent_auth=store.authenticate_agent, fetch_url=
                     if not store.set_org_event_url(conn, oid, url):
                         return self._json(404, {"error": "not found"})
                     applied["event_url"] = url
+                if "job_quota" in body:
+                    # The one org field a session may *not* set: a tenant that could raise its own
+                    # cap has no cap. Only the operator's bootstrap token writes it.
+                    if p["kind"] != "root":
+                        return self._json(403,
+                                          {"error": "job_quota is set by the server operator"})
+                    quota = body.get("job_quota")
+                    if quota is not None and (isinstance(quota, bool)
+                                              or not isinstance(quota, int) or quota < 0):
+                        return self._json(
+                            400, {"error": "job_quota must be a non-negative integer or null"})
+                    if not store.set_org_quota(conn, oid, quota):
+                        return self._json(404, {"error": "not found"})
+                    applied["job_quota"] = quota
                 if "shopify_secret" in body:
                     secret = body.get("shopify_secret")     # null clears it
                     if secret is not None and not (isinstance(secret, str) and secret.strip()):
@@ -759,6 +895,22 @@ def make_handler(*, conn, token, agent_auth=store.authenticate_agent, fetch_url=
                     return
                 ok = store.revoke_api_key(conn, int(m.group(1)), org_id=p["org_id"])
                 return self._json(200, {"ok": True}) if ok else self._json(404, {"error": "not found"})
+            mu = _USER_ID.match(self.path)
+            if mu:
+                p = self._manager()
+                if p is None:
+                    return
+                uid = int(mu.group(1))
+                if p["user_id"] == uid:
+                    # Removing yourself would sign you out mid-request and, in a two-admin org,
+                    # is the mistake nobody can undo from the dashboard. Someone else does it.
+                    return self._json(400, {"error": "cannot remove your own account"})
+                res = store.delete_user(conn, uid, org_id=p["org_id"])
+                if res == "deleted":
+                    return self._json(200, {"ok": True})
+                if res == "last_user":
+                    return self._json(400, {"error": "an org must keep at least one account"})
+                return self._json(404, {"error": "not found"})
             mj = _JOB_ID.match(self.path)
             if mj:
                 ok, org = self._client_org()
@@ -839,6 +991,7 @@ def start_reaper(conn, *, timeout_s=300, max_retries=2, interval_s=30):
                 store.expire_jobs(conn)
                 store.requeue_stale(conn, timeout_s, max_retries)
                 store.purge_expired_sessions(conn)
+                store.purge_expired_resets(conn)
             except Exception as e:
                 print(f"reaper error: {e}", file=sys.stderr)
             time.sleep(interval_s)
@@ -859,7 +1012,9 @@ def main():
     store.init_db(conn)
     start_reaper(conn)
     start_webhook_dispatcher(conn)
-    httpd = create_server(conn, token, host="0.0.0.0", port=port)
+    httpd = create_server(conn, token, host="0.0.0.0", port=port,
+                          signup=os.environ.get("PRINTAPI_SIGNUP", "closed"),
+                          public_url=os.environ.get("PUBLIC_URL"))
     print(f"printpapi listening on :{port}")
     httpd.serve_forever()
 

@@ -30,6 +30,14 @@ Environment variables:
 | `PRINT_DB` | `printpapi.db` | SQLite database path |
 | `PRINT_PORT` | `3460` | Listen port |
 | `LOG_REQUESTS` | *(off)* | Set to log every HTTP request |
+| `PRINTAPI_SIGNUP` | `closed` | `open` lets anyone create an org via `POST /signup` — for a hosted deployment, not a private box |
+| `PUBLIC_URL` | *(unset)* | This server's own address, e.g. `https://print.example`. Only then does a password-reset mail carry a link (see [api.md](api.md#password-reset)) |
+| `SMTP_HOST` | *(unset)* | Mail server for password resets. Unset ⇒ the reset token is printed to stderr instead |
+| `SMTP_PORT` | `587` (`465` with `SMTP_SSL`) | |
+| `SMTP_USER` / `SMTP_PASSWORD` | *(unset)* | Omit for an anonymous relay |
+| `SMTP_FROM` | `printpapi@localhost` | Envelope sender |
+| `SMTP_SSL` | *(off)* | `1` for implicit TLS; otherwise STARTTLS is used |
+| `SMTP_STARTTLS` | `1` | `0` to disable STARTTLS (plaintext relay on a trusted network) |
 
 ```bash
 PRINTAPI_TOKEN=change-me PRINT_DB=data/printpapi.db python -m app.server
@@ -60,9 +68,12 @@ is copied into the runtime image — there is no Node at runtime.
 
 `GET /` serves a static, secret-free React dashboard: a live overview (queue counters,
 job-outcome breakdown, activity feed), printers online/offline, searchable job history with
-cancel, one-click test print, API-key management, a **Team** page (add the people who may sign
-in, change your own password), agent install instructions, light/dark theme and a ⌘K command
-palette. You sign in with an account — or paste a token; either way the credential is kept in
+cancel, one-click test print, API-key management, a **Team** page (add or remove the people who
+may sign in, change your own password), a **Settings** page (this month's jobs against the org's
+quota, the agent-event URL, the Shopify webhook secret), agent install instructions, light/dark
+theme and a ⌘K command palette. You sign in with an account — creating one yourself where the
+operator allows it, and resetting a forgotten password by e-mail — or paste a token; either way
+the credential is kept in
 `localStorage` and sent as a bearer header — nothing sensitive lives in the served files. The test print sends a
 PDF only to PDF-capable printers and a ZPL label to everything else.
 

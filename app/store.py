@@ -1,4 +1,5 @@
 # printpapi — self-hosted PrintNode alternative. Elastic License 2.0 (see LICENSE).
+import datetime
 import hashlib
 import hmac
 import json
@@ -14,7 +15,7 @@ _LOCK = threading.Lock()  # ponytail: global lock; per-connection pool only if i
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS orgs(
   id INTEGER PRIMARY KEY, name TEXT NOT NULL, event_url TEXT, shopify_secret TEXT,
-  created_at REAL NOT NULL);
+  job_quota INTEGER, created_at REAL NOT NULL);
 CREATE TABLE IF NOT EXISTS users(
   id INTEGER PRIMARY KEY, org_id INTEGER NOT NULL, name TEXT NOT NULL, created_at REAL NOT NULL,
   email TEXT, password_hash TEXT);
@@ -22,6 +23,11 @@ CREATE TABLE IF NOT EXISTS users(
 -- column does not exist yet when this script runs. NULLs are distinct in SQLite, so the seeded
 -- legacy user (no e-mail) is unconstrained.
 CREATE TABLE IF NOT EXISTS sessions(
+  id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL,
+  token_hash TEXT NOT NULL UNIQUE, created_at REAL NOT NULL, expires_at REAL NOT NULL);
+-- One live reset per user (a new request supersedes the old one), stored hashed like every other
+-- credential and deleted the moment it is spent.
+CREATE TABLE IF NOT EXISTS password_resets(
   id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL,
   token_hash TEXT NOT NULL UNIQUE, created_at REAL NOT NULL, expires_at REAL NOT NULL);
 CREATE TABLE IF NOT EXISTS agents(
@@ -77,7 +83,8 @@ def init_db(conn):
                         "INTEGER NOT NULL DEFAULT 0",
                         "ALTER TABLE users ADD COLUMN email TEXT",
                         "ALTER TABLE users ADD COLUMN password_hash TEXT",
-                        "CREATE UNIQUE INDEX IF NOT EXISTS users_email ON users(email)"):
+                        "CREATE UNIQUE INDEX IF NOT EXISTS users_email ON users(email)",
+                        "ALTER TABLE orgs ADD COLUMN job_quota INTEGER"):
                 try:
                     conn.execute(ddl)
                 except sqlite3.OperationalError:
@@ -120,18 +127,19 @@ def list_orgs(conn):
     """Orgs for the root listing. The Shopify webhook secret is reported as a flag, never echoed —
     it is the one credential here that has to be stored in plaintext (HMAC needs it)."""
     with _LOCK:
-        rows = conn.execute("SELECT id, name, event_url, shopify_secret, created_at "
+        rows = conn.execute("SELECT id, name, event_url, shopify_secret, job_quota, created_at "
                             "FROM orgs ORDER BY id").fetchall()
     return [{"id": r["id"], "name": r["name"], "event_url": r["event_url"],
-             "shopify_secret_set": bool(r["shopify_secret"]), "created_at": r["created_at"]}
+             "shopify_secret_set": bool(r["shopify_secret"]), "job_quota": r["job_quota"],
+             "created_at": r["created_at"]}
             for r in rows]
 
 
 def get_org(conn, org_id):
     """Full org row including secrets — for server-side use (HMAC verification), not for output."""
     with _LOCK:
-        row = conn.execute("SELECT id, name, event_url, shopify_secret, created_at FROM orgs "
-                           "WHERE id=?", (org_id,)).fetchone()
+        row = conn.execute("SELECT id, name, event_url, shopify_secret, job_quota, created_at "
+                           "FROM orgs WHERE id=?", (org_id,)).fetchone()
     return dict(row) if row else None
 
 
@@ -155,6 +163,36 @@ def set_org_event_url(conn, org_id, url):
 def set_org_shopify_secret(conn, org_id, secret):
     """The org's Shopify webhook signing secret (None clears it). False if no such org."""
     return _set_org_field(conn, org_id, "shopify_secret", secret)
+
+
+def set_org_quota(conn, org_id, quota):
+    """Jobs this org may submit per calendar month (None = unlimited). False if no such org."""
+    return _set_org_field(conn, org_id, "job_quota", quota)
+
+
+class QuotaExceeded(Exception):
+    pass
+
+
+def month_start(now=None):
+    """Start of the current UTC calendar month — the quota window. Calendar months (not a rolling
+    30 days) so the budget resets on the same date a subscription bills."""
+    now = time.time() if now is None else now
+    d = datetime.datetime.fromtimestamp(now, datetime.timezone.utc)
+    return d.replace(day=1, hour=0, minute=0, second=0, microsecond=0).timestamp()
+
+
+def _usage(conn, org_id, since):
+    # ponytail: a COUNT over jobs per submit (unindexed, like metrics). A counter column or an
+    # index on jobs(org_id, created_at) if a busy org ever makes this the bottleneck.
+    return conn.execute("SELECT COUNT(*) c FROM jobs WHERE org_id=? AND created_at >= ?",
+                        (org_id, since)).fetchone()["c"]
+
+
+def org_usage(conn, org_id, since=None):
+    """Jobs this org has submitted in the quota window (this calendar month by default)."""
+    with _LOCK:
+        return _usage(conn, org_id, month_start() if since is None else since)
 
 
 def org_exists(conn, org_id):
@@ -296,6 +334,107 @@ def create_user(conn, org_id, email, password_hash):
             raise
 
 
+def signup(conn, org_name, email, password_hash):
+    """Self-serve: a new org and its first user in one transaction. Raises sqlite3.IntegrityError
+    if the e-mail is taken — the rollback takes the half-made org with it, so a failed signup
+    leaves nothing behind."""
+    now = time.time()
+    addr = _email(email)
+    with _LOCK:
+        try:
+            org_id = conn.execute("INSERT INTO orgs(name, created_at) VALUES(?,?)",
+                                  (org_name, now)).lastrowid
+            cur = conn.execute(
+                "INSERT INTO users(org_id, name, email, password_hash, created_at) "
+                "VALUES(?,?,?,?,?)", (org_id, addr, addr, password_hash, now))
+            conn.commit()
+            return {"org_id": org_id, "user_id": cur.lastrowid}
+        except Exception:
+            conn.rollback()
+            raise
+
+
+def delete_user(conn, user_id, org_id=None):
+    """Remove an account and everything that could still authenticate as it.
+    Returns 'deleted' | 'not_found' (also for another org's user) | 'last_user'.
+
+    An org always keeps at least one account — deleting the last one would leave printers and keys
+    with no way back in. Jobs keep the raw user_id: the history is not joined against users, so a
+    removed account leaves its past prints readable."""
+    with _LOCK:
+        try:
+            row = conn.execute(
+                "SELECT org_id FROM users WHERE id=:uid AND email IS NOT NULL "
+                "AND (:org IS NULL OR org_id = :org)", {"uid": user_id, "org": org_id}).fetchone()
+            if row is None:
+                return "not_found"
+            if conn.execute("SELECT COUNT(*) c FROM users WHERE org_id=? AND email IS NOT NULL",
+                            (row["org_id"],)).fetchone()["c"] <= 1:
+                return "last_user"
+            conn.execute("DELETE FROM sessions WHERE user_id=?", (user_id,))
+            conn.execute("DELETE FROM password_resets WHERE user_id=?", (user_id,))
+            conn.execute("DELETE FROM users WHERE id=?", (user_id,))
+            conn.commit()
+            return "deleted"
+        except Exception:
+            conn.rollback()
+            raise
+
+
+def create_password_reset(conn, user_id, token, ttl_s, now=None):
+    """Mint a one-shot reset token, dropping any earlier one for that user — a second "forgot my
+    password" click must not leave the first mail's link working."""
+    now = time.time() if now is None else now
+    expires_at = now + ttl_s
+    with _LOCK:
+        try:
+            conn.execute("DELETE FROM password_resets WHERE user_id=?", (user_id,))
+            conn.execute("INSERT INTO password_resets(user_id, token_hash, created_at, expires_at) "
+                         "VALUES(?,?,?,?)", (user_id, _hash_key(token), now, expires_at))
+            conn.commit()
+            return expires_at
+        except Exception:
+            conn.rollback()
+            raise
+
+
+def consume_password_reset(conn, token, password_hash, now=None):
+    """Spend a reset token: set the password, drop the token and log every browser out. Returns the
+    user id, or None if the token is unknown, expired or already used. All under one lock, so a
+    token can never be spent twice."""
+    if not token:
+        return None
+    now = time.time() if now is None else now
+    with _LOCK:
+        try:
+            row = conn.execute("SELECT id, user_id FROM password_resets "
+                               "WHERE token_hash=? AND expires_at > ?",
+                               (_hash_key(token), now)).fetchone()
+            if row is None:
+                return None
+            conn.execute("UPDATE users SET password_hash=? WHERE id=?",
+                         (password_hash, row["user_id"]))
+            conn.execute("DELETE FROM password_resets WHERE id=?", (row["id"],))
+            conn.execute("DELETE FROM sessions WHERE user_id=?", (row["user_id"],))
+            conn.commit()
+            return row["user_id"]
+        except Exception:
+            conn.rollback()
+            raise
+
+
+def purge_expired_resets(conn, now=None):
+    now = time.time() if now is None else now
+    with _LOCK:
+        try:
+            cur = conn.execute("DELETE FROM password_resets WHERE expires_at <= ?", (now,))
+            conn.commit()
+            return cur.rowcount
+        except Exception:
+            conn.rollback()
+            raise
+
+
 def get_user_by_email(conn, email):
     """The login lookup — the only place the password hash leaves the DB."""
     addr = _email(email)
@@ -413,7 +552,14 @@ def enqueue_job(conn, printer_id, type_, mode, payload, user_id=DEFAULT_USER, ti
                                    (p["org_id"], idempotency_key)).fetchone()
                 if row:
                     conn.commit()
-                    return row["id"]
+                    return row["id"]        # a resubmit is the same job, so it spends no quota
+            quota = conn.execute("SELECT job_quota FROM orgs WHERE id=?",
+                                 (p["org_id"],)).fetchone()
+            quota = quota["job_quota"] if quota else None
+            if quota is not None and _usage(conn, p["org_id"], month_start(now)) >= quota:
+                # Checked here rather than in the handlers so every caller — POST /jobs, /orders,
+                # the Shopify webhook and the PrintNode compat layer — is capped by one guard.
+                raise QuotaExceeded(f"monthly job quota reached ({quota})")
             cur = conn.execute(
                 "INSERT INTO jobs(org_id, user_id, printer_id, agent_id, type, mode, state, "
                 "payload, title, copies, options, callback_url, idempotency_key, expires_at, "

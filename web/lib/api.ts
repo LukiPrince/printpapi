@@ -61,6 +61,23 @@ export type OrgUser = {
   created_at: number;
 };
 
+/** One org's own settings. The Shopify secret is only ever reported as a flag. */
+export type Org = {
+  id: number;
+  name: string;
+  event_url: string | null;
+  shopify_secret_set: boolean;
+  job_quota: number | null;
+  jobs_this_month: number;
+  created_at: number;
+};
+
+/** What this server offers before anyone is signed in — read from /health. */
+export type ServerInfo = {
+  signup: "open" | "closed";
+  password_reset: boolean;
+};
+
 export type Metrics = {
   jobs: Record<JobState, number>;
   agents_online: number;
@@ -123,7 +140,7 @@ async function request(path: string, init: RequestInit = {}, token = getToken())
     // /apikeys and /users need an account (or the bootstrap token), so a 401 there is "this
     // credential cannot manage the org", not "session dead". Only a rejected token on a client
     // endpoint signs you out.
-    if (!path.startsWith("/apikeys") && !path.startsWith("/users")) {
+    if (!path.startsWith("/apikeys") && !path.startsWith("/users") && !path.startsWith("/orgs")) {
       window.dispatchEvent(new CustomEvent(UNAUTHORIZED_EVENT));
     }
     throw new ApiError(401, "unauthorized");
@@ -168,6 +185,58 @@ export async function login(email: string, password: string) {
   }
   return body as { token: string; expires_at: number; org_id: number; user_id: number };
 }
+
+/** Unauthenticated calls: the sign-in screen makes them before any token exists. `error` from the
+ *  body is preserved so the server's own wording ("signup is disabled…") reaches the user. */
+async function open_(path: string, body: unknown) {
+  const res = await fetch(path, jsonBody(body));
+  const parsed = await res.json().catch(() => ({}));
+  if (!res.ok) throw new ApiError(res.status, parsed?.error ?? `request failed (${res.status})`);
+  return parsed;
+}
+
+/** What this server allows before sign-in. Never throws — a server too old to report these
+ *  simply offers neither. */
+export async function getServerInfo(): Promise<ServerInfo> {
+  let body: Partial<ServerInfo> = {};
+  try {
+    const res = await fetch("/health");
+    if (res.ok) body = (await res.json()) as Partial<ServerInfo>;
+  } catch {
+    /* unreachable or too old to answer — advertise neither door */
+  }
+  return {
+    signup: body.signup === "open" ? "open" : "closed",
+    password_reset: !!body.password_reset,
+  };
+}
+
+/** Self-serve: a new org, its first account, and a session token in one call. */
+export const signup = (email: string, password: string, orgName: string) =>
+  open_("/signup", { email, password, org_name: orgName }) as Promise<{
+    token: string;
+    org_id: number;
+    user_id: number;
+    email: string;
+  }>;
+
+/** Always resolves for a well-formed address, whether or not it has an account. */
+export const requestPasswordReset = (email: string) => open_("/password/reset", { email });
+
+export const confirmPasswordReset = (token: string, password: string) =>
+  open_("/password/reset/confirm", { token, password });
+
+export const deleteUser = (id: number) => request(`/users/${id}`, { method: "DELETE" });
+
+export const getOrg = (id: number) => getJSON<Org>(`/orgs/${id}`);
+
+/** Root only — every org on the server, for the settings page's org picker. */
+export const listOrgs = () => getJSON<{ orgs: Org[] }>("/orgs").then((r) => r.orgs ?? []);
+
+export const updateOrg = (
+  id: number,
+  patch: { event_url?: string | null; shopify_secret?: string | null; job_quota?: number | null },
+) => request(`/orgs/${id}`, { ...jsonBody(patch), method: "PUT" });
 
 /** Best-effort server-side session teardown. Raw fetch: a 401 here must not trigger the
  *  global unauthorized handler — signing out is exactly what the caller is already doing. */

@@ -22,7 +22,7 @@ Token comparison is constant-time (`hmac.compare_digest`).
 | Method & path | Auth | Purpose |
 |---|---|---|
 | `GET /` | none | Web dashboard (static bundle from `app/web`; data fetched with the token) |
-| `GET /health` | none | Liveness check |
+| `GET /health` | none | Liveness check, plus whether this server offers `signup` and `password_reset` |
 | `GET /metrics` | client | Prometheus text: job counts by state, agent/printer liveness |
 | `POST /jobs` | client | Submit a job → `{job_id}` |
 | `POST /orders` | client | Render an order as a packing slip and print it → `{job_id}` ([e-commerce](ecommerce.md)) |
@@ -33,15 +33,20 @@ Token comparison is constant-time (`hmac.compare_digest`).
 | `GET /printers` | client | Registered printers + online/offline + capabilities |
 | `GET /computers` | client | Registered agents + online/offline + printer count |
 | `POST /login` | none | E-mail + password → `{token, expires_at, org_id, user_id}` |
+| `POST /signup` | none | Self-serve org + first account + session (`403` unless the operator opened it) |
+| `POST /password/reset` | none | Mail a one-shot reset token — always `{"ok": true}` |
+| `POST /password/reset/confirm` | none | `{token, password}` → sets it and logs every browser out |
 | `POST /logout` | session | End this session server-side |
 | `GET /me` | any | `{kind: root\|session\|key, org_id}` (+ `email`, `user_id` for a session) |
 | `PUT /me/password` | session | `{current, new}` — changes it and logs every browser out |
 | `POST /users` | manage | Add a user to the caller's own org → `{id, email, org_id}` |
 | `GET /users` | manage | Users of the caller's org (root: all orgs) |
+| `DELETE /users/{id}` | manage | Remove an account (never your own, never an org's last one) |
 | `POST /orgs/{id}/users` | root | Create an org's first user |
 | `POST /orgs` | root | Create an org → `{id, name}` |
 | `GET /orgs` | root | List orgs (`event_url`, `shopify_secret_set` — never the secret itself) |
-| `PUT /orgs/{id}` | manage | Set/clear the org's `event_url` and/or `shopify_secret` |
+| `GET /orgs/{id}` | manage | One org's settings + `job_quota` and `jobs_this_month` |
+| `PUT /orgs/{id}` | manage | Set/clear `event_url`, `shopify_secret`; `job_quota` is root-only |
 | `POST /apikeys` | manage | Issue a client key → `{id, label, org_id, key}` (key shown once) |
 | `GET /apikeys` | manage | List keys with their org (never the secret) |
 | `DELETE /apikeys/{id}` | manage | Revoke a key |
@@ -219,7 +224,7 @@ login mints a **session token** carried in the same `Authorization: Bearer` head
 else, so nothing else about the API changes.
 
 ```bash
-# 1. root seeds the org's first user (there is no self-signup)
+# 1. root seeds the org's first user (or the org signs itself up — see Self-signup below)
 curl -s -X POST localhost:3460/orgs/2/users -H 'Authorization: Bearer <PRINTAPI_TOKEN>' \
      -d '{"email":"ops@acme.example","password":"a long passphrase"}'
 
@@ -247,11 +252,70 @@ What holds:
 - **Login is throttled** per e-mail (10 failures / 15 minutes → `429`), and a wrong address costs
   the same time as a wrong password, so the endpoint does not enumerate accounts.
 - **E-mails are unique across the whole server** (login carries no org), lower-cased and trimmed.
+- **Removing an account** (`DELETE /users/{id}`) drops its sessions and any pending reset with it.
+  You cannot remove yourself (`400`), an org cannot lose its last account (`400`), and another
+  org's user is a `404`. Their jobs stay in the history; their API keys are untouched — revoke
+  those separately.
 
-Not built yet: self-signup, password reset by e-mail (root sets a new one), and per-user roles.
-The throttle counters are per process, in memory and bounded (several server processes count
-separately, and a large enough spray of invented addresses evicts counters instead of growing
-memory). Passwords over 1024 characters are rejected rather than hashed.
+Not built yet: per-user roles. The throttle counters are per process, in memory and bounded
+(several server processes count separately, and a large enough spray of invented addresses evicts
+counters instead of growing memory). Passwords over 1024 characters are rejected rather than
+hashed.
+
+### Self-signup
+
+`POST /signup {email, password, org_name?}` creates an org, its first account and a session in one
+call — the same body a login answers with. It is **off unless the operator turns it on**
+(`PRINTAPI_SIGNUP=open`); otherwise it is a `403`, because a self-hosted box on the open internet
+must not hand an org to whoever finds it. `GET /health` reports `"signup": "open"|"closed"` so the
+dashboard only offers the door when it exists.
+
+Signups are throttled by client address (the same counter a failed login uses), so one host cannot
+spray orgs. Behind a reverse proxy every signup shares one address — put the rate limit in the
+proxy there. `org_name` defaults to the e-mail's domain. A taken address is a `409` and leaves no
+half-made org behind.
+
+### Password reset
+
+```bash
+curl -s -X POST localhost:3460/password/reset -d '{"email":"ops@acme.example"}'
+# -> {"ok": true}   (the same answer for an address with no account)
+
+curl -s -X POST localhost:3460/password/reset/confirm \
+     -d '{"token":"sess_…","password":"a new long passphrase"}'
+```
+
+- The token is **one-shot**, valid for an hour, stored hashed, and a second request supersedes the
+  first. Spending it sets the password and logs every browser out.
+- Requests are throttled per address, counted whether or not the account exists — a `429` leaks
+  nothing either.
+- Mail goes out over **SMTP** (`SMTP_HOST`, `SMTP_PORT`, `SMTP_USER`, `SMTP_PASSWORD`, `SMTP_FROM`,
+  `SMTP_SSL`, `SMTP_STARTTLS`). With no `SMTP_HOST` the message is printed to stderr instead, so a
+  self-hosted instance still works — the operator reads the token out of the log.
+- The mail carries a **link only if `PUBLIC_URL` is set** (`https://…/?reset=<token>`). Without it
+  it carries the bare token, because building the link from the `Host` header would let anyone who
+  can reach this server mail a valid token pointing at a host of their choosing.
+- `GET /health` reports `"password_reset": true` once SMTP is configured; the dashboard offers
+  "Forgot password?" only then.
+
+### Quotas
+
+An org can be capped at a number of jobs per calendar month (UTC):
+
+```bash
+curl -s -X PUT localhost:3460/orgs/2 -H 'Authorization: Bearer <PRINTAPI_TOKEN>' \
+     -d '{"job_quota": 500}'      # null clears it — unlimited is the default
+```
+
+- **Root sets it, nobody else** — a session that could raise its own cap has no cap, so
+  `job_quota` on `PUT /orgs/{id}` is a `403` for anything but the bootstrap token. Every other
+  field on that endpoint stays manageable by the org itself.
+- A submit past the cap answers **`402`** and prints nothing. The guard sits in the enqueue path,
+  so `POST /jobs`, `POST /orders`, the Shopify webhook and the PrintNode-compatible
+  `POST /printjobs` (`{"code": "QuotaExceeded"}`) are all covered by it.
+- An **idempotent resubmit spends nothing** — it returns the original job, it does not create one.
+- `GET /orgs/{id}` reports `job_quota` and `jobs_this_month`, which is what the dashboard's
+  Settings page shows.
 
 ## Metrics
 
