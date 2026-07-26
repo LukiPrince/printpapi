@@ -16,7 +16,9 @@ up and prints it — documents **and** label printers (Zebra/ZPL, Bixolon, therm
 - Multi-tenant: orgs isolate API keys, agents, printers and jobs
 - Fleet monitoring: `GET /computers` + online/offline webhooks, Prometheus `/metrics`
 - Retry-safe submits (`idempotency_key`) and job deadlines (`expire_after`)
-- Source available ([Elastic License 2.0](#license): self-host freely, don't resell it as a service) · 187 tests
+- **PrintNode-compatible API layer** — point an existing SDK/integration at your server
+  ([docs](docs/printnode-compat.md))
+- Source available ([Elastic License 2.0](#license): self-host freely, don't resell it as a service) · 199 tests
 
 ## Get started
 
@@ -76,8 +78,13 @@ simpler: no certificates, no browser, one HTTP call.
 **[PrintNode](https://www.printnode.com/)** is the closest match feature-wise — printpapi is a
 self-hosted alternative to it: same poll-from-behind-NAT model, same job/printer/computer API
 shape, without the per-printer monthly fee or sending your documents through someone else's cloud.
-It has things we don't (scales, a hosted SLA, an official plugin ecosystem — see the
-[roadmap](docs/roadmap.md)).
+It has things we don't (scales, a hosted SLA — see the [roadmap](docs/roadmap.md)). Software you
+already wrote against their API can be pointed here: send HTTP Basic auth instead of a bearer token
+and the server answers in their JSON shapes
+([PrintNode-compatible API](docs/printnode-compat.md)).
+
+*PrintNode is a trademark of PrintNode Ltd. printpapi is not affiliated with, endorsed by, or
+sponsored by PrintNode.*
 
 ## Documentation
 
@@ -86,6 +93,7 @@ It has things we don't (scales, a hosted SLA, an official plugin ecosystem — s
 | [Server](docs/server.md) | how it works, configuration, Docker, dashboard (+ rebuilding it), API keys, security |
 | [Agent](docs/agent.md) | install, `agent.ini`, printer syntax, labels vs PDF, per-printer setup, service install |
 | [HTTP API](docs/api.md) | endpoints, auth, content types, job lifecycle |
+| [PrintNode-compatible API](docs/printnode-compat.md) | point an existing PrintNode client at printpapi |
 | [Recipes](docs/recipes.md) | print from n8n, Zapier, Make, curl — in one HTTP node |
 | [E-commerce](docs/ecommerce.md) | WooCommerce plugin, Shopify webhook, `POST /orders` |
 | [Roadmap](docs/roadmap.md) | what's planned for v2 |

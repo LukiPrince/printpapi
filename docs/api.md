@@ -41,6 +41,11 @@ Token comparison is constant-time (`hmac.compare_digest`).
 
 Request bodies are capped at 32 MB.
 
+An `Authorization: Basic` header instead of `Bearer` switches the same server to the
+**[PrintNode-compatible shapes](printnode-compat.md)** (`/whoami`, `/printjobs`, and PrintNode's
+JSON for `/printers` and `/computers`), so an existing client can be pointed here unchanged. Same
+keys, same orgs; everything below describes the `Bearer` API.
+
 ## Submitting a job
 
 ```bash

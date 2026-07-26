@@ -14,7 +14,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlparse
 
-from app import store
+from app import printnode, store
 from app.dispatch import (decode_payload, agent_mode, parse_copies, parse_callback_url,
                           parse_options, parse_expire_after, parse_idempotency_key,
                           DispatchError, FetchError, _http_get, _http_post)
@@ -28,6 +28,10 @@ _AGENT_PAYLOAD = re.compile(r"^/agent/jobs/(\d+)/payload$")
 _AGENT_RESULT = re.compile(r"^/agent/jobs/(\d+)/result$")
 _APIKEY_ID = re.compile(r"^/apikeys/(\d+)$")
 _ORG_ID = re.compile(r"^/orgs/(\d+)$")
+# PrintNode-compat paths: a collection addressed by id set ("5", "5,7", "5-9"), optionally with a
+# sub-resource. Only reachable with HTTP Basic auth — see _printnode_get.
+_PN_SET = re.compile(r"^/(computers|printers|printjobs)/([\d,\- ]+)(/printers|/states)?$")
+_PN_COLLECTIONS = ("/whoami", "/computers", "/printers", "/printjobs")
 
 # The dashboard is a static, secret-free Next.js export in app/web (source in web/, built with
 # `npm run build:app`). It prompts for the API token, keeps it in localStorage, and calls the JSON
@@ -146,6 +150,24 @@ def make_handler(*, conn, token, agent_auth=store.authenticate_agent, fetch_url=
             key = self._presented_key()
             return agent_auth(conn, key) if key else None
 
+        def _submit_job(self, body, org):
+            """The POST /jobs core: validate, fetch the payload, enqueue. Returns the job id and
+            raises DispatchError / FetchError / store.UnknownPrinter for the caller to map — the
+            PrintNode compat layer submits through here too, so there is one validation path."""
+            mode = agent_mode(body.get("type"))
+            # Validate before decode_payload: a bad field must 400 without first fetching a URL
+            # (and a retried submit must not re-fetch it either).
+            copies = parse_copies(body)
+            callback_url = parse_callback_url(body)
+            options = parse_options(body, mode)
+            idem = parse_idempotency_key(body)
+            expire_after = parse_expire_after(body)
+            data = decode_payload(body, fetch_url=fetch)
+            return store.enqueue_job(conn, body.get("printer_id"), body.get("type"), mode, data,
+                                     title=body.get("title"), copies=copies,
+                                     callback_url=callback_url, options=options, org_id=org,
+                                     idempotency_key=idem, expire_after=expire_after)
+
         def _enqueue_order(self, payload, fmt, opts, org, *, idem=None, shop=None):
             """Render a store order as a packing slip and queue it as a pdf job. `opts` carries the
             same job knobs POST /jobs takes (printer_id, copies, title, expire_after, …)."""
@@ -206,6 +228,125 @@ def make_handler(*, conn, token, agent_auth=store.authenticate_agent, fetch_url=
                                        idem=f"shopify-{sid}" if sid else None,
                                        shop=self.headers.get("X-Shopify-Shop-Domain"))
 
+        # --- PrintNode-compatible layer -------------------------------------------------------
+        # Selected by auth scheme, not by URL: PrintNode carries the API key as the HTTP Basic
+        # username, so a Basic header means "answer in their shapes" while Bearer keeps ours. The
+        # shapes themselves live in app/printnode.py; these methods are only routing + auth.
+        def _is_basic(self):
+            return self.headers.get("Authorization", "").startswith("Basic ")
+
+        def _pn_error(self, code, name, message):
+            return self._json(code, {"code": name, "message": message})
+
+        def _pn_org(self):
+            """Same credentials as the Bearer API — any issued client key, or the root token."""
+            key = printnode.basic_key(self.headers.get("Authorization", ""))
+            if key and hmac.compare_digest(key, token):
+                return True, None
+            row = store.authenticate_client(conn, key)
+            return (True, row["org_id"]) if row else (False, None)
+
+        def _pn_printers(self, org, ids=None, agent_ids=None):
+            comps = {c["id"]: printnode.computer(c)
+                     for c in store.list_agents(conn, online_window_s, org_id=org)}
+            return [printnode.printer(p, comps.get(p["agent_id"]))
+                    for p in store.list_printers(conn, online_window_s, org_id=org)
+                    if (ids is None or p["id"] in ids)
+                    and (agent_ids is None or p["agent_id"] in agent_ids)]
+
+        def _pn_jobs(self, org, ids):
+            if ids:
+                return store.recent_jobs(conn, limit=len(ids), org_id=org, ids=ids)
+            # `?limit=` is how their clients page the job list; silently capping every caller at our
+            # own default would be a surprising truncation. Junk falls back to the default.
+            q = parse_qs(urlparse(self.path).query)
+            try:
+                limit = min(max(int((q.get("limit") or ["50"])[0]), 1), 500)
+            except ValueError:
+                limit = 50
+            return store.recent_jobs(conn, limit=limit, org_id=org)
+
+        def _printnode_get(self):
+            """PrintNode-shaped GETs. False if the path is not part of the compat surface."""
+            path = self.path.split("?", 1)[0]
+            m = _PN_SET.match(path)
+            if path not in _PN_COLLECTIONS and not m:
+                return False
+            kind = m.group(1) if m else path.lstrip("/")
+            sub = (m.group(3) or "") if m else ""
+            if ((sub == "/printers" and kind != "computers")
+                    or (sub == "/states" and kind != "printjobs")):
+                return False                    # e.g. /printers/1/states — not a route of theirs
+            ok, org = self._pn_org()
+            if not ok:
+                self._pn_error(401, "Unauthorized", "invalid API key")
+                return True
+            try:
+                ids = printnode.parse_set(m.group(2)) if m else None
+            except printnode.CompatError as e:
+                self._pn_error(400, "BadRequest", str(e))
+                return True
+            if path == "/whoami":
+                agents = store.list_agents(conn, online_window_s, org_id=org)
+                self._json(200, printnode.whoami(
+                    org, store.metrics(conn, online_window_s, org_id=org),
+                    [a["name"] for a in agents if a["online"]]))
+            elif kind == "computers" and sub != "/printers":
+                self._json(200, [printnode.computer(a)
+                                 for a in store.list_agents(conn, online_window_s, org_id=org)
+                                 if ids is None or a["id"] in ids])
+            elif kind == "printers" or sub == "/printers":
+                self._json(200, self._pn_printers(
+                    org, ids=ids if kind == "printers" else None,
+                    agent_ids=ids if kind == "computers" else None))
+            elif sub == "/states":
+                self._json(200, [printnode.printjob_states(j) for j in self._pn_jobs(org, ids)])
+            else:
+                pmap = {p["id"]: p for p in self._pn_printers(org)}
+                self._json(200, [printnode.printjob(j, pmap.get(j["printer_id"]))
+                                 for j in self._pn_jobs(org, ids)])
+            return True
+
+        def _printnode_post(self):
+            if self.path.split("?", 1)[0] != "/printjobs":
+                return False
+            ok, org = self._pn_org()
+            if not ok:
+                self._pn_error(401, "Unauthorized", "invalid API key")
+                return True
+            try:
+                body = self._read_json()
+            except ValueError:
+                self._pn_error(400, "BadRequest", "malformed json body")
+                return True
+            try:
+                jid = self._submit_job(printnode.job_body(body), org)
+            except FetchError as e:
+                self._pn_error(502, "DownstreamError", str(e))
+            except (printnode.CompatError, DispatchError, store.UnknownPrinter) as e:
+                self._pn_error(400, "BadRequest", str(e))
+            else:
+                self._json(201, jid)      # they answer a create with the bare print job id
+            return True
+
+        def _printnode_delete(self):
+            """Their DELETE /printjobs/{set} drops queued jobs; ours cancels them (a printed job
+            stays in the history) and answers with the number affected, as they do."""
+            m = _PN_SET.match(self.path.split("?", 1)[0])
+            if not m or m.group(1) != "printjobs" or m.group(3):
+                return False
+            ok, org = self._pn_org()
+            if not ok:
+                self._pn_error(401, "Unauthorized", "invalid API key")
+                return True
+            try:
+                ids = printnode.parse_set(m.group(2))
+            except printnode.CompatError as e:
+                self._pn_error(400, "BadRequest", str(e))
+                return True
+            self._json(200, sum(store.cancel_job(conn, i, org_id=org) == "cancelled" for i in ids))
+            return True
+
         def _html(self, code, html, body=True):
             data = html.encode()
             self.send_response(code)
@@ -253,6 +394,8 @@ def make_handler(*, conn, token, agent_auth=store.authenticate_agent, fetch_url=
             self._empty(404)
 
         def do_GET(self):
+            if self._is_basic() and self._printnode_get():
+                return
             if self.path in ("/", "/index.html"):
                 return None if self._serve_dashboard() else self._json(404, {"error": "not found"})
             if self.path == "/health":
@@ -335,6 +478,8 @@ def make_handler(*, conn, token, agent_auth=store.authenticate_agent, fetch_url=
             self._json(404, {"error": "not found"})
 
         def do_POST(self):
+            if self._is_basic() and self._printnode_post():
+                return
             if self.path == "/jobs":
                 ok, org = self._client_org()
                 if not ok:
@@ -344,20 +489,7 @@ def make_handler(*, conn, token, agent_auth=store.authenticate_agent, fetch_url=
                 except ValueError:
                     return self._json(400, {"error": "bad json"})
                 try:
-                    mode = agent_mode(body.get("type"))
-                    # Validate before decode_payload: a bad field must 400 without first fetching
-                    # a URL (and a retried submit must not re-fetch it either).
-                    copies = parse_copies(body)
-                    callback_url = parse_callback_url(body)
-                    options = parse_options(body, mode)
-                    idem = parse_idempotency_key(body)
-                    expire_after = parse_expire_after(body)
-                    data = decode_payload(body, fetch_url=fetch)
-                    jid = store.enqueue_job(conn, body.get("printer_id"), body.get("type"),
-                                            mode, data, title=body.get("title"), copies=copies,
-                                            callback_url=callback_url, options=options,
-                                            org_id=org, idempotency_key=idem,
-                                            expire_after=expire_after)
+                    jid = self._submit_job(body, org)
                 except FetchError as e:
                     return self._json(502, {"error": f"downstream: {e}"})
                 except (DispatchError, store.UnknownPrinter) as e:
@@ -475,6 +607,8 @@ def make_handler(*, conn, token, agent_auth=store.authenticate_agent, fetch_url=
             self._json(404, {"error": "not found"})
 
         def do_DELETE(self):
+            if self._is_basic() and self._printnode_delete():
+                return
             m = _APIKEY_ID.match(self.path)
             if m:
                 if not self._admin_ok():

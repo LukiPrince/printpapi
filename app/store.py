@@ -461,15 +461,24 @@ def get_job(conn, job_id, org_id=None):
     return dict(row) if row else None
 
 
-def recent_jobs(conn, limit=50, org_id=None):
+def recent_jobs(conn, limit=50, org_id=None, ids=None):
+    """The job history, newest first. `ids` restricts it to specific job ids (the PrintNode compat
+    layer addresses jobs by id set) — still org-filtered, so a foreign id is simply absent."""
+    params = {"limit": limit, "org": org_id}
+    where = ""
+    if ids is not None:
+        if not ids:
+            return []                      # `IN ()` is a syntax error, and the answer is empty
+        params.update({f"i{n}": v for n, v in enumerate(ids)})
+        where = f" AND j.id IN ({','.join(f':i{n}' for n in range(len(ids)))})"
     with _LOCK:
         rows = conn.execute(
             "SELECT j.id, j.printer_id, p.name AS printer_name, a.name AS agent_name, j.title, "
             "j.state, j.type, j.mode, j.error, j.created_at, j.finished_at "
             "FROM jobs j JOIN printers p ON p.id = j.printer_id "
             "JOIN agents a ON a.id = j.agent_id "
-            "WHERE (:org IS NULL OR j.org_id = :org) "
-            "ORDER BY j.id DESC LIMIT :limit", {"limit": limit, "org": org_id}).fetchall()
+            "WHERE (:org IS NULL OR j.org_id = :org)" + where +
+            " ORDER BY j.id DESC LIMIT :limit", params).fetchall()
     return [dict(r) for r in rows]
 
 
@@ -540,7 +549,7 @@ def list_printers(conn, online_window_s, now=None, org_id=None):
     now = time.time() if now is None else now
     with _LOCK:
         rows = conn.execute(
-            "SELECT p.id, p.name, p.agent_id, p.can_pdf, p.capabilities, "
+            "SELECT p.id, p.name, p.agent_id, p.can_pdf, p.capabilities, p.created_at, "
             "a.name AS agent_name, a.last_seen_at "
             "FROM printers p JOIN agents a ON a.id = p.agent_id "
             "WHERE (:org IS NULL OR p.org_id = :org) ORDER BY p.id", {"org": org_id}).fetchall()
@@ -550,6 +559,7 @@ def list_printers(conn, online_window_s, now=None, org_id=None):
         out.append({
             "id": r["id"], "name": r["name"], "agent_id": r["agent_id"],
             "agent_name": r["agent_name"], "can_pdf": bool(r["can_pdf"]),
+            "created_at": r["created_at"],
             "capabilities": json.loads(r["capabilities"]) if r["capabilities"] else None,
             "online": seen is not None and (now - seen) <= online_window_s,
         })

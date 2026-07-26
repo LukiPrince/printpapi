@@ -122,5 +122,9 @@ SHA-256-hashed agent and client keys, `http(s)`-only URL fetches, 32 MB request-
 no `shell=True`, agent temp-file cleanup, and job payloads scoped so an agent can only touch
 its own jobs.
 
+The [PrintNode-compatible layer](printnode-compat.md) accepts HTTP **Basic** auth as well — the key
+rides in the username, so it is the same secret with the same org scope, but base64 in a header is
+not encryption: put TLS in front of it, as you should for the bearer token anyway.
+
 The server speaks plain HTTP — put your own reverse proxy / TLS in front for anything beyond
 the LAN. Vulnerability reports: see [SECURITY.md](../SECURITY.md).

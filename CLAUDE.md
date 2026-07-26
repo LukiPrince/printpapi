@@ -24,6 +24,7 @@ gotchas, and the v1 plan. Don't re-derive; build on it.
 ```
 app/        server: dispatch.py (pure logic) + store.py (SQLite) + server.py (HTTP + static serve)
             orders.py (shop payload -> order dict) + packing_slip.py (order dict -> PDF), both pure
+            printnode.py (PrintNode-shaped JSON <-> ours, pure; selected by HTTP Basic auth)
 app/web/    built dashboard bundle — generated, committed, never hand-edited
 web/        dashboard source (Next.js). `npm run build:app` builds + syncs into app/web
 agent/      cross-platform agent (Windows + Linux/macOS/CUPS): print_agent.py + tests

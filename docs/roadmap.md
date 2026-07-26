@@ -54,9 +54,12 @@ order of pull:
 6. ~~**Multi-tenancy / child accounts**~~ ✅ **shipped** — org-scoped keys, printers and jobs, with
    `POST/GET /orgs`. Still open on top of it: billing, quotas, per-org dashboard users/login,
    org-scoped key self-management, org deletion.
-7. **PrintNode API compatibility layer** — same endpoints/JSON so the existing plugin ecosystem
-   (Zapier/Make nodes, Odoo/WooCommerce/Business Central plugins, official PHP/Python SDKs) can
-   point at a printpapi base URL unchanged. Big lever, needs careful surface mapping.
+7. ~~**PrintNode API compatibility layer**~~ ✅ **shipped** — `/whoami`, `/computers`, `/printers`,
+   `POST|GET|DELETE /printjobs` and `/printjobs/{set}/states` in their JSON shapes, selected by auth
+   scheme (HTTP Basic → compat, `Bearer` → ours), so a client with a configurable base URL needs one
+   line changed. See [printnode-compat.md](printnode-compat.md). Left open: plugins that hardcode
+   their hostname still need a proxy/DNS override, state *history* is single-entry, and scales /
+   credits / child accounts are not portable.
 8. **File backend ("virtual print server")** — a printer target that writes the rendered job to
    disk as PDF instead of paper (two independent r/selfhosted asks; archival/paperless workflows).
 9. **Star CloudPRNT protocol endpoint** — Star kitchen/receipt printers poll a server URL natively;
