@@ -17,8 +17,9 @@ up and prints it — documents **and** label printers (Zebra/ZPL, Bixolon, therm
   ([docs](docs/agent.md#file-output-virtual-print-server))
 - Multi-tenant: orgs isolate API keys, agents, printers and jobs — each with its own
   **e-mail/password logins** for the dashboard ([docs](docs/api.md#accounts-and-login))
-- Run it as a service: optional **self-signup**, password reset by e-mail, and a per-org
-  **monthly job quota** ([docs](docs/api.md#quotas))
+- Run it as a service: optional **self-signup**, password reset by e-mail, a per-org
+  **monthly job quota** ([docs](docs/api.md#quotas)), and **plans + a signed billing webhook** that
+  works with any payment provider ([docs](docs/billing.md))
 - Fleet monitoring: `GET /computers` + online/offline webhooks, Prometheus `/metrics`
 - Retry-safe submits (`idempotency_key`) and job deadlines (`expire_after`)
 - **PrintNode-compatible API layer** — point an existing SDK/integration at your server
@@ -26,7 +27,7 @@ up and prints it — documents **and** label printers (Zebra/ZPL, Bixolon, therm
 - **Star CloudPRNT**: Star receipt/label printers poll the server themselves — no agent, nothing
   installed at the site ([docs](docs/cloudprnt.md); built to the published spec, not yet verified
   on a physical printer)
-- Source available ([Elastic License 2.0](#license): self-host freely, don't resell it as a service) · 284 tests
+- Source available ([Elastic License 2.0](#license): self-host freely, don't resell it as a service) · 296 tests
 
 ## Get started
 
@@ -105,6 +106,7 @@ sponsored by PrintNode.*
 | [Star CloudPRNT](docs/cloudprnt.md) | Star printers polling the server directly, without an agent |
 | [Recipes](docs/recipes.md) | print from n8n, Zapier, Make, curl — in one HTTP node |
 | [E-commerce](docs/ecommerce.md) | WooCommerce plugin, Shopify webhook, `POST /orders` |
+| [Billing](docs/billing.md) | plans, checkout links, the signed provider webhook, org deletion |
 | [Roadmap](docs/roadmap.md) | what's planned for v2 |
 
 Contributions welcome — see [CONTRIBUTING.md](CONTRIBUTING.md).

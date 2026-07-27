@@ -68,8 +68,19 @@ export type Org = {
   event_url: string | null;
   shopify_secret_set: boolean;
   job_quota: number | null;
+  plan: string | null;
   jobs_this_month: number;
   created_at: number;
+};
+
+/** A billing plan from the operator's catalogue. `jobs` null = unlimited; the checkout URL
+ *  already carries this org's id, so the provider's webhook can name it back. */
+export type Plan = {
+  id: string;
+  name: string;
+  jobs: number | null;
+  price: string | number | null;
+  checkout_url: string | null;
 };
 
 /** What this server offers before anyone is signed in — read from /health. */
@@ -235,8 +246,16 @@ export const listOrgs = () => getJSON<{ orgs: Org[] }>("/orgs").then((r) => r.or
 
 export const updateOrg = (
   id: number,
-  patch: { event_url?: string | null; shopify_secret?: string | null; job_quota?: number | null },
+  patch: {
+    event_url?: string | null;
+    shopify_secret?: string | null;
+    job_quota?: number | null;
+    plan?: string;
+  },
 ) => request(`/orgs/${id}`, { ...jsonBody(patch), method: "PUT" });
+
+/** The plan catalogue plus the caller's current plan. Empty on a server without billing. */
+export const listPlans = () => getJSON<{ plans: Plan[]; current: string | null }>("/plans");
 
 /** Best-effort server-side session teardown. Raw fetch: a 401 here must not trigger the
  *  global unauthorized handler — signing out is exactly what the caller is already doing. */

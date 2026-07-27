@@ -14,7 +14,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlparse
 
-from app import auth, cloudprnt, mail, printnode, store
+from app import auth, billing, cloudprnt, mail, printnode, store
 from app.dispatch import (decode_payload, agent_mode, parse_copies, parse_callback_url,
                           parse_options, parse_expire_after, parse_idempotency_key,
                           DispatchError, FetchError, _http_get, _http_post)
@@ -112,7 +112,7 @@ def make_handler(*, conn, token, agent_auth=store.authenticate_agent, fetch_url=
                  long_poll_timeout=25.0, poll_interval=1.0, online_window_s=60,
                  session_ttl_s=auth.SESSION_TTL_S, max_login_fails=10, login_window_s=900,
                  signup="closed", send_mail=None, public_url=None, reset_ttl_s=3600,
-                 reset_enabled=None):
+                 reset_enabled=None, plans=(), billing_secret=None):
     fetch = fetch_url or _http_get
     limiter = auth.LoginLimiter(max_fails=max_login_fails, window_s=login_window_s)
     # Signup is off unless the operator turns it on: a self-hosted box on the open internet must
@@ -121,6 +121,9 @@ def make_handler(*, conn, token, agent_auth=store.authenticate_agent, fetch_url=
     send_mail = send_mail or mail.send
     reset_enabled = mail.configured() if reset_enabled is None else bool(reset_enabled)
     public_url = (public_url or "").rstrip("/")
+    # Billing needs both halves: a catalogue to sell and a secret to trust the provider's callback.
+    # A self-hosted box configures neither, and every billing route answers 503.
+    plans = list(plans)
 
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, fmt, *args):
@@ -395,6 +398,32 @@ def make_handler(*, conn, token, agent_auth=store.authenticate_agent, fetch_url=
             return self._enqueue_order(payload, "shopify", {"printer_id": printer_id}, org,
                                        idem=f"shopify-{sid}" if sid else None,
                                        shop=self.headers.get("X-Shopify-Shop-Domain"))
+
+        def _billing_webhook(self):
+            """The payment provider's callback: "this org is on that plan now". Signed with a
+            shared secret over the raw body — the body names an org, so an unsigned one would let
+            anybody grant themselves the top plan."""
+            try:
+                raw = self._read_body()          # read first: an unread body poisons keep-alive
+            except ValueError:
+                return self._json(400, {"error": "bad content-length"})
+            if not plans or not billing_secret:
+                return self._json(503, {"error": "billing is not configured on this server"})
+            if not billing.verify(billing_secret, raw, self.headers.get("X-Signature", "")):
+                return self._json(401, {"error": "bad signature"})
+            try:
+                ev = billing.parse_event(json.loads(raw or b"{}"), plans)
+            except ValueError as e:              # bad JSON and billing.BillingError alike
+                return self._json(400, {"error": str(e)})
+            org_id = ev["org_id"]
+            if org_id is None:                   # named by its owner's address instead
+                user = store.get_user_by_email(conn, ev["email"])
+                org_id = user["org_id"] if user else None
+            plan = ev["plan"]
+            if org_id is None or not store.set_org_plan(conn, org_id, plan["id"], plan["jobs"]):
+                return self._json(404, {"error": "unknown org"})
+            return self._json(200, {"ok": True, "org_id": org_id, "plan": plan["id"],
+                                    "job_quota": plan["jobs"]})
 
         # --- PrintNode-compatible layer -------------------------------------------------------
         # Selected by auth scheme, not by URL: PrintNode carries the API key as the HTTP Basic
@@ -707,6 +736,17 @@ def make_handler(*, conn, token, agent_auth=store.authenticate_agent, fetch_url=
                 if p["kind"] == "session":
                     me.update(email=p["email"], user_id=p["user_id"])
                 return self._json(200, me)
+            if self.path == "/plans":
+                # The catalogue, with each checkout link already pointed at the caller's own org
+                # so the provider hands that id back in its webhook. [] = billing not configured.
+                p = self._principal()
+                if p is None:
+                    return self._json(401, {"error": "unauthorized"})
+                org = store.get_org(conn, p["org_id"]) if p["org_id"] else None
+                return self._json(200, {
+                    "plans": [dict(pl, checkout_url=billing.checkout_url(pl, p["org_id"]))
+                              for pl in plans],
+                    "current": org["plan"] if org else None})
             if self.path == "/apikeys":
                 p = self._manager()
                 return p and self._json(200, {"keys": store.list_api_keys(conn,
@@ -732,7 +772,7 @@ def make_handler(*, conn, token, agent_auth=store.authenticate_agent, fetch_url=
                 return self._json(200, {
                     "id": org["id"], "name": org["name"], "event_url": org["event_url"],
                     "shopify_secret_set": bool(org["shopify_secret"]),   # never echo the secret
-                    "job_quota": org["job_quota"],
+                    "job_quota": org["job_quota"], "plan": org["plan"],
                     "jobs_this_month": store.org_usage(conn, oid),
                     "created_at": org["created_at"]})
             mp = _AGENT_PAYLOAD.match(self.path)
@@ -805,6 +845,8 @@ def make_handler(*, conn, token, agent_auth=store.authenticate_agent, fetch_url=
                                            p["org_id"], user_id=p["user_id"])
             if self.path.split("?", 1)[0] == "/integrations/shopify/orders":
                 return self._shopify_webhook()
+            if self.path == "/billing/webhook":
+                return self._billing_webhook()
             if self.path == "/login":
                 return self._login()
             if self.path == "/signup":
@@ -967,6 +1009,17 @@ def make_handler(*, conn, token, agent_auth=store.authenticate_agent, fetch_url=
                     if not store.set_org_quota(conn, oid, quota):
                         return self._json(404, {"error": "not found"})
                     applied["job_quota"] = quota
+                if "plan" in body:
+                    # Same rule as the quota it grants: the operator (or a signed billing event)
+                    # moves an org between plans, never the org itself.
+                    if p["kind"] != "root":
+                        return self._json(403, {"error": "plan is set by billing, not by the org"})
+                    plan = billing.find(plans, body.get("plan"))
+                    if plan is None:
+                        return self._json(400, {"error": f"unknown plan: {body.get('plan')!r}"})
+                    if not store.set_org_plan(conn, oid, plan["id"], plan["jobs"]):
+                        return self._json(404, {"error": "not found"})
+                    applied["plan"], applied["job_quota"] = plan["id"], plan["jobs"]
                 if "shopify_secret" in body:
                     secret = body.get("shopify_secret")     # null clears it
                     if secret is not None and not (isinstance(secret, str) and secret.strip()):
@@ -1010,6 +1063,18 @@ def make_handler(*, conn, token, agent_auth=store.authenticate_agent, fetch_url=
                 if res == "last_user":
                     return self._json(400, {"error": "an org must keep at least one account"})
                 return self._json(404, {"error": "not found"})
+            mo = _ORG_ID.match(self.path)
+            if mo:
+                # Root only, and never DEFAULT_ORG: an org holds other people's print history, and
+                # the default one is where an agent with an unknown key still lands.
+                if not self._admin_ok():
+                    return self._json(401, {"error": "unauthorized"})
+                oid = int(mo.group(1))
+                if oid == store.DEFAULT_ORG:
+                    return self._json(400, {"error": "the default org cannot be removed"})
+                if not store.delete_org(conn, oid):
+                    return self._json(404, {"error": "not found"})
+                return self._json(200, {"ok": True})
             mj = _JOB_ID.match(self.path)
             if mj:
                 ok, org = self._client_org()
@@ -1111,9 +1176,16 @@ def main():
     store.init_db(conn)
     start_reaper(conn)
     start_webhook_dispatcher(conn)
+    # PRINTAPI_PLANS is the catalogue itself (a JSON array) or a path to a file holding one, so a
+    # compose file can mount it instead of squeezing JSON into an env var.
+    raw_plans = os.environ.get("PRINTAPI_PLANS", "").strip()
+    if raw_plans and not raw_plans.startswith("["):
+        raw_plans = Path(raw_plans).read_text(encoding="utf-8")
     httpd = create_server(conn, token, host="0.0.0.0", port=port,
                           signup=os.environ.get("PRINTAPI_SIGNUP", "closed"),
-                          public_url=os.environ.get("PUBLIC_URL"))
+                          public_url=os.environ.get("PUBLIC_URL"),
+                          plans=billing.load_plans(raw_plans),
+                          billing_secret=os.environ.get("PRINTAPI_BILLING_SECRET"))
     print(f"printpapi listening on :{port}")
     httpd.serve_forever()
 

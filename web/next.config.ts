@@ -12,7 +12,7 @@ const DEV_API = process.env.PRINTPAPI_ORIGIN ?? "http://127.0.0.1:3460";
 // "/users/" to the bundle. The Team page's own data therefore does not load under `next dev`.
 const API_PATHS = [
   "/health", "/metrics", "/printers", "/computers", "/jobs", "/apikeys", "/orgs",
-  "/me", "/login", "/logout", "/signup", "/password",
+  "/me", "/login", "/logout", "/signup", "/password", "/plans",
 ];
 
 const nextConfig: NextConfig = {

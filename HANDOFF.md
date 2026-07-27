@@ -104,6 +104,17 @@ extracted, generalized OSS project.
     sets it, a session cannot** — a tenant that could raise its own cap has no cap.
   - `GET /health` reports `signup` and `password_reset` so the sign-in screen only offers doors
     that exist. See `docs/api.md#self-signup`, `#password-reset`, `#quotas`.
+  - **Billing** (`app/billing.py`, pure) — a plan catalogue in `PRINTAPI_PLANS` (JSON array, or a
+    path to a file with one) and one HMAC-signed `POST /billing/webhook`
+    (`PRINTAPI_BILLING_SECRET`) that puts an org on a plan; the plan's `jobs` is written into
+    `orgs.job_quota` in the same UPDATE, so the plan can never disagree with the cap that is
+    actually enforced. `GET /plans` returns the catalogue with each `checkout_url`'s `{org}`
+    substituted for the caller, so the provider echoes the org id back in its event. A non-active
+    status downgrades to the **first** plan in the catalogue (make it free). Root may also set
+    `plan` on `PUT /orgs/{id}`; a session may not (same reasoning as the quota). `DELETE /orgs/{id}`
+    (root, never `DEFAULT_ORG`) removes a tenant with everything in it. **No payment provider is
+    integrated on purpose** — theirs is signed their own way, so a five-line adapter verifies their
+    event and re-signs it as ours. See `docs/billing.md`.
 - Management endpoints — **per-client API keys** (root *or* a session, never a machine key):
   - `POST /apikeys {label}` → issues a new random key (shown once); `GET /apikeys` lists labels;
     `DELETE /apikeys/{id}` revokes. Keys are stored sha256-hashed; revoked keys stop authorizing.
@@ -205,12 +216,15 @@ key and user self-management — `app/auth.py`, `docs/api.md#accounts-and-login`
 **hosted-service plumbing** on top of those (self-signup, password reset by e-mail, user removal,
 org settings in the dashboard, monthly job quotas — `app/mail.py`, `docs/api.md#self-signup`), and
 **Star CloudPRNT** (roadmap #9: the printer polls us itself, no agent at the site —
-`app/cloudprnt.py`, `docs/cloudprnt.md`; spec-complete but unverified on hardware).
-284 tests green.
+`app/cloudprnt.py`, `docs/cloudprnt.md`; spec-complete but unverified on hardware), and
+**billing** (plans + a provider-agnostic signed webhook + org deletion — `app/billing.py`,
+`docs/billing.md`), which was the last missing product piece for a paid deployment.
+296 tests green.
 A demand-research sweep (July 2026) produced the ranked v2 roadmap in `docs/roadmap.md` — read it
-before inventing features. Roadmap #1–#9 are done. What is left on the ranked list: #10 scales
-(agent-side USB HID), #11 ESC/POS templating. Non-code leftover: code-sign the Windows agent (needs
-a cert, gotcha #2). And for a paid deployment, **billing** is still the one missing product piece.
+before inventing features. Roadmap #1–#9 are done, and so is billing. What is left on the ranked
+list: #10 scales (agent-side USB HID), #11 ESC/POS templating. Non-code leftovers: code-sign the
+Windows agent (needs a cert, gotcha #2), pick and wire an actual payment provider to the billing
+webhook (an adapter, not server code), TLS/hosting, and a designed packing slip.
 
 On the PrintNode compat layer specifically, the deliberate ceilings are: a job's state *history* is
 a single entry (we store the current state only), `capabilities.papers` carries names with `null`
@@ -267,9 +281,11 @@ what actually authorizes the print.
 
 **Strategic context for what comes next:** the repo owner wants a cheap hosted SaaS
 ("Shopify/WooCommerce order comes in → label/packing slip prints") undercutting the paid
-PrintNode-wrapper plugins. Org isolation, document rendering (roadmap #5) and the account
-plumbing (signup, reset, quotas) are done — **billing is the last piece of product** before a
-paid deployment: a quota is enforced but nothing charges for exceeding or raising it.
+PrintNode-wrapper plugins. Org isolation, document rendering (roadmap #5), the account plumbing
+(signup, reset, quotas) and now billing (plans, checkout links, the signed webhook, org deletion)
+are all done — **what remains is business, not product**: choose a payment provider (the server
+takes any, via a small re-signing adapter — the choice was deliberately deferred), then TLS,
+hosting and a designed packing slip.
 
 ## 6. Reference
 

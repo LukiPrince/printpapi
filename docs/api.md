@@ -45,8 +45,11 @@ Token comparison is constant-time (`hmac.compare_digest`).
 | `POST /orgs/{id}/users` | root | Create an org's first user |
 | `POST /orgs` | root | Create an org → `{id, name}` |
 | `GET /orgs` | root | List orgs (`event_url`, `shopify_secret_set` — never the secret itself) |
-| `GET /orgs/{id}` | manage | One org's settings + `job_quota` and `jobs_this_month` |
-| `PUT /orgs/{id}` | manage | Set/clear `event_url`, `shopify_secret`; `job_quota` is root-only |
+| `GET /orgs/{id}` | manage | One org's settings + `plan`, `job_quota` and `jobs_this_month` |
+| `PUT /orgs/{id}` | manage | Set/clear `event_url`, `shopify_secret`; `job_quota` and `plan` are root-only |
+| `DELETE /orgs/{id}` | root | Remove an org and everything in it (never the default org) |
+| `GET /plans` | any | The [billing](billing.md) plan catalogue + the caller's current plan |
+| `POST /billing/webhook` | HMAC | The payment provider's callback: this org is on that plan now |
 | `POST /apikeys` | manage | Issue a client key → `{id, label, org_id, key}` (key shown once) |
 | `GET /apikeys` | manage | List keys with their org (never the secret) |
 | `DELETE /apikeys/{id}` | manage | Revoke a key |
@@ -317,6 +320,15 @@ curl -s -X PUT localhost:3460/orgs/2 -H 'Authorization: Bearer <PRINTAPI_TOKEN>'
 - An **idempotent resubmit spends nothing** — it returns the original job, it does not create one.
 - `GET /orgs/{id}` reports `job_quota` and `jobs_this_month`, which is what the dashboard's
   Settings page shows.
+
+### Plans and billing
+
+A hosted deployment sells those quotas as **plans**: `PRINTAPI_PLANS` is the catalogue, a
+plan's `jobs` becomes the org's `job_quota`, and a signed `POST /billing/webhook` from the payment
+provider (via a small adapter) moves an org onto one. `GET /plans` lists the catalogue with each
+checkout link already carrying the caller's org id. Root can also set `plan` on `PUT /orgs/{id}`
+by hand, and `DELETE /orgs/{id}` removes a tenant that leaves. Unconfigured ⇒ off, which is the
+self-hosted default. Full contract: **[billing.md](billing.md)**.
 
 ## Metrics
 

@@ -2,9 +2,9 @@
 
 import { useCallback, useState } from "react";
 import { toast } from "sonner";
-import { Gauge, Loader2, Lock, Save, Webhook } from "lucide-react";
+import { CreditCard, Gauge, Loader2, Lock, Save, Webhook } from "lucide-react";
 import { usePoll } from "@/hooks/use-poll";
-import { getMe, getOrg, listOrgs, updateOrg, type Org } from "@/lib/api";
+import { getMe, getOrg, listOrgs, listPlans, updateOrg, type Org } from "@/lib/api";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -34,6 +34,8 @@ export default function SettingsPage() {
     useCallback(() => (chosen === null ? Promise.resolve(null) : getOrg(chosen)), [chosen]),
     0,
   );
+  // Empty on a server without a plan catalogue — then the whole billing card stays hidden.
+  const { data: catalogue } = usePoll(useCallback(() => listPlans(), []), 0);
 
   const [eventUrl, setEventUrl] = useState("");
   const [secret, setSecret] = useState("");
@@ -107,6 +109,60 @@ export default function SettingsPage() {
                 ))}
               </SelectContent>
             </Select>
+          </CardContent>
+        </Card>
+      )}
+
+      {(catalogue?.plans.length ?? 0) > 0 && (
+        <Card>
+          <CardHeader>
+            <CardTitle className="flex items-center gap-2">
+              <CreditCard className="size-4" /> Plan
+            </CardTitle>
+            <CardDescription>
+              What this org may print per month. Checkout happens at the payment provider — this
+              server never sees a card, it only hears back which plan you are on.
+            </CardDescription>
+          </CardHeader>
+          <CardContent className="space-y-2">
+            {catalogue!.plans.map((plan) => {
+              const current = org?.plan === plan.id;
+              return (
+                <div
+                  key={plan.id}
+                  className="flex flex-wrap items-center gap-3 rounded-lg border p-3"
+                >
+                  <div className="flex-1">
+                    <div className="flex items-center gap-2 font-medium">
+                      {plan.name}
+                      {current && <Badge>current</Badge>}
+                    </div>
+                    <div className="text-muted-foreground text-sm">
+                      {plan.jobs === null ? "unlimited jobs" : `${plan.jobs} jobs / month`}
+                      {plan.price ? ` — ${plan.price}` : ""}
+                    </div>
+                  </div>
+                  {isRoot ? (
+                    <Button
+                      variant="outline"
+                      disabled={current || busy === "Plan"}
+                      onClick={() => save("Plan", { plan: plan.id })}
+                    >
+                      {current ? "In use" : "Move here"}
+                    </Button>
+                  ) : (
+                    plan.checkout_url &&
+                    !current && (
+                      <Button asChild variant="outline">
+                        <a href={plan.checkout_url} target="_blank" rel="noreferrer">
+                          Choose
+                        </a>
+                      </Button>
+                    )
+                  )}
+                </div>
+              );
+            })}
           </CardContent>
         </Card>
       )}

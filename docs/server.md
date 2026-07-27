@@ -38,6 +38,8 @@ Environment variables:
 | `SMTP_FROM` | `printpapi@localhost` | Envelope sender |
 | `SMTP_SSL` | *(off)* | `1` for implicit TLS; otherwise STARTTLS is used |
 | `SMTP_STARTTLS` | `1` | `0` to disable STARTTLS (plaintext relay on a trusted network) |
+| `PRINTAPI_PLANS` | *(unset)* | [Billing](billing.md) catalogue: a JSON array of plans, or a path to a file holding one. Unset ⇒ no plans, no billing routes |
+| `PRINTAPI_BILLING_SECRET` | *(unset)* | Shared secret for the `POST /billing/webhook` signature. Unset ⇒ the webhook answers `503` |
 
 ```bash
 PRINTAPI_TOKEN=change-me PRINT_DB=data/printpapi.db python -m app.server

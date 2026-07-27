@@ -16,7 +16,7 @@ _LOCK = threading.Lock()  # ponytail: global lock; per-connection pool only if i
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS orgs(
   id INTEGER PRIMARY KEY, name TEXT NOT NULL, event_url TEXT, shopify_secret TEXT,
-  job_quota INTEGER, created_at REAL NOT NULL);
+  job_quota INTEGER, plan TEXT, created_at REAL NOT NULL);
 CREATE TABLE IF NOT EXISTS users(
   id INTEGER PRIMARY KEY, org_id INTEGER NOT NULL, name TEXT NOT NULL, created_at REAL NOT NULL,
   email TEXT, password_hash TEXT);
@@ -85,7 +85,8 @@ def init_db(conn):
                         "ALTER TABLE users ADD COLUMN email TEXT",
                         "ALTER TABLE users ADD COLUMN password_hash TEXT",
                         "CREATE UNIQUE INDEX IF NOT EXISTS users_email ON users(email)",
-                        "ALTER TABLE orgs ADD COLUMN job_quota INTEGER"):
+                        "ALTER TABLE orgs ADD COLUMN job_quota INTEGER",
+                        "ALTER TABLE orgs ADD COLUMN plan TEXT"):
                 try:
                     conn.execute(ddl)
                 except sqlite3.OperationalError:
@@ -128,19 +129,19 @@ def list_orgs(conn):
     """Orgs for the root listing. The Shopify webhook secret is reported as a flag, never echoed —
     it is the one credential here that has to be stored in plaintext (HMAC needs it)."""
     with _LOCK:
-        rows = conn.execute("SELECT id, name, event_url, shopify_secret, job_quota, created_at "
-                            "FROM orgs ORDER BY id").fetchall()
+        rows = conn.execute("SELECT id, name, event_url, shopify_secret, job_quota, plan, "
+                            "created_at FROM orgs ORDER BY id").fetchall()
     return [{"id": r["id"], "name": r["name"], "event_url": r["event_url"],
              "shopify_secret_set": bool(r["shopify_secret"]), "job_quota": r["job_quota"],
-             "created_at": r["created_at"]}
+             "plan": r["plan"], "created_at": r["created_at"]}
             for r in rows]
 
 
 def get_org(conn, org_id):
     """Full org row including secrets — for server-side use (HMAC verification), not for output."""
     with _LOCK:
-        row = conn.execute("SELECT id, name, event_url, shopify_secret, job_quota, created_at "
-                           "FROM orgs WHERE id=?", (org_id,)).fetchone()
+        row = conn.execute("SELECT id, name, event_url, shopify_secret, job_quota, plan, "
+                           "created_at FROM orgs WHERE id=?", (org_id,)).fetchone()
     return dict(row) if row else None
 
 
@@ -169,6 +170,44 @@ def set_org_shopify_secret(conn, org_id, secret):
 def set_org_quota(conn, org_id, quota):
     """Jobs this org may submit per calendar month (None = unlimited). False if no such org."""
     return _set_org_field(conn, org_id, "job_quota", quota)
+
+
+def set_org_plan(conn, org_id, plan, quota):
+    """Move an org onto a billing plan. The plan id is bookkeeping; its quota is what bites, and
+    both are written in one UPDATE so they can never disagree. False if no such org."""
+    with _LOCK:
+        try:
+            cur = conn.execute("UPDATE orgs SET plan=?, job_quota=? WHERE id=?",
+                               (plan, quota, org_id))
+            conn.commit()
+            return cur.rowcount == 1
+        except Exception:
+            conn.rollback()
+            raise
+
+
+def delete_org(conn, org_id):
+    """Remove an org and everything that belongs to it — jobs, printers, agents, keys, accounts
+    and their sessions. False if there is no such org.
+
+    No soft delete: a tenant that cancelled and asked to be forgotten is what this is for. The
+    caller decides who may (root only) and protects DEFAULT_ORG — an agent presenting an unknown
+    key still enrolls there."""
+    with _LOCK:
+        try:
+            if conn.execute("SELECT 1 FROM orgs WHERE id=?", (org_id,)).fetchone() is None:
+                return False
+            users = "SELECT id FROM users WHERE org_id=?"
+            conn.execute(f"DELETE FROM sessions WHERE user_id IN ({users})", (org_id,))
+            conn.execute(f"DELETE FROM password_resets WHERE user_id IN ({users})", (org_id,))
+            for table in ("jobs", "printers", "agents", "api_keys", "users"):
+                conn.execute(f"DELETE FROM {table} WHERE org_id=?", (org_id,))
+            conn.execute("DELETE FROM orgs WHERE id=?", (org_id,))
+            conn.commit()
+            return True
+        except Exception:
+            conn.rollback()
+            raise
 
 
 class QuotaExceeded(Exception):

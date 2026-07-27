@@ -35,6 +35,10 @@ v1 is deliberately small (see [CONTRIBUTING.md](../CONTRIBUTING.md) for the YAGN
 - ~~**Hosted-service plumbing**~~ ✅ opt-in self-signup, password reset by e-mail (SMTP, stderr
   fallback), account removal, a Settings page for the org's own knobs, and per-org monthly job
   quotas answering `402`. See [api.md](api.md#self-signup).
+- ~~**Billing**~~ ✅ a plan catalogue (`PRINTAPI_PLANS`), checkout links carrying the org id, one
+  HMAC-signed `POST /billing/webhook` that moves an org onto a plan (and its quota with it), and
+  `DELETE /orgs/{id}` for the tenant that leaves. Provider-agnostic on purpose — no SDK, no
+  dependency. See [billing.md](billing.md).
 
 ## v2 candidates
 
@@ -69,8 +73,11 @@ order of pull:
    that no longer needs the root token. See [Accounts and login](api.md#accounts-and-login).
    And since then the plumbing a paid deployment needs: opt-in
    [self-signup](api.md#self-signup), [password reset](api.md#password-reset) by e-mail, account
-   removal, an org Settings page, and monthly [job quotas](api.md#quotas). Still open on top of
-   it: **billing** (the quota is enforced, nothing charges for it), plans/tiers, org deletion.
+   removal, an org Settings page, and monthly [job quotas](api.md#quotas). And since then
+   **[billing](billing.md)**: a plan catalogue, a signed provider webhook that sets an org's plan
+   and quota, plan buttons in Settings, and `DELETE /orgs/{id}`. Still open on top of it: no
+   provider is integrated (their event goes through a small adapter that re-signs it), no
+   proration/trials/seats, and nothing dunns an over-quota tenant.
 7. ~~**PrintNode API compatibility layer**~~ ✅ **shipped** — `/whoami`, `/computers`, `/printers`,
    `POST|GET|DELETE /printjobs` and `/printjobs/{set}/states` in their JSON shapes, selected by auth
    scheme (HTTP Basic → compat, `Bearer` → ours), so a client with a configurable base URL needs one
