@@ -1,7 +1,14 @@
 # Billing (plans, checkout links, one signed webhook)
 
-For a **hosted** printpapi that charges money. A self-hosted box configures none of this, and
+For a printpapi deployment that charges for prints. A self-hosted box configures none of this, and
 every billing route stays off (`503`, and `GET /plans` returns an empty catalogue).
+
+> **What this is licensed for.** The [Elastic License 2.0](../LICENSE) does **not** allow offering
+> printpapi to the public as a hosted or managed print service of your own — that right is the
+> licensor's. These endpoints exist for: internal chargeback between departments or clients, an IT
+> service provider billing an *identified* client it runs printpapi for (the additional permission
+> in `LICENSE`), and the licensor's own hosted offering. Having the code does not grant the right;
+> read `LICENSE` before you point a payment provider at this.
 
 printpapi does not integrate a payment provider — it takes a **plan catalogue** and a **signed
 callback**. Every provider (Stripe, Paddle, Lemon Squeezy, an invoice you send by hand) can
