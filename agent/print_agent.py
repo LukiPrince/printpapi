@@ -314,7 +314,8 @@ def register_with_retry(base, key, name, printers, *, http_post=_post, sleep=tim
     while True:
         try:
             reg = register(base, key, name, printers, http_post=http_post)
-            if not isinstance(reg, dict) or "printer_ids" not in reg or "computer_id" not in reg:
+            if not isinstance(reg, dict) or not isinstance(reg.get("printer_ids"), dict) \
+                    or "computer_id" not in reg:
                 raise ValueError(f"unexpected register reply: {reg!r:.200}")
             return reg
         except Exception as e:

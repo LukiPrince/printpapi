@@ -1,3 +1,5 @@
+import runpy
+import shutil
 import tempfile
 
 import pytest
@@ -671,6 +673,22 @@ def test_register_with_retry_retries_a_reply_missing_expected_fields():
     assert len(calls) == 2
 
 
+def test_register_with_retry_retries_a_reply_with_wrong_printer_ids_type():
+    # Both fields present but printer_ids is not a dict (e.g. null, or a list) - main() would
+    # crash on .items() at the call site, so this must retry like a missing field does.
+    calls = []
+
+    def wrong_type_then_ok(url, key, body):
+        calls.append(url)
+        if len(calls) == 1:
+            return {"computer_id": 1, "printer_ids": None}
+        return {"computer_id": 1, "printer_ids": {"p": 1}}
+    reg = print_agent.register_with_retry("http://x", "k", "pc", [], http_post=wrong_type_then_ok,
+                                          sleep=lambda s: None, log=lambda m: None)
+    assert reg == {"computer_id": 1, "printer_ids": {"p": 1}}
+    assert len(calls) == 2
+
+
 # --- poll loop: log only on a failing/recovered transition, not every 2s retry -----------------
 
 def test_poll_forever_logs_only_on_failing_and_recovered_transitions():
@@ -699,6 +717,9 @@ def test_main_registers_with_retry_and_starts_the_poll_loop(monkeypatch, tmp_pat
     monkeypatch.setattr(print_agent, "load_config", lambda base_dir: cfg)
     monkeypatch.setattr(print_agent, "select_backend", lambda **_: ("raw_fn", "pdf_fn"))
     monkeypatch.setattr(print_agent, "add_capabilities", lambda printers, fn: printers)
+    # main() also runs the real configure_http(*http_settings(cfg)), which would otherwise
+    # overwrite module-level _HTTP with the default values and leak past this test.
+    monkeypatch.setattr(print_agent, "_HTTP", {"headers": {}, "timeout": 60.0})
 
     calls = []
 
@@ -722,3 +743,18 @@ def test_main_registers_with_retry_and_starts_the_poll_loop(monkeypatch, tmp_pat
                         [{"name": "p", "can_pdf": False, "target": "p"}])
     assert calls[1] == ("poll", "https://x", "k",
                         {1: {"name": "p", "can_pdf": False, "target": "p"}})
+
+
+def test_dunder_main_logs_a_bad_agent_ini_before_exiting(monkeypatch, tmp_path):
+    # Runs the file the way Task Scheduler / a double-click does: as __main__, no agent.ini next
+    # to it. The `except SystemExit` block in the __main__ guard must reach the crash log even
+    # though SystemExit is a BaseException (a plain `except Exception` would miss it).
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path))
+    copy = tmp_path / "print_agent.py"
+    shutil.copy(print_agent.__file__, copy)
+
+    with pytest.raises(SystemExit):
+        runpy.run_path(str(copy), run_name="__main__")
+
+    text = (tmp_path / "print_agent-error.log").read_text(encoding="utf-8")
+    assert "exit: missing or invalid" in text
