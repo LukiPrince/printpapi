@@ -307,14 +307,23 @@ def register_with_retry(base, key, name, printers, *, http_post=_post, sleep=tim
     """register() until it works. At boot the network (or an auth proxy) is often not there yet;
     a one-shot register killed the process, and a logon-triggered task never restarted it.
     Retries on anything - OSError (network/HTTP status) and ValueError (a proxy's HTML page
-    instead of JSON) alike; a permanent misconfiguration shows up in the log, once per try."""
+    instead of JSON) alike; a permanent misconfiguration shows up in the log, once per try.
+    Also retries a reply that parsed but is not what main() needs (e.g. an empty {} from a proxy
+    that ate the body) instead of letting main() crash on it after only one attempt."""
     attempt = 0
     while True:
         try:
-            return register(base, key, name, printers, http_post=http_post)
+            reg = register(base, key, name, printers, http_post=http_post)
+            if not isinstance(reg, dict) or "printer_ids" not in reg or "computer_id" not in reg:
+                raise ValueError(f"unexpected register reply: {reg!r:.200}")
+            return reg
         except Exception as e:
             wait = min(2 ** attempt, max_wait)
-            log(f"register failed (try {attempt + 1}), retry in {wait}s: {e}")
+            msg = f"register failed (try {attempt + 1}), retry in {wait}s: {e}"
+            # stderr too, not just the log file: an interactive hand test (python.exe, not
+            # pythonw) would otherwise sit silently waiting with nothing on the console.
+            print(msg, file=sys.stderr)
+            log(msg)
             sleep(wait)
             attempt += 1
 
@@ -426,6 +435,28 @@ def http_settings(agent_cfg):
     return headers, timeout
 
 
+def _poll_forever(base, key, printer_by_id, *, raw_fn, pdf_fn, run_once=run_once,
+                  sleep=time.sleep, log=_log_error):
+    """The main loop: poll, print, repeat. Logs only on a failing/recovered transition, not every
+    error - at the 2 s retry interval a down server or a revoked token would otherwise write
+    about 43k lines/day and bury the one thing an operator needs from the crash log. Still prints
+    every error to the console for a foreground/hand-test run."""
+    failing = False
+    while True:
+        try:
+            run_once(base, key, printer_by_id, raw_fn=raw_fn, pdf_fn=pdf_fn)
+        except Exception as e:
+            if not failing:
+                log(f"poll error: {e}")
+                failing = True
+            print(f"poll error: {e}")
+            sleep(2)
+        else:
+            if failing:
+                log("poll recovered")
+                failing = False
+
+
 def main():
     base_dir = os.path.dirname(sys.executable) if getattr(sys, "frozen", False) \
         else os.path.dirname(os.path.abspath(__file__))
@@ -443,20 +474,19 @@ def main():
     entry_by_name = {p["name"]: p for p in printers}
     printer_by_id = {pid: entry_by_name[pname] for pname, pid in reg["printer_ids"].items()}
     print(f"print-agent registered as computer {reg['computer_id']}, printers={printer_by_id}")
-    while True:
-        try:
-            run_once(base, key, printer_by_id, raw_fn=raw_fn, pdf_fn=pdf_fn)
-        except Exception as e:
-            print(f"poll error: {e}")
-            time.sleep(2)
+    _poll_forever(base, key, printer_by_id, raw_fn=raw_fn, pdf_fn=pdf_fn)
 
 
 if __name__ == "__main__":
     try:
         main()
+    except SystemExit as e:
+        # load_config() and http_settings() raise this for a bad agent.ini; it is a BaseException,
+        # so it would otherwise skip the log entirely (and under pythonw, skip the console too).
+        if e.code not in (None, 0):
+            _log_error(f"exit: {e.code}")
+        raise
     except Exception:
         import traceback
-        logdir = os.environ.get("LOCALAPPDATA") or tempfile.gettempdir()
-        with open(os.path.join(logdir, "print_agent-error.log"), "a", encoding="utf-8") as f:
-            f.write(traceback.format_exc())
+        _log_error(traceback.format_exc())
         raise

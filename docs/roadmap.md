@@ -102,9 +102,9 @@ order of pull:
 11. **ESC/POS receipt rendering/templating** — images/QR/receiptline-style markdown → ESC-POS. Where
     Home-Assistant/hobbyist efforts stall today; expensive to do well, raw passthrough already works.
 12. **Code-signed Windows agent installer** — the one blocker that needs a certificate, not code.
-- **Opt-in: reject unknown keys on `/agent/register`.** Today an unrecognised bearer enrolls into
-  the default org - harmless on a LAN, but anyone who can reach `/agent/*` from outside can add
-  agents and printers there. Until then, exposing `/agent/*` needs an auth proxy in front.
+13. **Opt-in: reject unknown keys on `/agent/register`.** Today an unrecognised bearer enrolls into
+    the default org - harmless on a LAN, but anyone who can reach `/agent/*` from outside can add
+    agents and printers there. Until then, exposing `/agent/*` needs an auth proxy in front.
 
 Explicitly parked: MCP/LLM printing (no measurable audience yet), email-to-print (not even
 PrintNode has it), Magento-specific work (generic webhook intake covers it), browser-side silent

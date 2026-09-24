@@ -1,3 +1,5 @@
+import tempfile
+
 import pytest
 from agent import print_agent
 
@@ -624,3 +626,99 @@ def test_log_error_appends_to_the_crash_log(tmp_path, monkeypatch):
     print_agent._log_error("register failed (try 2)")
     text = (tmp_path / "print_agent-error.log").read_text(encoding="utf-8")
     assert "try 1" in text and "try 2" in text
+
+
+def test_log_error_falls_back_to_the_tempdir_without_localappdata(monkeypatch, tmp_path):
+    monkeypatch.delenv("LOCALAPPDATA", raising=False)
+    monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
+    print_agent._log_error("no LOCALAPPDATA on this box")
+    assert (tmp_path / "print_agent-error.log").read_text(encoding="utf-8")
+
+
+def test_log_error_swallows_a_missing_log_directory(monkeypatch, tmp_path):
+    # LOCALAPPDATA set but pointing nowhere (odd profile, wiped folder) must not crash the caller.
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path / "does-not-exist"))
+    print_agent._log_error("should not raise")
+
+
+def test_register_with_retry_prints_to_stderr_for_interactive_runs(capsys):
+    # A hand test runs python.exe (has a console), not pythonw.exe - a wrong key or unreachable
+    # server must show something while it waits, not just append to a log file.
+    n = {"i": 0}
+
+    def once_then_ok(url, key, body):
+        n["i"] += 1
+        if n["i"] == 1:
+            raise OSError("connection failed: [Errno 11001] getaddrinfo failed")
+        return {"computer_id": 1, "printer_ids": {}}
+    print_agent.register_with_retry("http://x", "k", "pc", [], http_post=once_then_ok,
+                                    sleep=lambda s: None, log=lambda m: None)
+    assert "register failed" in capsys.readouterr().err
+
+
+def test_register_with_retry_retries_a_reply_missing_expected_fields():
+    # An empty 200 body (e.g. a misbehaving proxy) parses fine but has neither field main() needs.
+    calls = []
+
+    def empty_then_ok(url, key, body):
+        calls.append(url)
+        if len(calls) == 1:
+            return {}
+        return {"computer_id": 3, "printer_ids": {"p": 1}}
+    reg = print_agent.register_with_retry("http://x", "k", "pc", [], http_post=empty_then_ok,
+                                          sleep=lambda s: None, log=lambda m: None)
+    assert reg == {"computer_id": 3, "printer_ids": {"p": 1}}
+    assert len(calls) == 2
+
+
+# --- poll loop: log only on a failing/recovered transition, not every 2s retry -----------------
+
+def test_poll_forever_logs_only_on_failing_and_recovered_transitions():
+    class _Stop(BaseException):
+        pass
+
+    calls, logged, slept = [], [], []
+
+    def fake_run_once(base, key, printer_by_id, *, raw_fn, pdf_fn):
+        calls.append(1)
+        if len(calls) in (1, 2):
+            raise OSError("down")
+        if len(calls) == 3:
+            return False  # recovered
+        raise _Stop  # end the test's otherwise-infinite loop
+
+    with pytest.raises(_Stop):
+        print_agent._poll_forever("http://x", "k", {}, raw_fn=None, pdf_fn=None,
+                                  run_once=fake_run_once, sleep=slept.append, log=logged.append)
+    assert logged == ["poll error: down", "poll recovered"]
+    assert slept == [2, 2]  # only the two failing calls sleep
+
+
+def test_main_registers_with_retry_and_starts_the_poll_loop(monkeypatch, tmp_path):
+    cfg = _ini(tmp_path)  # server_url=https://x, api_key=k, printers=p, no name -> default "agent"
+    monkeypatch.setattr(print_agent, "load_config", lambda base_dir: cfg)
+    monkeypatch.setattr(print_agent, "select_backend", lambda **_: ("raw_fn", "pdf_fn"))
+    monkeypatch.setattr(print_agent, "add_capabilities", lambda printers, fn: printers)
+
+    calls = []
+
+    def fake_retry(base, key, name, printers):
+        calls.append(("register", base, key, name, printers))
+        return {"computer_id": 9, "printer_ids": {"p": 1}}
+    monkeypatch.setattr(print_agent, "register_with_retry", fake_retry)
+
+    class _Stop(BaseException):
+        pass
+
+    def fake_poll_forever(base, key, printer_by_id, **kw):
+        calls.append(("poll", base, key, printer_by_id))
+        raise _Stop
+    monkeypatch.setattr(print_agent, "_poll_forever", fake_poll_forever)
+
+    with pytest.raises(_Stop):
+        print_agent.main()
+
+    assert calls[0] == ("register", "https://x", "k", "agent",
+                        [{"name": "p", "can_pdf": False, "target": "p"}])
+    assert calls[1] == ("poll", "https://x", "k",
+                        {1: {"name": "p", "can_pdf": False, "target": "p"}})
