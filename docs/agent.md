@@ -49,9 +49,10 @@ printers   = Zebra GK420d ; HP LaserJet|pdf ; warehouse-label = socket://192.168
 ### Unattended machines
 
 On start the agent registers until it succeeds (backoff 1 s … 5 min), so a machine that boots
-before its network is up simply waits instead of exiting. Each failed try and every crash is
-appended to `%LOCALAPPDATA%\print_agent-error.log` (Windows) or the temp dir - that file is the
-first thing to read over remote desktop.
+before its network is up simply waits instead of exiting. Each failed register try, the first poll
+error after a working stretch (and the matching "poll recovered"), a rejected `agent.ini` and every
+crash are appended to `%LOCALAPPDATA%\print_agent-error.log` (Windows) or the temp dir - that file
+is the first thing to read over remote desktop.
 
 When exposing the server to agents outside your LAN, publish **only** `/agent/*` and put an auth
 proxy in front: `/agent/register` enrolls an unknown key into the default org (see roadmap).
@@ -247,4 +248,4 @@ executable) — or use a code-signed build when one is available.
   successful print doesn't make the server requeue (and re-print) the job.
 - If the agent dies mid-job, the server's reaper requeues the job after the visibility timeout.
 - Crash log: `%LOCALAPPDATA%\print_agent-error.log` (Windows) / `print_agent-error.log` in the
-  temp dir (Linux, macOS).
+  temp dir (Linux, macOS) - see [Unattended machines](#unattended-machines) for what gets logged.
