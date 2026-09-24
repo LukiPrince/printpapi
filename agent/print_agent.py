@@ -291,6 +291,34 @@ def register(base, key, name, printers, http_post=_post):
     return http_post(base + "/agent/register", key, {"name": name, "printers": printers})
 
 
+def _log_error(msg):
+    """Append one line to the crash log. Under pythonw there is no console; this file is what
+    an operator reads over remote desktop."""
+    logdir = os.environ.get("LOCALAPPDATA") or tempfile.gettempdir()
+    try:
+        with open(os.path.join(logdir, "print_agent-error.log"), "a", encoding="utf-8") as f:
+            f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} {msg}\n")
+    except OSError:
+        pass
+
+
+def register_with_retry(base, key, name, printers, *, http_post=_post, sleep=time.sleep,
+                        log=_log_error, max_wait=300):
+    """register() until it works. At boot the network (or an auth proxy) is often not there yet;
+    a one-shot register killed the process, and a logon-triggered task never restarted it.
+    Retries on anything - OSError (network/HTTP status) and ValueError (a proxy's HTML page
+    instead of JSON) alike; a permanent misconfiguration shows up in the log, once per try."""
+    attempt = 0
+    while True:
+        try:
+            return register(base, key, name, printers, http_post=http_post)
+        except Exception as e:
+            wait = min(2 ** attempt, max_wait)
+            log(f"register failed (try {attempt + 1}), retry in {wait}s: {e}")
+            sleep(wait)
+            attempt += 1
+
+
 def poll_job(base, key, http_get=_get):
     return http_get(base + "/agent/jobs", key)
 
@@ -411,7 +439,7 @@ def main():
     raw_fn, pdf_fn = select_backend(sumatra=sumatra)
     printers = parse_printers(agent_cfg["printers"])
     add_capabilities(printers, select_caps_collector())
-    reg = register(base, key, name, printers)
+    reg = register_with_retry(base, key, name, printers)
     entry_by_name = {p["name"]: p for p in printers}
     printer_by_id = {pid: entry_by_name[pname] for pname, pid in reg["printer_ids"].items()}
     print(f"print-agent registered as computer {reg['computer_id']}, printers={printer_by_id}")

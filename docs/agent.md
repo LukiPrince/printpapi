@@ -30,6 +30,32 @@ name       = office-pc
 printers   = Zebra GK420d ; HP LaserJet|pdf ; warehouse-label = socket://192.168.1.50:9100
 ```
 
+### Optional: timeout and extra headers
+
+- `timeout = 60` in `[agent]` - socket timeout per request in seconds (default 60, minimum 30,
+  because the server long-polls 25 s). Without it, a NAT flow that is silently dropped mid-poll
+  would hang the agent forever while the dashboard already shows it offline.
+- A `[headers]` section adds headers to every request. Use it when an auth proxy sits in front of
+  the server's `/agent/` paths, for example a Cloudflare Access service-token policy:
+
+  ```ini
+  [headers]
+  CF-Access-Client-Id     = <client id>
+  CF-Access-Client-Secret = <client secret>
+  ```
+
+  `Authorization`, `User-Agent` and `Content-Type` are set by the agent and are refused here.
+
+### Unattended machines
+
+On start the agent registers until it succeeds (backoff 1 s … 5 min), so a machine that boots
+before its network is up simply waits instead of exiting. Each failed try and every crash is
+appended to `%LOCALAPPDATA%\print_agent-error.log` (Windows) or the temp dir - that file is the
+first thing to read over remote desktop.
+
+When exposing the server to agents outside your LAN, publish **only** `/agent/*` and put an auth
+proxy in front: `/agent/register` enrolls an unknown key into the default org (see roadmap).
+
 ### Printer syntax
 
 `name [|pdf] [= target]`, semicolon-separated:

@@ -569,3 +569,58 @@ def test_http_settings_keeps_percent_signs_in_secrets(tmp_path):
     # configparser interpolation would choke on '%' — secrets are read raw
     headers, _ = print_agent.http_settings(_ini(tmp_path, "[headers]\nX-Token = a%b\n"))
     assert headers == {"x-token": "a%b"}
+
+
+# --- register with retry (unattended remote machines) -------------------------------------------
+
+def test_register_with_retry_retries_until_success():
+    calls, waits, logged = [], [], []
+
+    def flaky(url, key, body):
+        calls.append(url)
+        if len(calls) < 3:
+            raise OSError("connection failed: [Errno 11001] getaddrinfo failed")
+        return {"computer_id": 7, "printer_ids": {"p": 1}}
+    reg = print_agent.register_with_retry("http://x", "k", "pc", [], http_post=flaky,
+                                          sleep=waits.append, log=logged.append)
+    assert reg["computer_id"] == 7
+    assert calls == ["http://x/agent/register"] * 3
+    assert waits == [1, 2]
+    assert len(logged) == 2 and "register failed" in logged[0]
+
+
+def test_register_with_retry_caps_the_wait():
+    n = {"i": 0}
+    waits = []
+
+    def down(url, key, body):
+        n["i"] += 1
+        if n["i"] <= 12:
+            raise OSError("down")
+        return {"computer_id": 1, "printer_ids": {}}
+    print_agent.register_with_retry("http://x", "k", "pc", [], http_post=down,
+                                    sleep=waits.append, log=lambda m: None, max_wait=300)
+    assert waits[:3] == [1, 2, 4]
+    assert max(waits) == 300 and len(waits) == 12
+
+
+def test_register_with_retry_survives_a_non_json_proxy_page():
+    # an auth proxy answering with its HTML login page surfaces as ValueError from json.loads
+    n = {"i": 0}
+
+    def proxy_then_ok(url, key, body):
+        n["i"] += 1
+        if n["i"] == 1:
+            raise ValueError("Expecting value: line 1 column 1 (char 0)")
+        return {"computer_id": 2, "printer_ids": {}}
+    reg = print_agent.register_with_retry("http://x", "k", "pc", [], http_post=proxy_then_ok,
+                                          sleep=lambda s: None, log=lambda m: None)
+    assert reg["computer_id"] == 2
+
+
+def test_log_error_appends_to_the_crash_log(tmp_path, monkeypatch):
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path))
+    print_agent._log_error("register failed (try 1)")
+    print_agent._log_error("register failed (try 2)")
+    text = (tmp_path / "print_agent-error.log").read_text(encoding="utf-8")
+    assert "try 1" in text and "try 2" in text
