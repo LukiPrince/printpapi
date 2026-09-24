@@ -12,6 +12,24 @@ import urllib.request
 
 _UA = "printpapi-agent"
 
+# Network settings, set once by main() from agent.ini (see http_settings). Module state rather
+# than two more parameters on every http fn: register/run_once take injectable
+# (url, key[, body]) callables, and threading headers + timeout through all of them buys nothing.
+#   headers - extra request headers, e.g. an auth proxy's service-token pair in front of /agent/*
+#   timeout - socket timeout per request. Must outlast the server's long-poll (25 s). Without one,
+#             a NAT flow that is silently dropped mid-poll hangs the agent forever while the
+#             server already shows it offline.
+_HTTP_DEFAULT_TIMEOUT = 60.0
+_MIN_TIMEOUT = 30.0
+_HTTP = {"headers": {}, "timeout": _HTTP_DEFAULT_TIMEOUT}
+_RESERVED_HEADERS = {"authorization", "user-agent", "content-type"}
+
+
+def configure_http(headers=None, timeout=None):
+    _HTTP["headers"] = dict(headers or {})
+    if timeout is not None:
+        _HTTP["timeout"] = float(timeout)
+
 
 def raw_to_printer(printer, data):
     import win32print  # only on Windows; injected in tests
@@ -239,12 +257,14 @@ def parse_printers(spec):
 
 def _req(url, key, *, data=None, method="GET", as_bytes=False):
     r = urllib.request.Request(url, data=data, method=method)
+    for name, value in _HTTP["headers"].items():
+        r.add_header(name, value)
     r.add_header("Authorization", f"Bearer {key}")
     r.add_header("User-Agent", _UA)
     if data is not None:
         r.add_header("Content-Type", "application/json")
     try:
-        with urllib.request.urlopen(r) as resp:
+        with urllib.request.urlopen(r, timeout=_HTTP["timeout"]) as resp:
             raw = resp.read()
             if resp.status == 204:
                 return None
@@ -353,10 +373,36 @@ def load_config(base_dir):
     return cfg["agent"]
 
 
+def http_settings(agent_cfg):
+    """agent.ini -> (extra headers, timeout).
+
+    Headers come from an optional [headers] section, one `Name = value` per line. configparser
+    lower-cases the names; HTTP header names are case-insensitive, so that is harmless. Values are
+    read raw (no interpolation) so a secret containing '%' survives. `timeout` is an optional key
+    in [agent]."""
+    parser = agent_cfg.parser
+    headers = {}
+    if parser.has_section("headers"):
+        defaults = parser.defaults()
+        for name, value in parser.items("headers", raw=True):
+            if name in defaults:
+                continue
+            if name.lower() in _RESERVED_HEADERS:
+                raise SystemExit(f"agent.ini [headers]: {name} is set by the agent itself")
+            headers[name] = value
+    timeout = agent_cfg.getfloat("timeout", fallback=_HTTP_DEFAULT_TIMEOUT)
+    if timeout < _MIN_TIMEOUT:
+        raise SystemExit(
+            f"agent.ini timeout = {timeout:g}: must be >= {_MIN_TIMEOUT:g} s "
+            f"(the server long-polls 25 s)")
+    return headers, timeout
+
+
 def main():
     base_dir = os.path.dirname(sys.executable) if getattr(sys, "frozen", False) \
         else os.path.dirname(os.path.abspath(__file__))
     agent_cfg = load_config(base_dir)
+    configure_http(*http_settings(agent_cfg))
     base = agent_cfg["server_url"].rstrip("/")
     key = agent_cfg["api_key"]
     name = agent_cfg.get("name", "agent")

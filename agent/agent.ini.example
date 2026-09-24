@@ -22,3 +22,14 @@ name = office-pc
 ;                              (job-<id>.pdf / .prn) instead of printed. Takes pdf and raw.
 ;                              Windows: file:///C:/printpapi/out
 printers = Zebra GK420d ; HP LaserJet|pdf ; warehouse-label = socket://192.168.1.50:9100
+
+; Optional: socket timeout per request in seconds (default 60, minimum 30 - the server
+; long-polls 25 s). Guards against a NAT flow that is silently dropped mid-poll.
+; timeout = 60
+
+; Optional: extra headers sent with every request - e.g. when an auth proxy in front of the
+; server's /agent/ paths wants a service-token pair. Authorization, User-Agent and
+; Content-Type are set by the agent and cannot be overridden here.
+; [headers]
+; CF-Access-Client-Id = <id>
+; CF-Access-Client-Secret = <secret>

@@ -489,3 +489,83 @@ def test_load_config_ok(tmp_path):
         "[agent]\nserver_url=http://x\napi_key=k\nprinters=p\n")
     cfg = print_agent.load_config(str(tmp_path))
     assert cfg["server_url"] == "http://x"
+
+
+# --- network settings: extra headers (auth proxy) + socket timeout ------------------------------
+
+class _Resp:
+    status = 200
+
+    def read(self):
+        return b'{"ok": true}'
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+
+def test_req_sends_extra_headers_and_timeout(monkeypatch):
+    import urllib.request
+    seen = {}
+
+    def fake(req, timeout=None):
+        seen["headers"] = dict(req.header_items())
+        seen["timeout"] = timeout
+        return _Resp()
+    monkeypatch.setattr(urllib.request, "urlopen", fake)
+    monkeypatch.setattr(print_agent, "_HTTP", {"headers": {}, "timeout": 60.0})
+    print_agent.configure_http({"cf-access-client-id": "id1", "cf-access-client-secret": "s3"}, 45)
+    assert print_agent._req("http://x/agent/jobs", "k") == {"ok": True}
+    assert seen["headers"]["Cf-access-client-id"] == "id1"
+    assert seen["headers"]["Cf-access-client-secret"] == "s3"
+    assert seen["headers"]["Authorization"] == "Bearer k"
+    assert seen["timeout"] == 45.0
+
+
+def test_req_has_a_default_timeout(monkeypatch):
+    import urllib.request
+    seen = {}
+
+    def fake(req, timeout=None):
+        seen["timeout"] = timeout
+        return _Resp()
+    monkeypatch.setattr(urllib.request, "urlopen", fake)
+    monkeypatch.setattr(print_agent, "_HTTP", {"headers": {}, "timeout": 60.0})
+    print_agent._req("http://x/agent/jobs", "k")
+    assert seen["timeout"] == 60.0
+
+
+def _ini(tmp_path, extra=""):
+    (tmp_path / "agent.ini").write_text(
+        "[agent]\nserver_url=https://x\napi_key=k\nprinters=p\n" + extra)
+    return print_agent.load_config(str(tmp_path))
+
+
+def test_http_settings_reads_headers_section_and_timeout(tmp_path):
+    cfg = _ini(tmp_path, "timeout=45\n[headers]\nCF-Access-Client-Id = id1\n"
+                         "CF-Access-Client-Secret = s3\n")
+    headers, timeout = print_agent.http_settings(cfg)
+    assert headers == {"cf-access-client-id": "id1", "cf-access-client-secret": "s3"}
+    assert timeout == 45.0
+
+
+def test_http_settings_defaults_without_section(tmp_path):
+    assert print_agent.http_settings(_ini(tmp_path)) == ({}, 60.0)
+
+
+def test_http_settings_rejects_timeout_below_long_poll(tmp_path):
+    with pytest.raises(SystemExit, match="timeout"):
+        print_agent.http_settings(_ini(tmp_path, "timeout=10\n"))
+
+
+def test_http_settings_refuses_to_override_the_agent_bearer(tmp_path):
+    with pytest.raises(SystemExit, match="set by the agent"):
+        print_agent.http_settings(_ini(tmp_path, "[headers]\nAuthorization = Bearer x\n"))
+
+
+def test_http_settings_keeps_percent_signs_in_secrets(tmp_path):
+    # configparser interpolation would choke on '%' — secrets are read raw
+    headers, _ = print_agent.http_settings(_ini(tmp_path, "[headers]\nX-Token = a%b\n"))
+    assert headers == {"x-token": "a%b"}
