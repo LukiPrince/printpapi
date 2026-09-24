@@ -27,7 +27,7 @@ up and prints it — documents **and** label printers (Zebra/ZPL, Bixolon, therm
 - **Star CloudPRNT**: Star receipt/label printers poll the server themselves — no agent, nothing
   installed at the site ([docs](docs/cloudprnt.md); built to the published spec, not yet verified
   on a physical printer)
-- Source available ([Elastic License 2.0](#license): self-host freely, don't resell it as a service) · 296 tests
+- Source available ([Elastic License 2.0](#license): self-host freely, don't resell it as a service) · 307 tests
 
 ## Get started
 

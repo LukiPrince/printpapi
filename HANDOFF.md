@@ -153,7 +153,7 @@ extracted, generalized OSS project.
   (semicolon-separated — Windows printer names, or CUPS queue names on Linux).
 - Shipped in the homelab as a signed-Python install (see gotcha #2), autostart via Task Scheduler.
 
-**Tests:** 282, all green (`python -m pytest`). Real loopback HTTP servers (ThreadingHTTPServer),
+**Tests:** 307, all green (`python -m pytest`). Real loopback HTTP servers (ThreadingHTTPServer),
 real SQLite (:memory:), injected render fns / subprocess runners — no mocks, no real printers.
 
 **Model:** **poll** — agent opens a long-poll `GET /agent/jobs` to the server, receives jobs, prints,
@@ -218,8 +218,11 @@ org settings in the dashboard, monthly job quotas — `app/mail.py`, `docs/api.m
 **Star CloudPRNT** (roadmap #9: the printer polls us itself, no agent at the site —
 `app/cloudprnt.py`, `docs/cloudprnt.md`; spec-complete but unverified on hardware), and
 **billing** (plans + a provider-agnostic signed webhook + org deletion — `app/billing.py`,
-`docs/billing.md`), which was the last missing product piece for a paid deployment.
-296 tests green.
+`docs/billing.md`), which was the last missing product piece for a paid deployment. The agent
+(v2.5.1) can also sit behind an auth proxy (extra headers from `agent.ini`'s `[headers]` section),
+has a socket timeout so a silently-dropped NAT flow can't hang it forever, and registers with
+backoff until it succeeds instead of exiting once at boot — see `docs/agent.md#unattended-machines`.
+307 tests green.
 A demand-research sweep (July 2026) produced the ranked v2 roadmap in `docs/roadmap.md` — read it
 before inventing features. Roadmap #1–#9 are done, and so is billing. What is left on the ranked
 list: #10 scales (agent-side USB HID), #11 ESC/POS templating. Non-code leftovers: code-sign the
