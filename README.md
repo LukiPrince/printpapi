@@ -18,6 +18,12 @@
 print job to a small HTTP API from anywhere; an agent on the machine with the printer picks it
 up and prints it: documents **and** label printers (Zebra/ZPL, Bixolon, thermal).
 
+<p align="center">
+  <a href="https://printpapi.lukaswotzka.com"><img src="docs/demo-pipeline.gif" width="860" alt="A print job travels from an HTTP request through the printpapi server and the agent to a Zebra label printer, which prints a shipping label"></a>
+  <br>
+  <b><a href="https://printpapi.lukaswotzka.com">Try the live demo</a></b>: send a print job and click through the real dashboard, in your browser, nothing to install.
+</p>
+
 - Agent **polls outbound**, so printers behind NAT/firewall work with **no inbound ports**
 - Server is **one small Rust binary**: no Python, no Node, nothing else to install (the dashboard is embedded)
 - React dashboard (live queue, job history, test print, API keys), REST API, SQLite job queue
@@ -44,6 +50,8 @@ up and prints it: documents **and** label printers (Zebra/ZPL, Bixolon, thermal)
 ## Get started
 
 Want to look first? The [live demo](https://printpapi.lukaswotzka.com) runs the real dashboard in your browser against sample data.
+
+[![The printpapi dashboard in the live demo: job counters, outcomes, fleet, recent activity and the demo's paper tray](docs/demo-dashboard.png)](https://printpapi.lukaswotzka.com/overview/)
 
 **Running v2 (the Python server)?** v3 uses the same API, environment and database; see the
 [migration guide](docs/migration.md) for the upgrade, the three stricter defaults and the way back.

@@ -61,7 +61,7 @@ order of pull:
    ([recipes.md](recipes.md)), per-family printer setup (Zebra/ZPL, DYMO, ESC/POS —
    [agent.md](agent.md#printer-setup-by-family)), and the QZ Tray / PrintNode comparison in the
    README. The hosted demo is shipped (https://printpapi.lukaswotzka.com, the dashboard against an in-browser
-   fake API). Left open: screenshots/GIF of the dashboard.
+   fake API), and the README shows it: a GIF of a print run and a dashboard screenshot.
 5. ~~**E-commerce auto-print integration (Shopify/WooCommerce)**~~ ✅ **shipped** —
    `POST /orders` renders an order as a packing slip (stdlib PDF writer, no dependency) and
    queues it; a WooCommerce plugin (`integrations/woocommerce`) and an HMAC-verified Shopify
