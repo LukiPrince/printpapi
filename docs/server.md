@@ -129,6 +129,9 @@ stripped from the production build, where the server serves the bundle and the A
 rebuild the binary (the bundle is embedded at compile time, so a running server keeps the old UI
 until then).
 
+`npm run build:demo` builds the hosted demo (start page plus the dashboard against an in-browser
+fake API) into `web/out-demo`; it is never synced into the binary.
+
 Asset paths under `/_next/static/` are content-hashed and served `immutable`; the HTML is
 served `no-cache`. Requests are confined to the embedded bundle — a path that escapes it 404s.
 

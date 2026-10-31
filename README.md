@@ -5,6 +5,7 @@
   <a href="https://github.com/LukiPrince/printpapi/releases/latest"><img src="https://img.shields.io/github/v/release/LukiPrince/printpapi?label=release" alt="Latest release"></a>
   <a href="https://github.com/LukiPrince/printpapi/pkgs/container/printpapi"><img src="https://img.shields.io/badge/docker-ghcr.io%2Flukiprince%2Fprintpapi-2496ED?logo=docker&amp;logoColor=white" alt="Docker image on GHCR"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-Elastic--2.0-blue" alt="License: Elastic 2.0"></a>
+  <a href="https://printpapi.lukaswotzka.com"><img src="https://img.shields.io/badge/live-demo-8a2be2" alt="Live demo"></a>
   <br>
   <a href="crates/"><img src="https://img.shields.io/badge/built_with-Rust-dea584?logo=rust&amp;logoColor=white" alt="Built with Rust"></a>
   <a href="docs/agent.md"><img src="https://img.shields.io/badge/agent-Windows%20%7C%20Linux%20%7C%20macOS-6e7781" alt="Agent: Windows, Linux, macOS"></a>
@@ -41,6 +42,8 @@ up and prints it: documents **and** label printers (Zebra/ZPL, Bixolon, thermal)
 - Source available ([Elastic License 2.0](#license): self-host freely, don't resell it as a service)
 
 ## Get started
+
+Want to look first? The [live demo](https://printpapi.lukaswotzka.com) runs the real dashboard in your browser against sample data.
 
 **Running v2 (the Python server)?** v3 uses the same API, environment and database; see the
 [migration guide](docs/migration.md) for the upgrade, the three stricter defaults and the way back.

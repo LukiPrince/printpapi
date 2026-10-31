@@ -15,8 +15,15 @@ const API_PATHS = [
   "/me", "/login", "/logout", "/signup", "/password", "/plans",
 ];
 
+// PRINTPAPI_DEMO=1 (npm run build:demo) builds the static demo into out-demo/. The module specifier
+// "printpapi-demo" is aliased to the real demo module there and to a stub otherwise, so product
+// code stays one import away from the demo and the production bundle never contains it.
+const demo = process.env.PRINTPAPI_DEMO === "1";
+
 const nextConfig: NextConfig = {
   output: "export",
+  turbopack: { resolveAlias: { "printpapi-demo": demo ? "./demo/on.tsx" : "./demo/off.ts" } },
+  ...(demo && { distDir: "out-demo", pageExtensions: ["demo.tsx", "tsx", "ts", "jsx", "js"] }),
   trailingSlash: true, // /devices/ -> devices/index.html, so deep links work off a dumb file server
   images: { unoptimized: true },
   ...(dev && {

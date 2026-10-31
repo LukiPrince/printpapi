@@ -1,7 +1,10 @@
 "use client";
 
 import { createContext, useCallback, useContext, useEffect, useSyncExternalStore } from "react";
+import { usePathname } from "next/navigation";
 import { AnimatePresence, motion } from "motion/react";
+import { STANDALONE_PATHS } from "printpapi-demo";
+import { normalizePath } from "@/lib/nav";
 import {
   UNAUTHORIZED_EVENT,
   clearToken,
@@ -23,6 +26,7 @@ const NOT_HYDRATED = () => undefined;
 
 export function AuthGate({ children }: { children: React.ReactNode }) {
   const token = useSyncExternalStore(subscribeToken, getToken, NOT_HYDRATED);
+  const pathname = usePathname();
 
   // Drop the server-side session too, so signing out on a shared machine really ends it.
   // Fire-and-forget: the local token goes either way.
@@ -36,6 +40,10 @@ export function AuthGate({ children }: { children: React.ReactNode }) {
     window.addEventListener(UNAUTHORIZED_EVENT, signOut);
     return () => window.removeEventListener(UNAUTHORIZED_EVENT, signOut);
   }, [signOut]);
+
+  // The demo's public pages (start page, privacy notice): no splash, no shell, so the prerendered
+  // HTML is the page. Empty in the production build.
+  if (STANDALONE_PATHS.includes(normalizePath(pathname))) return <>{children}</>;
 
   if (token === undefined) {
     return (

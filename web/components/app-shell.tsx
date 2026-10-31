@@ -12,6 +12,7 @@ import { LiveRail } from "@/components/live-rail";
 import { Button } from "@/components/ui/button";
 import { useAuth } from "@/components/auth-gate";
 import { cn } from "@/lib/utils";
+import { DemoBanner, DemoRail, DemoSignOut } from "printpapi-demo";
 
 export function AppShell({ children }: { children: React.ReactNode }) {
   const pathname = usePathname();
@@ -21,6 +22,8 @@ export function AppShell({ children }: { children: React.ReactNode }) {
   const palette = useCommandPalette();
 
   return (
+    <>
+    {DemoBanner && <DemoBanner />}
     <div className="min-h-svh md:grid md:grid-cols-[15rem_minmax(0,1fr)] xl:grid-cols-[15rem_minmax(0,1fr)_19rem]">
       {/* sidebar — the ink block */}
       <nav className="flex gap-1 overflow-x-auto bg-sidebar px-3 py-2 text-sidebar-foreground md:sticky md:top-0 md:h-svh md:flex-col md:overflow-y-auto md:px-3 md:py-5">
@@ -75,15 +78,19 @@ export function AppShell({ children }: { children: React.ReactNode }) {
           >
             <Command />
           </Button>
-          <Button
-            variant="ghost"
-            size="sm"
-            onClick={signOut}
-            className="ml-auto font-mono text-[0.7rem] tracking-[0.08em] text-sidebar-foreground uppercase hover:bg-white/7 hover:text-white"
-          >
-            <LogOut />
-            Sign out
-          </Button>
+          {DemoSignOut ? (
+            <DemoSignOut />
+          ) : (
+            <Button
+              variant="ghost"
+              size="sm"
+              onClick={signOut}
+              className="ml-auto font-mono text-[0.7rem] tracking-[0.08em] text-sidebar-foreground uppercase hover:bg-white/7 hover:text-white"
+            >
+              <LogOut />
+              Sign out
+            </Button>
+          )}
         </div>
       </nav>
 
@@ -106,9 +113,10 @@ export function AppShell({ children }: { children: React.ReactNode }) {
         </motion.div>
       </main>
 
-      <LiveRail help={current.help} />
+      {DemoRail ? <DemoRail help={current.help} /> : <LiveRail help={current.help} />}
 
       <CommandPalette open={palette.open} onOpenChange={palette.setOpen} />
     </div>
+    </>
   );
 }

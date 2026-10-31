@@ -8,7 +8,10 @@
     "start": "next start",
     "lint": "eslint",
     "sync": "node scripts/sync.mjs",
-    "build:app": "next build && node scripts/sync.mjs"
+    "build:app": "next build && node scripts/sync.mjs",
+    "build:demo": "node scripts/build-demo.mjs",
+    "check:bundles": "node scripts/check-bundles.mjs",
+    "test": "node --test demo/*.test.ts lib/*.test.ts"
   },
   "dependencies": {
     "class-variance-authority": "^0.7.1",

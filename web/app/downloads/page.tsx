@@ -5,6 +5,7 @@ import { Apple, MonitorCheck, Terminal } from "lucide-react";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { CopyButton } from "@/components/copy-button";
+import { DEMO_SERVER_URL } from "printpapi-demo";
 import { useClientValue } from "@/hooks/use-client-value";
 
 const RELEASES = "https://github.com/LukiPrince/printpapi/releases/latest";
@@ -59,7 +60,7 @@ const STEPS = [
 ];
 
 export default function DownloadsPage() {
-  const origin = useClientValue(() => window.location.origin, "http://localhost:3460");
+  const origin = useClientValue(() => DEMO_SERVER_URL ?? window.location.origin, "http://localhost:3460");
 
   const ini = `[agent]
 server_url = ${origin}

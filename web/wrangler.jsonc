@@ -1,0 +1,3 @@
+{ "name": "printpapi-demo", "compatibility_date": "2026-10-01",
+  "assets": { "directory": "./out-demo", "html_handling": "auto-trailing-slash", "not_found_handling": "404-page" },
+  "workers_dev": true, "preview_urls": false }

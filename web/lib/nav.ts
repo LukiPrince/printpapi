@@ -1,4 +1,5 @@
 import { Download, Gauge, History, KeyRound, Printer, Send, SlidersHorizontal, Users } from "lucide-react";
+import { OVERVIEW_HREF } from "printpapi-demo";
 
 export type NavItem = {
   href: string;
@@ -10,7 +11,7 @@ export type NavItem = {
 
 export const NAV: NavItem[] = [
   {
-    href: "/",
+    href: OVERVIEW_HREF,
     label: "Overview",
     eyebrow: "Fleet status",
     icon: Gauge,

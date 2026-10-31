@@ -87,7 +87,7 @@ Two deliberate leniencies, because the point of this layer is that an unmodified
   would break printing for no gain. Everything we *do* map is validated normally — a bad *value*
   still `400`s.
 - **Options on a raw job are dropped whole.** ZPL/ESC-POS carries its own layout, no renderer ever
-  sees it, so paper/duplex are meaningless there ([gotcha #1](../HANDOFF.md#3-hard-won-gotchas--do-not-rediscover-these)).
+  sees it, so paper/duplex are meaningless there ([gotcha #1](agent.md#labels-vs-documents-the-one-rule)).
 
 ## Job states
 

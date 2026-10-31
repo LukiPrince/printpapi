@@ -29,3 +29,10 @@ agent.ini
 
 # Rust
 target/
+
+# Maintainer-only working docs (plans, specs, handoff, release routine): kept locally, not published
+docs/superpowers/
+HANDOFF.md
+RELEASE_CHECKLIST.md
+docs/design-v0-homelab.md
+.impeccable/

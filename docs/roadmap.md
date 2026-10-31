@@ -60,7 +60,8 @@ order of pull:
    Python), the "one HTTP node" automation recipes for n8n/Zapier/Make
    ([recipes.md](recipes.md)), per-family printer setup (Zebra/ZPL, DYMO, ESC/POS —
    [agent.md](agent.md#printer-setup-by-family)), and the QZ Tray / PrintNode comparison in the
-   README. Left open: screenshots/GIF of the dashboard, and a hosted demo.
+   README. The hosted demo is shipped (https://printpapi.lukaswotzka.com, the dashboard against an in-browser
+   fake API). Left open: screenshots/GIF of the dashboard.
 5. ~~**E-commerce auto-print integration (Shopify/WooCommerce)**~~ ✅ **shipped** —
    `POST /orders` renders an order as a packing slip (stdlib PDF writer, no dependency) and
    queues it; a WooCommerce plugin (`integrations/woocommerce`) and an HMAC-verified Shopify

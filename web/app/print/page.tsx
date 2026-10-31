@@ -2,6 +2,7 @@
 
 import { useMemo, useState } from "react";
 import Link from "next/link";
+import { useRouter } from "next/navigation";
 import { AnimatePresence, motion } from "motion/react";
 import { toast } from "sonner";
 import { AlertTriangle, FileText, Link2, Loader2, Minus, Plus, Printer, Zap } from "lucide-react";
@@ -28,6 +29,7 @@ import { EmptyState, FieldLabel, PulseDot } from "@/components/bits";
 type Source = "pdf" | "raw" | "url" | "test";
 
 export default function PrintPage() {
+  const router = useRouter();
   const { data: printers } = usePoll(listPrinters, 15000);
   const [source, setSource] = useState<Source>("pdf");
   const [printerId, setPrinterId] = useState<string>("");
@@ -84,7 +86,7 @@ export default function PrintPage() {
       const { job_id } = await createJob(await buildJob());
       toast.success(`Job #${job_id} queued`, {
         description: `${printer.name} · ${copies} ${copies === 1 ? "copy" : "copies"}`,
-        action: { label: "History", onClick: () => location.assign("/history/") },
+        action: { label: "History", onClick: () => router.push("/history/") },
       });
       setFile(null);
       setTitle("");

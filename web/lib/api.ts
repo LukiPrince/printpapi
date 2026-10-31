@@ -1,7 +1,9 @@
 // Thin client for the printpapi HTTP API. The token lives in localStorage and is
 // sent as a bearer header on every call — the static shell itself carries no secrets.
 
-export const TOKEN_KEY = "printpapi_token";
+import { getToken } from "./token";
+
+export { TOKEN_KEY, clearToken, getToken, setToken, subscribeToken } from "./token";
 export const UNAUTHORIZED_EVENT = "printpapi:unauthorized";
 
 export type JobState = "queued" | "claimed" | "done" | "failed" | "cancelled";
@@ -113,33 +115,6 @@ export class ApiError extends Error {
   ) {
     super(message);
   }
-}
-
-const tokenListeners = new Set<() => void>();
-
-export function getToken(): string {
-  if (typeof window === "undefined") return "";
-  return window.localStorage.getItem(TOKEN_KEY) ?? "";
-}
-
-/** Subscribe to token changes — from this tab, or from another one signing out. */
-export function subscribeToken(onChange: () => void) {
-  tokenListeners.add(onChange);
-  window.addEventListener("storage", onChange);
-  return () => {
-    tokenListeners.delete(onChange);
-    window.removeEventListener("storage", onChange);
-  };
-}
-
-export function setToken(token: string) {
-  window.localStorage.setItem(TOKEN_KEY, token);
-  tokenListeners.forEach((cb) => cb());
-}
-
-export function clearToken() {
-  window.localStorage.removeItem(TOKEN_KEY);
-  tokenListeners.forEach((cb) => cb());
 }
 
 async function request(path: string, init: RequestInit = {}, token = getToken()): Promise<Response> {

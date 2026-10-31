@@ -67,6 +67,12 @@ jobs:
         working-directory: web
       - run: npm run build
         working-directory: web
+      - run: npm test
+        working-directory: web
+      - run: npm run build:demo
+        working-directory: web
+      - run: npm run check:bundles
+        working-directory: web
       - name: bundle must be rebuilt when the UI source changes
         run: |
           base='${{ github.event.pull_request.base.sha || github.event.before }}'
@@ -75,7 +81,10 @@ jobs:
             echo "no usable base commit — skipping drift check"; exit 0
           fi
           changed=$(git diff --name-only "$base" HEAD)
-          if echo "$changed" | grep -q '^web/' && ! echo "$changed" | grep -q '^crates/server/web/'; then
+          # demo-only files cannot change the embedded bundle (off.ts and surface.ts can)
+          ui=$(echo "$changed" | grep '^web/'             | grep -Ev '^web/demo/(off\.ts|surface\.ts)$' | grep -Ev '^web/demo/'             | grep -Ev '^web/(wrangler\.jsonc|scripts/build-demo\.mjs|scripts/check-bundles\.mjs)$' || true)
+          ui="$ui$(echo "$changed" | grep -E '^web/demo/(off\.ts|surface\.ts)$' || true)"
+          if [ -n "$ui" ] && ! echo "$changed" | grep -q '^crates/server/web/'; then
             echo "::error::web/ changed but crates/server/web/ was not regenerated."
             echo "Run: cd web && npm run build:app   — then commit crates/server/web."
             exit 1

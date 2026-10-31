@@ -4,6 +4,7 @@ import { useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
 import { useTheme } from "next-themes";
 import { toast } from "sonner";
+import { DemoSignOut } from "printpapi-demo";
 import { LogOut, Moon, Printer, Sun } from "lucide-react";
 import {
   Command,
@@ -108,10 +109,12 @@ export function CommandPalette({
               {resolvedTheme === "dark" ? <Sun /> : <Moon />}
               Switch to {resolvedTheme === "dark" ? "light" : "dark"} theme
             </CommandItem>
-            <CommandItem value="sign out logout" onSelect={() => run(signOut)}>
-              <LogOut />
-              Sign out
-            </CommandItem>
+            {!DemoSignOut && (
+              <CommandItem value="sign out logout" onSelect={() => run(signOut)}>
+                <LogOut />
+                Sign out
+              </CommandItem>
+            )}
           </CommandGroup>
         </CommandList>
       </Command>
