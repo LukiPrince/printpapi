@@ -1,0 +1,30 @@
+{
+ "number": "9 €",
+ "shop": "Café Zürich ß",
+ "customer": "Jörg Müller 日本語",
+ "note": "Grüße 日本",
+ "address": [
+  "Straße 1 😀",
+  "Ĉapelo ŝ",
+  " ‘x’ “y” — … ™ Ÿ"
+ ],
+ "lines": [
+  {
+   "qty": "1",
+   "sku": "€-1",
+   "name": "Größe XL — 日本 😀 ñ",
+   "total": "5 €"
+  },
+  {
+   "qty": "1",
+   "name": "œ Œ ž Ž š Š ƒ † ‡ ‰ • ˜ ˆ",
+   "total": "6"
+  }
+ ],
+ "totals": [
+  [
+   "Gesamt €",
+   "11 €"
+  ]
+ ]
+}

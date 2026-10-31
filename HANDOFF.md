@@ -3,7 +3,7 @@
 Continuation notes for building the self-hosted PrintNode alternative (public and source
 available — Elastic License 2.0 since after v1.4.0, see `LICENSE`). If you are a fresh
 session: read this top to bottom, then `CLAUDE.md`, then `docs/design-v0-homelab.md`. The code in
-`app/` + `agent/` already works in production — it is your starting point, not a blank page.
+`crates/` already works in production — it is your starting point, not a blank page.
 
 ## 1. Origin
 
@@ -15,17 +15,21 @@ extracted, generalized OSS project.
 
 ## 2. What works today (v1 core poll engine)
 
-**Server** (`app/`, Python stdlib only):
+Since v3.0.0 both halves are Rust (see §5); the last Python server is v2.5.1. Everything below
+is the same behaviour the Python implementation had — the HTTP API, env vars and SQLite schema
+are unchanged.
+
+**Server** (`crates/server`, binary `printpapi`):
 
 - `GET /` — **web dashboard**: a Next.js **static export** (source in `web/`, built bundle committed
-  to `app/web`), served straight off disk by the stdlib server. Live overview (queue counters,
+  to `crates/server/web`), embedded into the binary at compile time and served from memory. Live overview (queue counters,
   outcome breakdown, activity feed), devices, searchable job history with cancel, API keys,
   **Team** (org users, add/remove, own password change), **Settings** (quota + usage, `event_url`,
   Shopify secret), agent setup, light/dark, ⌘K palette. Sign-in takes an account (e-mail +
   password) or a pasted token, and offers self-signup / "forgot password" where the server
   reports them on `/health`. Secret-free shell — it prompts for the token and calls the
   JSON endpoints with it, so all data stays behind auth. Test print picks a PDF for PDF-capable
-  printers, a ZPL label otherwise (gotcha #1). Static serving is confined to `app/web`
+  printers, a ZPL label otherwise (gotcha #1). Static serving is confined to the embedded bundle
   (traversal 404s); `/_next/static/` is immutable-cached, HTML is `no-cache`.
 - Client endpoints (bearer auth — the bootstrap `PRINTAPI_TOKEN` or any issued per-client key):
   - `POST /jobs` — submit a job `{printer_id, type, content|url}` → `{job_id}`. Optional: `title`,
@@ -42,7 +46,7 @@ extracted, generalized OSS project.
     `computer_offline` — once per edge, at-most-once (see `docs/api.md#computers-agents`).
   - `POST /orders` — a shop order in, a **packing slip** out: `{printer_id, order, format?}` where
     `format` is `shopify`/`woocommerce` (map that store's own JSON) or absent (already normalized).
-    Renders with `app/packing_slip.py` (stdlib PDF writer) and queues it as a pdf job. A raw-only
+    Renders with `crates/server/src/packing_slip.rs` (hand-written PDF writer) and queues it as a pdf job. A raw-only
     printer is a `400` — gotcha #1 enforced server-side.
   - `POST /integrations/shopify/orders?key=…&printer_id=…` — Shopify's order webhook. Shopify can
     send no auth header, so the URL key names the org and the `X-Shopify-Hmac-Sha256` signature
@@ -50,16 +54,16 @@ extracted, generalized OSS project.
     order id. The WooCommerce side is a real WP plugin in `integrations/woocommerce` that calls
     `POST /orders` with a client key.
   - `GET /metrics` — Prometheus text. `GET /health`.
-- **PrintNode-compatible layer** (`app/printnode.py`, roadmap #7) — the *same* endpoints answer in
+- **PrintNode-compatible layer** (`crates/server/src/printnode.rs`, roadmap #7) — the *same* endpoints answer in
   PrintNode's JSON shapes when the request authenticates with **HTTP Basic** instead of `Bearer`
   (their clients carry the API key as the Basic username, so nothing needs enabling). Surface:
   `GET /whoami`, `/computers`, `/printers`, `POST|GET|DELETE /printjobs`,
   `/printjobs/{set}/states`, plus their id-set paths (`/printers/5-9`). Pure translation — same
-  keys, same orgs, same `POST /jobs` validation path (`_submit_job`), no schema or agent change.
+  keys, same orgs, same `POST /jobs` validation path (one shared submit function), no schema or agent change.
   Their unknown option keys are dropped rather than rejected (a client sends its whole option set);
   options on raw jobs are dropped whole. See `docs/printnode-compat.md` for the mapping tables and
   the trademark disclaimer that has to stay.
-- **Star CloudPRNT** (`app/cloudprnt.py`, roadmap #9) — Star's printers poll an HTTP URL by
+- **Star CloudPRNT** (`crates/server/src/cloudprnt.rs`, roadmap #9) — Star's printers poll an HTTP URL by
   themselves, so at a site with one there is **no agent to install**. `POST|GET|DELETE
   /cloudprnt/{client-key}` (or the bare path with the key as HTTP Basic user) answers their three
   methods: the poll claims a job and offers it as `{"jobReady": true, "mediaTypes": […],
@@ -75,14 +79,14 @@ extracted, generalized OSS project.
   to stay. **Caveat: built from the published spec, never run against a physical printer** — the
   firmware-dependent parts (optional `jobToken` / `printingInProgress`, the exact confirmation code)
   are where it will need a fix, and the docs say so out loud.
-- **Org accounts** (`app/auth.py` + `users`/`sessions` in the store) — a person signs in with
+- **Org accounts** (`crates/server/src/auth.rs` + `users`/`sessions` in the store) — a person signs in with
   e-mail + password (`POST /login`) and gets a **session token** carried in the same
   `Authorization: Bearer` header. Three credential kinds, one header: *root* (bootstrap token,
   every org), *session* (one org, may manage it), *key* (one org, print + read only — a leaked
   integration key cannot issue itself a successor). Which table the credential resolves in *is*
   the permission; there is no role column. `POST /logout`, `GET /me`, `PUT /me/password`
   (invalidates that user's sessions), `POST|GET /users`, and root-only `POST /orgs/{id}/users`
-  for an org's first user. Passwords are stdlib `scrypt`, sessions expire after 30 days and are
+  for an org's first user. Passwords are `scrypt` (the same hashes the Python server wrote still verify), sessions expire after 30 days and are
   stored hashed, login is throttled per e-mail and does not enumerate accounts.
   See `docs/api.md#accounts-and-login`.
 - **Hosted-service plumbing** on top of the accounts — what a paid deployment needs and a private
@@ -91,7 +95,7 @@ extracted, generalized OSS project.
     unless `PRINTAPI_SIGNUP=open`**; throttled by client address (an org sprayer picks a fresh
     e-mail each time, so counting addresses bounds nothing).
   - `POST /password/reset` / `/password/reset/confirm` — a one-shot, hour-long, hashed token,
-    superseded by the next request, mailed over SMTP (`app/mail.py`, stdlib `smtplib`). No
+    superseded by the next request, mailed over SMTP (`crates/server/src/mail.rs`, plain SMTP). No
     `SMTP_HOST` ⇒ the mail goes to stderr, so a self-host still works. The mail carries a **link
     only if `PUBLIC_URL` is set** — deriving it from the `Host` header would let anyone mail a
     valid token pointing at their own host.
@@ -104,7 +108,7 @@ extracted, generalized OSS project.
     sets it, a session cannot** — a tenant that could raise its own cap has no cap.
   - `GET /health` reports `signup` and `password_reset` so the sign-in screen only offers doors
     that exist. See `docs/api.md#self-signup`, `#password-reset`, `#quotas`.
-  - **Billing** (`app/billing.py`, pure) — a plan catalogue in `PRINTAPI_PLANS` (JSON array, or a
+  - **Billing** (`crates/server/src/billing.rs`, pure) — a plan catalogue in `PRINTAPI_PLANS` (JSON array, or a
     path to a file with one) and one HMAC-signed `POST /billing/webhook`
     (`PRINTAPI_BILLING_SECRET`) that puts an org on a plan; the plan's `jobs` is written into
     `orgs.job_quota` in the same UPDATE, so the plan can never disagree with the cap that is
@@ -127,18 +131,21 @@ extracted, generalized OSS project.
   - `GET /agent/jobs/{id}/payload` — raw bytes of the job payload.
   - `POST /agent/jobs/{id}/result` — agent reports `{ok, error}`.
 - SQLite job store (`PRINT_DB`, default `printpapi.db`), WAL mode, global write lock.
+- Idle long-polls cost no thread, and a newly queued job wakes the waiting long-poll at once.
 - Visibility-timeout reaper: stale claimed jobs requeued (up to `max_retries`), then failed;
   same loop expires deadline-passed jobs.
 - Content types: `raw_base64`, `pdf_base64`, `raw_uri`, `raw_uri_post`, `pdf_uri_post`.
-- `app/dispatch.py` pure logic (injectable fetchers); `app/store.py` SQLite store; `app/server.py` HTTP.
+- `dispatch.rs` pure logic (injectable fetchers); `store.rs` SQLite store; `server.rs` + `http.rs` HTTP
+  (hyper directly, no framework), all under `crates/server/src/`.
 - Env vars: `PRINTAPI_TOKEN` (required), `PRINT_DB` (default `printpapi.db`), `PRINT_PORT` (default `3460`).
 
-**Agent** (`agent/print_agent.py`, **cross-platform** — Windows + Linux/macOS via CUPS):
+**Agent** (`crates/agent`, binary `printpapi-agent`, **cross-platform** — Windows + Linux/macOS via CUPS):
 
 - Registers its printers on startup, then loops: `run_once` → long-poll → download payload → print →
   report result.
-- `select_backend()` picks the print path by OS at startup:
-  - **Windows:** `raw` → `win32print` RAW (ZPL/ESC-POS straight to the spooler); `pdf` → SumatraPDF
+- The print path is picked by OS at startup:
+  - **Windows:** `raw` → RAW datatype straight to the spooler (ZPL/ESC-POS; no pywin32, the Rust
+    agent calls the spooler API itself); `pdf` → SumatraPDF
     silent-print via the installed driver.
   - **Linux + macOS/CUPS:** `raw` → `lp -d <queue> -o raw` (already-rendered bytes, CUPS must not
     re-render); `pdf` → `lp -d <queue>` (CUPS filter chain renders it). macOS needs no code of its
@@ -149,12 +156,17 @@ extracted, generalized OSS project.
     printing it — archival, Paperless consume folders, testing without burning labels. Takes both
     modes (`can_pdf` forced true: a directory cannot misrender), copies get a `-N` suffix, print
     options are ignored. Agent-only — the server sees an ordinary printer.
-- Configured via `agent.ini` (next to the script): `server_url`, `api_key`, `name`, `printers`
+- Configured via `agent.ini` (next to the executable): `server_url`, `api_key`, `name`, `printers`
   (semicolon-separated — Windows printer names, or CUPS queue names on Linux).
 - Shipped in the homelab as a signed-Python install (see gotcha #2), autostart via Task Scheduler.
+- The Python agent (`agent/print_agent.py`) is kept unchanged as the **legacy agent** for locked-down
+  Windows, where the unsigned Rust exe is blocked; it still has its tests (`python -m pytest
+  agent/tests`) in CI.
 
-**Tests:** 315, all green (`python -m pytest`). Real loopback HTTP servers (ThreadingHTTPServer),
-real SQLite (:memory:), injected render fns / subprocess runners — no mocks, no real printers.
+**Tests:** `cargo test --workspace` (plus `python -m pytest agent/tests` for the legacy agent).
+Real loopback HTTP servers, real SQLite (in memory), injected render fns / subprocess runners —
+no mocks, no real printers. `tools/parity/parity.py` proves black-box parity of the Rust server with
+the v2.5.1 Python server (see its README); `tools/bench/bench.py` measures resources and speed.
 
 **Model:** **poll** — agent opens a long-poll `GET /agent/jobs` to the server, receives jobs, prints,
 reports back. No inbound ports needed on the agent's machine (PrintNode's core trick). The old push
@@ -170,12 +182,12 @@ model (server → agent on same LAN) is superseded.
    unsigned PyInstaller `.exe` (and exes run from `%TEMP%`, so a normal installer fails with "Error
    4551: application control policy"). Workarounds: run the agent via the **signed Python interpreter**
    (`pythonw.exe` is PSF-signed → allowed; the `.py` is data, not an executable), or **code-sign** the
-   exe. For OSS: code-signing (Azure Trusted Signing or an OV/EV cert) is the proper answer for a
+   exe. The Rust agent exe is **not signed yet**, so the Python agent remains the fallback there. For OSS: code-signing (Azure Trusted Signing or an OV/EV cert) is the proper answer for a
    shippable agent.
 3. **A WAF/Cloudflare in front of a fetched URL 403s `Python-urllib`.** The original deployment's
    PDF-rendering service and workflow API both sat behind Cloudflare and returned 403/1010 to the
    default urllib User-Agent. Fix: send a browser UA (`Mozilla/5.0`) on every outbound HTTP request.
-   Already done in `app/dispatch.py`.
+   Already done in `crates/server/src/dispatch.rs`.
 
 ## 4. v1 OSS scope (the plan)
 
@@ -209,20 +221,20 @@ webhooks, per-job print options, printer capability discovery, **multi-tenancy**
 n8n/Zapier/Make, per-printer-family setup, QZ Tray/PrintNode comparison in the README), and
 **e-commerce auto-print** (roadmap #5: `POST /orders`, packing-slip renderer, WooCommerce plugin,
 Shopify webhook — `docs/ecommerce.md`), and the **PrintNode API compatibility layer** (roadmap #7:
-`app/printnode.py`, Basic-auth-selected — `docs/printnode-compat.md`), and the **file backend**
+`crates/server/src/printnode.rs`, Basic-auth-selected — `docs/printnode-compat.md`), and the **file backend**
 (roadmap #8: a `file:///dir` printer target in the agent — `docs/agent.md#file-output-virtual-print-server`),
 and **org accounts** on top of multi-tenancy (e-mail/password login, session tokens, org-scoped
-key and user self-management — `app/auth.py`, `docs/api.md#accounts-and-login`), and the
+key and user self-management — `crates/server/src/auth.rs`, `docs/api.md#accounts-and-login`), and the
 **hosted-service plumbing** on top of those (self-signup, password reset by e-mail, user removal,
-org settings in the dashboard, monthly job quotas — `app/mail.py`, `docs/api.md#self-signup`), and
+org settings in the dashboard, monthly job quotas — `crates/server/src/mail.rs`, `docs/api.md#self-signup`), and
 **Star CloudPRNT** (roadmap #9: the printer polls us itself, no agent at the site —
-`app/cloudprnt.py`, `docs/cloudprnt.md`; spec-complete but unverified on hardware), and
-**billing** (plans + a provider-agnostic signed webhook + org deletion — `app/billing.py`,
+`crates/server/src/cloudprnt.rs`, `docs/cloudprnt.md`; spec-complete but unverified on hardware), and
+**billing** (plans + a provider-agnostic signed webhook + org deletion — `crates/server/src/billing.rs`,
 `docs/billing.md`), which was the last missing product piece for a paid deployment. The agent
 (v2.5.1) can also sit behind an auth proxy (extra headers from `agent.ini`'s `[headers]` section),
 has a socket timeout so a silently-dropped NAT flow can't hang it forever, and registers with
 backoff until it succeeds instead of exiting once at boot — see `docs/agent.md#unattended-machines`.
-315 tests green.
+The tests are green (`cargo test --workspace`).
 A demand-research sweep (July 2026) produced the ranked v2 roadmap in `docs/roadmap.md` — read it
 before inventing features. Roadmap #1–#9 are done, and so is billing. What is left on the ranked
 list: #10 scales (agent-side USB HID), #11 ESC/POS templating. Non-code leftovers: code-sign the
@@ -236,10 +248,10 @@ child accounts are not portable at all. Clients that hardcode their hostname sti
 proxy/DNS override — only ones with a configurable base URL work by themselves. The legal footing:
 reimplementing an API is lawful (EU 2009/24/EC Art. 1(2), CJEU C-406/10; US *Google v. Oracle*),
 provided no documentation text or SDK code is copied and the trademark is used only descriptively —
-which is why the disclaimer sits in the README, the compat doc and `app/printnode.py`'s docstring.
+which is why the disclaimer sits in the README, the compat doc and the module comment of `crates/server/src/printnode.rs`.
 
 On the e-commerce work specifically, the deliberate ceilings are: the packing slip is plain
-(Helvetica, no logo, no template — `# ponytail:` note at the top of `app/packing_slip.py`),
+(Helvetica, no logo, no template — `// ponytail:` note at the top of `crates/server/src/packing_slip.rs`),
 carrier labels are not first-class (submit them as `pdf_uri`/`raw_uri`), and the Shopify path
 needs the client key in the webhook URL because Shopify cannot send an auth header — the HMAC is
 what actually authorizes the print.
@@ -258,7 +270,7 @@ what actually authorizes the print.
 - **Org accounts are done on top of it** (see §2): per-org users with a password login, session
   tokens, and org-scoped key/user self-management. Still open: billing, quotas, self-signup,
   password reset by e-mail, org deletion; and an agent key doubling as its org's client key (see
-  the `# ponytail:` note in `server.py`'s `/agent/register`). Since then **self-signup, password
+  the `ponytail` note on the server's `/agent/register` route). Since then **self-signup, password
   reset, user removal, org settings in the dashboard and monthly job quotas have shipped** (§2) —
   what is still open for a hosted offering is **billing** (a quota is enforced, nothing charges
   for it), plans/tiers, and org deletion. Known ceilings: the login/signup/reset throttles are per
@@ -289,6 +301,18 @@ PrintNode-wrapper plugins. Org isolation, document rendering (roadmap #5), the a
 are all done — **what remains is business, not product**: choose a payment provider (the server
 takes any, via a small re-signing adapter — the choice was deliberately deferred), then TLS,
 hosting and a designed packing slip.
+
+**v3.0.0: Rust rewrite.** Server and agent were rewritten in Rust; the last Python server is v2.5.1.
+The HTTP API, the env vars and the SQLite schema stay the same (an existing `printpapi.db` opens
+unchanged, plus a few additive indexes on the hot queries), and `tools/parity/parity.py` checks the
+Rust server against v2.5.1 black-box. Why: performance and resources. The server is one small
+binary with the dashboard embedded (no Python, no Node, a distroless image); an idle long-poll
+costs no thread; and a queued job wakes the waiting long-poll at once instead of being found by a
+1 s DB poll. `tools/bench/` has the measurements. The Python server code and its tests are gone;
+the Python agent stays as the legacy agent. **Signing caveat:** the Rust agent exe is not
+code-signed, so locked-down Windows machines (gotcha #2) still need the Python agent via the
+PSF-signed `pythonw.exe` until a signed build exists — code-signing is now the one thing blocking
+the Rust agent there.
 
 ## 6. Reference
 

@@ -1,4 +1,5 @@
-; printpapi agent configuration — copy to agent.ini next to print_agent.py and edit.
+; printpapi agent configuration — copy to agent.ini next to printpapi-agent(.exe) (or the legacy
+; print_agent.py) and edit.
 ; Full reference: https://github.com/LukiPrince/printpapi/blob/main/docs/agent.md
 
 [agent]

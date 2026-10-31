@@ -7,35 +7,52 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { CopyButton } from "@/components/copy-button";
 import { useClientValue } from "@/hooks/use-client-value";
 
+const RELEASES = "https://github.com/LukiPrince/printpapi/releases/latest";
+
 const STEPS = [
   {
-    title: "Grab the agent",
+    title: "Download the agent",
     body: (
       <>
-        Copy <code className="font-mono">agent/print_agent.py</code> from the printpapi repo onto the
-        machine the printers are attached to.
+        Get the archive for your platform from the{" "}
+        <a href={RELEASES} className="underline" target="_blank" rel="noreferrer">
+          latest release
+        </a>
+        : <code className="font-mono">printpapi-agent-windows-x86_64.zip</code>,{" "}
+        <code className="font-mono">-linux-x86_64</code>,{" "}
+        <code className="font-mono">-linux-aarch64</code>,{" "}
+        <code className="font-mono">-macos-aarch64</code> or{" "}
+        <code className="font-mono">-macos-x86_64</code> (<code className="font-mono">.tar.gz</code>).
+        Unpack it on the machine the printers are attached to.
       </>
     ),
   },
   {
-    title: "Install the prerequisites",
+    title: "Check the print path",
     body: (
       <>
-        Python 3.9+. On Windows also <code className="font-mono">pywin32</code> plus SumatraPDF for
-        PDF rendering; on Linux, CUPS provides <code className="font-mono">lp</code>.
+        Nothing to install for the agent itself. On Windows, put{" "}
+        <code className="font-mono">SumatraPDF.exe</code> next to it (or on PATH) to print PDFs.
+        On Linux and macOS, CUPS provides <code className="font-mono">lp</code>.
       </>
     ),
   },
   {
     title: "Write agent.ini",
-    body: <>Drop the config below next to the script and fill in your agent key.</>,
+    body: (
+      <>
+        Save the config below as <code className="font-mono">agent.ini</code> next to the
+        executable and fill in your agent key.
+      </>
+    ),
   },
   {
     title: "Run it",
     body: (
       <>
-        <code className="font-mono">python print_agent.py</code> — then autostart it via Task
-        Scheduler or a systemd unit.
+        Start <code className="font-mono">printpapi-agent</code> (
+        <code className="font-mono">printpapi-agent.exe</code> on Windows) — then autostart it via
+        Task Scheduler, a systemd unit or launchd.
       </>
     ),
   },
@@ -127,19 +144,25 @@ printers = Zebra GK420d ; HP LaserJet|pdf ; netz-bixolon = socket://192.168.1.50
             </TabsList>
             <TabsContent value="windows" className="mt-4 space-y-2 text-sm text-muted-foreground">
               <p>
-                Task Scheduler → <em>At log on</em> → run{" "}
-                <code className="font-mono">pythonw.exe print_agent.py</code>.
+                Task Scheduler → <em>At startup</em> → run{" "}
+                <code className="font-mono">C:\printpapi\printpapi-agent.exe</code>, or install
+                it as a service with nssm. It is a console program; with &quot;run whether user is
+                logged on or not&quot; no window shows.
               </p>
               <p>
-                Locked-down machines (Smart App Control / WDAC) block unsigned executables. Running
-                via the PSF-signed <code className="font-mono">pythonw.exe</code> sidesteps this —
-                the <code className="font-mono">.py</code> file is data, not an executable.
+                Locked-down machines (Smart App Control / WDAC / AppLocker) block the agent
+                because it is not code-signed yet. Until signed builds exist, use the Python agent
+                (<code className="font-mono">agent/print_agent.py</code> in the repo) through the
+                PSF-signed <code className="font-mono">pythonw.exe</code> — the{" "}
+                <code className="font-mono">.py</code> file is data, not an executable. It needs
+                Python 3.9+ and <code className="font-mono">pywin32</code>, and reads the same{" "}
+                <code className="font-mono">agent.ini</code>.
               </p>
             </TabsContent>
             <TabsContent value="linux" className="mt-4 space-y-2 text-sm text-muted-foreground">
               <p>
-                A user systemd unit with{" "}
-                <code className="font-mono">ExecStart=/usr/bin/python3 print_agent.py</code> and{" "}
+                A systemd unit with{" "}
+                <code className="font-mono">ExecStart=/opt/printpapi/printpapi-agent</code> and{" "}
                 <code className="font-mono">Restart=always</code>.
               </p>
               <p>
@@ -149,9 +172,10 @@ printers = Zebra GK420d ; HP LaserJet|pdf ; netz-bixolon = socket://192.168.1.50
             </TabsContent>
             <TabsContent value="macos" className="mt-4 space-y-2 text-sm text-muted-foreground">
               <p>
-                A <code className="font-mono">launchd</code> plist in{" "}
-                <code className="font-mono">~/Library/LaunchAgents</code> with{" "}
-                <code className="font-mono">RunAtLoad</code>.
+                A <code className="font-mono">launchd</code> plist whose{" "}
+                <code className="font-mono">ProgramArguments</code> is the binary, with{" "}
+                <code className="font-mono">RunAtLoad</code> and{" "}
+                <code className="font-mono">KeepAlive</code>.
               </p>
               <p>macOS uses the same CUPS path as Linux, so the printer names match lpstat.</p>
             </TabsContent>

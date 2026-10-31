@@ -1,0 +1,6 @@
+[env]
+# The bundled SQLite is compiled without autoconf, so it does not know fdatasync() exists and
+# syncs every commit with a full fsync() (data + metadata). Debian's SQLite — the one the Python
+# server ran on — uses fdatasync(); on Linux this halves the cost of a durable commit. Ignored on
+# Windows (os_win.c) and macOS (SQLite keeps fsync/F_FULLFSYNC there).
+LIBSQLITE3_FLAGS = "-DHAVE_FDATASYNC=1"

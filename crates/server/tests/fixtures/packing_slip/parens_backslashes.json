@@ -1,0 +1,24 @@
+{
+ "number": "(1)",
+ "customer": "Foo (Bar) \\ Baz",
+ "note": "back\\slash (paren)",
+ "address": [
+  "C:\\dir\\file",
+  "((nested))",
+  "a\\(b\\)"
+ ],
+ "lines": [
+  {
+   "qty": "1",
+   "sku": "\\(",
+   "name": "x) y ( z \\\\",
+   "total": "(1)"
+  }
+ ],
+ "totals": [
+  [
+   "Sub(total)",
+   "1\\2"
+  ]
+ ]
+}

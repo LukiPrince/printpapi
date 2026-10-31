@@ -109,7 +109,7 @@ Header (title, shop, order number, date), the ship-to block, the line-item table
 customer note, and `Page n/m`. Helvetica, A4, black and white.
 
 It is deliberately plain: **no logo, no custom template, no Latin-only-breaking scripts** — the
-renderer is ~150 lines of stdlib PDF in `app/packing_slip.py`, which is what keeps the server
-dependency-free. If you need a designed document, render it wherever you already have a
+renderer is a small hand-written PDF writer in `crates/server/src/packing_slip.rs`, which is what
+keeps the server dependency-free. If you need a designed document, render it wherever you already have a
 templating stack and submit it as `pdf_uri` ([recipes](recipes.md#the-one-node-trick-let-the-server-fetch-the-document)) —
 that path takes any PDF, including your carrier's shipping label.

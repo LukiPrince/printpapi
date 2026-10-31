@@ -1,7 +1,24 @@
 name: ci
 on: [push, pull_request]
 jobs:
-  test:
+  rust:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all --check
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - run: cargo test --workspace --locked
+
+  # The Python agent stays shipped for locked-down Windows (Smart App Control blocks an unsigned
+  # .exe, the PSF-signed pythonw.exe is allowed) until the Rust agent is code-signed.
+  legacy-agent:
     strategy:
       matrix:
         os: [ubuntu-latest, windows-latest]
@@ -12,11 +29,27 @@ jobs:
         with:
           python-version: "3.12"
       - run: pip install pytest
-      - run: python -m pytest -q
+      - run: python -m pytest -q agent/tests
 
-  # The dashboard bundle in app/web is committed (so a plain `python -m app.server` checkout works
-  # without Node). This job proves the source in web/ still builds, and that nobody changed the
-  # source without regenerating the bundle that actually ships.
+  # Black-box parity: the Rust server must answer every scripted request exactly like the last
+  # Python release (extracted from its tag by the harness itself).
+  parity:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # the harness extracts the Python server from a tag
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: cargo build --release --locked -p printpapi-server
+      - run: python tools/parity/parity.py --rust target/release/printpapi
+
+  # The dashboard bundle in crates/server/web is committed (so a plain `cargo build` checkout has
+  # a UI without Node). This job proves the source in web/ still builds, and that nobody changed
+  # the source without regenerating the bundle that actually ships.
   dashboard:
     runs-on: ubuntu-latest
     steps:
@@ -42,9 +75,9 @@ jobs:
             echo "no usable base commit — skipping drift check"; exit 0
           fi
           changed=$(git diff --name-only "$base" HEAD)
-          if echo "$changed" | grep -q '^web/' && ! echo "$changed" | grep -q '^app/web/'; then
-            echo "::error::web/ changed but app/web/ was not regenerated."
-            echo "Run: cd web && npm run build:app   — then commit app/web."
+          if echo "$changed" | grep -q '^web/' && ! echo "$changed" | grep -q '^crates/server/web/'; then
+            echo "::error::web/ changed but crates/server/web/ was not regenerated."
+            echo "Run: cd web && npm run build:app   — then commit crates/server/web."
             exit 1
           fi
           echo "bundle is in step with the source"

@@ -21,7 +21,7 @@ Token comparison is constant-time (`hmac.compare_digest`).
 
 | Method & path | Auth | Purpose |
 |---|---|---|
-| `GET /` | none | Web dashboard (static bundle from `app/web`; data fetched with the token) |
+| `GET /` | none | Web dashboard (static bundle embedded in the binary; data fetched with the token) |
 | `GET /health` | none | Liveness check, plus whether this server offers `signup` and `password_reset` |
 | `GET /metrics` | client | Prometheus text: job counts by state, agent/printer liveness |
 | `POST /jobs` | client | Submit a job → `{job_id}` |
@@ -128,7 +128,7 @@ it. On CUPS, `bin`/`paper` values must not contain spaces.
 | `pdf_uri_post` | `url` + `json` | POSTs `json` to the URL, queues as PDF |
 
 URL fetches are `http(s)`-only and sent with a browser User-Agent (WAF/CDN-fronted services
-reject the default Python one).
+reject a default library one such as Python's).
 
 ## Webhooks
 
@@ -208,18 +208,20 @@ Rules:
   a nonexistent printer gets.
 - **Root spans orgs.** The bootstrap `PRINTAPI_TOKEN` reads, submits and cancels across every org
   (that's what the dashboard uses), and is the only credential that can manage orgs and keys.
-- **Agents inherit their key's org.** A key issued for org N puts the agent in org N. Any other key
-  (including the ones existing agents already use) enrolls into the default org `1`, so nothing
-  about a single-org install changes. Agent names are unique *per org*, not globally; an agent key
-  is still bound to its name on first contact.
+- **Agents inherit their key's org.** A key issued for org N puts the agent in org N; the root
+  token enrolls into the default org `1`. Any other key is `401` since v3 — except one an agent
+  already holds (machines enrolled under v2 keep working), and except with
+  `PRINTAPI_OPEN_ENROLLMENT=1`, which restores the v2 rule (any key enrolls into org `1`). Agent
+  names are unique *per org*, not globally; an agent key is still bound to its name on first
+  contact. Revoking an issued key also stops the agent that enrolled with it.
 - `org_id` is optional on `POST /apikeys` and defaults to `1`. An unknown org → `400`.
 
 **Existing installs need no migration** — everything already lives in org `1`, root behaves as
 before, and every issued key resolves to org `1`.
 
 Deliberately out of scope for now (`# ponytail:` in the code): billing, quotas, and org deletion.
-An agent key doubles as its org's client key, and revoking it stops client calls but not an
-already-registered agent's polling.
+An agent key doubles as its org's client key; issue one per machine to keep a lost machine's
+blast radius to that machine.
 
 ## Accounts and login
 

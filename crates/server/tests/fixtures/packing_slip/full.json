@@ -1,0 +1,47 @@
+{
+ "number": "1001",
+ "date": "2026-07-25",
+ "shop": "Acme Store",
+ "customer": "Jane Doe",
+ "email": "jane@example.com",
+ "phone": "+49 30 123456",
+ "note": "leave at the door",
+ "source_id": "42",
+ "address": [
+  "Musterweg 1",
+  "12345 Berlin",
+  "DE"
+ ],
+ "lines": [
+  {
+   "qty": "2",
+   "sku": "A-1",
+   "name": "Widget",
+   "total": "19.80 EUR"
+  },
+  {
+   "qty": "1",
+   "sku": "B-2",
+   "name": "Gadget (large)",
+   "total": "9.90 EUR"
+  },
+  {
+   "qty": "1",
+   "name": "No sku, no total"
+  }
+ ],
+ "totals": [
+  [
+   "Subtotal",
+   "29.70 EUR"
+  ],
+  [
+   "Shipping",
+   "4.90 EUR"
+  ],
+  [
+   "Total",
+   "34.60 EUR"
+  ]
+ ]
+}

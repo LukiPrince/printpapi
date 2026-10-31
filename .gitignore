@@ -26,3 +26,6 @@ agent.ini
 
 # SDD scratch (briefs, reports, progress ledger)
 .superpowers/
+
+# Rust
+target/

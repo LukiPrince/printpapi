@@ -1,0 +1,28 @@
+[package]
+name = "printpapi-agent"
+description = "printpapi agent: long-polls the server and prints on this machine"
+version.workspace = true
+edition.workspace = true
+license-file.workspace = true
+publish.workspace = true
+
+[lib]
+name = "printpapi_agent"
+path = "src/lib.rs"
+
+[[bin]]
+name = "printpapi-agent"
+path = "src/main.rs"
+
+[dependencies]
+chrono = { version = "0.4.45", default-features = false, features = ["clock", "std"] }
+percent-encoding = "2.3.2"
+serde_json = { version = "1.0.154", features = ["preserve_order"] }
+ureq = { version = "3.5.0", default-features = false, features = ["rustls", "platform-verifier", "win-system-proxy"] }
+wait-timeout = "0.2.1"
+
+[dev-dependencies]
+tempfile = "3.27.0"
+
+[target."cfg(windows)".dependencies]
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Graphics_Printing", "Win32_Graphics_Gdi", "Win32_Storage_Xps", "Win32_Security"] }

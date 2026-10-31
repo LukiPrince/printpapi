@@ -1,0 +1,27 @@
+# Elastic License 2.0 (see LICENSE)
+[workspace]
+resolver = "3"
+members = ["crates/server", "crates/agent"]
+
+[workspace.package]
+version = "3.0.0"
+edition = "2024"
+license-file = "LICENSE"
+publish = false
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
+
+# The scrypt password hash costs ~1 s per call unoptimised; the integration tests hash a lot.
+[profile.dev.package.scrypt]
+opt-level = 3
+[profile.dev.package.salsa20]
+opt-level = 3
+[profile.dev.package.pbkdf2]
+opt-level = 3
+[profile.dev.package.sha2]
+opt-level = 3
+[profile.dev.package.hmac]
+opt-level = 3

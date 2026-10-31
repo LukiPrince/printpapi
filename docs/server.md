@@ -1,6 +1,7 @@
 # Server
 
-Python **standard library only** — no framework, no dependencies. HTTP handler + SQLite queue.
+One Rust binary, `printpapi` — no runtime, no Python, no Node. HTTP handler + SQLite queue. The
+dashboard is embedded in the binary.
 
 ## How it works
 
@@ -40,10 +41,33 @@ Environment variables:
 | `SMTP_STARTTLS` | `1` | `0` to disable STARTTLS (plaintext relay on a trusted network) |
 | `PRINTAPI_PLANS` | *(unset)* | [Billing](billing.md) catalogue: a JSON array of plans, or a path to a file holding one. Unset ⇒ no plans, no billing routes |
 | `PRINTAPI_BILLING_SECRET` | *(unset)* | Shared secret for the `POST /billing/webhook` signature. Unset ⇒ the webhook answers `503` |
+| `PRINTAPI_PRIVATE_URLS` | `deny` with open signup, else `allow` | `deny`: payload URLs (`*_uri`, `*_uri_post`), job `callback_url`s and org `event_url`s may only reach public addresses — no loopback, LAN, link-local/cloud-metadata or other private ranges, checked after DNS on every redirect hop. `allow`: anywhere (a self-hosted box fetching PDFs from an internal service). Set `deny` whenever people you do not trust get keys |
+| `PRINTAPI_OPEN_ENROLLMENT` | *(off)* | `1`: any Bearer value enrolls a new agent into the default org (the v2 rule). Off: a new agent needs an issued key or the root token |
 
 ```bash
-PRINTAPI_TOKEN=change-me PRINT_DB=data/printpapi.db python -m app.server
+PRINTAPI_TOKEN=change-me PRINT_DB=data/printpapi.db ./printpapi
 ```
+
+`printpapi --version` prints the version. An existing `printpapi.db` from the Python server
+(v2.5.1 or older) opens unchanged — the schema is the same, apart from a few additive indexes.
+
+### Upgrading from the Python server (v2.x)
+
+Same environment, same database, same API. The [migration guide](migration.md) walks through the
+server and agent upgrade, the defaults that are stricter in v3 and how to roll back.
+
+## Install
+
+Download the `printpapi-server-<platform>` archive from the
+[latest release](https://github.com/LukiPrince/printpapi/releases/latest) and unpack it, or build it
+(needs [Rust](https://rustup.rs/); on Windows the GNU or MSVC toolchain):
+
+```bash
+cargo build --release -p printpapi-server   # -> target/release/printpapi
+```
+
+The build embeds the dashboard from `crates/server/web` (committed), so no Node is needed to build
+the server. See [Dashboard](#dashboard) for changing the UI.
 
 ## Docker
 
@@ -62,9 +86,11 @@ volume — see [`docker-compose.yml`](../docker-compose.yml).
 Build it yourself instead: `docker build -t printpapi .` then run the same command with
 `printpapi` in place of the `ghcr.io/...` image.
 
-Image is `python:3.12-slim` + `cups-client`. The server itself needs no Python packages. The
-build is two-stage: a `node:22-slim` stage compiles the dashboard, and only its static output
-is copied into the runtime image — there is no Node at runtime.
+The image is distroless (`gcr.io/distroless/cc-debian13`) and holds just the `printpapi` binary —
+no Python, no `cups-client`, no shell (so `docker exec ... sh` does not work). The build has three
+stages: `node:22-slim` compiles the dashboard, a Rust stage builds the server with it embedded
+(cross-compiled for arm64), and only the binary is copied into the runtime image. The container
+runs as root, as the Python image did, so an existing data volume stays writable.
 
 ## Dashboard
 
@@ -81,30 +107,30 @@ PDF only to PDF-capable printers and a ZPL label to everything else.
 
 **Where it comes from.** The source is a Next.js app in [`web/`](../web) (App Router,
 TypeScript, Tailwind v4, [shadcn/ui](https://ui.shadcn.com) on Radix, Motion for animation).
-It is built as a **static export** — plain HTML/JS/CSS — and committed to `app/web`, which
-the server serves directly. That keeps the server stdlib-only and means a plain
-`python -m app.server` checkout has a working dashboard with no Node installed.
+It is built as a **static export** — plain HTML/JS/CSS — committed to `crates/server/web` and
+**embedded into the binary at compile time**. A plain `cargo build` checkout therefore has a
+working dashboard with no Node installed, and the running server needs no files next to it.
 
 Changing the UI:
 
 ```bash
-PRINTAPI_TOKEN=change-me python -m app.server   # the API, on :3460
+PRINTAPI_TOKEN=change-me cargo run -p printpapi-server   # the API, on :3460
 
 cd web
 npm install
 npm run dev        # localhost:3000 with hot reload; API calls are proxied to :3460 in dev
-npm run build:app  # static export -> web/out, then synced into app/web (commit that)
+npm run build:app  # static export -> web/out, then synced into crates/server/web (commit that)
 ```
 
 `npm run dev` only works against a running server — it has no API of its own. The dev-only proxy
 lives in `web/next.config.ts`; point it elsewhere with `PRINTPAPI_ORIGIN=http://host:port`. It is
-stripped from the production build, where the Python server serves the bundle and the API together.
-**`app/web` is build output** — change `web/`, run `npm run build:app`, commit both.
+stripped from the production build, where the server serves the bundle and the API together.
+**`crates/server/web` is build output** — change `web/`, run `npm run build:app`, commit both, then
+rebuild the binary (the bundle is embedded at compile time, so a running server keeps the old UI
+until then).
 
 Asset paths under `/_next/static/` are content-hashed and served `immutable`; the HTML is
-served `no-cache`. Requests are confined to `app/web` — a path that escapes it 404s.
-If `app/web` is missing (source checkout, never built), `GET /` returns a short page telling
-you to build it; the JSON API is unaffected.
+served `no-cache`. Requests are confined to the embedded bundle — a path that escapes it 404s.
 
 ## API keys
 

@@ -1,0 +1,84 @@
+name: release
+# On a version tag: build the agent and the server for every platform and attach them to the
+# GitHub release of that tag. A missing release is created as a *draft*, so the notes are still
+# written by hand before it goes public; an existing one just gets the assets (re)uploaded.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: windows-latest, target: x86_64-pc-windows-msvc, name: windows-x86_64, exe: .exe }
+          - { os: ubuntu-latest, target: x86_64-unknown-linux-gnu, name: linux-x86_64, exe: "" }
+          - { os: ubuntu-24.04-arm, target: aarch64-unknown-linux-gnu, name: linux-aarch64, exe: "" }
+          - { os: macos-latest, target: aarch64-apple-darwin, name: macos-aarch64, exe: "" }
+          - { os: macos-latest, target: x86_64-apple-darwin, name: macos-x86_64, exe: "" }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - run: cargo build --release --locked --target ${{ matrix.target }} -p printpapi-agent -p printpapi-server
+      - name: package
+        shell: bash
+        run: |
+          set -eux
+          rel=target/${{ matrix.target }}/release
+          for pkg in agent server; do
+            d=dist/printpapi-$pkg-${{ matrix.name }}
+            mkdir -p "$d"
+            cp LICENSE "$d/"
+          done
+          cp "$rel/printpapi-agent${{ matrix.exe }}" agent/agent.ini.example dist/printpapi-agent-${{ matrix.name }}/
+          cp "$rel/printpapi${{ matrix.exe }}" dist/printpapi-server-${{ matrix.name }}/
+          cd dist
+          for d in printpapi-agent-${{ matrix.name }} printpapi-server-${{ matrix.name }}; do
+            if [ "${{ runner.os }}" = "Windows" ]; then 7z a -tzip "$d.zip" "$d" >/dev/null
+            else tar -czf "$d.tar.gz" "$d"; fi
+            rm -rf "$d"
+          done
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.name }}
+          path: dist/*
+
+  publish:
+    needs: build
+    # Publish whatever built: one broken platform must not hold back the others' archives.
+    if: ${{ !cancelled() && startsWith(github.ref, 'refs/tags/') }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      # The legacy Python agent, for Windows machines that block the unsigned Rust exe.
+      - name: package the Python agent
+        run: |
+          mkdir -p py/printpapi-agent-python
+          cp agent/print_agent.py agent/agent.ini.example LICENSE py/printpapi-agent-python/
+          (cd py && zip -qr ../dist/printpapi-agent-python.zip printpapi-agent-python)
+      - env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          # The release notes are the annotated tag's message: subject = title, body = notes.
+          # (checkout leaves a shallow, lightweight copy of the tag; fetch the real tag object.)
+          git fetch --force origin "refs/tags/$TAG:refs/tags/$TAG"
+          git tag -l --format='%(contents:subject)' "$TAG" > title.txt
+          git tag -l --format='%(contents:body)' "$TAG" > notes.md
+          [ -s title.txt ] || echo "$TAG" > title.txt
+          [ -s notes.md ] || echo "Binaries for $TAG." > notes.md
+          gh release view "$TAG" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1 \
+            || gh release create "$TAG" -R "$GITHUB_REPOSITORY" --verify-tag \
+                 --title "$(cat title.txt)" --notes-file notes.md
+          gh release upload "$TAG" dist/* -R "$GITHUB_REPOSITORY" --clobber

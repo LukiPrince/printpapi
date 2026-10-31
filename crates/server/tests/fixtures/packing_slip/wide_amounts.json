@@ -1,0 +1,414 @@
+{
+ "number": "55",
+ "date": "2026-01-01",
+ "shop": "W",
+ "address": [],
+ "lines": [
+  {
+   "qty": "1",
+   "sku": "S-0",
+   "name": "n",
+   "total": "1"
+  },
+  {
+   "qty": "2",
+   "sku": "S-1",
+   "name": "nn",
+   "total": "11"
+  },
+  {
+   "qty": "3",
+   "sku": "S-2",
+   "name": "nnn",
+   "total": "111"
+  },
+  {
+   "qty": "4",
+   "sku": "S-3",
+   "name": "nnnn",
+   "total": "1111"
+  },
+  {
+   "qty": "5",
+   "sku": "S-4",
+   "name": "nnnnn",
+   "total": "11111"
+  },
+  {
+   "qty": "1",
+   "sku": "S-5",
+   "name": "nnnnnn",
+   "total": "111111"
+  },
+  {
+   "qty": "2",
+   "sku": "S-6",
+   "name": "nnnnnnn",
+   "total": "1111111"
+  },
+  {
+   "qty": "3",
+   "sku": "S-7",
+   "name": "nnnnnnnn",
+   "total": "11111111"
+  },
+  {
+   "qty": "4",
+   "sku": "S-8",
+   "name": "nnnnnnnnn",
+   "total": "111111111"
+  },
+  {
+   "qty": "5",
+   "sku": "S-9",
+   "name": "nnnnnnnnnn",
+   "total": "1111111111"
+  },
+  {
+   "qty": "1",
+   "sku": "S-10",
+   "name": "nnnnnnnnnnn",
+   "total": "11111111111"
+  },
+  {
+   "qty": "2",
+   "sku": "S-11",
+   "name": "nnnnnnnnnnnn",
+   "total": "111111111111"
+  },
+  {
+   "qty": "3",
+   "sku": "S-12",
+   "name": "nnnnnnnnnnnnn",
+   "total": "1111111111111"
+  },
+  {
+   "qty": "4",
+   "sku": "S-13",
+   "name": "nnnnnnnnnnnnnn",
+   "total": "11111111111111"
+  },
+  {
+   "qty": "5",
+   "sku": "S-14",
+   "name": "nnnnnnnnnnnnnnn",
+   "total": "111111111111111"
+  },
+  {
+   "qty": "1",
+   "sku": "S-15",
+   "name": "nnnnnnnnnnnnnnnn",
+   "total": "1111111111111111"
+  },
+  {
+   "qty": "2",
+   "sku": "S-16",
+   "name": "nnnnnnnnnnnnnnnnn",
+   "total": "11111111111111111"
+  },
+  {
+   "qty": "3",
+   "sku": "S-17",
+   "name": "nnnnnnnnnnnnnnnnnn",
+   "total": "111111111111111111"
+  },
+  {
+   "qty": "4",
+   "sku": "S-18",
+   "name": "nnnnnnnnnnnnnnnnnnn",
+   "total": "1111111111111111111"
+  },
+  {
+   "qty": "5",
+   "sku": "S-19",
+   "name": "nnnnnnnnnnnnnnnnnnnn",
+   "total": "11111111111111111111"
+  },
+  {
+   "qty": "1",
+   "sku": "S-20",
+   "name": "nnnnnnnnnnnnnnnnnnnnn",
+   "total": "111111111111111111111"
+  },
+  {
+   "qty": "2",
+   "sku": "S-21",
+   "name": "nnnnnnnnnnnnnnnnnnnnnn",
+   "total": "1111111111111111111111"
+  },
+  {
+   "qty": "3",
+   "sku": "S-22",
+   "name": "nnnnnnnnnnnnnnnnnnnnnnn",
+   "total": "11111111111111111111111"
+  },
+  {
+   "qty": "4",
+   "sku": "S-23",
+   "name": "nnnnnnnnnnnnnnnnnnnnnnnn",
+   "total": "111111111111111111111111"
+  },
+  {
+   "qty": "5",
+   "sku": "S-24",
+   "name": "nnnnnnnnnnnnnnnnnnnnnnnnn",
+   "total": "1111111111111111111111111"
+  },
+  {
+   "qty": "1",
+   "sku": "S-25",
+   "name": "nnnnnnnnnnnnnnnnnnnnnnnnnn",
+   "total": "11111111111111111111111111"
+  },
+  {
+   "qty": "2",
+   "sku": "S-26",
+   "name": "nnnnnnnnnnnnnnnnnnnnnnnnnnn",
+   "total": "111111111111111111111111111"
+  },
+  {
+   "qty": "3",
+   "sku": "S-27",
+   "name": "nnnnnnnnnnnnnnnnnnnnnnnnnnnn",
+   "total": "1111111111111111111111111111"
+  },
+  {
+   "qty": "4",
+   "sku": "S-28",
+   "name": "nnnnnnnnnnnnnnnnnnnnnnnnnnnnn",
+   "total": "11111111111111111111111111111"
+  },
+  {
+   "qty": "5",
+   "sku": "S-29",
+   "name": "nnnnnnnnnnnnnnnnnnnnnnnnnnnnnn",
+   "total": "111111111111111111111111111111"
+  },
+  {
+   "qty": "1",
+   "sku": "S-30",
+   "name": "nnnnnnnnnnnnnnnnnnnnnnnnnnnnnnn",
+   "total": "1"
+  },
+  {
+   "qty": "2",
+   "sku": "S-31",
+   "name": "nnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnn",
+   "total": "11"
+  },
+  {
+   "qty": "3",
+   "sku": "S-32",
+   "name": "nnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnn",
+   "total": "111"
+  },
+  {
+   "qty": "4",
+   "sku": "S-33",
+   "name": "nnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnn",
+   "total": "1111"
+  },
+  {
+   "qty": "5",
+   "sku": "S-34",
+   "name": "nnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnn",
+   "total": "11111"
+  },
+  {
+   "qty": "1",
+   "sku": "S-35",
+   "name": "nnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnn",
+   "total": "111111"
+  },
+  {
+   "qty": "2",
+   "sku": "S-36",
+   "name": "nnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnn",
+   "total": "1111111"
+  },
+  {
+   "qty": "3",
+   "sku": "S-37",
+   "name": "nnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnn",
+   "total": "11111111"
+  },
+  {
+   "qty": "4",
+   "sku": "S-38",
+   "name": "nnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnn",
+   "total": "111111111"
+  },
+  {
+   "qty": "5",
+   "sku": "S-39",
+   "name": "nnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnn",
+   "total": "1111111111"
+  },
+  {
+   "qty": "1",
+   "sku": "S-40",
+   "name": "nnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnn",
+   "total": "11111111111"
+  },
+  {
+   "qty": "2",
+   "sku": "S-41",
+   "name": "nnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnn",
+   "total": "111111111111"
+  },
+  {
+   "qty": "3",
+   "sku": "S-42",
+   "name": "nnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnn",
+   "total": "1111111111111"
+  },
+  {
+   "qty": "4",
+   "sku": "S-43",
+   "name": "nnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnn",
+   "total": "11111111111111"
+  },
+  {
+   "qty": "5",
+   "sku": "S-44",
+   "name": "nnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnn",
+   "total": "111111111111111"
+  },
+  {
+   "qty": "1",
+   "sku": "S-45",
+   "name": "nnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnn",
+   "total": "1111111111111111"
+  },
+  {
+   "qty": "2",
+   "sku": "S-46",
+   "name": "nnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnn",
+   "total": "11111111111111111"
+  },
+  {
+   "qty": "3",
+   "sku": "S-47",
+   "name": "nnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnn",
+   "total": "111111111111111111"
+  },
+  {
+   "qty": "4",
+   "sku": "S-48",
+   "name": "nnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnn",
+   "total": "1111111111111111111"
+  },
+  {
+   "qty": "5",
+   "sku": "S-49",
+   "name": "nnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnn",
+   "total": "11111111111111111111"
+  },
+  {
+   "qty": "1",
+   "sku": "S-50",
+   "name": "nnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnn",
+   "total": "111111111111111111111"
+  },
+  {
+   "qty": "2",
+   "sku": "S-51",
+   "name": "nnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnn",
+   "total": "1111111111111111111111"
+  },
+  {
+   "qty": "3",
+   "sku": "S-52",
+   "name": "nnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnn",
+   "total": "11111111111111111111111"
+  },
+  {
+   "qty": "4",
+   "sku": "S-53",
+   "name": "nnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnn",
+   "total": "111111111111111111111111"
+  },
+  {
+   "qty": "5",
+   "sku": "S-54",
+   "name": "nnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnn",
+   "total": "1111111111111111111111111"
+  },
+  {
+   "qty": "1",
+   "sku": "S-55",
+   "name": "nnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnn",
+   "total": "11111111111111111111111111"
+  },
+  {
+   "qty": "2",
+   "sku": "S-56",
+   "name": "nnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnn",
+   "total": "111111111111111111111111111"
+  },
+  {
+   "qty": "3",
+   "sku": "S-57",
+   "name": "nnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnn",
+   "total": "1111111111111111111111111111"
+  },
+  {
+   "qty": "4",
+   "sku": "S-58",
+   "name": "nnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnn",
+   "total": "11111111111111111111111111111"
+  },
+  {
+   "qty": "5",
+   "sku": "S-59",
+   "name": "nnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnn",
+   "total": "111111111111111111111111111111"
+  }
+ ],
+ "totals": [
+  [
+   "T",
+   "9"
+  ],
+  [
+   "TT",
+   "99"
+  ],
+  [
+   "TTT",
+   "999"
+  ],
+  [
+   "TTTT",
+   "9999"
+  ],
+  [
+   "TTTTT",
+   "99999"
+  ],
+  [
+   "TTTTTT",
+   "999999"
+  ],
+  [
+   "TTTTTTT",
+   "9999999"
+  ],
+  [
+   "TTTTTTTT",
+   "99999999"
+  ],
+  [
+   "TTTTTTTTT",
+   "999999999"
+  ],
+  [
+   "TTTTTTTTTT",
+   "9999999999"
+  ],
+  [
+   "TTTTTTTTTTT",
+   "99999999999"
+  ]
+ ]
+}

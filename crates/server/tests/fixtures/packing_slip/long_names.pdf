@@ -1,0 +1,66 @@
+%PDF-1.4
+1 0 obj
+<< /Type /Catalog /Pages 2 0 R >>
+endobj
+2 0 obj
+<< /Type /Pages /Kids [5 0 R] /Count 1 >>
+endobj
+3 0 obj
+<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>
+endobj
+4 0 obj
+<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica-Bold /Encoding /WinAnsiEncoding >>
+endobj
+5 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] /Resources << /Font << /F1 3 0 R /F2 4 0 R >> >> /Contents 6 0 R >>
+endobj
+6 0 obj
+<< /Length 1819 >>
+stream
+BT /F2 18 Tf 40 788 Td (Packing slip) Tj ET
+BT /F1 10 Tf 207 788 Td (SSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSS) Tj ET
+BT /F2 12 Tf 40 762 Td (Order 3333333333333333333333333333333333333333) Tj ET
+BT /F1 10 Tf 40 736 Td (NNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNN…) Tj ET
+BT /F1 10 Tf 40 722 Td (AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA…) Tj ET
+BT /F1 10 Tf 40 708 Td (BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB…) Tj ET
+BT /F1 10 Tf 40 694 Td (C) Tj ET
+BT /F1 10 Tf 40 680 Td (eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee…) Tj ET
+BT /F2 10 Tf 40 654 Td (Qty) Tj ET
+BT /F2 10 Tf 74 654 Td (SKU) Tj ET
+BT /F2 10 Tf 150 654 Td (Item) Tj ET
+BT /F2 10 Tf 520 654 Td (Amount) Tj ET
+0.5 w 40 649 m 555 649 l S
+BT /F1 10 Tf 40 635 Td (11111111111111111111) Tj ET
+BT /F1 10 Tf 74 635 Td (SKU-XXXXXXX…) Tj ET
+BT /F1 10 Tf 150 635 Td (Name yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy…) Tj ET
+BT /F1 10 Tf 462 635 Td (123456789.99 EUR) Tj ET
+BT /F1 10 Tf 40 621 Td (1) Tj ET
+BT /F1 10 Tf 74 621 Td (short) Tj ET
+BT /F1 10 Tf 150 621 Td (wwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwww) Tj ET
+BT /F1 10 Tf 549 621 Td (1) Tj ET
+BT /F1 10 Tf 40 607 Td (1) Tj ET
+BT /F1 10 Tf 74 607 Td (zzzzzzzzzzzz) Tj ET
+BT /F1 10 Tf 150 607 Td (vvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvv) Tj ET
+BT /F1 10 Tf 549 607 Td (2) Tj ET
+0.5 w 355 588 m 555 588 l S
+BT /F2 10 Tf 355 572 Td (A very long total label that overflows) Tj ET
+BT /F2 10 Tf 480 572 Td (999999.99 EUR) Tj ET
+BT /F1 10 Tf 40 544 Td (Note: nnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnn…) Tj ET
+BT /F1 8 Tf 40 24 Td (Page 1/1) Tj ET
+
+endstream
+endobj
+xref
+0 7
+0000000000 65535 f 
+0000000009 00000 n 
+0000000058 00000 n 
+0000000115 00000 n 
+0000000212 00000 n 
+0000000314 00000 n 
+0000000450 00000 n 
+trailer
+<< /Size 7 /Root 1 0 R >>
+startxref
+2321
+%%EOF

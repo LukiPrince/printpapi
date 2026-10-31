@@ -1,0 +1,47 @@
+{
+ "number": "727",
+ "date": "2026-07-25",
+ "customer": "Jane Doe",
+ "email": "jane@example.com",
+ "phone": "+49 30 123456",
+ "note": "leave at the door",
+ "source_id": "727",
+ "address": [
+  "Musterweg 1",
+  "Hinterhaus",
+  "12345 Berlin, BE",
+  "DE"
+ ],
+ "lines": [
+  {
+   "qty": "2",
+   "sku": "A-1",
+   "name": "Widget",
+   "total": "19.80 EUR"
+  },
+  {
+   "qty": "1",
+   "sku": "B-2",
+   "name": "Gadget",
+   "total": "9.90 EUR"
+  }
+ ],
+ "totals": [
+  [
+   "Discount",
+   "1.00 EUR"
+  ],
+  [
+   "Shipping",
+   "4.90 EUR"
+  ],
+  [
+   "Tax",
+   "3.20 EUR"
+  ],
+  [
+   "Total",
+   "34.60 EUR"
+  ]
+ ]
+}

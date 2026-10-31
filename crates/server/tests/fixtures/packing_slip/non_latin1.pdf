@@ -1,0 +1,61 @@
+%PDF-1.4
+1 0 obj
+<< /Type /Catalog /Pages 2 0 R >>
+endobj
+2 0 obj
+<< /Type /Pages /Kids [5 0 R] /Count 1 >>
+endobj
+3 0 obj
+<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>
+endobj
+4 0 obj
+<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica-Bold /Encoding /WinAnsiEncoding >>
+endobj
+5 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] /Resources << /Font << /F1 3 0 R /F2 4 0 R >> >> /Contents 6 0 R >>
+endobj
+6 0 obj
+<< /Length 985 >>
+stream
+BT /F2 18 Tf 40 788 Td (Packing slip) Tj ET
+BT /F1 10 Tf 480 788 Td (Café Zürich ß) Tj ET
+BT /F2 12 Tf 40 762 Td (Order 9 €) Tj ET
+BT /F1 10 Tf 40 736 Td (Jörg Müller ???) Tj ET
+BT /F1 10 Tf 40 722 Td (Straße 1 ?) Tj ET
+BT /F1 10 Tf 40 708 Td (?apelo ?) Tj ET
+BT /F1 10 Tf 40 694 Td (??? ‘x’ “y” — … ™ Ÿ) Tj ET
+BT /F2 10 Tf 40 668 Td (Qty) Tj ET
+BT /F2 10 Tf 74 668 Td (SKU) Tj ET
+BT /F2 10 Tf 150 668 Td (Item) Tj ET
+BT /F2 10 Tf 520 668 Td (Amount) Tj ET
+0.5 w 40 663 m 555 663 l S
+BT /F1 10 Tf 40 649 Td (1) Tj ET
+BT /F1 10 Tf 74 649 Td (€-1) Tj ET
+BT /F1 10 Tf 150 649 Td (Größe XL — ?? ? ñ) Tj ET
+BT /F1 10 Tf 538 649 Td (5 €) Tj ET
+BT /F1 10 Tf 40 635 Td (1) Tj ET
+BT /F1 10 Tf 74 635 Td () Tj ET
+BT /F1 10 Tf 150 635 Td (œ Œ ž Ž š Š ƒ † ‡ ‰ • ˜ ˆ) Tj ET
+BT /F1 10 Tf 549 635 Td (6) Tj ET
+0.5 w 355 616 m 555 616 l S
+BT /F2 10 Tf 355 600 Td (Gesamt €) Tj ET
+BT /F2 10 Tf 532 600 Td (11 €) Tj ET
+BT /F1 10 Tf 40 572 Td (Note: Grüße ??) Tj ET
+BT /F1 8 Tf 40 24 Td (Page 1/1) Tj ET
+
+endstream
+endobj
+xref
+0 7
+0000000000 65535 f 
+0000000009 00000 n 
+0000000058 00000 n 
+0000000115 00000 n 
+0000000212 00000 n 
+0000000314 00000 n 
+0000000450 00000 n 
+trailer
+<< /Size 7 /Root 1 0 R >>
+startxref
+1486
+%%EOF

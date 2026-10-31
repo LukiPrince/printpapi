@@ -6,23 +6,39 @@ only** — nothing listens on the printer's machine, so NAT/firewalls are no pro
 
 ## Install
 
-1. Copy `agent/print_agent.py` to the machine (Python 3.9+).
+The agent is a single Rust binary, `printpapi-agent`. No Python, no runtime.
+
+1. Download the archive for the machine from the
+   [latest release](https://github.com/LukiPrince/printpapi/releases/latest) and unpack it. Each
+   archive holds the binary, `agent.ini.example` and `LICENSE`:
+   - `printpapi-agent-windows-x86_64.zip`
+   - `printpapi-agent-linux-x86_64.tar.gz`, `printpapi-agent-linux-aarch64.tar.gz`
+   - `printpapi-agent-macos-aarch64.tar.gz` (Apple silicon), `printpapi-agent-macos-x86_64.tar.gz`
+     (Intel)
 2. Platform bits:
-   - **Windows:** `pip install pywin32`. For PDF printing, put `SumatraPDF.exe` next to the
-     script (or on `PATH`) — it silent-prints through the installed driver.
+   - **Windows:** nothing for raw jobs — the agent talks to the spooler directly (no `pywin32`
+     any more). For PDF printing, put `SumatraPDF.exe` next to `printpapi-agent.exe` (or on
+     `PATH`) — it silent-prints through the installed driver.
    - **Linux:** CUPS (`lp` must work). Raw jobs go to the queue with `-o raw`; PDFs go through
      the CUPS filter chain.
    - **macOS:** same CUPS path as Linux, nothing to install (`lp` ships with the OS) — but read
      [macOS](#macos) below, raw printing has one setup trap.
-3. Create `agent.ini` next to the script (below).
-4. Run: `python print_agent.py` — for autostart see [Run as a service](#run-as-a-service).
+3. Create `agent.ini` **next to the executable** (below; copy `agent.ini.example`). The agent finds
+   it there whatever its working directory is.
+4. Run `printpapi-agent` (`printpapi-agent.exe` on Windows; on Linux/macOS `chmod +x` it first if
+   needed). It is a console program. For autostart see [Run as a service](#run-as-a-service).
+
+On a locked-down Windows machine that blocks the exe, see [Locked-down Windows](#locked-down-windows).
+
+Replacing a Python agent from v2? Keep its `agent.ini` (same `name` and `api_key`) so the machine
+and its printer ids stay the same; the steps are in the [migration guide](migration.md#upgrade-the-agents).
 
 ## agent.ini
 
 ```ini
 [agent]
 server_url = http://yourserver:3460
-api_key    = your-agent-key
+api_key    = key-from-the-Keys-page
 name       = office-pc
 ; printers: semicolon-separated. Append |pdf for document printers.
 ; A CUPS queue / Windows printer name, socket://IP:PORT for a raw network printer,
@@ -54,8 +70,14 @@ error after a working stretch (and the matching "poll recovered"), a rejected `a
 crash are appended to `%LOCALAPPDATA%\print_agent-error.log` (Windows) or the temp dir - that file
 is the first thing to read over remote desktop.
 
-When exposing the server to agents outside your LAN, publish **only** `/agent/*` and put an auth
-proxy in front: `/agent/register` enrolls an unknown key into the default org (see roadmap).
+`api_key` is a key issued for the agent — on the dashboard's **Keys** page or with
+`POST /apikeys` — and the agent lands in that key's org. A made-up key is refused (`401`) since
+v3; agents that enrolled with one under v2 keep working, and `PRINTAPI_OPEN_ENROLLMENT=1` on the
+server restores the old rule. Issue one key per machine: revoking it on the Keys page stops that
+agent at once.
+
+When exposing the server to agents outside your LAN, publishing only `/agent/*` (behind TLS) is
+still the smallest surface.
 
 ### Printer syntax
 
@@ -73,7 +95,7 @@ proxy in front: `/agent/register` enrolls an unknown key into the default org (s
 
 A label printer **cannot parse a PDF** — send it raw PDF bytes and it form-feeds blank labels.
 printpapi keeps the paths separate: `raw` jobs (ZPL/ESC-POS) go straight to the printer;
-`pdf` jobs are rendered first (SumatraPDF on Windows, CUPS on Linux). Mark only real document
+`pdf` jobs are rendered first (SumatraPDF on Windows, CUPS on Linux and macOS). Mark only real document
 printers with `|pdf`.
 
 ## Printer setup by family
@@ -150,10 +172,8 @@ printers = Zebra GK420d ; archive = file:///srv/paperless/consume
 
 ## macOS
 
-macOS printing *is* CUPS, so the agent takes the same path as Linux — `select_backend()` picks
-`lp` for anything that isn't Windows, and `lpoptions -p <queue> -l` reports capabilities. Nothing
-to install beyond Python (`/usr/bin/python3` asks for the Xcode Command Line Tools the first time;
-`xcode-select --install` if it does).
+macOS printing *is* CUPS, so the agent takes the same path as Linux — it picks `lp` for anything
+that isn't Windows, and `lpoptions -p <queue> -l` reports capabilities. Nothing to install.
 
 The one trap is **raw printing**. A label printer added through the normal *Printers & Scanners*
 dialog usually lands as a driverless/AirPrint queue, and that queue's filter chain mangles or
@@ -186,8 +206,7 @@ Description=printpapi agent
 After=network-online.target cups.service
 
 [Service]
-ExecStart=/usr/bin/python3 /opt/printpapi/print_agent.py
-WorkingDirectory=/opt/printpapi
+ExecStart=/opt/printpapi/printpapi-agent
 Restart=always
 RestartSec=5
 User=printpapi
@@ -196,8 +215,9 @@ User=printpapi
 WantedBy=multi-user.target
 ```
 
-`sudo systemctl enable --now printpapi-agent`. The service user needs no special rights — any
-local user may submit to CUPS.
+`agent.ini` lives next to the binary (`/opt/printpapi/agent.ini`), so no `WorkingDirectory` is
+needed. `sudo systemctl enable --now printpapi-agent`. The service user needs no special rights —
+any local user may submit to CUPS.
 
 **macOS — launchd** (`/Library/LaunchDaemons/com.printpapi.agent.plist`, root-owned, mode 644):
 
@@ -209,8 +229,7 @@ local user may submit to CUPS.
   <key>Label</key><string>com.printpapi.agent</string>
   <key>ProgramArguments</key>
   <array>
-    <string>/usr/bin/python3</string>
-    <string>/opt/printpapi/print_agent.py</string>
+    <string>/opt/printpapi/printpapi-agent</string>
   </array>
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><true/>
@@ -224,23 +243,42 @@ local user may submit to CUPS.
 (`sudo launchctl load -w <plist>` on older macOS). A daemon can print: CUPS queues are
 system-wide.
 
-**Windows — Task Scheduler**, running the *signed* interpreter (see below):
+**Windows — Task Scheduler:**
 
 ```powershell
 schtasks /create /tn printpapi-agent /sc onstart /rl highest /ru SYSTEM `
-  /tr '"C:\Program Files\Python312\pythonw.exe" C:\printpapi\print_agent.py'
+  /tr "C:\printpapi\printpapi-agent.exe"
 ```
 
 Caveat: printers installed *per user* are invisible to `SYSTEM`. Either install the printer for
 all machine users, or create the task under the operator's account with "run whether user is
-logged on or not". `nssm install printpapi-agent <pythonw.exe> <script>` works too if you want
-real service semantics (auto-restart, `sc` control).
+logged on or not". The agent is a console program; under "run whether user is logged on or not"
+no window shows. `nssm install printpapi-agent C:\printpapi\printpapi-agent.exe` works too if you
+want real service semantics (auto-restart, `sc` control).
 
 ## Locked-down Windows
 
-Smart App Control / WDAC / AppLocker block unsigned executables. Run the agent through the
-signed Python interpreter (`pythonw.exe` is PSF-signed; the `.py` file is data, not an
-executable) — or use a code-signed build when one is available.
+Smart App Control / WDAC / AppLocker block unsigned executables, and the Rust agent exe is **not
+code-signed yet**, so such machines refuse to start it. Until signed builds exist, use the Python
+agent, which stays available as the *legacy agent* (`agent/print_agent.py` in the repo, unchanged
+and still tested in CI). It runs through the signed Python interpreter — `pythonw.exe` is
+PSF-signed, and the `.py` file is data, not an executable:
+
+1. Copy `agent/print_agent.py` to the machine (Python 3.9+; every release also has it as
+   `printpapi-agent-python.zip`) and `pip install pywin32`. For PDF
+   printing put `SumatraPDF.exe` next to the script (or on `PATH`).
+2. Create `agent.ini` next to the script — same format and keys as above.
+3. Run `python print_agent.py`, and for autostart:
+
+   ```powershell
+   schtasks /create /tn printpapi-agent /sc onstart /rl highest /ru SYSTEM `
+     /tr '"C:\Program Files\Python312\pythonw.exe" C:\printpapi\print_agent.py'
+   ```
+
+   (`nssm install printpapi-agent <pythonw.exe> <script>` works too; the per-user printer caveat
+   above applies.)
+
+Switch to the Rust agent once a code-signed build is released.
 
 ## Reliability
 

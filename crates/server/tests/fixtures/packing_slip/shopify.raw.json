@@ -1,0 +1,61 @@
+{
+ "format": "shopify",
+ "payload": {
+  "id": 450789469,
+  "order_number": 1001,
+  "name": "#1001",
+  "created_at": "2026-07-25T10:22:51-04:00",
+  "currency": "EUR",
+  "subtotal_price": "29.70",
+  "total_tax": "0.00",
+  "total_price": "34.60",
+  "note": "leave at the door",
+  "email": "jane@example.com",
+  "customer": {
+   "first_name": "Jane",
+   "last_name": "Doe"
+  },
+  "shipping_address": {
+   "name": "Jane Doe",
+   "address1": "Musterweg 1",
+   "address2": "",
+   "zip": "12345",
+   "city": "Berlin",
+   "province": "Brandenburg",
+   "country": "Germany",
+   "phone": "+49 30 123456"
+  },
+  "shipping_lines": [
+   {
+    "title": "Standard",
+    "price": "4.90"
+   },
+   {
+    "title": "Fast",
+    "price": "2.5"
+   }
+  ],
+  "line_items": [
+   {
+    "quantity": 2,
+    "sku": "A-1",
+    "title": "Widget",
+    "variant_title": "blue",
+    "price": "9.90"
+   },
+   {
+    "quantity": 1,
+    "sku": "B-2",
+    "title": "Gadget",
+    "variant_title": "Default Title",
+    "price": "9.90"
+   },
+   {
+    "quantity": 3,
+    "sku": "C-3",
+    "title": "Ümlaut “quoted” (x)",
+    "price": "0.335"
+   }
+  ]
+ }
+}
