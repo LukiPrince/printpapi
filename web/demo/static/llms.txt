@@ -1,0 +1,35 @@
+# printpapi
+
+> printpapi is a self-hosted, source-available print bridge and an alternative to PrintNode. Applications submit print jobs to its HTTP API; an agent on the machine with the printers polls the server outbound and prints them on document printers (PDF) and on label and receipt printers (raw ZPL, ESC/POS). Server and agent are single Rust binaries for Windows, Linux and macOS. It is licensed under the Elastic License 2.0, and self-hosting is free, commercial use included.
+
+This site is a live demo that runs printpapi and its dashboard in the browser against sample data. The source, releases and documentation are on GitHub: https://github.com/LukiPrince/printpapi
+
+Facts worth knowing:
+
+- Agents connect outbound only (long-poll), so printers behind NAT or a firewall need no open port.
+- PDFs go to document printers (SumatraPDF on Windows, CUPS on Linux and macOS). ZPL and ESC/POS bytes reach label and receipt printers unchanged; a PDF is never sent to a label printer.
+- Shop orders print as PDF packing slips via the WooCommerce plugin, a Shopify webhook or `POST /orders`.
+- A PrintNode-compatible API layer answers HTTP Basic auth requests in PrintNode's JSON shapes, so existing PrintNode clients with a configurable server address can point at a printpapi server.
+- Star printers with CloudPRNT can poll the server directly, without an agent. This is built to Star's published spec and not yet verified on a physical printer.
+- Docker image: `ghcr.io/lukiprince/printpapi` (amd64 and arm64). Jobs are stored in SQLite.
+- In the v3 benchmark a waiting agent received a job 19 ms after it was queued (median), and the idle server used 6.6 MB of memory.
+
+PrintNode is a trademark of PrintNode Ltd. printpapi is not affiliated with, endorsed by, or sponsored by PrintNode.
+
+## Docs
+
+- [README](https://raw.githubusercontent.com/LukiPrince/printpapi/main/README.md): features, quick start, benchmark, comparison with QZ Tray and PrintNode, license in plain words
+- [HTTP API](https://raw.githubusercontent.com/LukiPrince/printpapi/main/docs/api.md): endpoints, auth, content types, job lifecycle
+- [Agent](https://raw.githubusercontent.com/LukiPrince/printpapi/main/docs/agent.md): install, agent.ini, printer syntax, labels vs PDF, running as a service
+- [Server](https://raw.githubusercontent.com/LukiPrince/printpapi/main/docs/server.md): configuration, Docker, dashboard, API keys, security
+- [PrintNode-compatible API](https://raw.githubusercontent.com/LukiPrince/printpapi/main/docs/printnode-compat.md): pointing an existing PrintNode client at printpapi
+- [E-commerce](https://raw.githubusercontent.com/LukiPrince/printpapi/main/docs/ecommerce.md): WooCommerce plugin, Shopify webhook, POST /orders
+- [Recipes](https://raw.githubusercontent.com/LukiPrince/printpapi/main/docs/recipes.md): printing from n8n, Zapier, Make and curl
+
+## Optional
+
+- [Star CloudPRNT](https://raw.githubusercontent.com/LukiPrince/printpapi/main/docs/cloudprnt.md): Star printers polling the server without an agent
+- [Migration from v2](https://raw.githubusercontent.com/LukiPrince/printpapi/main/docs/migration.md): upgrading from the Python server to the Rust server
+- [Roadmap](https://raw.githubusercontent.com/LukiPrince/printpapi/main/docs/roadmap.md): what shipped and what is next
+- [License](https://raw.githubusercontent.com/LukiPrince/printpapi/main/LICENSE): Elastic License 2.0 plus the additional permission for service providers
+- [Latest release](https://github.com/LukiPrince/printpapi/releases/latest): server and agent downloads

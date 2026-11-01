@@ -74,6 +74,38 @@ const KIND_ORDER: Kind[] = ["label", "slip", "receipt"];
 const PICK_TITLE: Record<Kind, string> = { label: "Shipping label", slip: "Packing slip", receipt: "Receipt" };
 const PAYLOAD_TAB: Record<Kind, string> = { label: "Payload (ZPL)", slip: "Order (JSON)", receipt: "Payload (ESC/POS)" };
 
+// Plain answers to what people ask a search engine or a chatbot about printpapi, in the prerendered HTML.
+const FAQ: [string, string][] = [
+  [
+    "What is printpapi?",
+    "A self-hosted print bridge. Your application sends a print job to its HTTP API, and an agent on a computer next to the printers picks the job up and prints it. Office printers and label or receipt printers work alike.",
+  ],
+  [
+    "How does it reach printers behind a firewall?",
+    "The agent only opens outbound connections. It keeps a long-poll request open to the server and gets each job the moment it is queued, so the site needs no open port and no VPN.",
+  ],
+  [
+    "Which printers does it support?",
+    "Any printer the operating system can print to. PDFs go to document printers through SumatraPDF on Windows or CUPS on Linux and macOS. ZPL labels and ESC/POS receipts are sent as raw bytes, so a label printer never gets a PDF.",
+  ],
+  [
+    "Is it an alternative to PrintNode?",
+    "Yes. It follows the same model, an agent polling from behind NAT, but runs on your own server and has no per-printer fee. Software written against the PrintNode API can switch if its server address is configurable: point it at your server, and the HTTP Basic auth it already sends selects the compatible API.",
+  ],
+  [
+    "Can it print shop orders automatically?",
+    "Yes. The WooCommerce plugin and a Shopify webhook send new orders to the server, which renders each one as a PDF packing slip. Any other system can do the same with POST /orders.",
+  ],
+  [
+    "How do I install it?",
+    "The server is one Rust binary for Windows, Linux and macOS, or the Docker image ghcr.io/lukiprince/printpapi. The agent is a second small binary on the machine with the printers, configured in agent.ini.",
+  ],
+  [
+    "What does it cost?",
+    "Self-hosting is free, commercial use included. printpapi is source available under the Elastic License 2.0: you may run, modify and redistribute it, but not offer it to the public as a hosted print service.",
+  ],
+];
+
 // What the prerender and the first client render show, whatever sessionStorage holds.
 const SEED = seedState(0);
 
@@ -457,6 +489,21 @@ export function Landing() {
             <b>PrintNode-compatible API</b>Point an existing PrintNode client at your own server.
           </li>
         </ul>
+      </section>
+
+      <section className={styles.faq} aria-labelledby="faq">
+        <h2 id="faq">Questions</h2>
+        <div className={styles.faqList}>
+          {FAQ.map(([q, a]) => (
+            <div key={q}>
+              <h3>{q}</h3>
+              <p>{a}</p>
+            </div>
+          ))}
+        </div>
+        <p className={styles.faqNote}>
+          PrintNode is a trademark of PrintNode Ltd. printpapi is not affiliated with, endorsed by, or sponsored by PrintNode.
+        </p>
       </section>
 
       <footer className={styles.siteFoot}>

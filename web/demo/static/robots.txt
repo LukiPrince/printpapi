@@ -1,0 +1,2 @@
+# Cloudflare prepends its managed rules for this zone; this file only adds the sitemap.
+Sitemap: https://printpapi.lukaswotzka.com/sitemap.xml

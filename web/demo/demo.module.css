@@ -835,6 +835,34 @@
   font-size: 0.92rem;
   margin-bottom: 0.2rem;
 }
+.faq {
+  margin-top: 3rem;
+}
+.faq h2 {
+  font-size: 1.6rem;
+  letter-spacing: -0.025em;
+  font-weight: 700;
+}
+.faqList {
+  margin-top: 1.2rem;
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 1.4rem 2rem;
+}
+.faqList h3 {
+  margin: 0 0 0.3rem;
+  font-size: 0.98rem;
+  font-weight: 600;
+}
+.landing .faqList p {
+  color: var(--muted-foreground);
+  max-width: 36rem;
+}
+.landing .faqNote {
+  margin-top: 1.4rem;
+  font-size: 0.75rem;
+  color: var(--muted-foreground);
+}
 .siteFoot {
   margin-top: 3rem;
   padding-top: 1.2rem;
@@ -888,6 +916,7 @@
   .link .pkt { left: 50%; top: 0; }
   .link.go .pkt { animation-name: pkt-v; }
   .facts { grid-template-columns: 1fr; }
+  .faqList { grid-template-columns: 1fr; }
   .demo { padding: 0.8rem; }
 }
 @media (max-width: 480px) {

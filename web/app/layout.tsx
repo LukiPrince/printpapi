@@ -2,7 +2,7 @@ import type { Metadata } from "next";
 import { Geist, Geist_Mono } from "next/font/google";
 import "./globals.css";
 import { Providers } from "@/components/providers";
-import { demoMetadata } from "@/demo/meta";
+import { demoJsonLd, demoMetadata } from "@/demo/meta";
 
 const geistSans = Geist({ variable: "--font-sans", subsets: ["latin"] });
 const geistMono = Geist_Mono({ variable: "--font-geist-mono", subsets: ["latin"] });
@@ -25,6 +25,13 @@ export default function RootLayout({ children }: Readonly<{ children: React.Reac
       className={`${geistSans.variable} ${geistMono.variable} h-full antialiased`}
     >
       <body className="min-h-full">
+        {demo && (
+          <script
+            type="application/ld+json"
+            // escaped "<" keeps the JSON from closing the script tag (Next.js JSON-LD guide)
+            dangerouslySetInnerHTML={{ __html: JSON.stringify(demoJsonLd).replace(/</g, "\\u003c") }}
+          />
+        )}
         <Providers>{children}</Providers>
       </body>
     </html>
