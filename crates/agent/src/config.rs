@@ -86,7 +86,6 @@ impl Config {
         Ok(Config { ini })
     }
 
-    #[cfg(test)]
     pub fn from_text(text: &str) -> Result<Config, String> {
         Ok(Config {
             ini: Ini::parse(text)?,
@@ -315,6 +314,177 @@ pub fn parse_printers(spec: &str) -> Result<Vec<Printer>, String> {
         out.push(Printer::new(name, can_pdf, target));
     }
     Ok(out)
+}
+
+/// Whether `printers` can spell this printer name: no `;`, `=` or `|` (they are the grammar), not
+/// empty, no surrounding blanks (the parser trims them, so the round trip would change the name)
+/// and no control characters (a newline would break the line).
+pub fn expressible_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.trim() == name
+        && !name.contains([';', '=', '|'])
+        && !name.chars().any(char::is_control)
+}
+
+/// Printers -> the `printers` value, the inverse of [`parse_printers`]. Entries are joined with
+/// ` ; `. `|pdf` is left out for `socket://` and `file://` targets because the parser sets it
+/// itself. A name or target the grammar cannot hold is an error naming it.
+pub fn format_printers(printers: &[Printer]) -> Result<String, String> {
+    let mut entries = Vec::new();
+    for p in printers {
+        if !expressible_name(&p.name) {
+            return Err(format!(
+                "printer name {} cannot be written to agent.ini (no ;, = or | allowed)",
+                repr_str(&p.name)
+            ));
+        }
+        if p.target.is_empty() || p.target.contains(';') || p.target.chars().any(char::is_control) {
+            return Err(format!(
+                "target {} of printer {} cannot be written to agent.ini",
+                repr_str(&p.target),
+                repr_str(&p.name)
+            ));
+        }
+        let implied = p.target.starts_with("socket://") || p.target.starts_with("file://");
+        let mut entry = p.name.clone();
+        if p.can_pdf && !implied {
+            entry.push_str("|pdf");
+        }
+        if p.target != p.name {
+            entry.push_str(" = ");
+            entry.push_str(&p.target);
+        }
+        entries.push(entry);
+    }
+    Ok(entries.join(" ; "))
+}
+
+/// What [`update_ini`] sets. `None` leaves the key as it is; `printers` is always set. The values
+/// are plain text: `update_ini` escapes `%` itself.
+pub struct IniUpdate<'a> {
+    pub server_url: Option<&'a str>,
+    pub api_key: Option<&'a str>,
+    pub name: Option<&'a str>,
+    pub printers: &'a str,
+}
+
+/// `existing` with the `[agent]` keys of `update` set, as text. Works line by line: a replaced
+/// key loses its indented continuation lines, a missing key is added at the end of `[agent]`
+/// (the section is added when absent), and every other line - comments, `[headers]`, `timeout` -
+/// stays as it is. `%` is doubled because `[agent]` reads through `BasicInterpolation`; line
+/// breaks in a value become blanks so one value never becomes two lines.
+pub fn update_ini(existing: Option<&str>, update: &IniUpdate) -> String {
+    let mut wanted: Vec<(&str, String)> = Vec::new();
+    for (key, value) in [
+        ("server_url", update.server_url),
+        ("api_key", update.api_key),
+        ("name", update.name),
+        ("printers", Some(update.printers)),
+    ] {
+        if let Some(v) = value {
+            wanted.push((key, v.replace(['\r', '\n'], " ").replace('%', "%%")));
+        }
+    }
+    let Some(existing) = existing else {
+        let mut out = String::from("[agent]\n");
+        for (key, v) in &wanted {
+            out.push_str(&format!("{key} = {v}\n"));
+        }
+        return out;
+    };
+
+    let section_of = |line: &str| {
+        let t = line.trim();
+        t.strip_prefix('[')
+            .and_then(|r| r.rsplit_once(']'))
+            .map(|(name, _)| name.to_string())
+    };
+    let indent = |line: &str| line.chars().take_while(|c| c.is_whitespace()).count();
+    let is_comment = |line: &str| line.trim().starts_with([';', '#']);
+    let is_skippable = |line: &str| line.trim().is_empty() || is_comment(line);
+
+    let lines: Vec<&str> = existing.lines().collect();
+    let mut out: Vec<String> = Vec::new();
+    let mut done: Vec<&str> = Vec::new();
+    // Index in `out` just after the last content line of `[agent]`, where new keys go.
+    let mut agent_end: Option<usize> = None;
+    let mut in_agent = false;
+    let mut i = 0;
+    while i < lines.len() {
+        let line = lines[i];
+        if let Some(section) = section_of(line) {
+            in_agent = section == "agent";
+            out.push(line.to_string());
+            if in_agent {
+                agent_end = Some(out.len());
+            }
+            i += 1;
+            continue;
+        }
+        let Some(key_pos) = line
+            .find(['=', ':'])
+            .filter(|_| in_agent && !is_skippable(line))
+        else {
+            out.push(line.to_string());
+            if in_agent && !is_skippable(line) {
+                agent_end = Some(out.len());
+            }
+            i += 1;
+            continue;
+        };
+        let key = line[..key_pos].trim().to_lowercase();
+        let key_indent = indent(line);
+        // The key line plus its continuation lines (more indented than the key). Blank and
+        // comment lines inside the run belong to it only when a continuation follows them.
+        let mut end = i + 1;
+        let mut last = i;
+        while end < lines.len() {
+            if is_skippable(lines[end]) {
+                end += 1;
+            } else if indent(lines[end]) > key_indent {
+                last = end;
+                end += 1;
+            } else {
+                break;
+            }
+        }
+        let run = &lines[i..=last];
+        if let Some((k, v)) = wanted.iter().find(|(k, _)| *k == key) {
+            out.push(format!("{k} = {v}"));
+            done.push(k);
+            // comments between the dropped lines survive
+            out.extend(
+                run[1..]
+                    .iter()
+                    .filter(|l| is_comment(l))
+                    .map(|l| l.to_string()),
+            );
+        } else {
+            out.extend(run.iter().map(|l| l.to_string()));
+        }
+        agent_end = Some(out.len());
+        i = last + 1;
+    }
+    let missing: Vec<String> = wanted
+        .iter()
+        .filter(|(k, _)| !done.contains(k))
+        .map(|(k, v)| format!("{k} = {v}"))
+        .collect();
+    match agent_end {
+        Some(at) => {
+            out.splice(at..at, missing);
+        }
+        None => {
+            if out.last().is_some_and(|l| !l.trim().is_empty()) {
+                out.push(String::new());
+            }
+            out.push("[agent]".into());
+            out.extend(missing);
+        }
+    }
+    let mut text = out.join("\n");
+    text.push('\n');
+    text
 }
 
 #[cfg(test)]
@@ -599,5 +769,149 @@ mod tests {
             ..Default::default()
         });
         assert_eq!(p.to_json()["capabilities"], json!({"papers": ["A4"]}));
+    }
+
+    #[test]
+    fn format_printers_round_trips() {
+        let list = vec![
+            Printer::new("Zebra GK420d", false, "Zebra GK420d"),
+            Printer::new("HP LaserJet", true, "HP LaserJet"),
+            Printer::new("Büro Drucker", true, "Büro Drucker"),
+            Printer::new("warehouse", false, "socket://192.168.1.50:9100"),
+            Printer::new("archive", true, "file:///srv/out"),
+        ];
+        assert_eq!(
+            parse_printers(&format_printers(&list).unwrap()).unwrap(),
+            list
+        );
+    }
+
+    #[test]
+    fn format_printers_refuses_what_the_grammar_cannot_hold() {
+        assert!(
+            format_printers(&[Printer::new("a;b", false, "a;b")])
+                .unwrap_err()
+                .contains("a;b")
+        );
+        assert!(
+            !expressible_name("x=y") && !expressible_name("x|y") && expressible_name("Büro (EG)")
+        );
+        assert!(!expressible_name("") && !expressible_name(" x") && !expressible_name("x\ny"));
+        assert!(format_printers(&[Printer::new("ok", false, "a;b")]).is_err());
+    }
+
+    #[test]
+    fn format_printers_spells_the_documented_forms() {
+        let list = vec![
+            Printer::new("a", false, "a"),
+            Printer::new("b", true, "b"),
+            Printer::new("c", true, "queue"),
+            Printer::new("d", false, "socket://h:9100"),
+        ];
+        assert_eq!(
+            format_printers(&list).unwrap(),
+            "a ; b|pdf ; c|pdf = queue ; d = socket://h:9100"
+        );
+    }
+
+    #[test]
+    fn update_ini_escapes_percent() {
+        let text = update_ini(
+            None,
+            &IniUpdate {
+                server_url: Some("https://x"),
+                api_key: Some("ab%cd"),
+                name: Some("pc"),
+                printers: "50% Drucker",
+            },
+        );
+        let cfg = Config::from_text(&text).unwrap();
+        assert_eq!(cfg.require("api_key").unwrap(), "ab%cd");
+        assert_eq!(cfg.require("printers").unwrap(), "50% Drucker");
+    }
+
+    #[test]
+    fn update_ini_keeps_everything_else() {
+        let old = "; note\n[agent]\nserver_url = https://x\napi_key = k\nname = pc\nprinters = a ;\n  b\ntimeout = 90\n\n[headers]\nCF-Access-Client-Id = a%b\n";
+        let text = update_ini(
+            Some(old),
+            &IniUpdate {
+                server_url: None,
+                api_key: None,
+                name: None,
+                printers: "c",
+            },
+        );
+        assert!(
+            text.contains("; note")
+                && text.contains("timeout = 90")
+                && text.contains("CF-Access-Client-Id = a%b")
+        );
+        assert!(!text.contains("  b"));
+        assert_eq!(
+            Config::from_text(&text)
+                .unwrap()
+                .require("printers")
+                .unwrap(),
+            "c"
+        );
+    }
+
+    #[test]
+    fn update_ini_adds_missing_keys_and_a_missing_section() {
+        let up = IniUpdate {
+            server_url: Some("https://x"),
+            api_key: None,
+            name: None,
+            printers: "p",
+        };
+        let text = update_ini(Some("[agent]\nnote = 1\n\n[headers]\nA = b\n"), &up);
+        let cfg = Config::from_text(&text).unwrap();
+        assert_eq!(cfg.require("server_url").unwrap(), "https://x");
+        assert_eq!(cfg.require("printers").unwrap(), "p");
+        assert!(text.find("printers = p").unwrap() < text.find("[headers]").unwrap());
+        assert!(text.contains("A = b"));
+        let text = update_ini(Some("[other]\nk = v\n"), &up);
+        let cfg = Config::from_text(&text).unwrap();
+        assert_eq!(cfg.require("printers").unwrap(), "p");
+        assert!(text.contains("[other]\nk = v"));
+    }
+
+    #[test]
+    fn update_ini_leaves_keys_of_other_sections_and_continuations_alone() {
+        let old = "[agent]\nname = pc\nprinters = a ;\n  name = b\n[headers]\nprinters = keep\n";
+        let text = update_ini(
+            Some(old),
+            &IniUpdate {
+                server_url: None,
+                api_key: None,
+                name: Some("new"),
+                printers: "c",
+            },
+        );
+        assert!(text.contains("[headers]\nprinters = keep"));
+        let cfg = Config::from_text(&text).unwrap();
+        assert_eq!(cfg.require("name").unwrap(), "new");
+        assert_eq!(cfg.require("printers").unwrap(), "c");
+    }
+
+    #[test]
+    fn update_ini_keeps_a_value_on_one_line() {
+        let text = update_ini(
+            None,
+            &IniUpdate {
+                server_url: None,
+                api_key: Some("a\nprinters = evil"),
+                name: None,
+                printers: "p",
+            },
+        );
+        assert_eq!(
+            Config::from_text(&text)
+                .unwrap()
+                .require("printers")
+                .unwrap(),
+            "p"
+        );
     }
 }
