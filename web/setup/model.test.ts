@@ -1,7 +1,7 @@
 // printpapi — self-hosted PrintNode alternative. Elastic License 2.0 (see LICENSE).
 import test from "node:test";
 import assert from "node:assert/strict";
-import { addNetworkPrinter, canLeavePrinters, canTest, errorText, fromFound, logLocation, needsSumatra } from "./model.ts";
+import { DEFAULT_RAW_PORT, addNetworkPrinter, canLeavePrinters, canTest, errorText, fromFound, logLocation, needsSumatra } from "./model.ts";
 import type { FoundPrinter, PrinterChoice } from "./api.ts";
 
 const choice = (over: Partial<PrinterChoice> = {}): PrinterChoice => ({
@@ -77,6 +77,15 @@ test("canTest blocks a PDF printer on Windows without SumatraPDF", () => {
   assert.equal(canTest(choice(), "windows", false), true);
   assert.equal(canTest(choice({ pdf: true }), "linux", false), true);
   assert.equal(canTest(choice({ pdf: true }), "macos", false), true);
+});
+
+test("canTest skips a locked printer: it was set up by hand and stays as it is", () => {
+  assert.equal(canTest(choice({ locked: true, target: "file:///dev/usb/lp0" }), "linux", true), false);
+  assert.equal(canTest(choice({ locked: false }), "linux", true), true);
+});
+
+test("the network printer form starts at the raw port 9100", () => {
+  assert.equal(DEFAULT_RAW_PORT, 9100);
 });
 
 test("errorText explains a proxy refusal and passes every other message through", () => {

@@ -68,7 +68,12 @@ export function StepTest({
                     {p.pdf ? "Print test page" : "Print test label"}
                   </Button>
                 </div>
-                {!allowed && (
+                {p.locked && (
+                  <p className="mt-1 text-xs text-muted-foreground">
+                    Set up by hand in agent.ini. It is kept as it is and not tested here.
+                  </p>
+                )}
+                {!allowed && !p.locked && (
                   <p className="mt-1 text-xs text-muted-foreground">
                     PDF test prints need SumatraPDF. Go back and download it first.
                   </p>

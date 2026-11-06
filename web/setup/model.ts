@@ -42,6 +42,7 @@ export function needsSumatra(platform: Platform, list: PrinterChoice[], present:
 }
 
 export function canTest(p: PrinterChoice, platform: Platform, sumatraPresent: boolean): boolean {
+  if (p.locked) return false;
   return !(p.pdf && platform === "windows" && !sumatraPresent);
 }
 
