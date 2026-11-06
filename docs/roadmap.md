@@ -7,8 +7,9 @@ v1 is deliberately small (see [CONTRIBUTING.md](../CONTRIBUTING.md) for the YAGN
 - ~~**Webhooks**~~ ✅ (per-job `callback_url`; best-effort retried delivery on terminal states; unsigned).
 - ~~**Job cancel**~~ ✅ (`DELETE /jobs/{id}` while queued; `cancelled` state; `409` once claimed).
 - ~~**`/metrics`**~~ ✅ Prometheus text format.
-- ~~**Job options**~~ ✅ `copies` + `options` on pdf jobs (`duplex`, `paper`, `bin`, `color`, `pages`),
-  mapped to SumatraPDF `-print-settings` / CUPS `lp -o`. See [api.md](api.md#submitting-a-job).
+- ~~**Job options**~~ ✅ `copies` + `options` on pdf jobs (`duplex`, `paper`, `bin`, `color`, `pages`,
+  `orientation`), mapped to SumatraPDF `-print-settings` / CUPS `lp -o`.
+  See [api.md](api.md#submitting-a-job).
 - ~~**Printer capabilities**~~ ✅ agent reports papers/bins/duplex/color at registration, in `GET /printers`.
 - ~~**Multi-tenancy**~~ ✅ org-scoped keys, agents, printers and jobs; `POST/GET /orgs` (root only);
   foreign ids 404. See [api.md](api.md#multi-tenancy).
@@ -115,10 +116,9 @@ order of pull:
     about 2 s for a slot instead of answering `503` at once. Keep the global cap: one decode can
     take a few hundred MB. Rendering in the background after accepting the job would need a new job
     state and would report a broken image late, so that waits until there are many tenants.
-15. **PDF orientation.** SumatraPDF rotates any page wider than it is tall, which hits landscape
-    labels on Windows. Add an `orientation` job option (`auto`, `portrait`, `landscape`) mapped to
-    SumatraPDF's `disable-auto-rotation`, `portrait` and `landscape` (3.5 or newer) and to CUPS, in
-    both agents, and let label jobs turn auto-rotation off themselves.
+15. **Re-test `orientation` on the next SumatraPDF.** Its master branch also writes `portrait` and
+    `landscape` into the driver's settings, where 3.6.1 only uses them for its own rotation. On a
+    driver whose paper is already wide that may flip the sheet and shrink the label.
 
 Explicitly parked: MCP/LLM printing (no measurable audience yet), email-to-print (not even
 PrintNode has it), Magento-specific work (generic webhook intake covers it), browser-side silent

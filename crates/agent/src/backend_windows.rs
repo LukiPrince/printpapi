@@ -104,8 +104,11 @@ pub fn pdf_to_printer(
         printer.to_string(),
     ];
     if let Some(o) = options.filter(|o| !o.is_empty()) {
-        argv.push("-print-settings".into());
-        argv.push(sumatra_settings(o)?);
+        let settings = sumatra_settings(o)?;
+        if !settings.is_empty() {
+            argv.push("-print-settings".into());
+            argv.push(settings);
+        }
     }
     argv.push("-silent".into());
     argv.push(tmp.0.to_string_lossy().into_owned());
@@ -399,6 +402,18 @@ mod tests {
         assert_eq!(c.argv[c.argv.len() - 2], "-silent");
         assert!(c.argv.last().unwrap().ends_with(".pdf"));
         assert_eq!(c.timeout, std::time::Duration::from_secs(60));
+    }
+
+    #[test]
+    fn test_pdf_to_printer_orientation_auto_no_print_settings() {
+        let (run, calls) = recording();
+        let opts = obj(json!({"orientation": "auto"}));
+        pdf_to_printer("HP", b"%PDF", Some(&opts), "SumatraPDF.exe", &run).unwrap();
+        assert!(
+            !calls.borrow()[0]
+                .argv
+                .contains(&"-print-settings".to_string())
+        );
     }
 
     #[test]

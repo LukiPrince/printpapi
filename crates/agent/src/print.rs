@@ -12,7 +12,7 @@ use serde_json::{Map, Value};
 use crate::config::{Capabilities, Printer, file_target_dir};
 use crate::pyrepr::{py_str, repr_str, truthy};
 
-/// A job's `options` (duplex/paper/bin/color/pages, validated by the server).
+/// A job's `options` (duplex/paper/bin/color/pages/orientation, validated by the server).
 pub type Options = Map<String, Value>;
 pub type SendResult = Result<(), String>;
 pub type RawFn = Box<dyn Fn(&str, &[u8]) -> SendResult>;
@@ -108,11 +108,26 @@ pub fn sumatra_settings(options: &Options) -> Result<String, String> {
     if let Some(c) = options.get("color") {
         parts.push(if truthy(c) { "color" } else { "monochrome" }.to_string());
     }
+    // Sumatra's own two words, nothing more: `disable-auto-rotation` next to `landscape` turns a
+    // wide page 90 degrees, and before 3.5 it is ignored, which leaves `portrait` turning that page
+    // 270 (measured on 3.4.6, 3.5.2, 3.6.1; the rule is in Sumatra's src/Print.cpp).
+    if options.contains_key("orientation") {
+        let v = opt_str(options, "orientation")?;
+        match v.as_str() {
+            "auto" => {}
+            "portrait" | "landscape" => parts.push(v),
+            _ => return Err(format!("unknown orientation value {}", repr_str(&v))),
+        }
+    }
     Ok(parts.join(","))
 }
 
 /// options dict -> `["-o", "k=v", ...]` for lp. lp splits one `-o` value on spaces, so a value
 /// with whitespace could smuggle extra options (e.g. `raw`) in — refuse those.
+///
+/// `orientation` stays out: CUPS reads the real paper size and turns a page only when the two
+/// disagree. `orientation-requested=3` changed nothing there and `=4` printed upside down
+/// (cups-filters 1.28.15).
 pub fn lp_options(options: &Options) -> Result<Vec<String>, String> {
     let mut pairs: Vec<(&str, String)> = Vec::new();
     if options.contains_key("duplex") {
@@ -451,6 +466,53 @@ pub(crate) mod tests {
             sumatra_settings(&obj(json!({"duplex": "one-sided", "color": true}))).unwrap(),
             "simplex,color"
         );
+    }
+
+    #[test]
+    fn orientation_is_sumatras_own_flag() {
+        for v in ["portrait", "landscape"] {
+            assert_eq!(
+                sumatra_settings(&obj(json!({"orientation": v}))).unwrap(),
+                v
+            );
+        }
+        assert_eq!(
+            sumatra_settings(&obj(
+                json!({"duplex": "short-edge", "orientation": "landscape"})
+            ))
+            .unwrap(),
+            "duplexshort,landscape"
+        );
+    }
+
+    #[test]
+    fn orientation_auto_adds_no_sumatra_flag() {
+        assert_eq!(
+            sumatra_settings(&obj(json!({"orientation": "auto"}))).unwrap(),
+            ""
+        );
+    }
+
+    #[test]
+    fn unknown_orientation_is_an_error_not_a_flag() {
+        assert_eq!(
+            sumatra_settings(&obj(json!({"orientation": "sideways"}))).unwrap_err(),
+            "unknown orientation value 'sideways'"
+        );
+        assert!(sumatra_settings(&obj(json!({"orientation": 90}))).is_err());
+    }
+
+    // orientation-requested=4 turned pages that already fit the paper upside down, so nothing of
+    // `orientation` may reach lp.
+    #[test]
+    fn cups_gets_no_orientation_flag() {
+        for v in ["auto", "portrait", "landscape"] {
+            assert!(
+                lp_options(&obj(json!({"orientation": v})))
+                    .unwrap()
+                    .is_empty()
+            );
+        }
     }
 
     #[test]

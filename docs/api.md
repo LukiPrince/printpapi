@@ -110,12 +110,22 @@ Windows, `lp -o` on CUPS):
 | `bin` | tray name (driver-specific) | `bin=` / `InputSlot=` |
 | `color` | `true` \| `false` | `color`/`monochrome` / `print-color-mode=` |
 | `pages` | ranges like `1-3,5` | print settings / `page-ranges=` |
+| `orientation` | `auto` \| `portrait` \| `landscape` | `portrait`/`landscape`, nothing for `auto` / no effect |
 
 Unknown keys or invalid values → `400`. Values are what the printer driver understands — check
 the printer's `capabilities` in `GET /printers` (`papers`, `bins`, `duplex`, `color`; reported
 best-effort by the agent at registration via the Windows driver or CUPS `lpoptions`, `null` when
 unavailable) for what it supports. An option the driver doesn't support is silently ignored by
 it. On CUPS, `bin`/`paper` values must not contain spaces.
+
+`orientation` is for labels that come out turned on Windows. With `auto`, the default, SumatraPDF
+turns a page wider than it is tall whenever the driver reports portrait. That is right on a tall
+sheet. A label driver can report portrait for a wide label too, and then the label comes out
+sideways and small: send `landscape` for such a label, or `portrait` for a tall one. The option has
+two costs. A wide page on a sheet that really is tall prints at about half the size, and SumatraPDF
+no longer matches the paper to the page, so the driver's paper has to be right. CUPS reads the real
+paper size and turns a page only when it does not fit, so the option has no effect there. It needs
+agent 3.2.0; older agents ignore it. Measured with SumatraPDF 3.4.6, 3.5.2 and 3.6.1.
 
 ## Content types
 

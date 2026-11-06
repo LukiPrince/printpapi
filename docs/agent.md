@@ -132,6 +132,8 @@ belongs on the PDF path:
    sheet-sized PDF onto a label is what produces the tiny-print-in-the-corner classic.
 4. Pick the label via `options.paper`. Don't guess the name: `GET /printers` reports the driver's
    own `capabilities.papers`, and only those values are accepted by the driver.
+5. If a wide label comes out turned and small on Windows, send `options.orientation: "landscape"`.
+   See [api.md](api.md#submitting-a-job).
 
 Brother QL and other raster label printers work the same way — driver + `|pdf`.
 

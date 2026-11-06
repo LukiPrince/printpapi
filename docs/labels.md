@@ -178,9 +178,12 @@ left edge instead (ZPL has no negative origin).
 - **Resolution.** ZPL is written in dots, and the server cannot ask a printer for its resolution.
   A template set to 203 dpi comes out about a third smaller on a 300 dpi printer, so `dpi` has to
   match the printer. PDF output keeps its physical size either way.
-- **Landscape labels on Windows.** SumatraPDF turns any page wider than it is tall by 90 degrees, so
-  a landscape template on a Windows printer marked `|pdf` comes out rotated. Portrait templates, ZPL
-  output and CUPS are not affected. An `orientation` option is on the [roadmap](roadmap.md).
+- **Wide labels on Windows.** When the driver reports portrait, SumatraPDF turns a page wider than
+  it is tall by 90 degrees. On a tall sheet that is right, but if the driver's paper is as wide as
+  the label, the label comes out sideways and small. Send `"options": {"orientation": "landscape"}`
+  with such jobs, see [api.md](api.md#submitting-a-job). The server never sets this by itself,
+  because on a tall sheet the same option halves the label. ZPL output is not affected, and CUPS
+  turns a page only when it does not fit the paper.
 - **Darkness.** `zpl_darkness` sends `^MD`, which adjusts the printer's darkness relative to its
   setting and stays in effect for later labels until something changes it.
 

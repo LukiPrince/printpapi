@@ -51,6 +51,10 @@ cd web && npm run build:app     # after any web/ change; commit crates/server/we
 - The platform-specific part. Windows: the spooler API directly, SumatraPDF for PDFs.
   Linux/macOS: CUPS `lp`. Config is `agent.ini` next to the executable. It never listens on a port.
 - PDFs only go to printers marked `|pdf`; everything else gets raw bytes (ZPL/ESC-POS).
+- The `orientation` option is SumatraPDF's `portrait`/`landscape` and nothing on CUPS. Don't add
+  `disable-auto-rotation` (next to `landscape` it turns a wide page 90 degrees) or
+  `orientation-requested` (`=4` prints upside down), and don't let the server pick a value: which
+  one is right depends on the driver.
 - `agent/print_agent.py` is the legacy Python agent for locked-down Windows, kept until the Rust
   exe is code-signed. Keep its tests green.
 

@@ -44,11 +44,15 @@ def raw_to_printer(printer, data):
         win32print.ClosePrinter(h)
 
 
-# Job 'options' (duplex/paper/bin/color/pages, validated by the server) map onto each
-# backend's native flags: SumatraPDF -print-settings on Windows, lp -o on CUPS.
+# Job 'options' (duplex/paper/bin/color/pages/orientation, validated by the server) map onto
+# each backend's native flags: SumatraPDF -print-settings on Windows, lp -o on CUPS.
 _SUMATRA_DUPLEX = {"long-edge": "duplexlong", "short-edge": "duplexshort", "one-sided": "simplex"}
 _CUPS_DUPLEX = {"long-edge": "two-sided-long-edge", "short-edge": "two-sided-short-edge",
                 "one-sided": "one-sided"}
+# Sumatra's own two words, nothing more: disable-auto-rotation next to landscape turns a wide page
+# 90 degrees, and before 3.5 it is ignored, which leaves portrait turning that page 270 (measured
+# on 3.4.6, 3.5.2, 3.6.1; the rule is in Sumatra's src/Print.cpp). 'auto' sends nothing.
+_SUMATRA_ORIENTATION = {"portrait": "portrait", "landscape": "landscape"}
 
 
 def _sumatra_settings(options):
@@ -64,12 +68,19 @@ def _sumatra_settings(options):
         parts.append(f"bin={options['bin']}")
     if "color" in options:
         parts.append("color" if options["color"] else "monochrome")
+    orientation = options.get("orientation", "auto")
+    if orientation != "auto":
+        parts.append(_SUMATRA_ORIENTATION[orientation])
     return ",".join(parts)
 
 
 def _lp_options(options):
     """options dict -> ['-o', 'k=v', ...] for lp. lp splits one -o value on spaces, so a
-    value with whitespace could smuggle extra options (e.g. 'raw') in — refuse those."""
+    value with whitespace could smuggle extra options (e.g. 'raw') in — refuse those.
+
+    'orientation' stays out: CUPS reads the real paper size and turns a page only when the two
+    disagree. orientation-requested=3 changed nothing there and =4 printed upside down
+    (cups-filters 1.28.15)."""
     pairs = []
     if "duplex" in options:
         pairs.append(("sides", _CUPS_DUPLEX[options["duplex"]]))
@@ -95,8 +106,9 @@ def pdf_to_printer(printer, data, options=None, sumatra="SumatraPDF.exe", run=su
         with os.fdopen(fd, "wb") as f:
             f.write(data)
         cmd = [sumatra, "-print-to", printer]
-        if options:
-            cmd += ["-print-settings", _sumatra_settings(options)]
+        settings = _sumatra_settings(options) if options else ""
+        if settings:
+            cmd += ["-print-settings", settings]
         run(cmd + ["-silent", path], check=True, timeout=60)
     finally:
         try:

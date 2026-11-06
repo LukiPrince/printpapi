@@ -122,6 +122,35 @@ def test_sumatra_settings_maps_all_options():
     assert print_agent._sumatra_settings({"duplex": "one-sided", "color": True}) == "simplex,color"
 
 
+def test_sumatra_settings_maps_orientation():
+    assert print_agent._sumatra_settings({"orientation": "landscape"}) == "landscape"
+    assert print_agent._sumatra_settings({"orientation": "portrait"}) == "portrait"
+    assert print_agent._sumatra_settings(
+        {"duplex": "short-edge", "orientation": "landscape"}) == "duplexshort,landscape"
+
+
+def test_sumatra_settings_orientation_auto_adds_nothing():
+    assert print_agent._sumatra_settings({"orientation": "auto"}) == ""
+
+
+def test_sumatra_settings_rejects_unknown_orientation():
+    with pytest.raises(KeyError):
+        print_agent._sumatra_settings({"orientation": "sideways"})
+
+
+def test_pdf_to_printer_orientation_auto_no_print_settings():
+    calls = []
+    print_agent.pdf_to_printer("HP", b"%PDF", options={"orientation": "auto"},
+                               run=lambda argv, **kw: calls.append(argv))
+    assert "-print-settings" not in calls[0]
+
+
+def test_cups_gets_no_orientation_flag():
+    # orientation-requested=4 turned pages that already fit the paper upside down.
+    for v in ("auto", "portrait", "landscape"):
+        assert print_agent._lp_options({"orientation": v}) == []
+
+
 def test_pdf_to_printer_passes_print_settings():
     calls = []
     print_agent.pdf_to_printer("HP", b"%PDF", options={"duplex": "short-edge"},

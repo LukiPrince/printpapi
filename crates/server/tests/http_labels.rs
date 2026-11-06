@@ -601,6 +601,34 @@ fn options_refused_on_raw_label() {
 }
 
 #[test]
+fn a_label_job_keeps_the_orientation_it_asked_for() {
+    let f = fixture();
+    make(&f, tpl("img", "image"));
+    fetched(&f, png());
+    let body = json!({"type": "label_uri", "url": "https://x/i.png", "template": "img",
+                      "options": {"orientation": "landscape"}});
+    let (code, v) = label_job(&f, "P", body);
+    assert_eq!(code, 200, "{v}");
+    assert_eq!(
+        claimed(&f).0.options,
+        Some(json!({"orientation": "landscape"}))
+    );
+}
+
+// A forced orientation halves a wide page on a tall sheet, where the default fills it. Which one a
+// printer needs depends on its driver, so the server must not choose.
+#[test]
+fn a_label_job_gets_no_orientation_of_its_own() {
+    let f = fixture();
+    make(&f, tpl("img", "image"));
+    fetched(&f, png());
+    let body = json!({"type": "label_uri", "url": "https://x/i.png", "template": "img"});
+    let (code, v) = label_job(&f, "P", body);
+    assert_eq!(code, 200, "{v}");
+    assert_eq!(claimed(&f).0.options, None);
+}
+
+#[test]
 fn cloudprnt_printer_is_refused() {
     let f = fixture();
     make(&f, tpl("txt", "text"));

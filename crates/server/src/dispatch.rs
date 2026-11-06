@@ -514,8 +514,9 @@ pub fn parse_copies(body: &Map<String, Value>) -> Result<i64, DispatchError> {
     }
 }
 
-const OPTION_KEYS: [&str; 5] = ["duplex", "paper", "bin", "color", "pages"];
+const OPTION_KEYS: [&str; 6] = ["duplex", "paper", "bin", "color", "pages", "orientation"];
 const OPTION_DUPLEX: [&str; 3] = ["long-edge", "short-edge", "one-sided"];
+const OPTION_ORIENTATION: [&str; 3] = ["auto", "portrait", "landscape"];
 
 /// `^[\w. -]{1,64}$` — no comma: paper/bin land in Sumatra's comma-separated -print-settings
 /// list, so a comma in a value would smuggle extra settings past validation.
@@ -570,6 +571,14 @@ pub fn parse_options(
         return invalid(format!(
             "duplex must be one of {}",
             OPTION_DUPLEX.join(", ")
+        ));
+    }
+    if let Some(v) = o.get("orientation")
+        && !v.as_str().is_some_and(|v| OPTION_ORIENTATION.contains(&v))
+    {
+        return invalid(format!(
+            "orientation must be one of {}",
+            OPTION_ORIENTATION.join(", ")
         ));
     }
     for k in ["paper", "bin"] {
@@ -1247,6 +1256,32 @@ mod tests {
             assert_eq!(
                 is_invalid(po(json!({"color": v}), "pdf")),
                 "color must be a boolean"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_options_takes_every_orientation() {
+        for v in ["auto", "portrait", "landscape"] {
+            let got = po(json!({"orientation": v}), "pdf").unwrap().unwrap();
+            assert_eq!(got["orientation"], v);
+        }
+    }
+
+    #[test]
+    fn parse_options_rejects_bad_orientation() {
+        for v in [
+            json!("sideways"),
+            json!("Landscape"),
+            json!(""),
+            json!(90),
+            json!(true),
+            json!(null),
+            json!(["portrait"]),
+        ] {
+            assert_eq!(
+                is_invalid(po(json!({"orientation": v}), "pdf")),
+                "orientation must be one of auto, portrait, landscape"
             );
         }
     }

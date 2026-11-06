@@ -542,6 +542,20 @@ fn options_roundtrip_and_validation_via_http() {
 }
 
 #[test]
+fn orientation_reaches_the_agent() {
+    let app = App::new();
+    let reg = register(&app.db, "pc", "ak", &[decl("HP", true)], DEFAULT_ORG);
+    let opts = json!({"orientation": "landscape"});
+    let pdf = json!({"printer_id": reg.pid("HP"), "type": "pdf_base64", "content": "JVBERg==",
+                     "options": opts});
+    assert_eq!(app.post("/jobs", Some("t"), pdf).0, 200);
+    assert_eq!(
+        app.agent("GET", "/agent/jobs", "ak", None).json()["options"],
+        opts
+    );
+}
+
+#[test]
 fn cancel_job_via_http_states_and_auth() {
     let app = App::new();
     let pid = agent_z(&app.db).pid("Z");
