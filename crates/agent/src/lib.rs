@@ -6,6 +6,7 @@ pub mod backend_cups;
 pub mod backend_windows;
 pub mod client;
 pub mod config;
+pub mod discover;
 pub mod ini;
 pub mod log;
 pub mod print;
