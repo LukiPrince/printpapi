@@ -23,6 +23,8 @@ pub const MARKER_NAME: &str = ".installed-by-setup";
 const SID_SYSTEM: &str = "*S-1-5-18";
 const SID_ADMINISTRATORS: &str = "*S-1-5-32-544";
 const CMD_TIMEOUT: u64 = 60;
+/// Exists while systemd is the running init (see sd_booted(3)).
+const SYSTEMD_RUN_DIR: &str = "/run/systemd/system";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Os {
@@ -281,7 +283,7 @@ pub fn identity_cmds(os: Os) -> Vec<Cmd> {
 
 /// Can the setup install here at all? Linux needs systemd.
 pub fn supported(os: Os) -> bool {
-    supported_at(os, Path::new("/run/systemd/system"))
+    supported_at(os, Path::new(SYSTEMD_RUN_DIR))
 }
 
 /// `supported` with the path that proves systemd is running as a parameter.
@@ -396,7 +398,10 @@ pub enum Installed {
 /// or a running process called `printpapi-agent` means somebody set it up by hand.
 ///
 /// Call this from the setup program, never from a process that is itself named `printpapi-agent`
-/// (the admin subcommands): on Linux and macOS it would find itself.
+/// (the admin subcommands): on Linux and macOS it would find itself. The same goes for any process
+/// whose name starts with the 15 characters `printpapi-agent`: Linux keeps only that much of the
+/// name in `comm`, so `pgrep -x` matches a `printpapi-agent-setup` too. The setup binary is
+/// therefore called `printpapi-setup`.
 pub fn detect(os: Os, l: &Layout, sys: &Path, run: &Runner) -> Installed {
     if l.marker.exists() {
         return Installed::Managed;
@@ -426,8 +431,23 @@ pub fn detect(os: Os, l: &Layout, sys: &Path, run: &Runner) -> Installed {
     }
 }
 
-/// Windows: a task called `printpapi-agent`, or a running `printpapi-agent.exe`.
+/// Windows: something called `printpapi-agent` is registered or running. Four looks, because the
+/// setup asks without administrator rights and each look is blind to something:
+/// - the task file `System32\Tasks\printpapi-agent`: a task made from an elevated shell with
+///   `/ru SYSTEM` (docs/agent.md) is invisible to `schtasks /query` for a normal user, but its
+///   file name is not. Anything but a clean "not found" counts as there: the file of a task the
+///   user may not read answers "access denied", not "missing".
+/// - `schtasks /query`, for a task the file check cannot see;
+/// - `sc query`, for the service of `nssm install printpapi-agent ...` (exit 1060 when missing);
+/// - `tasklist`, for an agent started by hand (the Python agent runs as `pythonw.exe` and is
+///   not found this way).
+// ponytail: `sc query` answers "access denied" (exit 5) for a service whose ACL hides it from
+// users; that counts as "not there". An nssm service has the default ACL, which allows the query.
 fn windows_agent_present(os: Os, sys: &Path, run: &Runner) -> bool {
+    // host-native join on purpose: this reads the real disk, which only matters on Windows
+    if task_file_present(sys.join("Tasks").join(TASK_NAME).try_exists()) {
+        return true;
+    }
     let mut query = cmd(vec![
         tool(os, sys, "schtasks.exe"),
         "/query".into(),
@@ -436,6 +456,15 @@ fn windows_agent_present(os: Os, sys: &Path, run: &Runner) -> bool {
     ]);
     query.capture = true;
     if run(&query).is_ok() {
+        return true;
+    }
+    let mut service = cmd(vec![
+        tool(os, sys, "sc.exe"),
+        "query".into(),
+        TASK_NAME.into(),
+    ]);
+    service.capture = true;
+    if run(&service).is_ok() {
         return true;
     }
     let mut list = cmd(vec![
@@ -450,6 +479,13 @@ fn windows_agent_present(os: Os, sys: &Path, run: &Runner) -> bool {
     matches!(run(&list), Ok(out) if String::from_utf8_lossy(&out)
         .to_ascii_lowercase()
         .contains("printpapi-agent.exe"))
+}
+
+/// `Path::try_exists` on the task file: only a definite "no" means there is no task. A task that
+/// was created by an elevated user gives `Err(PermissionDenied)` to everybody else, and that
+/// means it exists. (`Path::exists` would turn the error into `false`.)
+fn task_file_present(found: std::io::Result<bool>) -> bool {
+    !matches!(found, Ok(false))
 }
 
 /// The log of the installed agent, for "see the log" in an error message. Windows: the crash log
@@ -472,6 +508,7 @@ mod tests {
     use super::*;
     use std::cell::RefCell;
     use std::rc::Rc;
+    use std::time::Duration;
 
     const WIN_SYS: &str = "C:\\Windows\\System32";
 
@@ -562,6 +599,10 @@ mod tests {
             "<Interval>PT1M</Interval>",
             "<MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>",
             "<RunLevel>HighestAvailable</RunLevel>",
+            "<Description>printpapi agent</Description>",
+            "<AllowHardTerminate>true</AllowHardTerminate>",
+            // the task must be enabled, or it never starts
+            "    <Enabled>true</Enabled>\r\n    <ExecutionTimeLimit>",
         ] {
             assert!(text.contains(needle), "{needle} missing in {text}");
         }
@@ -605,10 +646,17 @@ mod tests {
         assert_eq!(cmds.len(), 1);
         let a = &cmds[0].argv;
         assert!(a[0].ends_with("icacls.exe"));
-        assert_eq!(a[1], "C:\\Program Files\\printpapi\\agent.ini");
-        for needle in ["/inheritance:r", "*S-1-5-18:F", "*S-1-5-32-544:F"] {
-            assert!(a.iter().any(|x| x == needle), "{needle} missing in {a:?}");
-        }
+        // /grant:r replaces what is there; plain /grant would add to it
+        assert_eq!(
+            a[1..],
+            [
+                "C:\\Program Files\\printpapi\\agent.ini",
+                "/inheritance:r",
+                "/grant:r",
+                "*S-1-5-18:F",
+                "*S-1-5-32-544:F"
+            ]
+        );
         assert!(
             !a.iter()
                 .any(|x| x.contains("Administrators") || x.contains("SYSTEM"))
@@ -660,6 +708,7 @@ mod tests {
             "ExecStart=/opt/printpapi/printpapi-agent",
             "After=network-online.target cups.service",
             "WantedBy=multi-user.target",
+            "Description=printpapi agent",
         ] {
             assert!(text.contains(needle), "{needle} missing in {text}");
         }
@@ -673,9 +722,64 @@ mod tests {
             "<key>RunAtLoad</key><true/>",
             "<key>KeepAlive</key><true/>",
             "<string>/opt/printpapi/printpapi-agent</string>",
+            "<key>StandardOutPath</key><string>/var/log/printpapi-agent.log</string>",
+            "<key>StandardErrorPath</key><string>/var/log/printpapi-agent.log</string>",
         ] {
             assert!(text.contains(needle), "{needle} missing in {text}");
         }
+        // `service_log_path` points at the file the plist writes to
+        assert!(text.contains(&format!(
+            "<string>{}</string>",
+            service_log_path(Os::Macos, Path::new("/")).display()
+        )));
+    }
+
+    #[test]
+    fn xml_escape_covers_the_five_characters() {
+        assert_eq!(
+            xml_escape("a&b<c>d\"e'f"),
+            "a&amp;b&lt;c&gt;d&quot;e&apos;f"
+        );
+        assert_eq!(xml_escape("Ü plain"), "Ü plain");
+    }
+
+    /// No command may run into its timeout at once, and none may hang for ever.
+    #[test]
+    fn every_command_has_a_sane_timeout() {
+        let sys = Path::new(WIN_SYS);
+        for os in [Os::Windows, Os::Linux, Os::Macos] {
+            let l = layout(os, Path::new("C:\\Program Files"));
+            let mut all = stop_cmds(os, &l, sys);
+            all.extend(ini_acl_cmds(os, &l, sys));
+            all.extend(start_cmds(os, &l, sys));
+            all.extend(remove_cmds(os, &l, sys));
+            all.extend(identity_cmds(os));
+            all.extend(identity_check(os));
+            assert!(!all.is_empty());
+            for c in all {
+                assert!(
+                    (Duration::from_secs(10)..=Duration::from_secs(300)).contains(&c.timeout),
+                    "{:?}",
+                    c
+                );
+            }
+        }
+    }
+
+    /// The texts say "same as docs/agent.md"; this keeps them from drifting apart.
+    #[test]
+    fn unit_and_plist_are_the_text_of_the_docs() {
+        let doc = include_str!("../../../docs/agent.md").replace("\r\n", "\n");
+        let unit = String::from_utf8(autostart_file(Os::Linux, &linux())).unwrap();
+        assert!(
+            doc.contains(&unit),
+            "systemd unit differs from docs/agent.md:\n{unit}"
+        );
+        let plist = String::from_utf8(autostart_file(Os::Macos, &mac())).unwrap();
+        assert!(
+            doc.contains(&plist),
+            "plist differs from docs/agent.md:\n{plist}"
+        );
     }
 
     #[test]
@@ -791,6 +895,7 @@ mod tests {
             assert!(supported_at(Os::Windows, dir));
             assert!(supported_at(Os::Macos, dir));
         }
+        assert_eq!(SYSTEMD_RUN_DIR, "/run/systemd/system");
         assert!(supported_at(Os::Linux, with.path()));
         assert!(!supported_at(Os::Linux, &without));
     }
@@ -817,7 +922,7 @@ mod tests {
     fn system_dir_is_the_real_tool_folder() {
         let dir = system_dir();
         if cfg!(windows) {
-            for tool in ["schtasks.exe", "tasklist.exe", "icacls.exe"] {
+            for tool in ["schtasks.exe", "tasklist.exe", "icacls.exe", "sc.exe"] {
                 assert!(dir.join(tool).exists(), "{tool} not in {dir:?}");
             }
         } else {
@@ -858,43 +963,75 @@ mod tests {
 
     const NOTHING_RUNNING: &str = "INFO: No tasks are running which match the specified criteria.";
 
-    /// Windows: `schtasks /query` succeeds or fails, `tasklist` answers `tasklist_out`, but only
-    /// to a call that captures stdout and filters for the agent. Every program is absolute.
-    fn windows_fake(schtasks_ok: bool, tasklist_out: &'static str) -> (Runner, Seen) {
+    /// A stand-in for `System32` on disk: `detect` looks for the task file in it.
+    fn fake_system32() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("Tasks")).unwrap();
+        dir
+    }
+
+    /// What the Windows tools answer. `schtasks /query` and `sc query` succeed or fail,
+    /// `tasklist` answers the `tasklist` text.
+    struct Win {
+        schtasks: bool,
+        service: bool,
+        tasklist: &'static str,
+    }
+
+    const WIN_NOTHING: Win = Win {
+        schtasks: false,
+        service: false,
+        tasklist: NOTHING_RUNNING,
+    };
+
+    /// Windows: every program is absolute (inside `sys`), every question captures stdout and has
+    /// exactly the arguments `detect` is documented to use. `tasklist` only answers a call that
+    /// filters for the agent.
+    fn windows_fake(sys: &Path, win: Win) -> (Runner, Seen) {
         let seen: Seen = Rc::new(RefCell::new(Vec::new()));
         let log = seen.clone();
+        let sys = s(sys);
         let run: Runner = Rc::new(move |c| {
             log.borrow_mut().push(c.clone());
-            assert!(c.argv[0].starts_with(WIN_SYS), "not absolute: {:?}", c.argv);
-            if c.argv[0].ends_with("schtasks.exe") {
-                return if schtasks_ok {
+            assert!(c.argv[0].starts_with(&sys), "not absolute: {:?}", c.argv);
+            assert!(c.capture, "output is needed: {:?}", c.argv);
+            let ok_or = |ok: bool| {
+                if ok {
                     Ok(Vec::new())
                 } else {
-                    Err("1".into())
-                };
+                    Err("Command exited with 1".to_string())
+                }
+            };
+            if c.argv[0].ends_with("schtasks.exe") {
+                assert_eq!(c.argv[1..], ["/query", "/tn", "printpapi-agent"]);
+                return ok_or(win.schtasks);
+            }
+            if c.argv[0].ends_with("sc.exe") {
+                assert_eq!(c.argv[1..], ["query", "printpapi-agent"]);
+                return ok_or(win.service);
             }
             assert!(c.argv[0].ends_with("tasklist.exe"), "{:?}", c.argv);
-            if c.capture
-                && c.argv
+            assert!(
+                c.argv
                     .iter()
-                    .any(|a| a == "IMAGENAME eq printpapi-agent.exe")
-            {
-                Ok(tasklist_out.as_bytes().to_vec())
-            } else {
-                Ok(Vec::new())
-            }
+                    .any(|a| a == "IMAGENAME eq printpapi-agent.exe"),
+                "{:?}",
+                c.argv
+            );
+            Ok(win.tasklist.as_bytes().to_vec())
         });
         (run, seen)
     }
 
-    /// Unix: only `<pgrep> -x printpapi-agent` is known. Exit 0 if `running`, 1 if not, an error
-    /// like a missing program if `pgrep_exists` is false.
+    /// Unix: only `<pgrep> -x printpapi-agent` is known, and it must capture. Exit 0 if `running`,
+    /// 1 if not, an error like a missing program if `pgrep_exists` is false.
     fn unix_fake(pgrep: &'static str, running: bool, pgrep_exists: bool) -> (Runner, Seen) {
         let seen: Seen = Rc::new(RefCell::new(Vec::new()));
         let log = seen.clone();
         let run: Runner = Rc::new(move |c| {
             log.borrow_mut().push(c.clone());
             assert_eq!(c.argv, [pgrep, "-x", "printpapi-agent"]);
+            assert!(c.capture, "output is needed: {:?}", c.argv);
             if !pgrep_exists {
                 Err("No such file or directory (os error 2)".into())
             } else if running {
@@ -914,11 +1051,10 @@ mod tests {
     fn detect_none_when_nothing_is_there() {
         let dir = tempfile::tempdir().unwrap();
         let l = temp_layout(dir.path());
-        let (win, _) = windows_fake(false, NOTHING_RUNNING);
-        assert_eq!(
-            detect(Os::Windows, &l, Path::new(WIN_SYS), &win),
-            Installed::None
-        );
+        let sys = fake_system32();
+        let (win, seen) = windows_fake(sys.path(), WIN_NOTHING);
+        assert_eq!(detect(Os::Windows, &l, sys.path(), &win), Installed::None);
+        assert_eq!(seen.borrow().len(), 3, "query, service, tasklist");
         for (os, pgrep) in unix_cases() {
             let (not_running, _) = unix_fake(pgrep, false, true);
             assert_eq!(
@@ -936,9 +1072,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let l = temp_layout(dir.path());
         std::fs::write(&l.autostart, "x").unwrap();
-        let (win, seen) = windows_fake(false, NOTHING_RUNNING);
+        let sys = fake_system32();
+        let (win, seen) = windows_fake(sys.path(), WIN_NOTHING);
         assert_eq!(
-            detect(Os::Windows, &l, Path::new(WIN_SYS), &win),
+            detect(Os::Windows, &l, sys.path(), &win),
             Installed::Foreign
         );
         assert!(seen.borrow().is_empty());
@@ -958,9 +1095,17 @@ mod tests {
         // what the setup leaves behind: the autostart file and the marker, together
         std::fs::write(&l.autostart, "x").unwrap();
         std::fs::write(&l.marker, "").unwrap();
-        let (win, seen) = windows_fake(true, "\"printpapi-agent.exe\"");
+        let sys = fake_system32();
+        let (win, seen) = windows_fake(
+            sys.path(),
+            Win {
+                schtasks: true,
+                service: true,
+                tasklist: "\"printpapi-agent.exe\"",
+            },
+        );
         assert_eq!(
-            detect(Os::Windows, &l, Path::new(WIN_SYS), &win),
+            detect(Os::Windows, &l, sys.path(), &win),
             Installed::Managed
         );
         assert!(seen.borrow().is_empty());
@@ -975,22 +1120,37 @@ mod tests {
     fn detect_finds_a_hand_made_task_or_a_running_process_on_windows() {
         let dir = tempfile::tempdir().unwrap();
         let l = temp_layout(dir.path());
-        let sys = Path::new(WIN_SYS);
-        let (task, seen) = windows_fake(true, "");
-        assert_eq!(detect(Os::Windows, &l, sys, &task), Installed::Foreign);
+        let sys = fake_system32();
+        let (task, seen) = windows_fake(
+            sys.path(),
+            Win {
+                schtasks: true,
+                ..WIN_NOTHING
+            },
+        );
+        assert_eq!(
+            detect(Os::Windows, &l, sys.path(), &task),
+            Installed::Foreign
+        );
         assert_eq!(
             seen.borrow()[0].argv[1..],
             ["/query", "/tn", "printpapi-agent"]
         );
         let (running, seen) = windows_fake(
-            false,
-            "\"PrintPapi-Agent.exe\",\"4242\",\"Services\",\"0\",\"9,000 K\"",
+            sys.path(),
+            Win {
+                tasklist: "\"PrintPapi-Agent.exe\",\"4242\",\"Services\",\"0\",\"9,000 K\"",
+                ..WIN_NOTHING
+            },
         );
-        assert_eq!(detect(Os::Windows, &l, sys, &running), Installed::Foreign);
-        let seen = seen.borrow();
-        assert_eq!(seen.len(), 2);
         assert_eq!(
-            seen[1].argv[1..],
+            detect(Os::Windows, &l, sys.path(), &running),
+            Installed::Foreign
+        );
+        let seen = seen.borrow();
+        assert_eq!(seen.len(), 3);
+        assert_eq!(
+            seen[2].argv[1..],
             [
                 "/fi",
                 "IMAGENAME eq printpapi-agent.exe",
@@ -999,6 +1159,61 @@ mod tests {
                 "/nh"
             ]
         );
+    }
+
+    /// A task made from an elevated shell is invisible to `schtasks /query` for a normal user,
+    /// but its file in `System32\Tasks` is not. The agent is not running at that moment.
+    #[test]
+    fn detect_finds_a_task_that_schtasks_cannot_see_by_its_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let l = temp_layout(dir.path());
+        let sys = fake_system32();
+        std::fs::write(sys.path().join("Tasks").join("printpapi-agent"), "<Task/>").unwrap();
+        let (win, _) = windows_fake(sys.path(), WIN_NOTHING);
+        assert_eq!(
+            detect(Os::Windows, &l, sys.path(), &win),
+            Installed::Foreign
+        );
+        // another task in the folder is not ours
+        let other = fake_system32();
+        std::fs::write(other.path().join("Tasks").join("printpapi-agent-x"), "").unwrap();
+        let (win, _) = windows_fake(other.path(), WIN_NOTHING);
+        assert_eq!(detect(Os::Windows, &l, other.path(), &win), Installed::None);
+    }
+
+    #[test]
+    fn only_a_clean_not_found_means_there_is_no_task_file() {
+        use std::io::{Error, ErrorKind};
+        assert!(!task_file_present(Ok(false)));
+        assert!(task_file_present(Ok(true)));
+        // `try_exists` on the task of another user: measured to be PermissionDenied
+        assert!(task_file_present(Err(Error::from(
+            ErrorKind::PermissionDenied
+        ))));
+        assert!(task_file_present(Err(Error::other("anything else"))));
+    }
+
+    /// The service of `nssm install printpapi-agent ...` runs the Python agent as `pythonw.exe`,
+    /// so neither the task nor `tasklist` sees it.
+    #[test]
+    fn detect_finds_an_nssm_service_on_windows() {
+        let dir = tempfile::tempdir().unwrap();
+        let l = temp_layout(dir.path());
+        let sys = fake_system32();
+        let (win, seen) = windows_fake(
+            sys.path(),
+            Win {
+                service: true,
+                ..WIN_NOTHING
+            },
+        );
+        assert_eq!(
+            detect(Os::Windows, &l, sys.path(), &win),
+            Installed::Foreign
+        );
+        let seen = seen.borrow();
+        assert_eq!(seen.len(), 2);
+        assert!(seen[1].argv[0].ends_with("sc.exe"));
     }
 
     #[test]
