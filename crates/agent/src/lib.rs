@@ -8,6 +8,7 @@ pub mod client;
 pub mod config;
 pub mod discover;
 pub mod ini;
+pub mod install;
 pub mod log;
 pub mod print;
 pub mod proc;
