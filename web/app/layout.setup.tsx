@@ -1,3 +1,4 @@
+// printpapi — self-hosted PrintNode alternative. Elastic License 2.0 (see LICENSE).
 import type { Metadata } from "next";
 import { Geist, Geist_Mono } from "next/font/google";
 import { ThemeProvider } from "next-themes";

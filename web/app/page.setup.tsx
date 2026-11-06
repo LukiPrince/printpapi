@@ -1,3 +1,4 @@
+// printpapi — self-hosted PrintNode alternative. Elastic License 2.0 (see LICENSE).
 "use client";
 
 import { Home } from "@/setup/home";

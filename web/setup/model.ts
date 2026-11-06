@@ -52,3 +52,15 @@ export function errorText(e: SetupError): string {
   }
   return e.message;
 }
+
+/** Where the installed agent writes its log; mirrors `service_log_path` in crates/agent/src/install.rs. */
+export function logLocation(platform: Platform): string {
+  switch (platform) {
+    case "windows":
+      return "C:\\Windows\\System32\\config\\systemprofile\\AppData\\Local\\print_agent-error.log";
+    case "macos":
+      return "/var/log/printpapi-agent.log";
+    case "linux":
+      return "/tmp/print_agent-error.log";
+  }
+}

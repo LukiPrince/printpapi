@@ -1,3 +1,4 @@
+// printpapi — self-hosted PrintNode alternative. Elastic License 2.0 (see LICENSE).
 // Builds the window of the agent setup into web/out-setup. Same tree as the dashboard,
 // PRINTPAPI_SETUP=1 switches next.config.ts to the page.setup.tsx files. Spawns Next's CLI
 // directly (no shell) so the exit code passes through.

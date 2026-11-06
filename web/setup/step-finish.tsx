@@ -5,8 +5,8 @@ import { useState } from "react";
 import { CircleCheck, Loader2, Rocket } from "lucide-react";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
-import { setup, toSetupError, type PrinterChoice } from "./api";
-import { errorText } from "./model";
+import { setup, toSetupError, type Platform, type PrinterChoice } from "./api";
+import { errorText, logLocation } from "./model";
 import { Actions, Notice } from "./bits";
 import type { Connection } from "./step-connect";
 
@@ -24,6 +24,7 @@ type Phase =
  * The key goes to `apply` and nowhere else; it is never shown.
  */
 export function StepFinish({
+  platform,
   connection,
   deviceName,
   selected,
@@ -31,6 +32,7 @@ export function StepFinish({
   onBackToConnect,
   onDone,
 }: {
+  platform: Platform;
   connection: Connection | null;
   deviceName: string;
   selected: PrinterChoice[];
@@ -132,7 +134,8 @@ export function StepFinish({
         )}
         {phase.at === "offline" && (
           <Notice tone="error">
-            The agent did not report in within 60 seconds. Check print_agent-error.log for the reason.
+            The agent did not report in within 60 seconds. Look for the reason in the log:{" "}
+            <span className="break-all font-mono text-xs">{logLocation(platform)}</span>
           </Notice>
         )}
         {phase.at === "failed" && <Notice tone="error">{phase.message}</Notice>}

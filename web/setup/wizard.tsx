@@ -95,6 +95,7 @@ export function Wizard({
       )}
       {step === "Finish" && (
         <StepFinish
+          platform={platform}
           connection={existing ? null : connection}
           deviceName={existing ? existing.name : (connection?.name ?? "")}
           selected={selected}

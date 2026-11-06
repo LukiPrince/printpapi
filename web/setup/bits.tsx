@@ -5,6 +5,8 @@ import { Check, CircleAlert, CircleCheck, Info, TriangleAlert } from "lucide-rea
 import { Barcode, Logo } from "@/components/brand";
 import { cn } from "@/lib/utils";
 
+// The breakpoint is 700px, not Tailwind's md (768px): the setup window is a fixed 760px wide and
+// must show the rail.
 /** The ink rail on the left with the steps, and the content column on the right. */
 export function Shell({
   steps,
@@ -16,15 +18,15 @@ export function Shell({
   children: React.ReactNode;
 }) {
   return (
-    <div className="min-h-svh md:grid md:grid-cols-[13rem_minmax(0,1fr)]">
-      <aside className="flex flex-col gap-4 bg-sidebar px-4 py-5 text-sidebar-foreground md:sticky md:top-0 md:h-svh">
+    <div className="min-h-svh min-[700px]:grid min-[700px]:grid-cols-[13rem_minmax(0,1fr)]">
+      <aside className="flex flex-col gap-4 bg-sidebar px-4 py-5 text-sidebar-foreground min-[700px]:sticky min-[700px]:top-0 min-[700px]:h-svh">
         <div className="flex items-center gap-2.5 px-1">
           <Logo className="size-7" />
           <span className="font-mono text-base font-bold tracking-tight text-white">printpapi</span>
         </div>
         <Barcode className="mx-1 h-3.5 text-white/30" />
         {steps && (
-          <ol className="mt-2 flex gap-4 md:flex-col md:gap-3">
+          <ol className="mt-2 flex gap-4 min-[700px]:flex-col min-[700px]:gap-3">
             {steps.map((label, n) => {
               const done = n < (current ?? 0);
               const on = n === current;
@@ -51,7 +53,7 @@ export function Shell({
           </ol>
         )}
       </aside>
-      <main className="px-4 py-6 md:px-8 md:py-8">
+      <main className="px-4 py-6 min-[700px]:px-8 min-[700px]:py-8">
         <div className="mx-auto max-w-xl space-y-4">{children}</div>
       </main>
     </div>

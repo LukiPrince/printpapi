@@ -1,7 +1,7 @@
 // printpapi — self-hosted PrintNode alternative. Elastic License 2.0 (see LICENSE).
 import test from "node:test";
 import assert from "node:assert/strict";
-import { addNetworkPrinter, canLeavePrinters, canTest, errorText, fromFound, needsSumatra } from "./model.ts";
+import { addNetworkPrinter, canLeavePrinters, canTest, errorText, fromFound, logLocation, needsSumatra } from "./model.ts";
 import type { FoundPrinter, PrinterChoice } from "./api.ts";
 
 const choice = (over: Partial<PrinterChoice> = {}): PrinterChoice => ({
@@ -83,4 +83,13 @@ test("errorText explains a proxy refusal and passes every other message through"
   assert.match(errorText({ code: "proxy", message: "403" }), /^A proxy in front of the server refused this\./);
   assert.match(errorText({ code: "proxy", message: "403" }), /\[headers\]/);
   assert.equal(errorText({ code: "bad_key", message: "That key was not accepted." }), "That key was not accepted.");
+});
+
+test("the log of the installed agent is named per platform", () => {
+  assert.equal(
+    logLocation("windows"),
+    "C:\\Windows\\System32\\config\\systemprofile\\AppData\\Local\\print_agent-error.log",
+  );
+  assert.equal(logLocation("linux"), "/tmp/print_agent-error.log");
+  assert.equal(logLocation("macos"), "/var/log/printpapi-agent.log");
 });
