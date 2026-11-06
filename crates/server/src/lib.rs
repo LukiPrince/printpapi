@@ -2,7 +2,7 @@
 //! The print server as a library, so the integration tests drive the same code `main` runs.
 //!
 //! Module map (each mirrors the Python module it replaced, see git history before v3.0.0):
-//! - pure logic: `dispatch`, `auth`, `billing`, `cloudprnt`, `orders`, `packing_slip`,
+//! - pure logic: `dispatch`, `auth`, `billing`, `cloudprnt`, `label`, `orders`, `packing_slip`,
 //!   `printnode`, `mail` (env -> SMTP plan), `pyfmt` (Python-compatible value formatting)
 //! - IO: `store` (SQLite), `server` (routing, sync), `http` (hyper glue, long-poll), `web`
 //!   (embedded dashboard bundle)
@@ -12,6 +12,7 @@ pub mod billing;
 pub mod cloudprnt;
 pub mod dispatch;
 pub mod http;
+pub mod label;
 pub mod mail;
 pub mod orders;
 pub mod packing_slip;

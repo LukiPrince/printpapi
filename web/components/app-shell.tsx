@@ -11,11 +11,21 @@ import { CommandPalette, useCommandPalette } from "@/components/command-palette"
 import { LiveRail } from "@/components/live-rail";
 import { Button } from "@/components/ui/button";
 import { useAuth } from "@/components/auth-gate";
+import { NavGuardProvider, useNavGuard } from "@/components/nav-guard";
 import { cn } from "@/lib/utils";
 import { DemoBanner, DemoRail, DemoSignOut } from "printpapi-demo";
 
 export function AppShell({ children }: { children: React.ReactNode }) {
+  return (
+    <NavGuardProvider>
+      <Shell>{children}</Shell>
+    </NavGuardProvider>
+  );
+}
+
+function Shell({ children }: { children: React.ReactNode }) {
   const pathname = usePathname();
+  const guard = useNavGuard();
   const active = normalizePath(pathname);
   const current = navFor(pathname);
   const { signOut } = useAuth();
@@ -44,6 +54,15 @@ export function AppShell({ children }: { children: React.ReactNode }) {
                 // adds RSC segment requests a plain file server has no file for.
                 prefetch={false}
                 aria-current={isActive ? "page" : undefined}
+                // A page with unsaved work asks before it is left; the entry of the current page
+                // takes its inner view (the label editor) back to the start.
+                onClick={(e) => {
+                  if (e.metaKey || e.ctrlKey || e.shiftKey || e.altKey || e.button !== 0) return;
+                  if (isActive || guard.dirty) {
+                    e.preventDefault();
+                    guard.navigate(item.href);
+                  }
+                }}
                 className={cn(
                   "relative flex items-center gap-2.5 rounded-md px-2.5 py-2 text-sm whitespace-nowrap transition-colors",
                   isActive
@@ -84,7 +103,7 @@ export function AppShell({ children }: { children: React.ReactNode }) {
             <Button
               variant="ghost"
               size="sm"
-              onClick={signOut}
+              onClick={() => guard.request(signOut)}
               className="ml-auto font-mono text-[0.7rem] tracking-[0.08em] text-sidebar-foreground uppercase hover:bg-white/7 hover:text-white"
             >
               <LogOut />

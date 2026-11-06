@@ -100,13 +100,45 @@ export type Metrics = {
 
 export type NewJob = {
   printer_id: number;
-  type: "pdf_base64" | "raw_base64" | "pdf_uri" | "raw_uri";
+  type:
+    | "pdf_base64"
+    | "raw_base64"
+    | "pdf_uri"
+    | "raw_uri"
+    | "label_uri"
+    | "label_base64"
+    | "label_text";
   content?: string;
   url?: string;
+  /** label_*: a label template by name or id. */
+  template?: string | number;
+  /** label_text: the text to print. */
+  text?: string;
   title?: string | null;
   copies?: number;
   callback_url?: string | null;
 };
+
+/** A box on the label in millimetres, measured from its top-left corner. */
+export type LabelBox = { x: number; y: number; w: number; h: number };
+
+/** A label template as the server stores it: where the content sits on one kind of label. */
+export type LabelSpec = {
+  name: string;
+  content: "image" | "text";
+  label_mm: { w: number; h: number };
+  dpi: number;
+  /** Clockwise, applied before the crop. */
+  rotate: 0 | 90 | 180 | 270;
+  crop_percent: { t: number; r: number; b: number; l: number };
+  place_mm: LabelBox;
+  text?: { wrap_chars: number; lines_per_label: number };
+  zpl_darkness?: number;
+  /** Which catalogue size the editor started from. The server only passes it through. */
+  size_ref?: string;
+};
+
+export type LabelTemplate = LabelSpec & { id: number; created_at: number; updated_at: number };
 
 export class ApiError extends Error {
   constructor(
@@ -276,6 +308,20 @@ export const issueApiKey = (label: string) =>
   );
 
 export const revokeApiKey = (id: number) => request(`/apikeys/${id}`, { method: "DELETE" });
+
+export const listLabels = () =>
+  getJSON<{ templates: LabelTemplate[] }>("/labels").then((r) => r.templates ?? []);
+
+export const createLabel = (spec: LabelSpec) =>
+  request("/labels", jsonBody(spec)).then((r) => r.json() as Promise<LabelTemplate>);
+
+export const updateLabel = (id: number, spec: LabelSpec) =>
+  request(`/labels/${id}`, { ...jsonBody(spec), method: "PUT" }).then(
+    (r) => r.json() as Promise<LabelTemplate>,
+  );
+
+export const deleteLabel = (id: number) =>
+  request(`/labels/${id}`, { method: "DELETE" }).then(() => undefined);
 
 const EMPTY_JOBS: Record<JobState, number> = {
   queued: 0,

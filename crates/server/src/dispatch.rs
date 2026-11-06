@@ -408,7 +408,7 @@ pub fn decode_payload(
 ) -> Result<Vec<u8>, DispatchError> {
     let t = body.get("type");
     match t.and_then(Value::as_str) {
-        Some("raw_base64" | "pdf_base64") => match body.get("content") {
+        Some("raw_base64" | "pdf_base64" | "label_base64") => match body.get("content") {
             Some(Value::String(s)) if !s.is_empty() => B64
                 .decode(s)
                 .or_else(|_| invalid(format!("bad base64: {}", py_b64_error(s)))),
@@ -418,7 +418,7 @@ pub fn decode_payload(
             }
             _ => invalid("missing 'content'"),
         },
-        Some("raw_uri" | "pdf_uri") => {
+        Some("raw_uri" | "pdf_uri" | "label_uri") => {
             let url = checked_http_url(body.get("url"))?;
             fetcher
                 .get(url)
@@ -441,6 +441,56 @@ pub fn decode_payload(
             t.map_or_else(|| "None".to_string(), repr)
         )),
     }
+}
+
+/// Which template a `label_*` job names: a string is a name, an integer is an id.
+#[derive(Debug, Clone, PartialEq)]
+pub enum TemplateRef {
+    Name(String),
+    Id(i64),
+}
+
+impl std::fmt::Display for TemplateRef {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            TemplateRef::Name(n) => f.write_str(n),
+            TemplateRef::Id(i) => write!(f, "{i}"),
+        }
+    }
+}
+
+/// The label-specific fields of a `label_uri` / `label_base64` / `label_text` job. `text` is
+/// `Some` only for `label_text`; the other two carry their image in `url` / `content`, which
+/// `decode_payload` reads.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LabelJob {
+    pub template: TemplateRef,
+    pub text: Option<String>,
+}
+
+/// `Ok(None)` for every other job type. Pure field checks, so a bad job 400s before the printer,
+/// the template or the network are touched.
+pub fn parse_label_job(body: &Map<String, Value>) -> Result<Option<LabelJob>, DispatchError> {
+    let t = body.get("type").and_then(Value::as_str);
+    if !matches!(t, Some("label_uri" | "label_base64" | "label_text")) {
+        return Ok(None);
+    }
+    let template = match body.get("template") {
+        None | Some(Value::Null) => return invalid("missing 'template'"),
+        Some(Value::String(s)) if !s.is_empty() => TemplateRef::Name(s.clone()),
+        Some(Value::Number(n)) if n.is_i64() => TemplateRef::Id(n.as_i64().unwrap_or_default()),
+        Some(_) => return invalid("template must be a name or an integer id"),
+    };
+    let text = if t == Some("label_text") {
+        match body.get("text") {
+            None | Some(Value::Null) => return invalid("missing 'text'"),
+            Some(Value::String(s)) => Some(s.clone()),
+            Some(_) => return invalid("text must be a string"),
+        }
+    } else {
+        None
+    };
+    Ok(Some(LabelJob { template, text }))
 }
 
 /// "pdf" for the pdf_* types, "raw" for everything else (unknown types included).
@@ -470,7 +520,7 @@ const OPTION_DUPLEX: [&str; 3] = ["long-edge", "short-edge", "one-sided"];
 /// `^[\w. -]{1,64}$` — no comma: paper/bin land in Sumatra's comma-separated -print-settings
 /// list, so a comma in a value would smuggle extra settings past validation.
 // Python's `$` also matched before a trailing newline; here it is rejected.
-fn valid_option_value(s: &str) -> bool {
+pub(crate) fn valid_option_value(s: &str) -> bool {
     let n = s.chars().count();
     (1..=64).contains(&n)
         && s.chars()
@@ -773,6 +823,104 @@ mod tests {
         let m = is_invalid(dp(json!({"type": "raw_base64", "content": 5})));
         assert!(m.starts_with("bad base64: "), "{m}");
         assert!(dp(json!({"type": "raw_base64", "content": [1]})).is_err());
+    }
+
+    // --- label jobs -------------------------------------------------------------------------
+
+    #[test]
+    fn label_uri_and_base64_decode_like_their_raw_twins() {
+        let f = Fake::ok(b"IMG");
+        let r = decode_payload(
+            &obj(json!({"type": "label_uri", "url": "https://x/i.png"})),
+            &f,
+        );
+        assert_eq!(r.unwrap(), b"IMG");
+        assert_eq!(f.calls.lock().unwrap()[0].0, "https://x/i.png");
+        assert_eq!(
+            dp(json!({"type": "label_base64", "content": "XlhBXlha"})).unwrap(),
+            b"^XA^XZ"
+        );
+        assert_eq!(
+            is_invalid(dp(
+                json!({"type": "label_uri", "url": "file:///etc/passwd"})
+            )),
+            "unsupported url scheme: 'file:///etc/passwd'"
+        );
+        assert_eq!(
+            is_invalid(dp(json!({"type": "label_uri"}))),
+            "missing 'url'"
+        );
+        assert_eq!(
+            is_invalid(dp(json!({"type": "label_base64"}))),
+            "missing 'content'"
+        );
+        assert!(
+            is_invalid(dp(json!({"type": "label_base64", "content": "!!!"})))
+                .starts_with("bad base64: ")
+        );
+        let down = Fake::err("HTTP Error 404: Not Found");
+        let r = decode_payload(
+            &obj(json!({"type": "label_uri", "url": "https://x"})),
+            &down,
+        );
+        assert_eq!(
+            r,
+            Err(DispatchError::Fetch(
+                "fetch failed: HTTP Error 404: Not Found".into()
+            ))
+        );
+    }
+
+    #[test]
+    fn label_text_has_no_payload_to_decode() {
+        // label_text is rendered from the body itself; decode_payload is not its path
+        assert!(dp(json!({"type": "label_text", "text": "x", "template": "t"})).is_err());
+    }
+
+    #[test]
+    fn label_job_fields() {
+        let job = |v: Value| parse_label_job(&obj(v));
+        assert_eq!(job(json!({"type": "raw_uri"})), Ok(None));
+        assert_eq!(job(json!({})), Ok(None));
+        let j = job(json!({"type": "label_uri", "template": "ship", "url": "https://x"}))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            (j.template, j.text),
+            (TemplateRef::Name("ship".into()), None)
+        );
+        let j = job(json!({"type": "label_base64", "template": 7}))
+            .unwrap()
+            .unwrap();
+        assert_eq!(j.template, TemplateRef::Id(7));
+        let j = job(json!({"type": "label_text", "template": "t", "text": "Hi ^"}))
+            .unwrap()
+            .unwrap();
+        assert_eq!(j.text.as_deref(), Some("Hi ^"));
+        assert_eq!(j.template.to_string(), "t");
+        assert_eq!(TemplateRef::Id(7).to_string(), "7");
+        for bad in [
+            json!({"type": "label_uri"}),
+            json!({"type": "label_uri", "template": ""}),
+            json!({"type": "label_uri", "template": 1.5}),
+            json!({"type": "label_uri", "template": true}),
+            json!({"type": "label_uri", "template": ["a"]}),
+            json!({"type": "label_text", "template": "t"}),
+            json!({"type": "label_text", "template": "t", "text": 5}),
+        ] {
+            assert!(
+                matches!(job(bad.clone()), Err(DispatchError::Invalid(_))),
+                "{bad}"
+            );
+        }
+        assert_eq!(
+            is_invalid(job(json!({"type": "label_uri"}))),
+            "missing 'template'"
+        );
+        assert_eq!(
+            is_invalid(job(json!({"type": "label_text", "template": "t"}))),
+            "missing 'text'"
+        );
     }
 
     #[test]

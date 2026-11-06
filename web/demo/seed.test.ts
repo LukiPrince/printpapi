@@ -68,3 +68,12 @@ test("sample data helpers", () => {
   assert.ok(z.includes(o.tracking));
   assert.equal(Buffer.from(b64("Köln"), "base64").toString("utf8"), "Köln");
 });
+
+test("two sample label templates, ids contiguous, names unique", () => {
+  const s = seedState(now);
+  assert.deepEqual(s.labels.map((l) => l.id), [1, 2]);
+  assert.equal(s.next.label, 3);
+  assert.deepEqual(s.labels.map((l) => l.content).sort(), ["image", "text"]);
+  assert.equal(new Set(s.labels.map((l) => l.name)).size, 2);
+  assert.ok(s.labels.every((l) => l.created_at < now && l.updated_at <= now));
+});

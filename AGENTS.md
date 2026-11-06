@@ -35,9 +35,9 @@ cd web && npm run build:app     # after any web/ change; commit crates/server/we
 ## Server (`crates/server`)
 
 - Few well-known crates, no web framework (`hyper` directly). A new dependency needs a reason.
-- Pure modules (`dispatch`, `orders`, `packing_slip`, `printnode`, `billing`, `cloudprnt`,
-  `auth`) do no IO and take injected fetchers. `store` (SQLite), `server`, `http`, `web` and
-  `mail` own the IO. Keep that split.
+- Pure modules (`dispatch`, `label`, `orders`, `packing_slip`, `printnode`, `billing`,
+  `cloudprnt`, `auth`) do no IO and take injected fetchers. `store` (SQLite), `server`, `http`,
+  `web` and `mail` own the IO. Keep that split.
 - Tests in `crates/server/tests/` use real loopback HTTP and in-memory SQLite with injected
   fetchers: no HTTP mocks, no printers.
 - Agents only ever connect outbound (long-poll) because they sit behind NAT. Design new features
@@ -61,6 +61,8 @@ cd web && npm run build:app     # after any web/ change; commit crates/server/we
 - Every API call goes through `web/lib/api.ts` with root-relative paths (same origin as the
   server). `next dev` proxies them to `PRINTPAPI_ORIGIN` (default `http://127.0.0.1:3460`).
 - Job states are always colour + icon + word (`web/lib/job-state.tsx`), never colour alone.
+- The label-size catalogue of the `/labels` page is `web/lib/label-sizes.ts`; each manufacturer
+  size cites its source there, so a new size needs one too.
 - Checks: `npm run lint`, `npm test`.
 - Demo build: `npm run build:demo` writes `web/out-demo/`, which `.github/workflows/demo.yml`
   deploys to printpapi.lukaswotzka.com; it is never synced into the binary. Demo code lives only

@@ -25,6 +25,7 @@ Token comparison is constant-time (`hmac.compare_digest`).
 | `GET /health` | none | Liveness check, plus whether this server offers `signup` and `password_reset` |
 | `GET /metrics` | client | Prometheus text: job counts by state, agent/printer liveness |
 | `POST /jobs` | client | Submit a job → `{job_id}` |
+| `GET\|POST /labels`, `GET\|PUT\|DELETE /labels/{id}` | client | [Label templates](labels.md): where the content sits on a label; jobs of type `label_*` render through them |
 | `POST /orders` | client | Render an order as a packing slip and print it → `{job_id}` ([e-commerce](ecommerce.md)) |
 | `POST /integrations/shopify/orders` | HMAC | Shopify order webhook (key in the URL, signature in the header) |
 | `GET /jobs` | client | Recent job history |
@@ -126,9 +127,18 @@ it. On CUPS, `bin`/`paper` values must not contain spaces.
 | `pdf_uri` | `url` | GETs the URL, queues as PDF |
 | `raw_uri_post` | `url` + `json` | POSTs `json` to the URL, queues the response bytes |
 | `pdf_uri_post` | `url` + `json` | POSTs `json` to the URL, queues as PDF |
+| `label_uri` | `url` + `template` | GETs an image, renders it through the [label template](labels.md) |
+| `label_base64` | `content` + `template` | decodes a base64 image, renders it through the template |
+| `label_text` | `text` + `template` | renders the text through the template |
 
 URL fetches are `http(s)`-only and sent with a browser User-Agent (WAF/CDN-fronted services
 reject a default library one such as Python's).
+
+The `label_*` types are the odd ones out: the server does not queue the bytes it received but a
+**rendered label**, a PDF for a `|pdf` printer and ZPL for any other. The job's mode follows the
+printer, so `options` are accepted on a PDF printer and refused on a ZPL one. The template is
+named by `template` (its name or its integer id). Templates, errors and examples:
+[labels.md](labels.md).
 
 ## Webhooks
 

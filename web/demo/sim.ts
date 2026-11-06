@@ -110,6 +110,8 @@ export function cancel(s: DemoState, id: number, now: number): "ok" | "not-found
   return "ok";
 }
 
-export function mode(type: string): "pdf" | "raw" {
+// A label_* job is rendered for its printer: PDF where it takes PDF, ZPL (raw) otherwise.
+export function mode(type: string, canPdf = false): "pdf" | "raw" {
+  if (type === "label_uri" || type === "label_base64" || type === "label_text") return canPdf ? "pdf" : "raw";
   return type === "pdf_base64" || type === "pdf_uri" || type === "pdf_uri_post" ? "pdf" : "raw";
 }

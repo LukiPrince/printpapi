@@ -365,6 +365,11 @@ CREATE TABLE IF NOT EXISTS printers(
   id INTEGER PRIMARY KEY AUTOINCREMENT, org_id INTEGER NOT NULL, agent_id INTEGER NOT NULL,
   name TEXT NOT NULL, can_pdf INTEGER NOT NULL DEFAULT 0, state TEXT NOT NULL DEFAULT 'active',
   capabilities TEXT, created_at REAL NOT NULL, UNIQUE(agent_id, name));
+-- Label templates (render settings for label_* jobs), one name per org. Additive: the Python
+-- server does not know the table and ignores it. `spec` is the contract JSON of `label::spec_json`.
+CREATE TABLE IF NOT EXISTS label_templates(
+  id INTEGER PRIMARY KEY, org_id INTEGER NOT NULL, name TEXT NOT NULL, spec TEXT NOT NULL,
+  created_at REAL NOT NULL, updated_at REAL NOT NULL, UNIQUE(org_id, name));
 CREATE TABLE IF NOT EXISTS jobs(
   id INTEGER PRIMARY KEY AUTOINCREMENT, org_id INTEGER NOT NULL, user_id INTEGER NOT NULL,
   printer_id INTEGER NOT NULL, agent_id INTEGER NOT NULL, type TEXT NOT NULL, mode TEXT NOT NULL,
@@ -683,7 +688,14 @@ pub fn delete_org(conn: &Connection, org_id: i64) -> Result<bool> {
         &format!("DELETE FROM password_resets WHERE user_id IN ({users})"),
         [org_id],
     )?;
-    for table in ["jobs", "printers", "agents", "api_keys", "users"] {
+    for table in [
+        "jobs",
+        "printers",
+        "agents",
+        "api_keys",
+        "users",
+        "label_templates",
+    ] {
         tx.execute(&format!("DELETE FROM {table} WHERE org_id=?"), [org_id])?;
     }
     tx.execute("DELETE FROM orgs WHERE id=?", [org_id])?;
@@ -1236,6 +1248,24 @@ pub fn get_printer(
         .optional()?)
 }
 
+/// `QuotaExceeded` once `org_id` has used up its monthly quota.
+pub fn check_quota(conn: &Connection, org_id: i64, now: f64) -> Result<()> {
+    let quota: Option<i64> = conn
+        .query_row("SELECT job_quota FROM orgs WHERE id=?", [org_id], |r| {
+            r.get(0)
+        })
+        .optional()?
+        .flatten();
+    if let Some(quota) = quota
+        && usage(conn, org_id, month_start(now))? >= quota
+    {
+        return Err(StoreError::QuotaExceeded(format!(
+            "monthly job quota reached ({quota})"
+        )));
+    }
+    Ok(())
+}
+
 pub fn enqueue_job(conn: &Connection, job: &NewJob<'_>) -> Result<Enqueued> {
     let now = crate::now();
     let unknown = || {
@@ -1277,21 +1307,9 @@ pub fn enqueue_job(conn: &Connection, job: &NewJob<'_>) -> Result<Enqueued> {
             });
         }
     }
-    let quota: Option<i64> = tx
-        .query_row("SELECT job_quota FROM orgs WHERE id=?", [org_id], |r| {
-            r.get(0)
-        })
-        .optional()?
-        .flatten();
     // Checked here rather than in the handlers so every caller — POST /jobs, /orders, the Shopify
     // webhook and the PrintNode compat layer — is capped by one guard.
-    if let Some(quota) = quota
-        && usage(&tx, org_id, month_start(now))? >= quota
-    {
-        return Err(StoreError::QuotaExceeded(format!(
-            "monthly job quota reached ({quota})"
-        )));
-    }
+    check_quota(&tx, org_id, now)?;
     let options: Option<String> = job
         .options
         .as_ref()
@@ -1753,6 +1771,181 @@ pub fn list_printers(
         })
     })?;
     Ok(rows.collect::<rusqlite::Result<_>>()?)
+}
+
+// --- label templates --------------------------------------------------------------------------
+
+/// One stored label template. `org` is `None` for root everywhere below and means the default
+/// org, like every other label call: root has no org of its own to keep templates in.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LabelTemplate {
+    pub id: i64,
+    pub org_id: i64,
+    pub spec: crate::label::Spec,
+    pub created_at: f64,
+    pub updated_at: f64,
+}
+
+impl LabelTemplate {
+    /// The HTTP shape: `{id, ...contract fields, created_at, updated_at}`.
+    pub fn to_json(&self) -> Value {
+        let mut v = crate::label::spec_json(&self.spec);
+        if let Value::Object(m) = &mut v {
+            let mut out = Map::new();
+            out.insert("id".into(), self.id.into());
+            out.append(m);
+            out.insert("created_at".into(), self.created_at.into());
+            out.insert("updated_at".into(), self.updated_at.into());
+            return Value::Object(out);
+        }
+        v
+    }
+}
+
+const LABEL_COLS: &str = "id, org_id, spec, created_at, updated_at";
+
+fn label_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<LabelTemplate> {
+    let text: String = r.get(2)?;
+    // The text was written by `create_label_template`; a row that no longer parses was edited by
+    // hand, and is reported as a database error rather than served half-read.
+    let bad = |e: String| {
+        rusqlite::Error::FromSqlConversionFailure(2, rusqlite::types::Type::Text, e.into())
+    };
+    let spec = serde_json::from_str::<Value>(&text)
+        .map_err(|e| bad(e.to_string()))?
+        .as_object()
+        .ok_or_else(|| bad("not an object".into()))
+        .and_then(|m| crate::label::parse_spec(m).map_err(bad))?;
+    Ok(LabelTemplate {
+        id: r.get(0)?,
+        org_id: r.get(1)?,
+        spec,
+        created_at: r.get(3)?,
+        updated_at: r.get(4)?,
+    })
+}
+
+/// The org's templates, by name.
+pub fn list_label_templates(conn: &Connection, org: Option<i64>) -> Result<Vec<LabelTemplate>> {
+    let mut stmt = conn.prepare(&format!(
+        "SELECT {LABEL_COLS} FROM label_templates WHERE org_id=? ORDER BY name COLLATE NOCASE, id"
+    ))?;
+    let rows = stmt.query_map([org.unwrap_or(DEFAULT_ORG)], label_row)?;
+    Ok(rows.collect::<rusqlite::Result<_>>()?)
+}
+
+/// By id; another org's template is simply not found.
+pub fn get_label_template(
+    conn: &Connection,
+    id: i64,
+    org: Option<i64>,
+) -> Result<Option<LabelTemplate>> {
+    Ok(conn
+        .query_row(
+            &format!("SELECT {LABEL_COLS} FROM label_templates WHERE id=? AND org_id=?"),
+            params![id, org.unwrap_or(DEFAULT_ORG)],
+            label_row,
+        )
+        .optional()?)
+}
+
+/// By name, within the org.
+pub fn find_label_template(
+    conn: &Connection,
+    name: &str,
+    org: Option<i64>,
+) -> Result<Option<LabelTemplate>> {
+    Ok(conn
+        .query_row(
+            &format!("SELECT {LABEL_COLS} FROM label_templates WHERE name=? AND org_id=?"),
+            params![name, org.unwrap_or(DEFAULT_ORG)],
+            label_row,
+        )
+        .optional()?)
+}
+
+/// `Err(Conflict)` when the org already has a template of that name.
+pub fn create_label_template(
+    conn: &Connection,
+    org: Option<i64>,
+    spec: &crate::label::Spec,
+) -> Result<LabelTemplate> {
+    let (org, now) = (org.unwrap_or(DEFAULT_ORG), crate::now());
+    let tx = begin(conn)?;
+    tx.execute(
+        "INSERT INTO label_templates(org_id, name, spec, created_at, updated_at) VALUES(?,?,?,?,?)",
+        params![
+            org,
+            spec.name,
+            crate::label::spec_json(spec).to_string(),
+            now,
+            now
+        ],
+    )?;
+    let id = tx.last_insert_rowid();
+    tx.commit()?;
+    Ok(LabelTemplate {
+        id,
+        org_id: org,
+        spec: spec.clone(),
+        created_at: now,
+        updated_at: now,
+    })
+}
+
+/// Replace the whole template. `Ok(None)` if the org has no such id, `Err(Conflict)` if the new
+/// name is another template's.
+pub fn update_label_template(
+    conn: &Connection,
+    id: i64,
+    org: Option<i64>,
+    spec: &crate::label::Spec,
+) -> Result<Option<LabelTemplate>> {
+    let (org, now) = (org.unwrap_or(DEFAULT_ORG), crate::now());
+    let tx = begin(conn)?;
+    let n = tx.execute(
+        "UPDATE label_templates SET name=?, spec=?, updated_at=? WHERE id=? AND org_id=?",
+        params![
+            spec.name,
+            crate::label::spec_json(spec).to_string(),
+            now,
+            id,
+            org
+        ],
+    )?;
+    if n == 0 {
+        return Ok(None);
+    }
+    let t = tx.query_row(
+        &format!("SELECT {LABEL_COLS} FROM label_templates WHERE id=?"),
+        [id],
+        label_row,
+    )?;
+    tx.commit()?;
+    Ok(Some(t))
+}
+
+pub fn delete_label_template(conn: &Connection, id: i64, org: Option<i64>) -> Result<bool> {
+    let tx = begin(conn)?;
+    let n = tx.execute(
+        "DELETE FROM label_templates WHERE id=? AND org_id=?",
+        params![id, org.unwrap_or(DEFAULT_ORG)],
+    )?;
+    tx.commit()?;
+    Ok(n == 1)
+}
+
+/// True for the pseudo-agent `register_cloudprnt` makes (its key hash starts with `cloudprnt:`).
+/// Such a device only understands Star commands, so templates cannot print on it.
+pub fn is_cloudprnt_agent(conn: &Connection, agent_id: i64) -> Result<bool> {
+    Ok(conn
+        .query_row(
+            "SELECT substr(api_key_hash, 1, 10) = 'cloudprnt:' FROM agents WHERE id=?",
+            [agent_id],
+            |r| r.get::<_, i64>(0),
+        )
+        .optional()?
+        == Some(1))
 }
 
 #[cfg(test)]
@@ -3587,5 +3780,112 @@ mod tests {
         all.sort_unstable();
         all.dedup();
         assert_eq!(all.len(), JOBS, "a job was claimed twice");
+    }
+
+    // --- label templates --------------------------------------------------------------------
+
+    fn label_spec(name: &str) -> crate::label::Spec {
+        let v = json!({
+            "name": name, "content": "image", "label_mm": {"w": 50, "h": 30}, "dpi": 203,
+            "rotate": 0, "crop_percent": {"t": 0, "r": 0, "b": 0, "l": 0},
+            "place_mm": {"x": 0, "y": 0, "w": 50, "h": 30}
+        });
+        crate::label::parse_spec(v.as_object().unwrap()).unwrap()
+    }
+
+    #[test]
+    fn label_templates_are_scoped_to_their_org() {
+        let conn = db();
+        let other = create_org(&conn, "other").unwrap();
+        let mine = create_label_template(&conn, None, &label_spec("a")).unwrap();
+        // None is the default org, on every path
+        assert_eq!(mine.org_id, DEFAULT_ORG);
+        assert_eq!(
+            get_label_template(&conn, mine.id, Some(DEFAULT_ORG)).unwrap(),
+            Some(mine.clone())
+        );
+        assert_eq!(
+            get_label_template(&conn, mine.id, None).unwrap(),
+            Some(mine.clone())
+        );
+        assert_eq!(
+            get_label_template(&conn, mine.id, Some(other)).unwrap(),
+            None
+        );
+        assert_eq!(find_label_template(&conn, "a", Some(other)).unwrap(), None);
+        assert_eq!(
+            find_label_template(&conn, "a", None).unwrap().unwrap().id,
+            mine.id
+        );
+        assert!(list_label_templates(&conn, Some(other)).unwrap().is_empty());
+        assert!(
+            update_label_template(&conn, mine.id, Some(other), &label_spec("b"))
+                .unwrap()
+                .is_none()
+        );
+        assert!(!delete_label_template(&conn, mine.id, Some(other)).unwrap());
+        assert!(delete_label_template(&conn, mine.id, None).unwrap());
+    }
+
+    #[test]
+    fn label_template_names_are_unique_per_org() {
+        let conn = db();
+        let other = create_org(&conn, "other").unwrap();
+        let a = create_label_template(&conn, None, &label_spec("a")).unwrap();
+        let b = create_label_template(&conn, None, &label_spec("b")).unwrap();
+        assert!(matches!(
+            create_label_template(&conn, None, &label_spec("a")),
+            Err(StoreError::Conflict)
+        ));
+        assert!(matches!(
+            update_label_template(&conn, b.id, None, &label_spec("a")),
+            Err(StoreError::Conflict)
+        ));
+        create_label_template(&conn, Some(other), &label_spec("a")).unwrap();
+        // renaming keeps id and creation time, and moves the update time
+        let renamed = update_label_template(&conn, a.id, None, &label_spec("c"))
+            .unwrap()
+            .unwrap();
+        assert_eq!((renamed.id, renamed.spec.name.as_str()), (a.id, "c"));
+        assert_eq!(renamed.created_at, a.created_at);
+        assert!(renamed.updated_at >= a.updated_at);
+        let names: Vec<_> = list_label_templates(&conn, None)
+            .unwrap()
+            .into_iter()
+            .map(|t| t.spec.name)
+            .collect();
+        assert_eq!(names, ["b", "c"]);
+    }
+
+    #[test]
+    fn delete_org_takes_its_label_templates() {
+        let conn = db();
+        let other = create_org(&conn, "other").unwrap();
+        create_label_template(&conn, Some(other), &label_spec("a")).unwrap();
+        create_label_template(&conn, None, &label_spec("a")).unwrap();
+        assert!(delete_org(&conn, other).unwrap());
+        assert!(list_label_templates(&conn, Some(other)).unwrap().is_empty());
+        assert_eq!(list_label_templates(&conn, None).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn only_a_cloudprnt_agent_counts_as_cloudprnt() {
+        let conn = db();
+        let dev = register_cloudprnt(&conn, DEFAULT_ORG, "cloudprnt-mac1").unwrap();
+        let reg = register_agent(
+            &conn,
+            "pc",
+            "ak",
+            &[PrinterDecl {
+                name: "Z".into(),
+                can_pdf: false,
+                capabilities: None,
+            }],
+            DEFAULT_ORG,
+        )
+        .unwrap();
+        assert!(is_cloudprnt_agent(&conn, dev.agent_id).unwrap());
+        assert!(!is_cloudprnt_agent(&conn, reg.computer_id).unwrap());
+        assert!(!is_cloudprnt_agent(&conn, 9999).unwrap());
     }
 }

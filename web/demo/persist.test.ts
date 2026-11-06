@@ -31,3 +31,22 @@ test("a saved state round-trips", () => {
   s.jobs.unshift({ ...s.jobs[0], id: s.next.job++, title: "extra" });
   assert.deepEqual(loadState(saveState(s), now + 99), s);
 });
+
+test("a state stored before label templates gets the sample ones", () => {
+  const s = seedState(now) as unknown as Record<string, unknown> & { next: Record<string, unknown> };
+  delete s.labels;
+  delete s.next.label;
+  const back = loadState(JSON.stringify(s), now + 99);
+  assert.deepEqual(back.labels, seedState(now + 99).labels);
+  assert.equal(back.next.label, 3);
+  assert.equal(back.jobs.length, seedState(now).jobs.length);
+});
+
+test("stored label templates survive a reload", () => {
+  const s = seedState(now);
+  s.labels.pop();
+  s.next.label = 9;
+  const back = loadState(saveState(s), now + 99);
+  assert.equal(back.labels.length, 1);
+  assert.equal(back.next.label, 9);
+});

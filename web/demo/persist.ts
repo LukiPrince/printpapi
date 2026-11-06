@@ -1,6 +1,6 @@
 // printpapi — self-hosted PrintNode alternative. Elastic License 2.0 (see LICENSE).
 // Turning the demo state into a string and back. Anything old, corrupt or foreign becomes a fresh seed.
-import { seedState } from "./seed.ts";
+import { seedLabels, seedState } from "./seed.ts";
 import type { DemoState } from "./seed.ts";
 
 export const STORAGE_KEY = "printpapi-demo-v1";
@@ -15,6 +15,8 @@ export function loadState(raw: string | null, now: number): DemoState {
     if (!ARRAYS.every((k) => Array.isArray(s[k]))) return seedState(now);
     if (!s.org || !s.me || !s.next || !s.todo) return seedState(now);
     s.trimmed ??= { done: 0, failed: 0, cancelled: 0, since_seed: 0 }; // states stored before trimmed existed
+    if (!Array.isArray(s.labels)) s.labels = seedLabels(now); // states stored before label templates existed
+    (s.next as Record<string, unknown>).label ??= Math.max(0, ...(s.labels as { id: number }[]).map((l) => l.id)) + 1;
     return s as unknown as DemoState;
   } catch {
     return seedState(now);

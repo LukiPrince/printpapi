@@ -31,6 +31,9 @@ up and prints it: documents **and** label printers (Zebra/ZPL, Bixolon, thermal)
 - Print options per job (copies, duplex, paper size, tray, color, page ranges) +
   capability discovery per printer
 - **Shop order → packing slip**: WooCommerce plugin, Shopify webhook, built-in PDF renderer
+- **Label templates**: set up once where an image or text sits on a label (sizes from the
+  catalogue, drag and scale in the dashboard); every job that names the template is rendered to
+  PDF or ZPL by the server ([docs](docs/labels.md))
 - **Virtual print server**: a `file://` printer archives the job to a directory instead of paper
   ([docs](docs/agent.md#file-output-virtual-print-server))
 - Multi-tenant: orgs isolate API keys, agents, printers and jobs, each with its own
@@ -168,6 +171,7 @@ sponsored by PrintNode.*
 | [HTTP API](docs/api.md) | endpoints, auth, content types, job lifecycle |
 | [PrintNode-compatible API](docs/printnode-compat.md) | point an existing PrintNode client at printpapi |
 | [Star CloudPRNT](docs/cloudprnt.md) | Star printers polling the server directly, without an agent |
+| [Label templates](docs/labels.md) | size and position of images and text on a label, rendered by the server to PDF or ZPL |
 | [Recipes](docs/recipes.md) | print from n8n, Zapier, Make, curl in one HTTP node |
 | [E-commerce](docs/ecommerce.md) | WooCommerce plugin, Shopify webhook, `POST /orders` |
 | [Billing](docs/billing.md) | plans, checkout links, the signed provider webhook, org deletion |

@@ -154,6 +154,48 @@ pub struct AppState {
     /// a few blocking threads queueing on the mutex buy nothing; the rest wait as cheap tasks
     /// (200 idle agents otherwise grew the blocking pool to 130+ threads).
     pub poll_slots: Arc<tokio::sync::Semaphore>,
+    /// Image renders (`label_uri`, `label_base64`) running at once. A decode can take a few
+    /// hundred MB, and the fetcher's slots are free again by the time the render starts.
+    pub render_slots: RenderSlots,
+}
+
+/// Concurrent image renders (see `AppState::render_slots`). ponytail: one global cap, not per
+/// org, and a full house answers 503 instead of queueing. A render is worth up to ~0.9 GB at the
+/// size limits, so 4 bound the worst case to a few GB; a typical label takes milliseconds.
+pub const RENDER_SLOTS: usize = 4;
+
+/// A counter of running renders, shaped like the fetcher's slots (`dispatch::HttpFetcher::slot`).
+pub struct RenderSlots {
+    in_flight: std::sync::atomic::AtomicUsize,
+    max: usize,
+}
+
+/// Holds one render slot; dropping it gives the slot back.
+pub struct RenderSlot<'a>(&'a std::sync::atomic::AtomicUsize);
+
+impl Drop for RenderSlot<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+impl RenderSlots {
+    pub fn new(max: usize) -> Self {
+        RenderSlots {
+            in_flight: std::sync::atomic::AtomicUsize::new(0),
+            max,
+        }
+    }
+
+    /// A slot, or `None` when `max` renders are already running.
+    pub fn try_enter(&self) -> Option<RenderSlot<'_>> {
+        use std::sync::atomic::Ordering::SeqCst;
+        if self.in_flight.fetch_add(1, SeqCst) >= self.max {
+            self.in_flight.fetch_sub(1, SeqCst);
+            return None;
+        }
+        Some(RenderSlot(&self.in_flight))
+    }
 }
 
 /// Concurrent long-poll DB calls (see `AppState::poll_slots`).
@@ -178,6 +220,7 @@ impl AppState {
             waker: Waker::default(),
             dummy_hash,
             poll_slots: Arc::new(tokio::sync::Semaphore::new(POLL_SLOTS)),
+            render_slots: RenderSlots::new(RENDER_SLOTS),
         }
     }
 }
@@ -252,7 +295,7 @@ impl Resp {
 
 use crate::pyfmt::{as_sql_int, py_str, repr, repr_str, truthy};
 use crate::store::{self, StoreError};
-use crate::{auth, billing, cloudprnt, dispatch, orders, packing_slip, printnode, web};
+use crate::{auth, billing, cloudprnt, dispatch, label, orders, packing_slip, printnode, web};
 use base64::{Engine, engine::general_purpose::STANDARD as B64};
 use hmac::{Hmac, KeyInit, Mac};
 use serde::Serialize;
@@ -260,6 +303,8 @@ use serde_json::{Map, json};
 use sha2::Sha256;
 
 type Obj = Map<String, Value>;
+
+const LABEL_NAME_TAKEN: &str = "label template name already in use";
 /// A handler outcome: a response, or a store failure nobody handled (answered 500).
 type R = Result<Resp, StoreError>;
 /// A precondition that already holds the response to send when it fails.
@@ -523,6 +568,8 @@ enum SubmitErr {
     Fetch(String),
     Quota(String),
     Invalid(String),
+    /// Too many renders running; the client may retry.
+    Busy(String),
     Store(StoreError),
 }
 
@@ -871,15 +918,28 @@ impl Ctx<'_> {
     ) -> Result<store::Enqueued, SubmitErr> {
         let null = Value::Null;
         let type_v = body.get("type").unwrap_or(&null);
-        let mode = dispatch::agent_mode(type_v);
+        let mut mode = dispatch::agent_mode(type_v);
         // Validate before decode_payload: a bad field must 400 without first fetching a URL (and
         // a retried submit must not re-fetch it either).
         let copies = dispatch::parse_copies(body)?;
         let callback_url = dispatch::parse_callback_url(body)?;
-        let options = dispatch::parse_options(body, mode)?;
+        let label = dispatch::parse_label_job(body)?;
+        // A label job's mode is its printer's, so its options are checked once that is known.
+        let mut options = if label.is_none() {
+            dispatch::parse_options(body, mode)?
+        } else {
+            None
+        };
         let idempotency_key = dispatch::parse_idempotency_key(body)?;
         let expire_after = dispatch::parse_expire_after(body)?;
-        let data = dispatch::decode_payload(body, &*self.s.fetcher)?;
+        let data = match &label {
+            None => dispatch::decode_payload(body, &*self.s.fetcher)?,
+            Some(l) => {
+                let (m, o, d) = self.label_payload(body, l, org)?;
+                (mode, options) = (m, o);
+                d
+            }
+        };
         let job = store::NewJob {
             printer_id: body.get("printer_id").unwrap_or(&null),
             type_: type_v.as_str().unwrap_or(""),
@@ -897,6 +957,85 @@ impl Ctx<'_> {
         self.enqueue(&job)
     }
 
+    /// A `label_*` job: the printer, then the template, then the payload, each before the next so
+    /// that an unknown printer or template never causes a fetch. The printer decides the output:
+    /// PDF where it takes PDF, ZPL otherwise (gotcha #1: never a PDF to a label printer). Returns
+    /// the job's mode, its validated options and the rendered bytes.
+    fn label_payload(
+        &self,
+        body: &Obj,
+        job: &dispatch::LabelJob,
+        org: Option<i64>,
+    ) -> Result<(&'static str, Option<Obj>, Vec<u8>), SubmitErr> {
+        let null = Value::Null;
+        let printer_v = body.get("printer_id").unwrap_or(&null);
+        let printer = self
+            .db(|c| store::get_printer(c, printer_v, org))
+            .map_err(SubmitErr::Store)?
+            .ok_or_else(|| SubmitErr::Invalid(format!("unknown printer: {}", py_str(printer_v))))?;
+        if self
+            .db(|c| store::is_cloudprnt_agent(c, printer.agent_id))
+            .map_err(SubmitErr::Store)?
+        {
+            return Err(SubmitErr::Invalid(
+                "CloudPRNT printers cannot print label templates — send raw Star commands".into(),
+            ));
+        }
+        let found = self
+            .db(|c| match &job.template {
+                dispatch::TemplateRef::Name(n) => store::find_label_template(c, n, org),
+                dispatch::TemplateRef::Id(i) => store::get_label_template(c, *i, org),
+            })
+            .map_err(SubmitErr::Store)?;
+        let Some(template) = found else {
+            return Err(SubmitErr::Invalid(format!(
+                "unknown label template: {}",
+                job.template
+            )));
+        };
+        let spec = template.spec;
+        let (want, what) = match job.text {
+            Some(_) => (label::Content::Text, "text"),
+            None => (label::Content::Image, "image"),
+        };
+        if spec.content != want {
+            return Err(SubmitErr::Invalid(format!(
+                "label template {} does not take {what} jobs",
+                spec.name
+            )));
+        }
+        let (mode, out) = if printer.can_pdf {
+            ("pdf", label::Output::Pdf)
+        } else {
+            ("raw", label::Output::Zpl)
+        };
+        let options = dispatch::parse_options(body, mode)?;
+        // Fetching and rendering cost a thread and a render slot, so an org past its quota stops
+        // before them, not at enqueue_job. A keyed job may be a resubmit, which spends no quota:
+        // that one still goes through and enqueue_job sorts it out.
+        if body.get("idempotency_key").is_none() {
+            match self.db(|c| store::check_quota(c, printer.org_id, crate::now())) {
+                Ok(()) => {}
+                Err(StoreError::QuotaExceeded(m)) => return Err(SubmitErr::Quota(m)),
+                Err(e) => return Err(SubmitErr::Store(e)),
+            }
+        }
+        let rendered = match &job.text {
+            Some(text) => label::render_text(&spec, text, out),
+            None => {
+                let img = dispatch::decode_payload(body, &*self.s.fetcher)?;
+                let Some(_slot) = self.s.render_slots.try_enter() else {
+                    return Err(SubmitErr::Busy(
+                        "label rendering is busy, try again later".into(),
+                    ));
+                };
+                label::render_image(&spec, &img, out)
+            }
+        };
+        let data = rendered.map_err(|e| SubmitErr::Invalid(format!("label: {e}")))?;
+        Ok((mode, options, data))
+    }
+
     fn enqueue(&self, job: &store::NewJob<'_>) -> Result<store::Enqueued, SubmitErr> {
         match self.db(|c| store::enqueue_job(c, job)) {
             Ok(e) => {
@@ -911,6 +1050,33 @@ impl Ctx<'_> {
         }
     }
 
+    /// A template body: the contract JSON, or the 400 for why it is not one.
+    fn label_spec(&self) -> Gate<label::Spec> {
+        let body = self.read_obj()?;
+        label::parse_spec(&body).map_err(|m| jerr(400, m))
+    }
+
+    fn post_labels(&self) -> R {
+        let org = gate!(self.client_org()?);
+        let spec = gate!(self.label_spec());
+        match self.db(|c| store::create_label_template(c, org, &spec)) {
+            Ok(t) => Ok(Resp::json(200, &t.to_json())),
+            Err(StoreError::Conflict) => Ok(jerr(409, LABEL_NAME_TAKEN)),
+            Err(e) => Err(e),
+        }
+    }
+
+    fn put_label(&self, id: i64) -> R {
+        let org = gate!(self.client_org()?);
+        let spec = gate!(self.label_spec());
+        match self.db(|c| store::update_label_template(c, id, org, &spec)) {
+            Ok(Some(t)) => Ok(Resp::json(200, &t.to_json())),
+            Ok(None) => Ok(not_found()),
+            Err(StoreError::Conflict) => Ok(jerr(409, LABEL_NAME_TAKEN)),
+            Err(e) => Err(e),
+        }
+    }
+
     fn post_jobs(&self) -> R {
         let Some(p) = self.principal()? else {
             return Ok(unauthorized());
@@ -921,6 +1087,7 @@ impl Ctx<'_> {
             Err(SubmitErr::Fetch(m)) => Ok(jerr(502, format!("downstream: {m}"))),
             Err(SubmitErr::Quota(m)) => Ok(jerr(402, m)),
             Err(SubmitErr::Invalid(m)) => Ok(jerr(400, m)),
+            Err(SubmitErr::Busy(m)) => Ok(jerr(503, m)),
             Err(SubmitErr::Store(e)) => Err(e),
         }
     }
@@ -993,7 +1160,9 @@ impl Ctx<'_> {
         match self.enqueue(&job) {
             Ok(e) => Ok(Resp::json(200, &json!({ "job_id": e.job_id }))),
             Err(SubmitErr::Quota(m)) => Ok(jerr(402, m)),
-            Err(SubmitErr::Invalid(m) | SubmitErr::Fetch(m)) => Ok(jerr(400, m)),
+            Err(SubmitErr::Invalid(m) | SubmitErr::Fetch(m) | SubmitErr::Busy(m)) => {
+                Ok(jerr(400, m))
+            }
             Err(SubmitErr::Store(e)) => Err(e),
         }
     }
@@ -1296,6 +1465,7 @@ impl Ctx<'_> {
             Err(SubmitErr::Fetch(m)) => self.pn_error(502, "DownstreamError", m),
             Err(SubmitErr::Quota(m)) => self.pn_error(402, "QuotaExceeded", m),
             Err(SubmitErr::Invalid(m)) => self.pn_error(400, "BadRequest", m),
+            Err(SubmitErr::Busy(m)) => self.pn_error(503, "ServiceUnavailable", m),
             Err(SubmitErr::Store(e)) => return Err(e),
         }))
     }
@@ -1519,7 +1689,20 @@ impl Ctx<'_> {
                 let jobs = self.db(|c| store::recent_jobs(c, 50, org, None))?;
                 return Ok(Resp::json(200, &json!({ "jobs": val(&jobs) })));
             }
+            "/labels" => {
+                let org = gate!(self.client_org()?);
+                let all = self.db(|c| store::list_label_templates(c, org))?;
+                let templates: Vec<Value> = all.iter().map(store::LabelTemplate::to_json).collect();
+                return Ok(Resp::json(200, &json!({ "templates": templates })));
+            }
             _ => {}
+        }
+        if let Some(id) = id_of(t, "/labels/", "") {
+            let org = gate!(self.client_org()?);
+            return Ok(match self.db(|c| store::get_label_template(c, id, org))? {
+                Some(l) => Resp::json(200, &l.to_json()),
+                None => not_found(),
+            });
         }
         if let Some(id) = id_of(t, "/jobs/", "") {
             let org = gate!(self.client_org()?);
@@ -1659,6 +1842,7 @@ impl Ctx<'_> {
         match t {
             "/jobs" => return self.post_jobs(),
             "/orders" => return self.post_orders(),
+            "/labels" => return self.post_labels(),
             "/billing/webhook" => return self.billing_webhook(),
             "/login" => return self.login(),
             "/signup" => return self.signup(),
@@ -1861,6 +2045,9 @@ impl Ctx<'_> {
         if let Some(oid) = id_of(t, "/orgs/", "") {
             return self.put_org(oid);
         }
+        if let Some(id) = id_of(t, "/labels/", "") {
+            return self.put_label(id);
+        }
         Ok(not_found())
     }
 
@@ -1992,6 +2179,14 @@ impl Ctx<'_> {
                 return Ok(jerr(400, "the default org cannot be removed"));
             }
             return Ok(if self.db(|c| store::delete_org(c, oid))? {
+                ok_true()
+            } else {
+                not_found()
+            });
+        }
+        if let Some(id) = id_of(t, "/labels/", "") {
+            let org = gate!(self.client_org()?);
+            return Ok(if self.db(|c| store::delete_label_template(c, id, org))? {
                 ok_true()
             } else {
                 not_found()

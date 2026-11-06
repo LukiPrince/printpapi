@@ -39,7 +39,7 @@ fn cp1252(c: char) -> u8 {
 }
 
 /// Text -> PDF string body: WinAnsi-encodable, with (, ) and \ escaped.
-fn esc(s: &str) -> Vec<u8> {
+pub(crate) fn esc(s: &str) -> Vec<u8> {
     let mut out = Vec::with_capacity(s.len());
     for c in s.chars() {
         let b = cp1252(c);

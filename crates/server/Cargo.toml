@@ -20,6 +20,7 @@ http = "1.5.0"
 http-body-util = "0.1.5"
 hyper = { version = "1.12.0", features = ["server", "http1"] }
 hyper-util = { version = "0.1.21", features = ["tokio"] }
+image = { version = "0.25.10", default-features = false, features = ["gif", "png", "jpeg"] }
 include_dir = "0.7.4"
 lettre = { version = "0.11.23", default-features = false, features = ["smtp-transport", "builder", "hostname", "rustls", "ring", "rustls-platform-verifier"] }
 rusqlite = { version = "0.41.1", features = ["bundled"] }

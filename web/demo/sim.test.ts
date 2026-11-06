@@ -160,3 +160,12 @@ test("trimmed jobs stay in the counters and a claimed job survives", () => {
   assert.equal(claimed.state, "claimed");
   assert.ok(s.jobs.includes(claimed));
 });
+
+test("mode of a label job is its printer's", () => {
+  assert.equal(mode("label_base64", true), "pdf");
+  assert.equal(mode("label_uri", true), "pdf");
+  assert.equal(mode("label_text", false), "raw");
+  assert.equal(mode("label_text"), "raw");
+  assert.equal(mode("raw_base64", true), "raw");
+  assert.equal(mode("pdf_base64", false), "pdf");
+});

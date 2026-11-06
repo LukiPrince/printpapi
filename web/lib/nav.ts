@@ -1,4 +1,4 @@
-import { Download, Gauge, History, KeyRound, Printer, Send, SlidersHorizontal, Users } from "lucide-react";
+import { Download, Gauge, History, KeyRound, Printer, Send, SlidersHorizontal, Tags, Users } from "lucide-react";
 import { OVERVIEW_HREF } from "printpapi-demo";
 
 export type NavItem = {
@@ -23,6 +23,13 @@ export const NAV: NavItem[] = [
     eyebrow: "Submit a job",
     icon: Send,
     help: "Pick a source and a printer, then hit PRINT. Label printers are raw-only — they cannot render a PDF, so send them ZPL/ESC-POS. A callback URL gets a POST when the job finishes.",
+  },
+  {
+    href: "/labels",
+    label: "Labels",
+    eyebrow: "Label templates",
+    icon: Tags,
+    help: "One template per kind of label: where the content sits and how big it is. Set it up once, then any job that names the template is rendered exactly that way. Label printers get ZPL, printers that take PDF get a PDF.",
   },
   {
     href: "/devices",

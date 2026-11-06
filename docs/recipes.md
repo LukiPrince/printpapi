@@ -26,6 +26,21 @@ That is the whole integration — **one HTTP node**. Same for a carrier's ZPL la
 (`"type": "raw_uri"`). If the document only exists behind a POST (a render service), use
 `pdf_uri_post` / `raw_uri_post` and pass the payload as `json`.
 
+### Label size and position: let the server do it
+
+A carrier's label or a product picture rarely has the size of your label stock. Set that up once as
+a [label template](labels.md) (dashboard → *Labels*: label size, rotation, crop, where the picture
+sits) and name it in the job. The server rotates, crops and sizes the picture and sends the
+printer what it understands, a PDF or ZPL:
+
+```json
+{"printer_id": 2, "type": "label_uri", "template": "shipping-4x6",
+ "url": "https://shop.example/orders/4712/label.gif", "idempotency_key": "order-4712-label"}
+```
+
+Same one HTTP node. `label_base64` takes an image you hold, `label_text` prints a short text such
+as an error code or a shelf name. See [labels.md](labels.md).
+
 Two fields worth setting on every automated job:
 
 - **`idempotency_key`** — order webhooks get redelivered. With a stable key (the order id) a

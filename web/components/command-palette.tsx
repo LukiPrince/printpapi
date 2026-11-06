@@ -1,7 +1,6 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import { useRouter } from "next/navigation";
 import { useTheme } from "next-themes";
 import { toast } from "sonner";
 import { DemoSignOut } from "printpapi-demo";
@@ -20,6 +19,7 @@ import { NAV } from "@/lib/nav";
 import { createJob, listPrinters, type Printer as PrinterT } from "@/lib/api";
 import { testJob } from "@/lib/testdoc";
 import { useAuth } from "@/components/auth-gate";
+import { useNavGuard } from "@/components/nav-guard";
 
 /** ⌘K / Ctrl-K: jump between views, flip the theme, or fire a test print. */
 export function CommandPalette({
@@ -29,7 +29,7 @@ export function CommandPalette({
   open: boolean;
   onOpenChange: (v: boolean) => void;
 }) {
-  const router = useRouter();
+  const guard = useNavGuard();
   const { setTheme, resolvedTheme } = useTheme();
   const { signOut } = useAuth();
   const [printers, setPrinters] = useState<PrinterT[]>([]);
@@ -69,7 +69,7 @@ export function CommandPalette({
               <CommandItem
                 key={item.href}
                 value={`${item.label} ${item.eyebrow}`}
-                onSelect={() => run(() => router.push(item.href))}
+                onSelect={() => run(() => guard.navigate(item.href))}
               >
                 <item.icon />
                 {item.label}
@@ -110,7 +110,7 @@ export function CommandPalette({
               Switch to {resolvedTheme === "dark" ? "light" : "dark"} theme
             </CommandItem>
             {!DemoSignOut && (
-              <CommandItem value="sign out logout" onSelect={() => run(signOut)}>
+              <CommandItem value="sign out logout" onSelect={() => run(() => guard.request(signOut))}>
                 <LogOut />
                 Sign out
               </CommandItem>

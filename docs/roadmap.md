@@ -39,6 +39,9 @@ v1 is deliberately small (see [CONTRIBUTING.md](../CONTRIBUTING.md) for the YAGN
   HMAC-signed `POST /billing/webhook` that moves an org onto a plan (and its quota with it), and
   `DELETE /orgs/{id}` for the tenant that leaves. Provider-agnostic on purpose — no SDK, no
   dependency. See [billing.md](billing.md).
+- ~~**Label templates**~~ ✅ a visual editor on the dashboard's Labels page and a catalogue of label
+  sizes; the server rotates, crops and places an image or lays out text, and sends PDF or ZPL
+  depending on the printer. See [labels.md](labels.md).
 
 ## v2 candidates
 
@@ -106,6 +109,16 @@ order of pull:
 13. **Opt-in: reject unknown keys on `/agent/register`.** Today an unrecognised bearer enrolls into
     the default org - harmless on a LAN, but anyone who can reach `/agent/*` from outside can add
     agents and printers there. Until then, exposing `/agent/*` needs an auth proxy in front.
+14. **Fair image rendering between orgs.** `RENDER_SLOTS` is one global cap of 4, so a single org
+    can hold every slot and others get a `503` until one frees up. Only matters on a shared server
+    with tenants. Fix in two steps: cap each org at 2 of the 4 slots, then let a job wait up to
+    about 2 s for a slot instead of answering `503` at once. Keep the global cap: one decode can
+    take a few hundred MB. Rendering in the background after accepting the job would need a new job
+    state and would report a broken image late, so that waits until there are many tenants.
+15. **PDF orientation.** SumatraPDF rotates any page wider than it is tall, which hits landscape
+    labels on Windows. Add an `orientation` job option (`auto`, `portrait`, `landscape`) mapped to
+    SumatraPDF's `disable-auto-rotation`, `portrait` and `landscape` (3.5 or newer) and to CUPS, in
+    both agents, and let label jobs turn auto-rotation off themselves.
 
 Explicitly parked: MCP/LLM printing (no measurable audience yet), email-to-print (not even
 PrintNode has it), Magento-specific work (generic webhook intake covers it), browser-side silent

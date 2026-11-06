@@ -368,3 +368,38 @@ fn write_a_database_for_python_to_read() {
         add_api_key(c, "rust-key", "pk_rust", DEFAULT_ORG).unwrap();
     });
 }
+
+#[test]
+fn a_python_database_gets_the_label_templates_table_at_startup() {
+    let (dir, db) = open();
+    let has_table = |db: &Db| -> bool {
+        db.with(|c| {
+            c.query_row(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='label_templates'",
+                [],
+                |_| Ok(()),
+            )
+            .is_ok()
+        })
+    };
+    assert!(has_table(&db));
+    // usable on the old rows' org, and a second start leaves what was saved alone
+    let spec = printpapi_server::label::parse_spec(
+        json!({
+            "name": "shipping", "content": "text", "label_mm": {"w": 50, "h": 30}, "dpi": 203,
+            "rotate": 0, "crop_percent": {"t": 0, "r": 0, "b": 0, "l": 0},
+            "place_mm": {"x": 0, "y": 0, "w": 50, "h": 30}
+        })
+        .as_object()
+        .unwrap(),
+    )
+    .unwrap();
+    db.with(|c| create_label_template(c, Some(ORG), &spec))
+        .unwrap();
+    drop(db);
+    let db = Db::open(dir.path().join("python_v2.sqlite3").to_str().unwrap()).unwrap();
+    assert!(has_table(&db));
+    let list = db.with(|c| list_label_templates(c, Some(ORG))).unwrap();
+    assert_eq!(list.len(), 1);
+    assert_eq!(list[0].spec.name, "shipping");
+}
