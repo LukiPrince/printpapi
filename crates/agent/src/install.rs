@@ -97,16 +97,23 @@ pub fn layout(os: Os, program_files: &Path) -> Layout {
 }
 
 /// The folder with the system tools: `%SystemRoot%\System32` on Windows, else `/`.
+// ponytail: trusts the `SystemRoot` environment variable of the elevated process. Fine while the
+// setup is unsigned (the spec accepts that gap); with code signing (roadmap 12) ask
+// `GetSystemDirectoryW` instead (windows-sys, feature `Win32_System_SystemInformation`).
 pub fn system_dir() -> PathBuf {
     if cfg!(windows) {
-        let root = std::env::var("SystemRoot")
-            .ok()
-            .filter(|r| !r.is_empty())
-            .unwrap_or_else(|| "C:\\Windows".to_string());
-        join(Os::Windows, Path::new(&root), "System32")
+        system32(std::env::var("SystemRoot").ok().as_deref())
     } else {
         PathBuf::from("/")
     }
+}
+
+/// `<SystemRoot>\System32`, with `C:\Windows` when the variable is missing or empty.
+fn system32(system_root: Option<&str>) -> PathBuf {
+    let root = system_root
+        .filter(|r| !r.is_empty())
+        .unwrap_or("C:\\Windows");
+    join(Os::Windows, Path::new(root), "System32")
 }
 
 /// Absolute path of a system tool. Rust's `Command` looks in the program's own folder first on
@@ -274,8 +281,13 @@ pub fn identity_cmds(os: Os) -> Vec<Cmd> {
 
 /// Can the setup install here at all? Linux needs systemd.
 pub fn supported(os: Os) -> bool {
+    supported_at(os, Path::new("/run/systemd/system"))
+}
+
+/// `supported` with the path that proves systemd is running as a parameter.
+fn supported_at(os: Os, systemd_dir: &Path) -> bool {
     match os {
-        Os::Linux => Path::new("/run/systemd/system").exists(),
+        Os::Linux => systemd_dir.exists(),
         Os::Windows | Os::Macos => true,
     }
 }
@@ -380,7 +392,11 @@ pub enum Installed {
     Foreign,
 }
 
-/// Is an agent installed, and is it ours?
+/// Is an agent installed, and is it ours? The marker decides first. Without it, an autostart file
+/// or a running process called `printpapi-agent` means somebody set it up by hand.
+///
+/// Call this from the setup program, never from a process that is itself named `printpapi-agent`
+/// (the admin subcommands): on Linux and macOS it would find itself.
 pub fn detect(os: Os, l: &Layout, sys: &Path, run: &Runner) -> Installed {
     if l.marker.exists() {
         return Installed::Managed;
@@ -388,35 +404,52 @@ pub fn detect(os: Os, l: &Layout, sys: &Path, run: &Runner) -> Installed {
     if l.autostart.exists() {
         return Installed::Foreign;
     }
-    if os == Os::Windows {
-        let mut query = cmd(vec![
-            tool(os, sys, "schtasks.exe"),
-            "/query".into(),
-            "/tn".into(),
-            TASK_NAME.into(),
-        ]);
-        query.capture = true;
-        if run(&query).is_ok() {
-            return Installed::Foreign;
-        }
-        let mut list = cmd(vec![
-            tool(os, sys, "tasklist.exe"),
-            "/fi".into(),
-            "IMAGENAME eq printpapi-agent.exe".into(),
-            "/fo".into(),
-            "csv".into(),
-            "/nh".into(),
-        ]);
-        list.capture = true;
-        if let Ok(out) = run(&list)
-            && String::from_utf8_lossy(&out)
-                .to_ascii_lowercase()
-                .contains("printpapi-agent.exe")
-        {
-            return Installed::Foreign;
-        }
+    let found = if os == Os::Windows {
+        windows_agent_present(os, sys, run)
+    } else {
+        // `-x` matches the whole process name; "printpapi-agent" is 15 characters, which is all
+        // that Linux keeps in `comm`. A missing `pgrep` errors like "not running": the install
+        // must not be blocked because the check cannot be made.
+        let program = if os == Os::Macos {
+            tool(os, sys, "usr/bin/pgrep")
+        } else {
+            "pgrep".to_string()
+        };
+        let mut pgrep = cmd(vec![program, "-x".into(), "printpapi-agent".into()]);
+        pgrep.capture = true;
+        run(&pgrep).is_ok()
+    };
+    if found {
+        Installed::Foreign
+    } else {
+        Installed::None
     }
-    Installed::None
+}
+
+/// Windows: a task called `printpapi-agent`, or a running `printpapi-agent.exe`.
+fn windows_agent_present(os: Os, sys: &Path, run: &Runner) -> bool {
+    let mut query = cmd(vec![
+        tool(os, sys, "schtasks.exe"),
+        "/query".into(),
+        "/tn".into(),
+        TASK_NAME.into(),
+    ]);
+    query.capture = true;
+    if run(&query).is_ok() {
+        return true;
+    }
+    let mut list = cmd(vec![
+        tool(os, sys, "tasklist.exe"),
+        "/fi".into(),
+        "IMAGENAME eq printpapi-agent.exe".into(),
+        "/fo".into(),
+        "csv".into(),
+        "/nh".into(),
+    ]);
+    list.capture = true;
+    matches!(run(&list), Ok(out) if String::from_utf8_lossy(&out)
+        .to_ascii_lowercase()
+        .contains("printpapi-agent.exe"))
 }
 
 /// The log of the installed agent, for "see the log" in an error message. Windows: the crash log
@@ -518,9 +551,13 @@ mod tests {
         for needle in [
             "<ExecutionTimeLimit>PT0S</ExecutionTimeLimit>",
             "<UserId>S-1-5-18</UserId>",
+            "<BootTrigger>\r\n      <Enabled>true</Enabled>\r\n    </BootTrigger>",
+            "<Count>255</Count>",
+            "<AllowStartOnDemand>true</AllowStartOnDemand>",
+            "<Actions Context=\"Author\">",
+            "<Principal id=\"Author\">",
             "<DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>",
             "<StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>",
-            "<BootTrigger>",
             "<RestartOnFailure>",
             "<Interval>PT1M</Interval>",
             "<MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>",
@@ -632,9 +669,9 @@ mod tests {
     fn plist_loads_at_boot() {
         let text = String::from_utf8(autostart_file(Os::Macos, &mac())).unwrap();
         for needle in [
-            "com.printpapi.agent",
-            "RunAtLoad",
-            "KeepAlive",
+            "<key>Label</key><string>com.printpapi.agent</string>",
+            "<key>RunAtLoad</key><true/>",
+            "<key>KeepAlive</key><true/>",
             "<string>/opt/printpapi/printpapi-agent</string>",
         ] {
             assert!(text.contains(needle), "{needle} missing in {text}");
@@ -748,13 +785,44 @@ mod tests {
 
     #[test]
     fn only_linux_without_systemd_is_unsupported() {
-        assert!(supported(Os::Windows));
-        assert!(supported(Os::Macos));
-        // on Linux the answer is the machine's own
+        let with = tempfile::tempdir().unwrap();
+        let without = with.path().join("missing");
+        for dir in [with.path(), without.as_path()] {
+            assert!(supported_at(Os::Windows, dir));
+            assert!(supported_at(Os::Macos, dir));
+        }
+        assert!(supported_at(Os::Linux, with.path()));
+        assert!(!supported_at(Os::Linux, &without));
+    }
+
+    #[test]
+    fn host_os_matches_the_build_target() {
+        assert_eq!(Os::host() == Os::Windows, cfg!(windows));
+        assert_eq!(Os::host() == Os::Macos, cfg!(target_os = "macos"));
         assert_eq!(
-            supported(Os::Linux),
-            Path::new("/run/systemd/system").exists()
+            Os::host() == Os::Linux,
+            !cfg!(windows) && !cfg!(target_os = "macos")
         );
+    }
+
+    #[test]
+    fn system32_follows_system_root_and_falls_back() {
+        assert_eq!(p(&system32(Some("D:\\Win"))), "D:\\Win\\System32");
+        assert_eq!(p(&system32(Some("D:\\Win\\"))), "D:\\Win\\System32");
+        assert_eq!(p(&system32(Some(""))), "C:\\Windows\\System32");
+        assert_eq!(p(&system32(None)), "C:\\Windows\\System32");
+    }
+
+    #[test]
+    fn system_dir_is_the_real_tool_folder() {
+        let dir = system_dir();
+        if cfg!(windows) {
+            for tool in ["schtasks.exe", "tasklist.exe", "icacls.exe"] {
+                assert!(dir.join(tool).exists(), "{tool} not in {dir:?}");
+            }
+        } else {
+            assert_eq!(dir, Path::new("/"));
+        }
     }
 
     #[test]
@@ -786,13 +854,18 @@ mod tests {
         }
     }
 
-    type Seen = Rc<RefCell<Vec<Vec<String>>>>;
+    type Seen = Rc<RefCell<Vec<Cmd>>>;
 
-    fn fake(schtasks_ok: bool, tasklist_out: &'static str) -> (Runner, Seen) {
+    const NOTHING_RUNNING: &str = "INFO: No tasks are running which match the specified criteria.";
+
+    /// Windows: `schtasks /query` succeeds or fails, `tasklist` answers `tasklist_out`, but only
+    /// to a call that captures stdout and filters for the agent. Every program is absolute.
+    fn windows_fake(schtasks_ok: bool, tasklist_out: &'static str) -> (Runner, Seen) {
         let seen: Seen = Rc::new(RefCell::new(Vec::new()));
         let log = seen.clone();
         let run: Runner = Rc::new(move |c| {
-            log.borrow_mut().push(c.argv.clone());
+            log.borrow_mut().push(c.clone());
+            assert!(c.argv[0].starts_with(WIN_SYS), "not absolute: {:?}", c.argv);
             if c.argv[0].ends_with("schtasks.exe") {
                 return if schtasks_ok {
                     Ok(Vec::new())
@@ -800,38 +873,102 @@ mod tests {
                     Err("1".into())
                 };
             }
-            Ok(tasklist_out.as_bytes().to_vec())
+            assert!(c.argv[0].ends_with("tasklist.exe"), "{:?}", c.argv);
+            if c.capture
+                && c.argv
+                    .iter()
+                    .any(|a| a == "IMAGENAME eq printpapi-agent.exe")
+            {
+                Ok(tasklist_out.as_bytes().to_vec())
+            } else {
+                Ok(Vec::new())
+            }
         });
         (run, seen)
     }
 
+    /// Unix: only `<pgrep> -x printpapi-agent` is known. Exit 0 if `running`, 1 if not, an error
+    /// like a missing program if `pgrep_exists` is false.
+    fn unix_fake(pgrep: &'static str, running: bool, pgrep_exists: bool) -> (Runner, Seen) {
+        let seen: Seen = Rc::new(RefCell::new(Vec::new()));
+        let log = seen.clone();
+        let run: Runner = Rc::new(move |c| {
+            log.borrow_mut().push(c.clone());
+            assert_eq!(c.argv, [pgrep, "-x", "printpapi-agent"]);
+            if !pgrep_exists {
+                Err("No such file or directory (os error 2)".into())
+            } else if running {
+                Ok(Vec::new())
+            } else {
+                Err("Command exited with 1".into())
+            }
+        });
+        (run, seen)
+    }
+
+    fn unix_cases() -> [(Os, &'static str); 2] {
+        [(Os::Linux, "pgrep"), (Os::Macos, "/usr/bin/pgrep")]
+    }
+
     #[test]
-    fn detect_managed_foreign_none() {
+    fn detect_none_when_nothing_is_there() {
         let dir = tempfile::tempdir().unwrap();
         let l = temp_layout(dir.path());
-        let sys = Path::new(WIN_SYS);
-        let (nothing, _) = fake(
-            false,
-            "INFO: No tasks are running which match the specified criteria.",
+        let (win, _) = windows_fake(false, NOTHING_RUNNING);
+        assert_eq!(
+            detect(Os::Windows, &l, Path::new(WIN_SYS), &win),
+            Installed::None
         );
-        for os in [Os::Windows, Os::Linux, Os::Macos] {
-            assert_eq!(detect(os, &l, sys, &nothing), Installed::None);
+        for (os, pgrep) in unix_cases() {
+            let (not_running, _) = unix_fake(pgrep, false, true);
+            assert_eq!(
+                detect(os, &l, Path::new("/"), &not_running),
+                Installed::None
+            );
+            // no pgrep on the machine: it cannot be told, so do not block the install
+            let (no_pgrep, _) = unix_fake(pgrep, false, false);
+            assert_eq!(detect(os, &l, Path::new("/"), &no_pgrep), Installed::None);
         }
+    }
 
-        // an autostart file without the marker is somebody else's
+    #[test]
+    fn detect_autostart_file_without_marker_is_foreign() {
+        let dir = tempfile::tempdir().unwrap();
+        let l = temp_layout(dir.path());
         std::fs::write(&l.autostart, "x").unwrap();
-        for os in [Os::Windows, Os::Linux, Os::Macos] {
-            assert_eq!(detect(os, &l, sys, &nothing), Installed::Foreign);
-        }
-        std::fs::remove_file(&l.autostart).unwrap();
-
-        // the marker wins, and nobody asks the system
-        std::fs::write(&l.marker, "").unwrap();
-        let (never, seen) = fake(true, "\"printpapi-agent.exe\"");
-        for os in [Os::Windows, Os::Linux, Os::Macos] {
-            assert_eq!(detect(os, &l, sys, &never), Installed::Managed);
-        }
+        let (win, seen) = windows_fake(false, NOTHING_RUNNING);
+        assert_eq!(
+            detect(Os::Windows, &l, Path::new(WIN_SYS), &win),
+            Installed::Foreign
+        );
         assert!(seen.borrow().is_empty());
+        for (os, pgrep) in unix_cases() {
+            let (not_running, _) = unix_fake(pgrep, false, true);
+            assert_eq!(
+                detect(os, &l, Path::new("/"), &not_running),
+                Installed::Foreign
+            );
+        }
+    }
+
+    #[test]
+    fn detect_the_normal_install_is_managed_and_nobody_asks_the_system() {
+        let dir = tempfile::tempdir().unwrap();
+        let l = temp_layout(dir.path());
+        // what the setup leaves behind: the autostart file and the marker, together
+        std::fs::write(&l.autostart, "x").unwrap();
+        std::fs::write(&l.marker, "").unwrap();
+        let (win, seen) = windows_fake(true, "\"printpapi-agent.exe\"");
+        assert_eq!(
+            detect(Os::Windows, &l, Path::new(WIN_SYS), &win),
+            Installed::Managed
+        );
+        assert!(seen.borrow().is_empty());
+        for (os, pgrep) in unix_cases() {
+            let (running, seen) = unix_fake(pgrep, true, true);
+            assert_eq!(detect(os, &l, Path::new("/"), &running), Installed::Managed);
+            assert!(seen.borrow().is_empty());
+        }
     }
 
     #[test]
@@ -839,16 +976,39 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let l = temp_layout(dir.path());
         let sys = Path::new(WIN_SYS);
-        let (task, seen) = fake(true, "");
+        let (task, seen) = windows_fake(true, "");
         assert_eq!(detect(Os::Windows, &l, sys, &task), Installed::Foreign);
-        assert_eq!(seen.borrow()[0][1..], ["/query", "/tn", "printpapi-agent"]);
-        let (running, _) = fake(
+        assert_eq!(
+            seen.borrow()[0].argv[1..],
+            ["/query", "/tn", "printpapi-agent"]
+        );
+        let (running, seen) = windows_fake(
             false,
             "\"PrintPapi-Agent.exe\",\"4242\",\"Services\",\"0\",\"9,000 K\"",
         );
         assert_eq!(detect(Os::Windows, &l, sys, &running), Installed::Foreign);
-        // the same answers mean nothing on the other systems: they have no schtasks
-        assert_eq!(detect(Os::Linux, &l, sys, &running), Installed::None);
-        assert_eq!(detect(Os::Macos, &l, sys, &task), Installed::None);
+        let seen = seen.borrow();
+        assert_eq!(seen.len(), 2);
+        assert_eq!(
+            seen[1].argv[1..],
+            [
+                "/fi",
+                "IMAGENAME eq printpapi-agent.exe",
+                "/fo",
+                "csv",
+                "/nh"
+            ]
+        );
+    }
+
+    #[test]
+    fn detect_finds_a_hand_started_agent_on_linux_and_macos() {
+        let dir = tempfile::tempdir().unwrap();
+        let l = temp_layout(dir.path());
+        for (os, pgrep) in unix_cases() {
+            let (running, seen) = unix_fake(pgrep, true, true);
+            assert_eq!(detect(os, &l, Path::new("/"), &running), Installed::Foreign);
+            assert_eq!(seen.borrow().len(), 1);
+        }
     }
 }
