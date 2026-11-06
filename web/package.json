@@ -10,10 +10,12 @@
     "sync": "node scripts/sync.mjs",
     "build:app": "next build && node scripts/sync.mjs",
     "build:demo": "node scripts/build-demo.mjs",
+    "build:setup": "node scripts/build-setup.mjs",
     "check:bundles": "node scripts/check-bundles.mjs",
-    "test": "node --test demo/*.test.ts lib/*.test.ts"
+    "test": "node --test demo/*.test.ts lib/*.test.ts setup/*.test.ts"
   },
   "dependencies": {
+    "@tauri-apps/api": "^2.12.4",
     "class-variance-authority": "^0.7.1",
     "clsx": "^2.1.1",
     "cmdk": "^1.1.1",

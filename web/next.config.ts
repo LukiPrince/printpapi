@@ -20,10 +20,16 @@ const API_PATHS = [
 // code stays one import away from the demo and the production bundle never contains it.
 const demo = process.env.PRINTPAPI_DEMO === "1";
 
+// PRINTPAPI_SETUP=1 (npm run build:setup) builds the window of the agent setup into out-setup/.
+// Only files named page.setup.tsx / layout.setup.tsx count as pages there, so the dashboard's
+// pages are left out; the other builds ignore those two files for the same reason.
+const setup = process.env.PRINTPAPI_SETUP === "1";
+
 const nextConfig: NextConfig = {
   output: "export",
   turbopack: { resolveAlias: { "printpapi-demo": demo ? "./demo/on.tsx" : "./demo/off.ts" } },
   ...(demo && { distDir: "out-demo", pageExtensions: ["demo.tsx", "tsx", "ts", "jsx", "js"] }),
+  ...(setup && { distDir: "out-setup", pageExtensions: ["setup.tsx"] }),
   trailingSlash: true, // /devices/ -> devices/index.html, so deep links work off a dumb file server
   images: { unoptimized: true },
   ...(dev && {

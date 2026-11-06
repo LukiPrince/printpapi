@@ -17,6 +17,7 @@
 /.next/
 /out/
 /out-demo/
+/out-setup/
 
 # production
 /build

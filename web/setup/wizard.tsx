@@ -1,0 +1,108 @@
+// printpapi — self-hosted PrintNode alternative. Elastic License 2.0 (see LICENSE).
+"use client";
+
+import { useEffect, useState } from "react";
+import { setup, type Existing, type FoundPrinter, type Platform, type PrinterChoice } from "./api";
+import { Shell } from "./bits";
+import { StepConnect, type Connection } from "./step-connect";
+import { StepPrinters } from "./step-printers";
+import { StepTest } from "./step-test";
+import { StepFinish } from "./step-finish";
+
+const NEW_STEPS = ["Connect", "Printers", "Test", "Finish"];
+const CHANGE_STEPS = ["Printers", "Test", "Finish"];
+
+/**
+ * The four steps (three when changing printers: server, key and name stay as they are).
+ * It only holds what the steps share; every rule lives in model.ts, every call in api.ts.
+ */
+export function Wizard({
+  platform,
+  existing,
+  onDone,
+}: {
+  platform: Platform;
+  /** Present when the printers of an installed agent are being changed. */
+  existing: Existing | null;
+  onDone: () => void;
+}) {
+  const steps = existing ? CHANGE_STEPS : NEW_STEPS;
+  const [i, setI] = useState(0);
+  const [connection, setConnection] = useState<Connection | null>(null);
+  const [selected, setSelected] = useState<PrinterChoice[]>(existing?.printers ?? []);
+  const [found, setFound] = useState<FoundPrinter[] | null>(null);
+  const [sumatra, setSumatra] = useState(false);
+
+  // A machine without printers, or without lpstat, comes back as an empty list, not an error.
+  useEffect(() => {
+    let live = true;
+    setup.listPrinters().then(
+      (list) => {
+        if (live) setFound(list);
+      },
+      () => {
+        if (live) setFound([]);
+      },
+    );
+    return () => {
+      live = false;
+    };
+  }, []);
+
+  useEffect(() => {
+    if (platform !== "windows") return;
+    let live = true;
+    setup.sumatraPresent().then(
+      (present) => {
+        if (live) setSumatra(present);
+      },
+      () => {},
+    );
+    return () => {
+      live = false;
+    };
+  }, [platform]);
+
+  const step = steps[i];
+  const back = () => setI((n) => Math.max(0, n - 1));
+  const next = () => setI((n) => Math.min(steps.length - 1, n + 1));
+
+  return (
+    <Shell steps={steps} current={i}>
+      {step === "Connect" && (
+        <StepConnect
+          initial={connection}
+          onNext={(c) => {
+            setConnection(c);
+            next();
+          }}
+        />
+      )}
+      {step === "Printers" && (
+        <StepPrinters
+          platform={platform}
+          found={found}
+          selected={selected}
+          sumatra={sumatra}
+          onChange={setSelected}
+          onSumatra={() => setSumatra(true)}
+          onBack={existing ? undefined : back}
+          onNext={next}
+        />
+      )}
+      {step === "Test" && (
+        <StepTest platform={platform} selected={selected} sumatra={sumatra} onBack={back} onNext={next} />
+      )}
+      {step === "Finish" && (
+        <StepFinish
+          connection={existing ? null : connection}
+          deviceName={existing ? existing.name : (connection?.name ?? "")}
+          selected={selected}
+          onBack={back}
+          onBackToConnect={existing ? undefined : () => setI(0)}
+          onDone={onDone}
+        />
+      )}
+    </Shell>
+  );
+}
