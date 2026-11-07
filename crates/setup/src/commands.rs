@@ -768,21 +768,15 @@ fn start_installed_tray() {
     let _ = command.spawn();
 }
 
-/// The installed `agent.ini` text an install builds on. A new connection over an installed agent
-/// (the settings window, which only knows the status file) must keep `[headers]` and `timeout` of
-/// the installed file, so it is read once, by an elevated `read-config`, unless this window has it
-/// already. A first install has nothing to keep, and a change of printers does not need the
-/// connection.
-fn installed_text_for(
-    known: Option<String>,
-    new_connection: bool,
-    installed_by_setup: bool,
-    read: &dyn Fn() -> Result<String, SetupError>,
-) -> Result<Option<String>, SetupError> {
-    if known.is_none() && new_connection && installed_by_setup {
-        return read().map(Some);
-    }
-    Ok(known)
+/// Does this install merge into the installed `agent.ini` instead of writing a new one? A new
+/// connection over an installed agent does when this window has not read the file (the settings
+/// window only knows the status file): `[headers]` and `timeout` of the installed file must
+/// survive, and reading it first would be a second administrator prompt. So the connection goes
+/// into the staging folder as a patch, and the elevated install merges it, like any other change.
+/// A first install has nothing to keep, a window that read the file builds on it itself, and a
+/// change of printers does not touch the connection.
+fn merges_into_installed(text_known: bool, new_connection: bool, installed_by_setup: bool) -> bool {
+    !text_known && new_connection && installed_by_setup
 }
 
 /// `elevate::run` for the commands that end icons: they are told to spare this window.
@@ -794,14 +788,22 @@ fn window_elevator() -> impl Fn(&Path, &[&OsStr]) -> Result<(), Elevate> {
 pub fn apply(state: Shared, request: ApplyRequest) -> Result<f64, SetupError> {
     let (agent, dir) = staged(&state)?;
     let tray_staged = stage_own_tray(&dir)?;
-    let existing = installed_text_for(
-        lock(&state).ini_text.clone(),
+    let existing = lock(&state).ini_text.clone();
+    let elevate = window_elevator();
+    let merged = merges_into_installed(
+        existing.is_some(),
         request.server_url.is_some(),
         layout().marker.is_file(),
-        &|| read_existing_in(&elevate::run, &agent, &dir).map(|c| c.text),
-    )?;
-    let elevate = window_elevator();
-    let applied = apply_in(&elevate, &agent, &dir, &request, existing.as_deref());
+    );
+    let applied = if merged {
+        // the window has no key to ask the server with: its wait reads the status file
+        apply_over_installed_in(&elevate, &agent, &dir, &request).map(|baseline| Applied {
+            baseline,
+            conn: None,
+        })
+    } else {
+        apply_in(&elevate, &agent, &dir, &request, existing.as_deref())
+    };
     restart_icon(
         &applied,
         tray_staged,
@@ -809,8 +811,12 @@ pub fn apply(state: Shared, request: ApplyRequest) -> Result<f64, SetupError> {
         &start_installed_tray,
     );
     let applied = applied?;
+    let mut guard = lock(&state);
+    if merged {
+        guard.conn = None;
+    }
     if let Some(conn) = applied.conn {
-        lock(&state).conn = Some(conn);
+        guard.conn = Some(conn);
     }
     Ok(applied.baseline)
 }
@@ -889,6 +895,10 @@ pub fn read_log(lines: usize) -> Result<String, SetupError> {
 /// What the window may change in an installed `agent.ini`: only what is named.
 #[derive(Debug, Deserialize)]
 pub struct PatchRequest {
+    /// `(server_url, api_key, name)`, set by the install over an installed agent, never by the
+    /// window.
+    #[serde(skip)]
+    connection: Option<(String, String, String)>,
     printers: Option<Vec<PrinterChoice>>,
     timeout: Option<f64>,
     /// `[name, value]` sets a header, `[name, null]` removes it.
@@ -905,6 +915,11 @@ const PREFLIGHT_INI: &str =
 /// own rules.
 pub fn patch_json(req: &PatchRequest) -> Result<String, SetupError> {
     let mut obj = serde_json::Map::new();
+    if let Some((url, key, name)) = &req.connection {
+        obj.insert("server_url".into(), Value::String(url.clone()));
+        obj.insert("api_key".into(), Value::String(key.clone()));
+        obj.insert("name".into(), Value::String(name.clone()));
+    }
     if let Some(list) = &req.printers {
         let printers: Vec<Printer> = list.iter().map(choice_to_printer).collect();
         let text = format_printers(&printers).map_err(|m| SetupError::new("printers", m))?;
@@ -946,6 +961,30 @@ fn apply_patch_in(
     let ran = run_elevated(elevate, agent, dir, "install");
     let _ = std::fs::remove_file(dir.join("patch.json"));
     local_baseline(&ran?)
+}
+
+/// A new connection and the printers over an installed agent: one elevated install that merges
+/// them into the installed file, so `[headers]` and `timeout` stay and there is one prompt.
+fn apply_over_installed_in(
+    elevate: Elevator,
+    agent: &Path,
+    dir: &Path,
+    request: &ApplyRequest,
+) -> Result<f64, SetupError> {
+    let (Some(url), Some(key), Some(name)) = (&request.server_url, &request.api_key, &request.name)
+    else {
+        return Err(SetupError::new(
+            "system",
+            "There is no connection to install with. Go back to the first step.",
+        ));
+    };
+    let patch = PatchRequest {
+        connection: Some((setup::normalize_server_url(url)?, key.clone(), name.clone())),
+        printers: Some(request.printers.clone()),
+        timeout: None,
+        headers: None,
+    };
+    apply_patch_in(elevate, agent, dir, &patch)
 }
 
 /// Apply a change. Returns the time on this computer right before the agent was started again,
@@ -1641,30 +1680,48 @@ printers = Z = socket://nohost
     }
 
     #[test]
-    fn the_installed_file_is_read_for_a_new_connection_only_when_there_is_one_to_keep() {
-        let reads = Cell::new(0);
-        let read = || {
-            reads.set(reads.get() + 1);
-            Ok(INSTALLED.to_string())
+    fn a_new_connection_over_an_installed_agent_is_merged_by_the_agent_not_read_by_the_window() {
+        // the settings window knows no text of the installed file: reading it would be a second
+        // administrator prompt, so the elevated install merges the connection into it instead
+        assert!(merges_into_installed(false, true, true));
+        // already read in this window (the wizard), a change of printers, or a first install
+        assert!(!merges_into_installed(true, true, true));
+        assert!(!merges_into_installed(false, false, true));
+        assert!(!merges_into_installed(false, true, false));
+    }
+
+    #[test]
+    fn a_connection_over_an_installed_agent_asks_once_and_names_only_what_is_new() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        // an agent.ini of an earlier run would win over the patch in the agent
+        std::fs::write(dir.join("agent.ini"), "stale").unwrap();
+        let asked = Cell::new(0);
+        let elevate = |_: &Path, args: &[&OsStr]| {
+            asked.set(asked.get() + 1);
+            assert_eq!(args[0], "install", "no read-config before it");
+            let dir = staging_dir_of(args);
+            assert!(!dir.join("agent.ini").exists());
+            let patch =
+                parse_patch(&std::fs::read_to_string(dir.join("patch.json")).unwrap()).unwrap();
+            assert_eq!(
+                patch.connection,
+                Some(("https://y".into(), "NEW-KEY".into(), "pc2".into()))
+            );
+            assert_eq!(patch.printers.as_deref(), Some("A"));
+            // headers and timeout are the installed file's: not named here
+            assert!(patch.headers.is_empty() && patch.timeout.is_none());
+            write_result(&dir, json!({"ok": true, "baseline_local": 1794048802.0}));
+            Ok(())
         };
-        // the settings window knows no text: a new connection over an installed agent reads it
-        let got = installed_text_for(None, true, true, &read).unwrap();
-        assert_eq!(got.as_deref(), Some(INSTALLED));
-        assert_eq!(reads.get(), 1);
-        // already read in this window, a change of printers, or a first install: no prompt
-        for (known, new_conn, managed) in [
-            (Some("kept".to_string()), true, true),
-            (None, false, true),
-            (None, true, false),
-        ] {
-            let got = installed_text_for(known.clone(), new_conn, managed, &read).unwrap();
-            assert_eq!(got, known);
-        }
-        assert_eq!(reads.get(), 1);
-        // a refused prompt stops the install: it would lose the headers silently otherwise
-        let refused = || Err(SetupError::new("cancelled", "no"));
-        let e = installed_text_for(None, true, true, &refused).unwrap_err();
-        assert_eq!(e.code, "cancelled");
+        let req = request(
+            Some(("https://y/", "NEW-KEY", "pc2")),
+            vec![choice("A", false, None)],
+        );
+        let baseline = apply_over_installed_in(&elevate, Path::new("agent"), dir, &req).unwrap();
+        assert_eq!(baseline, 1794048802.0);
+        assert_eq!(asked.get(), 1);
+        assert_eq!(names_in(dir), ["result.json"]);
     }
 
     // ---- changes of the settings
@@ -1675,6 +1732,7 @@ printers = Z = socket://nohost
         headers: Option<Vec<(&str, Option<&str>)>>,
     ) -> PatchRequest {
         PatchRequest {
+            connection: None,
             printers,
             timeout,
             headers: headers.map(|h| {
