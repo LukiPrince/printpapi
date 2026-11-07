@@ -29,8 +29,8 @@ test("macOS has no hand check yet, so it is beta", () => {
   assert.ok(mac.every((d) => d.beta));
 });
 
-test("the Windows setup is not beta", () => {
-  const win = setupDownloads().filter((d) => d.platform === "windows");
-  assert.ok(win.length > 0);
-  assert.ok(win.every((d) => !d.beta));
+// No platform has had its hand check on real hardware yet (install, test print, change printers,
+// remove), so every setup is beta. Take this test out with the first flag that goes to false.
+test("before any hand check every setup is beta", () => {
+  assert.ok(setupDownloads().every((d) => d.beta));
 });

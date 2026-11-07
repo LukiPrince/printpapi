@@ -2412,7 +2412,7 @@ checksum = "925383efa346730478fb4838dbe9137d2a47675ad789c546d150a6e1dd4ab31c"
 
 [[package]]
 name = "printpapi-agent"
-version = "3.2.0"
+version = "3.3.0"
 dependencies = [
  "chrono",
  "libc",
@@ -2426,7 +2426,7 @@ dependencies = [
 
 [[package]]
 name = "printpapi-setup"
-version = "3.2.0"
+version = "3.3.0"
 dependencies = [
  "printpapi-agent",
  "serde",
