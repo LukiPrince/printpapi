@@ -5,6 +5,7 @@
 mod commands;
 mod elevate;
 mod staging;
+mod tray;
 
 use std::process::ExitCode;
 use std::sync::{Mutex, PoisonError};
@@ -27,12 +28,38 @@ fn startup_problem(webview: Result<String, String>, on_windows: bool) -> Option<
 }
 
 fn main() -> ExitCode {
-    let webview = tauri::webview_version().map_err(|e| e.to_string());
-    if let Some(problem) = startup_problem(webview, cfg!(windows)) {
-        fail(problem);
-        return ExitCode::FAILURE;
+    let tray_mode = std::env::args().skip(1).any(|a| a == "--tray");
+    // The icon lives as long as the process; a second icon of this user ends at once.
+    let _single = if tray_mode {
+        match tray::lock_path().as_deref().and_then(tray::single_instance) {
+            Some(lock) => Some(lock),
+            None => return ExitCode::SUCCESS,
+        }
+    } else {
+        None
+    };
+    // The icon needs no web view: it makes no window.
+    if !tray_mode {
+        let webview = tauri::webview_version().map_err(|e| e.to_string());
+        if let Some(problem) = startup_problem(webview, cfg!(windows)) {
+            fail(problem);
+            return ExitCode::FAILURE;
+        }
     }
     let built = tauri::Builder::default()
+        // `tauri.conf.json` has `"create": false`: the window is made here, so that `--tray` has none.
+        .setup(move |app| {
+            if tray_mode {
+                tray::setup(app)
+            } else {
+                tauri::WebviewWindowBuilder::from_config(
+                    app.handle(),
+                    &app.config().app.windows[0],
+                )?
+                .build()?;
+                Ok(())
+            }
+        })
         .manage(Mutex::new(AppState::default()))
         .invoke_handler(tauri::generate_handler![
             commands::get_platform,

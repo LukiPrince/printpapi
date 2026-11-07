@@ -60,11 +60,16 @@ fn private_root() -> io::Result<PathBuf> {
     Ok(std::env::temp_dir())
 }
 
-/// `%LOCALAPPDATA%` of the user, asked of Windows (`SHGetKnownFolderPath(FOLDERID_LocalAppData)`),
-/// not of the environment.
-/// https://learn.microsoft.com/en-us/windows/win32/api/shlobj_core/nf-shlobj_core-shgetknownfolderpath
 #[cfg(windows)]
 fn private_root() -> io::Result<PathBuf> {
+    local_app_data()
+}
+
+/// `%LOCALAPPDATA%` of the user, asked of Windows (`SHGetKnownFolderPath(FOLDERID_LocalAppData)`),
+/// not of the environment. The tray icon keeps its lock file here, too.
+/// https://learn.microsoft.com/en-us/windows/win32/api/shlobj_core/nf-shlobj_core-shgetknownfolderpath
+#[cfg(windows)]
+pub fn local_app_data() -> io::Result<PathBuf> {
     use std::os::windows::ffi::OsStringExt;
     use windows_sys::Win32::System::Com::CoTaskMemFree;
     use windows_sys::Win32::UI::Shell::{FOLDERID_LocalAppData, SHGetKnownFolderPath};
