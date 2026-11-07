@@ -28,7 +28,7 @@ up and prints it: documents **and** label printers (Zebra/ZPL, Bixolon, thermal)
 - Server is **one small Rust binary**: no Python, no Node, nothing else to install (the dashboard is embedded)
 - React dashboard (live queue, job history, test print, API keys), REST API, SQLite job queue
 - Cross-platform agent, also a single Rust binary: Windows (spooler + SumatraPDF), Linux and macOS (CUPS)
-- Print options per job (copies, duplex, paper size, tray, color, page ranges) +
+- Print options per job (copies, duplex, paper size, tray, color, page ranges, orientation) +
   capability discovery per printer
 - **Shop order → packing slip**: WooCommerce plugin, Shopify webhook, built-in PDF renderer
 - **Label templates**: set up once where an image or text sits on a label (sizes from the
@@ -85,10 +85,14 @@ docker run -e PRINTAPI_TOKEN=change-me -p 3460:3460 ghcr.io/lukiprince/printpapi
 Or `docker compose up -d`, which keeps the DB in a volume (see [`docker-compose.yml`](docker-compose.yml)).
 Prefer to build it yourself? `docker build -t printpapi .`
 
-**Agent**, on the machine with the printers. The easiest way is the setup app: download
-`printpapi-setup-<platform>` from the
-[latest release](https://github.com/LukiPrince/printpapi/releases/latest), open it and follow the four
-steps ([docs](docs/agent.md#setup-app)). Or by hand:
+**Agent**, on the machine with the printers. The easiest way is the setup app: download the
+`printpapi-setup-<platform>-<arch>` file for your system from the
+[latest release](https://github.com/LukiPrince/printpapi/releases/latest) (`.exe` on Windows, `.dmg`
+on macOS, `.deb` or `.AppImage` on Linux), open it and follow the four steps
+([docs](docs/agent.md#setup-app)). It also installs a tray icon with a settings window
+([docs](docs/agent.md#tray-icon-and-settings)). Every setup download is Beta until someone has run
+it by hand. It is not code-signed yet, so the system warns first, and Smart App Control / WDAC block
+it: use the Python agent there ([docs](docs/agent.md#locked-down-windows)). Or by hand:
 
 1. Download the `printpapi-agent-<platform>` archive from the
    [latest release](https://github.com/LukiPrince/printpapi/releases/latest) and unpack it (Windows
@@ -106,7 +110,8 @@ steps ([docs](docs/agent.md#setup-app)). Or by hand:
    printers   = Zebra GK420d; HP LaserJet|pdf
    ```
 
-3. Run `./printpapi-agent` (`printpapi-agent.exe` on Windows).
+3. Run `./printpapi-agent` (`printpapi-agent.exe` on Windows). For unattended use it should start
+   with the machine, see [Run as a service](docs/agent.md#run-as-a-service).
 
 First print: dashboard → **Devices** → **Test print**.
 
