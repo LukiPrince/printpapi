@@ -7,8 +7,9 @@ only** — nothing listens on the printer's machine, so NAT/firewalls are no pro
 ## Setup app
 
 The easiest way on Windows, macOS and Linux with a desktop: download `printpapi-setup-<platform>`
-from the [latest release](https://github.com/LukiPrince/printpapi/releases/latest), open it and go
-through four steps (connect to the server with an agent key, pick the printers, test print, done).
+(`.exe` on Windows, `.dmg` on macOS, `.deb` or `.AppImage` on Linux) from the
+[latest release](https://github.com/LukiPrince/printpapi/releases/latest), open it and go through
+four steps (connect to the server with an agent key, pick the printers, test print, done).
 It writes `agent.ini`, installs the agent to `%ProgramFiles%\printpapi-agent\` (Windows) or
 `/opt/printpapi-agent/` (macOS, Linux) and starts it with the machine: a scheduled task
 `printpapi-agent` on Windows, a launchd daemon `com.printpapi.agent` on macOS, a systemd unit
@@ -56,10 +57,12 @@ for them once.
   the agent wrote there; anything else in that folder stays).
 
 - The setup is not code-signed yet, so the system warns first. Windows: *More info*, then *Run
-  anyway*. macOS: System Settings, Privacy & Security, *Open Anyway*. macOS and the aarch64 Linux
-  builds are marked Beta on the downloads page until someone has run them by hand.
+  anyway*. macOS: System Settings, Privacy & Security, *Open Anyway*. Every setup download is marked
+  Beta on the downloads page until someone has run it by hand.
 - Smart App Control and WDAC block the unsigned exe with no way around it. Use the Python agent
   ([Locked-down Windows](#locked-down-windows)).
+- An AppImage starts only once it is executable: run `chmod +x` on the file, or tick *Allow
+  executing as program* in its properties.
 - Linux without a desktop or without systemd: use the manual steps below.
 - An agent you set up by hand is not taken over: the setup stops and says so, so a job is never
   printed twice.
