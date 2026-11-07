@@ -31,6 +31,18 @@ jobs:
       - run: pip install pytest
       - run: python -m pytest -q agent/tests
 
+  # The docs follow the code: links, anchors, setup file names and wording, checked mechanically.
+  docs:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install pytest
+      - run: python -m pytest -q tools/docs
+      - run: python tools/docs/check_docs.py
+
   # Black-box parity: the Rust server must answer every scripted request exactly like the last
   # Python release (extracted from its tag by the harness itself).
   parity:

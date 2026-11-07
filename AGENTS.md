@@ -12,6 +12,10 @@ export embedded into the server binary.
   deliberate shortcut with a `// ponytail:` comment that names its ceiling.
 - **Security at trust boundaries stays:** auth on every endpoint, constant-time token compare,
   `http(s)`-only fetches, no shell with user input, temp files cleaned up.
+- **Docs follow the code.** Before a push, compare `README.md` and `docs/` with the change. The
+  PreToolUse hook in `.claude/settings.json` holds Claude's `git push` until then
+  (`python tools/docs/push_hook.py --mark`); it only covers pushes made by Claude Code. CI's `docs`
+  job runs the mechanical part (links, anchors, setup file names).
 - **Licensing.** New Rust files start with
   `// printpapi — self-hosted PrintNode alternative. Elastic License 2.0 (see LICENSE).`
   `integrations/woocommerce/` is GPL-2.0-or-later. Never re-license a file without reading
@@ -23,6 +27,8 @@ export embedded into the server binary.
 cargo test --workspace          # from the repo root
 cd crates/setup && cargo test   # the setup app, not a workspace member
 python -m pytest agent/tests    # legacy Python agent
+python -m pytest tools/docs
+python tools/docs/check_docs.py   # links, anchors, setup file names in the docs
 cd web && npm run build:app     # after any web/ change; commit crates/server/web with it
 ```
 

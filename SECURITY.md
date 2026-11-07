@@ -7,7 +7,7 @@ The latest state of `main` is the supported version.
 ## Reporting a vulnerability
 
 Please report vulnerabilities **privately** via GitHub's
-[security advisories](../../security/advisories/new) ("Report a vulnerability" on the repo's
+[security advisories](https://github.com/LukiPrince/printpapi/security/advisories/new) ("Report a vulnerability" on the repo's
 Security tab). Do not open a public issue for security problems.
 
 You can expect an initial response within a week. There is no bug bounty.
