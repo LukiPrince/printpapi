@@ -134,9 +134,7 @@ fn lock<'a>(state: &'a Shared) -> MutexGuard<'a, AppState> {
 // ---- machine
 
 fn layout() -> Layout {
-    let program_files =
-        std::env::var("ProgramFiles").unwrap_or_else(|_| "C:\\Program Files".to_string());
-    install::layout(Os::host(), Path::new(&program_files))
+    install::layout(Os::host(), &install::program_files())
 }
 
 /// Windows `CREATE_NO_WINDOW`: without it a console window flashes up for every `schtasks`, `sc`

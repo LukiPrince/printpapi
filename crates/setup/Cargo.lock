@@ -2386,6 +2386,7 @@ name = "printpapi-agent"
 version = "3.2.0"
 dependencies = [
  "chrono",
+ "libc",
  "percent-encoding",
  "serde_json",
  "sha2 0.11.1",

@@ -98,24 +98,73 @@ pub fn layout(os: Os, program_files: &Path) -> Layout {
     }
 }
 
-/// The folder with the system tools: `%SystemRoot%\System32` on Windows, else `/`.
-// ponytail: trusts the `SystemRoot` environment variable of the elevated process. Fine while the
-// setup is unsigned (the spec accepts that gap); with code signing (roadmap 12) ask
-// `GetSystemDirectoryW` instead (windows-sys, feature `Win32_System_SystemInformation`).
-pub fn system_dir() -> PathBuf {
-    if cfg!(windows) {
-        system32(std::env::var("SystemRoot").ok().as_deref())
-    } else {
-        PathBuf::from("/")
+/// Where `%ProgramFiles%` points on a standard installation, and what is used when Windows cannot
+/// say (and off Windows, where `layout` has no use for it).
+const DEFAULT_PROGRAM_FILES: &str = "C:\\Program Files";
+
+/// The folder the Windows agent is installed under. It is asked of Windows
+/// (`SHGetKnownFolderPath(FOLDERID_ProgramFiles)`), not of the environment: the install runs with
+/// administrator rights, and whoever started it can hand it an environment variable of their own.
+/// https://learn.microsoft.com/en-us/windows/win32/api/shlobj_core/nf-shlobj_core-shgetknownfolderpath
+// ponytail: this is the 64-bit `Program Files`, which is what an x86_64 build gets. A 32-bit build
+// under WOW64 would be given `Program Files (x86)` by this call, and `FOLDERID_ProgramFilesX64`
+// would be the one to ask for; there is no such build.
+pub fn program_files() -> PathBuf {
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::System::Com::CoTaskMemFree;
+        use windows_sys::Win32::UI::Shell::{FOLDERID_ProgramFiles, SHGetKnownFolderPath};
+        let mut raw: *mut u16 = std::ptr::null_mut();
+        // SAFETY: `raw` is only read when the call succeeded, as a null-terminated string that
+        // this call allocated; it is freed once, whether or not the call succeeded (see the docs).
+        let found = unsafe {
+            let hr =
+                SHGetKnownFolderPath(&FOLDERID_ProgramFiles, 0, std::ptr::null_mut(), &mut raw);
+            let path = (hr >= 0 && !raw.is_null()).then(|| {
+                let len = (0..).take_while(|&n| *raw.add(n) != 0).count();
+                wide_to_path(std::slice::from_raw_parts(raw, len))
+            });
+            CoTaskMemFree(raw.cast());
+            path
+        };
+        found.unwrap_or_else(|| PathBuf::from(DEFAULT_PROGRAM_FILES))
     }
+    #[cfg(not(windows))]
+    PathBuf::from(DEFAULT_PROGRAM_FILES)
 }
 
-/// `<SystemRoot>\System32`, with `C:\Windows` when the variable is missing or empty.
-fn system32(system_root: Option<&str>) -> PathBuf {
-    let root = system_root
-        .filter(|r| !r.is_empty())
-        .unwrap_or("C:\\Windows");
-    join(Os::Windows, Path::new(root), "System32")
+#[cfg(windows)]
+fn wide_to_path(wide: &[u16]) -> PathBuf {
+    use std::os::windows::ffi::OsStringExt;
+    PathBuf::from(std::ffi::OsString::from_wide(wide))
+}
+
+/// The folder with the system tools: `System32` on Windows, else `/`. Windows is asked
+/// (`GetSystemDirectoryW`), not the `SystemRoot` environment variable, for the reason given at
+/// [`program_files`].
+/// https://learn.microsoft.com/en-us/windows/win32/api/sysinfoapi/nf-sysinfoapi-getsystemdirectoryw
+// ponytail: a 32-bit build under WOW64 would get `SysWOW64` here; the agent is x86_64. When the
+// call fails (it does not on a working system), `C:\Windows\System32` is used.
+pub fn system_dir() -> PathBuf {
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::System::SystemInformation::GetSystemDirectoryW;
+        let mut buf = vec![0u16; 260];
+        loop {
+            // SAFETY: the buffer is as long as the length passed
+            let n = unsafe { GetSystemDirectoryW(buf.as_mut_ptr(), buf.len() as u32) } as usize;
+            if n == 0 {
+                return PathBuf::from("C:\\Windows\\System32");
+            }
+            if n < buf.len() {
+                return wide_to_path(&buf[..n]);
+            }
+            // too short: `n` is the length needed, with the terminator
+            buf.resize(n, 0);
+        }
+    }
+    #[cfg(not(windows))]
+    PathBuf::from("/")
 }
 
 /// Absolute path of a system tool. Rust's `Command` looks in the program's own folder first on
@@ -294,12 +343,12 @@ fn supported_at(os: Os, systemd_dir: &Path) -> bool {
     }
 }
 
-/// Restrict `agent.ini` (it holds the key): SYSTEM and Administrators on Windows, `root:printpapi`
+/// Restrict `ini`, an `agent.ini` or the new file that is about to become one (it holds the key): SYSTEM and Administrators on Windows, `root:printpapi`
 /// 0640 on Linux, root 0600 on macOS. Windows uses SIDs, because group names are localised
 /// ("Administratoren" on a German Windows). icacls takes a SID with a leading `*`
 /// (https://learn.microsoft.com/en-us/windows-server/administration/windows-commands/icacls).
-pub fn ini_acl_cmds(os: Os, l: &Layout, sys: &Path) -> Vec<Cmd> {
-    let ini = s(&l.ini);
+pub fn ini_acl_cmds(os: Os, ini: &Path, sys: &Path) -> Vec<Cmd> {
+    let ini = s(ini);
     match os {
         Os::Windows => vec![cmd(vec![
             tool(os, sys, "icacls.exe"),
@@ -629,7 +678,7 @@ mod tests {
         let l = win_layout("C:\\Program Files");
         let sys = Path::new(WIN_SYS);
         let mut all = stop_cmds(Os::Windows, &l, sys);
-        all.extend(ini_acl_cmds(Os::Windows, &l, sys));
+        all.extend(ini_acl_cmds(Os::Windows, &l.ini, sys));
         all.extend(start_cmds(Os::Windows, &l, sys));
         all.extend(remove_cmds(Os::Windows, &l, sys));
         assert!(all.len() >= 5);
@@ -642,7 +691,7 @@ mod tests {
     #[test]
     fn acl_uses_sids_not_names() {
         let l = win_layout("C:\\Program Files");
-        let cmds = ini_acl_cmds(Os::Windows, &l, Path::new(WIN_SYS));
+        let cmds = ini_acl_cmds(Os::Windows, &l.ini, Path::new(WIN_SYS));
         assert_eq!(cmds.len(), 1);
         let a = &cmds[0].argv;
         assert!(a[0].ends_with("icacls.exe"));
@@ -750,7 +799,7 @@ mod tests {
         for os in [Os::Windows, Os::Linux, Os::Macos] {
             let l = layout(os, Path::new("C:\\Program Files"));
             let mut all = stop_cmds(os, &l, sys);
-            all.extend(ini_acl_cmds(os, &l, sys));
+            all.extend(ini_acl_cmds(os, &l.ini, sys));
             all.extend(start_cmds(os, &l, sys));
             all.extend(remove_cmds(os, &l, sys));
             all.extend(identity_cmds(os));
@@ -792,7 +841,7 @@ mod tests {
 
     #[test]
     fn linux_acl() {
-        let cmds = ini_acl_cmds(Os::Linux, &linux(), Path::new("/"));
+        let cmds = ini_acl_cmds(Os::Linux, &linux().ini, Path::new("/"));
         assert_eq!(
             argvs(&cmds),
             [
@@ -804,7 +853,7 @@ mod tests {
 
     #[test]
     fn macos_acl() {
-        let cmds = ini_acl_cmds(Os::Macos, &mac(), Path::new("/"));
+        let cmds = ini_acl_cmds(Os::Macos, &mac().ini, Path::new("/"));
         assert_eq!(
             argvs(&cmds),
             [vec!["/bin/chmod", "600", "/opt/printpapi/agent.ini"]]
@@ -881,7 +930,7 @@ mod tests {
         assert!(identity_cmds(Os::Macos).is_empty());
         let mut all = start_cmds(Os::Macos, &l, sys);
         all.extend(stop_cmds(Os::Macos, &l, sys));
-        all.extend(ini_acl_cmds(Os::Macos, &l, sys));
+        all.extend(ini_acl_cmds(Os::Macos, &l.ini, sys));
         for c in all {
             assert!(c.argv[0].starts_with('/'), "{:?}", c.argv);
         }
@@ -910,18 +959,38 @@ mod tests {
         );
     }
 
+    #[cfg(windows)]
     #[test]
-    fn system32_follows_system_root_and_falls_back() {
-        assert_eq!(p(&system32(Some("D:\\Win"))), "D:\\Win\\System32");
-        assert_eq!(p(&system32(Some("D:\\Win\\"))), "D:\\Win\\System32");
-        assert_eq!(p(&system32(Some(""))), "C:\\Windows\\System32");
-        assert_eq!(p(&system32(None)), "C:\\Windows\\System32");
+    fn program_files_is_asked_of_windows_not_of_the_environment() {
+        // nothing else in this binary reads `ProgramFiles`, so changing it here races with nobody
+        let real = std::env::var_os("ProgramFiles").unwrap();
+        // SAFETY: see above; the value is put back before the test ends
+        unsafe { std::env::set_var("ProgramFiles", "Z:\\planted") };
+        let dir = program_files();
+        unsafe { std::env::set_var("ProgramFiles", &real) };
+        assert!(dir.is_absolute() && dir.is_dir(), "{dir:?}");
+        assert!(!dir.starts_with("Z:\\planted"), "{dir:?}");
+        // and it is the folder the environment names on this machine
+        assert_eq!(
+            dir.to_string_lossy().to_lowercase(),
+            real.to_string_lossy().to_lowercase()
+        );
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn program_files_has_a_value_off_windows_too() {
+        assert_eq!(program_files(), Path::new("C:\\Program Files"));
     }
 
     #[test]
     fn system_dir_is_the_real_tool_folder() {
         let dir = system_dir();
         if cfg!(windows) {
+            // the system folder Windows names, whatever the environment says
+            // (Windows spells it `C:\WINDOWS\system32`)
+            let last = dir.file_name().unwrap().to_string_lossy().to_lowercase();
+            assert!(dir.is_absolute() && last == "system32", "{dir:?}");
             for tool in ["schtasks.exe", "tasklist.exe", "icacls.exe", "sc.exe"] {
                 assert!(dir.join(tool).exists(), "{tool} not in {dir:?}");
             }

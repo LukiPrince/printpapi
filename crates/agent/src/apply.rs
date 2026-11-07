@@ -268,28 +268,67 @@ fn set_mode(_: &Path, _: u32) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Put a copy of `from` at `to` as a new file: written next to it, given its rights (the service
-/// user has to be able to run it whatever the rights of the source were), then renamed over `to`. A
-/// new inode matters on macOS, where the kernel caches the code signature per vnode and kills a
-/// binary that was overwritten in place.
+/// A new file at `path` that only this process has open. On Unix it is created with `mode` (the
+/// umask of the caller can only narrow it), so it is never wider than that, not even for a moment.
+fn create_new_file(path: &Path, mode: u32) -> std::io::Result<std::fs::File> {
+    // a leftover of a run that died keeps its owner and rights when written into again
+    match std::fs::remove_file(path) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e),
+        _ => {}
+    }
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(mode);
+    }
+    #[cfg(not(unix))]
+    let _ = mode;
+    opts.open(path)
+}
+
+/// Put `bytes` at `to` as a new file: written next to it, given exactly `mode` (Unix; the umask
+/// of the caller, which pkexec does not reset, must not decide), then renamed over `to`. A reader
+/// never sees half a file, and on macOS a new inode matters, because the kernel caches the code
+/// signature per vnode and kills a binary that was overwritten in place.
+fn place_file(to: &Path, bytes: &[u8], mode: u32) -> std::io::Result<()> {
+    let name = to.file_name().unwrap_or_default().to_string_lossy();
+    let tmp = to.with_file_name(format!(".{name}.new"));
+    let result = create_new_file(&tmp, mode)
+        .and_then(|mut f| f.write_all(bytes))
+        .and_then(|()| set_mode(&tmp, mode))
+        .and_then(|()| std::fs::rename(&tmp, to));
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    result
+}
+
+/// Put a copy of `from` at `to`, with the rights the service user needs to run it.
 ///
 /// The bytes are written, not `fs::copy`'d: as root, macOS's copy (`fclonefileat`, `fcopyfile`)
 /// keeps the source's owner, which is the user who started the setup. The LaunchDaemon runs as
 /// root, so that user could then rewrite what root runs. A file this process creates belongs to
 /// this process (root, elevated).
 fn install_binary(from: &Path, to: &Path) -> std::io::Result<()> {
-    let tmp = to.with_file_name(".printpapi-agent.new");
-    let result = std::fs::read(from)
-        .and_then(|bytes| {
-            // a leftover of a run that died keeps its owner when written into again
-            match std::fs::remove_file(&tmp) {
-                Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e),
-                _ => {}
-            }
-            std::fs::write(&tmp, bytes)
-        })
-        .and_then(|()| set_mode(&tmp, 0o755))
-        .and_then(|()| std::fs::rename(&tmp, to));
+    place_file(to, &std::fs::read(from)?, 0o755)
+}
+
+/// Replace `agent.ini` with `text` without ever having an empty or half written one: the new file
+/// is made next to it, gets its restrictive rights while it is still empty (the key comes only
+/// after), and is renamed over the old one. A run that dies in between leaves the installed
+/// `agent.ini`, and with it the key, as it was.
+fn write_ini(env: &Env, text: &str) -> Result<(), ApplyError> {
+    let tmp = env.layout.ini.with_file_name(".agent.ini.new");
+    let result = (|| {
+        create_new_file(&tmp, 0o600).map_err(|e| system("cannot create agent.ini", e))?;
+        for c in install::ini_acl_cmds(env.os, &tmp, &env.sys) {
+            (env.run)(&c).map_err(|e| system("cannot restrict agent.ini", e))?;
+        }
+        std::fs::write(&tmp, text.as_bytes()).map_err(|e| system("cannot write agent.ini", e))?;
+        std::fs::rename(&tmp, &env.layout.ini).map_err(|e| system("cannot replace agent.ini", e))
+    })();
     if result.is_err() {
         let _ = std::fs::remove_file(&tmp);
     }
@@ -317,6 +356,56 @@ fn clear_dir_except(dir: &Path, keep: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
+/// What an earlier run left at the install folder and `agent.ini` is looked at before anything is
+/// done with it. The commands run elevated: a link there would send root's reads, writes and
+/// deletes wherever it points, and a folder that another user owns lets that user swap what root
+/// runs. `root` is whether this process is root, a parameter so a test can ask both ways.
+#[cfg(unix)]
+fn check_install_dir_as(l: &Layout, root: bool) -> Result<(), ApplyError> {
+    use std::os::unix::fs::MetadataExt;
+    let refuse = |what: String| Err(ApplyError::System(what));
+    match std::fs::symlink_metadata(&l.dir) {
+        Ok(meta) if meta.file_type().is_symlink() => {
+            return refuse(format!(
+                "{} is a symbolic link, and the setup does not follow it. Remove the link and try again.",
+                l.dir.display()
+            ));
+        }
+        Ok(meta) if !meta.is_dir() => {
+            return refuse(format!("{} is not a folder.", l.dir.display()));
+        }
+        Ok(meta) if root && meta.uid() != 0 => {
+            return refuse(format!(
+                "{} is not owned by root, and the setup does not use a folder that another user controls. Check it, remove it and try again.",
+                l.dir.display()
+            ));
+        }
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(system("cannot look at the install folder", e)),
+    }
+    match std::fs::symlink_metadata(&l.ini) {
+        Ok(meta) if meta.file_type().is_symlink() => refuse(format!(
+            "{} is a symbolic link, and the setup does not follow it. Remove the link and try again.",
+            l.ini.display()
+        )),
+        _ => Ok(()),
+    }
+}
+
+/// `check_install_dir_as` for the real user id (`std` has no `geteuid`, hence the `libc` crate).
+#[cfg(unix)]
+fn check_install_dir(l: &Layout) -> Result<(), ApplyError> {
+    check_install_dir_as(l, unsafe { libc::geteuid() } == 0)
+}
+
+// ponytail: Windows has no check. The folder is under `%ProgramFiles%`, which only administrators
+// can write to, so nobody else can plant a link there.
+#[cfg(not(unix))]
+fn check_install_dir(_: &Layout) -> Result<(), ApplyError> {
+    Ok(())
+}
+
 /// Install. Returns `last_seen_at` of this device as read right after registering, which the
 /// window compares against to know the agent really started.
 pub fn apply(staging: &Path, env: &Env) -> Result<f64, ApplyError> {
@@ -326,6 +415,8 @@ pub fn apply(staging: &Path, env: &Env) -> Result<f64, ApplyError> {
 fn apply_with(staging: &Path, env: &Env, sumatra_sha: &str) -> Result<f64, ApplyError> {
     let staged = read_staged(staging, sumatra_sha)?;
     let l = &env.layout;
+    // before the server or the machine is touched
+    check_install_dir(l)?;
 
     // Registering first: it is where a wrong key, a taken name or a proxy show up, and until it
     // worked nothing on the machine or the server has changed.
@@ -375,24 +466,18 @@ fn apply_with(staging: &Path, env: &Env, sumatra_sha: &str) -> Result<f64, Apply
     .map_err(|e| system("cannot copy the agent", e))?;
     if let Some(exe) = &staged.sumatra {
         retry(FILE_ATTEMPTS, env.sleep, &mut || {
-            std::fs::write(&l.sumatra, exe)
+            place_file(&l.sumatra, exe, 0o755)
         })
         .map_err(|e| system("cannot copy SumatraPDF", e))?;
     }
-    // The key goes in only after the file has its restrictive rights.
-    std::fs::File::create(&l.ini).map_err(|e| system("cannot create agent.ini", e))?;
-    for c in install::ini_acl_cmds(env.os, l, &env.sys) {
-        (env.run)(&c).map_err(|e| system("cannot restrict agent.ini", e))?;
-    }
-    std::fs::write(&l.ini, staged.text.as_bytes())
-        .map_err(|e| system("cannot write agent.ini", e))?;
+    write_ini(env, &staged.text)?;
     // The marker before the autostart file: a run that dies in between is found as ours next time.
-    std::fs::write(&l.marker, b"").map_err(|e| system("cannot write the marker", e))?;
+    place_file(&l.marker, b"", 0o644).map_err(|e| system("cannot write the marker", e))?;
     if let Some(parent) = l.autostart.parent() {
         std::fs::create_dir_all(parent)
             .map_err(|e| system("cannot create the autostart folder", e))?;
     }
-    std::fs::write(&l.autostart, install::autostart_file(env.os, l))
+    place_file(&l.autostart, &install::autostart_file(env.os, l), 0o644)
         .map_err(|e| system("cannot write the autostart file", e))?;
     // The old agent is stopped by now. Its long-poll bumped last_seen_at until then, so the value
     // the window compares against is read here, not before. A failing read keeps the first one.
@@ -429,6 +514,7 @@ fn last_seen(http: &dyn Http, staged: &Staged, computer_id: i64) -> Result<f64, 
 /// this setup made.
 pub fn remove(env: &Env) -> Result<(), ApplyError> {
     let l = &env.layout;
+    check_install_dir(l)?;
     if !l.marker.is_file() {
         return Err(ApplyError::System(
             "This agent was not installed by the setup, so the setup leaves it alone.".into(),
@@ -468,6 +554,7 @@ pub fn remove(env: &Env) -> Result<(), ApplyError> {
 /// Copy the protected `agent.ini` into the staging folder for "change printers", owned by whoever
 /// owns that folder.
 pub fn export_config(staging: &Path, env: &Env) -> Result<(), ApplyError> {
+    check_install_dir(&env.layout)?;
     let ini = std::fs::read(&env.layout.ini)
         .map_err(|e| system("cannot read the installed agent.ini", e))?;
     write_fresh(staging, "agent.ini", &ini).map_err(|e| system("cannot write the copy", e))
@@ -516,15 +603,13 @@ fn write_fresh(dir: &Path, name: &str, bytes: &[u8]) -> std::io::Result<()> {
 /// The admin subcommands. `None` when `args` (without the program name) is not one of them, so
 /// `main` runs the agent as before.
 pub fn cli(args: &[String]) -> Option<ExitCode> {
-    let program_files =
-        std::env::var("ProgramFiles").unwrap_or_else(|_| "C:\\Program Files".to_string());
     let os = Os::host();
     let http_for = |s: &HttpSettings| -> Box<dyn Http> { Box::new(Client::new(s)) };
     let sleep = |secs: u64| std::thread::sleep(std::time::Duration::from_secs(secs));
     let env = std::env::current_exe()
         .map(|self_exe| Env {
             os,
-            layout: install::layout(os, Path::new(&program_files)),
+            layout: install::layout(os, &install::program_files()),
             sys: install::system_dir(),
             run: real_runner(),
             http_for: &http_for,
@@ -675,7 +760,10 @@ mod tests {
                     let mut note = format!("run {line}");
                     // what the disk looks like at the moment this command runs
                     if line.contains("chmod") || line.contains("icacls") {
-                        let len = std::fs::metadata(&layout.ini).map(|m| m.len());
+                        // the file the command is about: it is empty while its rights are set
+                        let dir = layout.dir.display().to_string();
+                        let file = c.argv.iter().find(|a| a.starts_with(&dir)).unwrap();
+                        let len = std::fs::metadata(file).map(|m| m.len());
                         note.push_str(&format!(" [ini len {len:?}]"));
                     }
                     if line.contains("enable") || line.contains("/create") {
@@ -806,7 +894,9 @@ mod tests {
     fn steps_run_in_order() {
         let fx = Fixture::new(Os::Linux);
         apply(&fx.staging, &fx.env()).unwrap();
-        let ini = fx.layout.ini.display();
+        // the rights are set on the new file, which replaces agent.ini only once it is complete
+        let ini = fx.layout.dir.join(".agent.ini.new");
+        let ini = ini.display();
         assert_eq!(
             fx.events(),
             vec![
@@ -814,7 +904,7 @@ mod tests {
                 "GET /computers".to_string(),
                 "run id -u printpapi".to_string(),
                 "run systemctl stop printpapi-agent".to_string(),
-                // the ini is empty while the ACL is set, the key comes after
+                // the new file is empty while the ACL is set, the key comes after
                 format!("run chown root:printpapi {ini}"),
                 format!("run chmod 640 {ini} [ini len Ok(0)]"),
                 // read again once the old agent is stopped, right before the new one starts
@@ -1127,8 +1217,76 @@ mod tests {
         let fx = Fixture::new(Os::Linux);
         fx.failing.borrow_mut().push("chmod".into());
         assert_eq!(apply(&fx.staging, &fx.env()).unwrap_err().code(), "system");
-        assert_eq!(std::fs::read(&fx.layout.ini).unwrap(), b"");
+        // the key was never written, and nothing is left of the attempt
+        assert!(!fx.layout.ini.exists());
+        assert!(!fx.layout.dir.join(".agent.ini.new").exists());
         assert!(!fx.layout.marker.exists());
+    }
+
+    #[test]
+    fn a_failing_install_keeps_the_installed_ini() {
+        // "Change printers" must not empty the installed agent.ini before the new one is complete:
+        // an abort in between would destroy the key
+        let fx = Fixture::new(Os::Linux);
+        apply(&fx.staging, &fx.env()).unwrap();
+        let installed = std::fs::read(&fx.layout.ini).unwrap();
+        let changed = INI.replace("shop-pc", "other-pc");
+        std::fs::write(fx.staging.join("agent.ini"), changed).unwrap();
+        fx.failing.borrow_mut().push("chmod".into());
+        assert_eq!(apply(&fx.staging, &fx.env()).unwrap_err().code(), "system");
+        assert_eq!(std::fs::read(&fx.layout.ini).unwrap(), installed);
+        assert!(!fx.layout.dir.join(".agent.ini.new").exists());
+    }
+
+    #[test]
+    fn a_second_install_replaces_the_ini_and_leaves_no_temporary_file() {
+        let fx = Fixture::new(Os::Linux);
+        apply(&fx.staging, &fx.env()).unwrap();
+        let changed = INI.replace("shop-pc", "other-pc");
+        std::fs::write(fx.staging.join("agent.ini"), changed).unwrap();
+        // a leftover of a run that died
+        std::fs::write(fx.layout.dir.join(".agent.ini.new"), b"half").unwrap();
+        apply(&fx.staging, &fx.env()).unwrap();
+        let ini = std::fs::read_to_string(&fx.layout.ini).unwrap();
+        assert!(
+            ini.contains("other-pc") && !ini.contains("shop-pc"),
+            "{ini}"
+        );
+        let mut names: Vec<_> = std::fs::read_dir(&fx.layout.dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        assert_eq!(
+            names,
+            [".installed-by-setup", "agent.ini", "printpapi-agent"]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rights_do_not_depend_on_the_umask_of_the_caller() {
+        use std::os::unix::fs::PermissionsExt;
+        // pkexec does not reset the umask, and 000 would make the systemd unit writable for all.
+        // This is the only test that touches the umask, so nothing here races with another.
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o7777;
+        let before = unsafe { libc::umask(0) };
+        let fx = Fixture::new(Os::Linux);
+        std::fs::write(fx.staging.join("SumatraPDF.exe"), b"abc").unwrap();
+        let result = apply_with(&fx.staging, &fx.env(), ABC_SHA);
+        let l = &fx.layout;
+        let seen = [
+            mode(&l.dir),
+            mode(&l.binary),
+            mode(&l.sumatra),
+            mode(&l.marker),
+            mode(&l.autostart),
+            mode(&l.ini),
+        ];
+        unsafe { libc::umask(before) };
+        result.unwrap();
+        // the ini is 0600 until the (faked) chown and chmod run, never wider than that
+        assert_eq!(seen, [0o755, 0o755, 0o755, 0o644, 0o644, 0o600]);
     }
 
     #[test]
@@ -1246,6 +1404,78 @@ mod tests {
         export_config(&fx.staging, &fx.env()).unwrap();
         let meta = std::fs::metadata(fx.staging.join("agent.ini")).unwrap();
         assert_eq!((meta.uid(), meta.gid()), (54321, 54321));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_install_folder_is_refused() {
+        let fx = Fixture::new(Os::Linux);
+        let elsewhere = fx.tmp.path().join("elsewhere");
+        std::fs::create_dir(&elsewhere).unwrap();
+        std::fs::write(elsewhere.join("agent.ini"), b"api_key = LOOT").unwrap();
+        std::os::unix::fs::symlink(&elsewhere, &fx.layout.dir).unwrap();
+        for e in [
+            apply(&fx.staging, &fx.env()).unwrap_err(),
+            remove(&fx.env()).unwrap_err(),
+            export_config(&fx.staging, &fx.env()).unwrap_err(),
+        ] {
+            assert_eq!(e.code(), "system");
+            assert!(e.to_string().contains("symbolic link"), "{e}");
+        }
+        // nothing was touched: not registered, not written, no command run
+        assert!(fx.events().is_empty(), "{:?}", fx.events());
+        assert_eq!(std::fs::read_dir(&elsewhere).unwrap().count(), 1);
+        let staged = std::fs::read(fx.staging.join("agent.ini")).unwrap();
+        assert_eq!(staged, INI.as_bytes());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_agent_ini_is_refused() {
+        let fx = Fixture::new(Os::Linux);
+        std::fs::create_dir_all(&fx.layout.dir).unwrap();
+        let victim = fx.tmp.path().join("victim");
+        std::fs::write(&victim, b"precious").unwrap();
+        std::os::unix::fs::symlink(&victim, &fx.layout.ini).unwrap();
+        for e in [
+            apply(&fx.staging, &fx.env()).unwrap_err(),
+            export_config(&fx.staging, &fx.env()).unwrap_err(),
+        ] {
+            assert_eq!(e.code(), "system");
+            assert!(e.to_string().contains("symbolic link"), "{e}");
+        }
+        assert_eq!(std::fs::read(&victim).unwrap(), b"precious");
+        assert!(fx.events().is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn as_root_an_install_folder_of_somebody_else_is_refused() {
+        use std::os::unix::fs::chown;
+        let fx = Fixture::new(Os::Linux);
+        std::fs::create_dir_all(&fx.layout.dir).unwrap();
+        // as root the folder is handed to another user, as anybody else it already is not root's
+        let _ = chown(&fx.layout.dir, Some(54321), Some(54321));
+        let e = check_install_dir_as(&fx.layout, true).unwrap_err();
+        assert_eq!(e.code(), "system");
+        assert!(e.to_string().contains("not owned by root"), "{e}");
+        // without root rights the owner is of no interest (tests as a normal user, hand installs)
+        assert_eq!(check_install_dir_as(&fx.layout, false), Ok(()));
+        // the real call decides by the real user id
+        let root = unsafe { libc::geteuid() } == 0;
+        assert_eq!(check_install_dir(&fx.layout).is_err(), root);
+        if root {
+            assert_eq!(apply(&fx.staging, &fx.env()).unwrap_err().code(), "system");
+            assert!(fx.events().is_empty());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_folder_that_is_not_there_yet_is_fine() {
+        let fx = Fixture::new(Os::Linux);
+        assert_eq!(check_install_dir_as(&fx.layout, true), Ok(()));
+        assert_eq!(check_install_dir(&fx.layout), Ok(()));
     }
 
     #[test]
