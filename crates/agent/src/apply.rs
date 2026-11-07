@@ -267,14 +267,27 @@ fn set_mode(_: &Path, _: u32) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Put a copy of `from` at `to` as a new file: copied next to it, given its rights (the service user
-/// has to be able to run it whatever the rights of the source were), then renamed over `to`. A new
-/// inode matters on macOS, where the kernel caches the code signature per vnode and kills a binary
-/// that was overwritten in place.
+/// Put a copy of `from` at `to` as a new file: written next to it, given its rights (the service
+/// user has to be able to run it whatever the rights of the source were), then renamed over `to`. A
+/// new inode matters on macOS, where the kernel caches the code signature per vnode and kills a
+/// binary that was overwritten in place.
+///
+/// The bytes are written, not `fs::copy`'d: as root, macOS's copy (`fclonefileat`, `fcopyfile`)
+/// keeps the source's owner, which is the user who started the setup. The LaunchDaemon runs as
+/// root, so that user could then rewrite what root runs. A file this process creates belongs to
+/// this process (root, elevated).
 fn install_binary(from: &Path, to: &Path) -> std::io::Result<()> {
     let tmp = to.with_file_name(".printpapi-agent.new");
-    let result = std::fs::copy(from, &tmp)
-        .and_then(|_| set_mode(&tmp, 0o755))
+    let result = std::fs::read(from)
+        .and_then(|bytes| {
+            // a leftover of a run that died keeps its owner when written into again
+            match std::fs::remove_file(&tmp) {
+                Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e),
+                _ => {}
+            }
+            std::fs::write(&tmp, bytes)
+        })
+        .and_then(|()| set_mode(&tmp, 0o755))
         .and_then(|()| std::fs::rename(&tmp, to));
     if result.is_err() {
         let _ = std::fs::remove_file(&tmp);
@@ -336,18 +349,9 @@ fn apply_with(staging: &Path, env: &Env, sumatra_sha: &str) -> Result<f64, Apply
         .ok_or_else(|| {
             ApplyError::System("the server's register reply has no computer_id".into())
         })?;
-    let computers = http
-        .get(&format!("{}/computers", staged.base), &staged.key)
-        .map_err(|e: HttpError| ApplyError::Unreachable(e.to_string()))?;
-    let baseline = computers
-        .as_ref()
-        .and_then(|v| v.get("computers"))
-        .and_then(Value::as_array)
-        .and_then(|list| list.iter().find(|c| c["id"].as_i64() == Some(computer_id)))
-        .map(|c| c["last_seen_at"].as_f64().unwrap_or(0.0))
-        .ok_or_else(|| {
-            ApplyError::System("the server does not list this device after registering".into())
-        })?;
+    // This first read is the check that the server lists the device. The value that counts is read
+    // again after the old agent is stopped (see below).
+    let first_seen = last_seen(&*http, &staged, computer_id)?;
 
     if let Some(check) = install::identity_check(env.os)
         && (env.run)(&check).is_err()
@@ -389,6 +393,9 @@ fn apply_with(staging: &Path, env: &Env, sumatra_sha: &str) -> Result<f64, Apply
     }
     std::fs::write(&l.autostart, install::autostart_file(env.os, l))
         .map_err(|e| system("cannot write the autostart file", e))?;
+    // The old agent is stopped by now. Its long-poll bumped last_seen_at until then, so the value
+    // the window compares against is read here, not before. A failing read keeps the first one.
+    let baseline = last_seen(&*http, &staged, computer_id).unwrap_or(first_seen);
     for (i, c) in install::start_cmds(env.os, l, &env.sys).iter().enumerate() {
         // the first macOS command removes the quarantine attribute, which a local file may lack
         let optional = env.os == Os::Macos && i == 0;
@@ -399,6 +406,22 @@ fn apply_with(staging: &Path, env: &Env, sumatra_sha: &str) -> Result<f64, Apply
         }
     }
     Ok(baseline)
+}
+
+/// `last_seen_at` of this device on the server.
+fn last_seen(http: &dyn Http, staged: &Staged, computer_id: i64) -> Result<f64, ApplyError> {
+    let computers = http
+        .get(&format!("{}/computers", staged.base), &staged.key)
+        .map_err(|e: HttpError| ApplyError::Unreachable(e.to_string()))?;
+    computers
+        .as_ref()
+        .and_then(|v| v.get("computers"))
+        .and_then(Value::as_array)
+        .and_then(|list| list.iter().find(|c| c["id"].as_i64() == Some(computer_id)))
+        .map(|c| c["last_seen_at"].as_f64().unwrap_or(0.0))
+        .ok_or_else(|| {
+            ApplyError::System("the server does not list this device after registering".into())
+        })
 }
 
 /// Uninstall: stop the agent, take out the autostart, delete the folder. Only for an installation
@@ -558,19 +581,26 @@ mod tests {
     type Events = Rc<RefCell<Vec<String>>>;
     type HttpFor = Box<dyn Fn(&HttpSettings) -> Box<dyn Http>>;
     type Reply = Rc<RefCell<Result<Option<Value>, HttpError>>>;
+    type Later = Rc<RefCell<Option<Result<Option<Value>, HttpError>>>>;
 
     struct FakeHttp {
         events: Events,
         register: Reply,
         computers: Reply,
+        /// what every GET /computers after the first one answers, when a test sets it
+        later: Later,
         seen: Rc<RefCell<Vec<(String, String)>>>,
     }
 
     impl Http for FakeHttp {
         fn get(&self, url: &str, key: &str) -> Result<Option<Value>, HttpError> {
+            let first = !self.events.borrow().iter().any(|e| e == "GET /computers");
             self.events.borrow_mut().push("GET /computers".into());
             self.seen.borrow_mut().push((url.into(), key.into()));
-            self.computers.borrow().clone()
+            match (first, self.later.borrow().clone()) {
+                (false, Some(later)) => later,
+                _ => self.computers.borrow().clone(),
+            }
         }
         fn get_bytes(&self, _: &str, _: &str) -> Result<Option<Vec<u8>>, HttpError> {
             unreachable!("apply downloads nothing")
@@ -590,6 +620,7 @@ mod tests {
         events: Events,
         register: Reply,
         computers: Reply,
+        later: Later,
         seen: Rc<RefCell<Vec<(String, String)>>>,
         /// the settings each http client was made with
         settings: Rc<RefCell<Vec<HttpSettings>>>,
@@ -631,6 +662,7 @@ mod tests {
                 {"id": 3, "name": "other", "last_seen_at": 1.0},
                 {"id": 7, "name": "shop-pc", "last_seen_at": 123.5}
             ]})))));
+            let later: Later = Rc::default();
             let seen: Rc<RefCell<Vec<(String, String)>>> = Rc::default();
             let settings: Rc<RefCell<Vec<HttpSettings>>> = Rc::default();
             let failing: Rc<RefCell<Vec<String>>> = Rc::default();
@@ -661,10 +693,11 @@ mod tests {
                 })
             };
             let http_for: HttpFor = {
-                let (events, register, computers, seen, settings) = (
+                let (events, register, computers, later, seen, settings) = (
                     events.clone(),
                     register.clone(),
                     computers.clone(),
+                    later.clone(),
                     seen.clone(),
                     settings.clone(),
                 );
@@ -674,6 +707,7 @@ mod tests {
                         events: events.clone(),
                         register: register.clone(),
                         computers: computers.clone(),
+                        later: later.clone(),
                         seen: seen.clone(),
                     })
                 })
@@ -686,6 +720,7 @@ mod tests {
                 events,
                 register,
                 computers,
+                later,
                 seen,
                 settings,
                 failing,
@@ -771,6 +806,8 @@ mod tests {
                 // the ini is empty while the ACL is set, the key comes after
                 format!("run chown root:printpapi {ini}"),
                 format!("run chmod 640 {ini} [ini len Ok(0)]"),
+                // read again once the old agent is stopped, right before the new one starts
+                "GET /computers".to_string(),
                 "run systemctl daemon-reload".to_string(),
                 "run systemctl enable --now printpapi-agent [marker true autostart true]"
                     .to_string(),
@@ -803,9 +840,34 @@ mod tests {
         let fx = Fixture::new(Os::Linux);
         assert_eq!(apply(&fx.staging, &fx.env()), Ok(123.5));
         let ev = fx.events();
-        let get = ev.iter().position(|e| e == "GET /computers").unwrap();
+        let get = ev.iter().rposition(|e| e == "GET /computers").unwrap();
         let start = ev.iter().position(|e| e.contains("enable")).unwrap();
         assert!(get < start, "{ev:?}");
+    }
+
+    #[test]
+    fn the_baseline_is_read_after_the_old_agent_is_stopped() {
+        // an old agent still long-polling bumps last_seen_at until it is stopped: a value read
+        // before that would let the window report success for an agent that never started
+        let fx = Fixture::new(Os::Linux);
+        *fx.later.borrow_mut() = Some(Ok(Some(json!({"computers": [
+            {"id": 7, "name": "shop-pc", "last_seen_at": 130.25}
+        ]}))));
+        assert_eq!(apply(&fx.staging, &fx.env()), Ok(130.25));
+        let ev = fx.events();
+        let stop = ev
+            .iter()
+            .position(|e| e.contains("systemctl stop"))
+            .unwrap();
+        let last_get = ev.iter().rposition(|e| e == "GET /computers").unwrap();
+        assert!(stop < last_get, "{ev:?}");
+    }
+
+    #[test]
+    fn a_failing_second_read_keeps_the_first_value() {
+        let fx = Fixture::new(Os::Linux);
+        *fx.later.borrow_mut() = Some(Err(HttpError::Os("connection failed".into())));
+        assert_eq!(apply(&fx.staging, &fx.env()), Ok(123.5));
     }
 
     #[test]
@@ -1334,6 +1396,31 @@ mod tests {
             .unwrap();
         apply(&fx.staging, &fx.env()).unwrap();
         assert_eq!(mode(&fx.layout.binary), 0o755);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_installed_binary_never_keeps_the_owner_of_the_source() {
+        // the setup is started by an ordinary user and elevated: the copy must belong to the
+        // elevated process (root), not to the user whose file it was made from. Only meaningful as
+        // root (CI container), where giving the source to someone else works; skipped otherwise.
+        use std::os::unix::fs::{MetadataExt, chown};
+        let fx = Fixture::new(Os::Linux);
+        let src = fx.tmp.path().join("self.exe");
+        if chown(&src, Some(501), Some(20)).is_err() {
+            return;
+        }
+        // a leftover of an earlier run that died, owned by that user as well
+        std::fs::create_dir_all(&fx.layout.dir).unwrap();
+        let tmp = fx.layout.dir.join(".printpapi-agent.new");
+        std::fs::write(&tmp, b"old").unwrap();
+        chown(&tmp, Some(501), Some(20)).unwrap();
+        apply(&fx.staging, &fx.env()).unwrap();
+        assert_eq!(std::fs::metadata(&fx.layout.binary).unwrap().uid(), 0);
+        assert_eq!(
+            std::fs::read(&fx.layout.binary).unwrap(),
+            b"the running binary"
+        );
     }
 
     #[cfg(unix)]

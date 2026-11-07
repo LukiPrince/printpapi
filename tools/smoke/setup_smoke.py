@@ -160,6 +160,12 @@ def main():
         baseline = result["baseline_last_seen"]
         if not INSTALL_DIR.is_dir() or not AUTOSTART.is_file():
             raise Fail(f"install left no {INSTALL_DIR} / {AUTOSTART}")
+        if not WIN:
+            # the service runs the binary as root (macOS) or as a user that must not own it: a copy
+            # that kept the starting user's ownership would let that user replace what root runs
+            for p in (INSTALL_DIR, INSTALL_DIR / "printpapi-agent"):
+                if p.stat().st_uid != 0:
+                    raise Fail(f"{p} is not owned by root")
 
         def online():
             for c in call(base, token, "GET", "/computers")["computers"]:
