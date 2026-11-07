@@ -137,6 +137,17 @@ pub struct Hooks<'a> {
     pub poll: &'a dyn Fn(&str, &str, &PrinterMap),
 }
 
+/// `msg` without the key. A key under 8 characters is no real key (the server hands out 32 hex
+/// digits) and masking it would cut up the text.
+// ponytail: only the key as one piece is found; a message that quotes part of it is not.
+fn mask_key(msg: String, key: &str) -> String {
+    if key.len() < 8 {
+        msg
+    } else {
+        msg.replace(key, "***")
+    }
+}
+
 /// agent.ini -> printers -> register -> poll. Returns only if `poll` does (tests) or start-up fails.
 pub fn start(cfg: &Config, hooks: &Hooks) -> Result<(), Fatal> {
     let base = cfg
@@ -149,8 +160,10 @@ pub fn start(cfg: &Config, hooks: &Hooks) -> Result<(), Fatal> {
         .get("name")
         .map_err(Fatal::Exit)?
         .unwrap_or_else(|| "agent".to_string());
-    let printers =
-        parse_printers(&cfg.require("printers").map_err(Fatal::Exit)?).map_err(Fatal::Crash)?;
+    // The printer errors quote the entry, which is how an operator finds it. An entry that pulls the
+    // key in with `%(api_key)s` must not put it into the log (in /tmp on Linux) or on the console.
+    let printers = parse_printers(&cfg.require("printers").map_err(Fatal::Exit)?)
+        .map_err(|m| Fatal::Crash(mask_key(m, &key)))?;
     let printers = add_capabilities(printers, hooks.caps);
     let reg = (hooks.register)(&base, &key, &name, &printers);
     let printer_by_id = build_printer_map(&printers, &reg).map_err(Fatal::Crash)?;
@@ -365,6 +378,36 @@ mod tests {
         log::append_log(log_dir.path(), &fatal.log_line());
         let text = std::fs::read_to_string(log_dir.path().join("print_agent-error.log")).unwrap();
         assert!(text.contains("exit: missing or invalid"));
+    }
+
+    #[test]
+    fn a_broken_agent_ini_never_puts_a_value_into_the_fatal_message() {
+        // A hand-damaged api_key line makes the parsers quote it. What `main` logs to the crash
+        // log (in /tmp on Linux, readable by everybody) and prints must not carry any value.
+        let ok = "server_url = https://x\nprinters = a | raw | file:///t\n";
+        let key = "api_key = SECRET-KEY-0123\n";
+        let cases = [
+            // no separator: the parser quotes the line
+            format!("[agent]\n{ok}api_key SECRET-KEY-0123\n"),
+            // text before the first section
+            format!("SECRET-KEY-0123\n[agent]\n{ok}{key}"),
+            // a stray % in the key, and a broken reference
+            format!("[agent]\n{ok}api_key = SECRET-KEY-0123%KEY\n"),
+            format!("[agent]\n{ok}api_key = SECRET-KEY-0123%(nope)s\n"),
+            format!("[agent]\n{ok}{key}name = SECRET-KEY-0123%1\n"),
+            format!("[agent]\n{ok}{key}timeout = %(api_key)s\n"),
+            // a printer entry that pulls the key in
+            format!("[agent]\nserver_url = https://x\n{key}printers = n = socket://%(api_key)s\n"),
+        ];
+        for text in cases {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::write(dir.path().join("agent.ini"), &text).unwrap();
+            let fatal = run(dir.path()).unwrap_err();
+            let (Fatal::Exit(m) | Fatal::Crash(m)) = &fatal;
+            assert!(!m.is_empty(), "{text}");
+            assert!(!m.contains("SECRET"), "{text}: {m}");
+            assert!(!fatal.log_line().contains("SECRET"), "{text}");
+        }
     }
 
     #[test]

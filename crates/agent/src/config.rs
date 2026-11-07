@@ -68,7 +68,8 @@ pub fn decode_ini(bytes: &[u8]) -> String {
 
 impl Config {
     /// Read `<base_dir>/agent.ini`. A missing/unreadable file or a missing `[agent]` section gives
-    /// the "missing or invalid" text; a malformed file gives the parser's complaint.
+    /// the "missing or invalid" text; a malformed file gives a text without the parser's quotes:
+    /// they carry the offending line, and that can be the `api_key` line.
     pub fn load(base_dir: &Path) -> Result<Config, String> {
         let ini_path = base_dir.join("agent.ini");
         let missing = || {
@@ -79,7 +80,12 @@ impl Config {
         };
         let bytes = std::fs::read(&ini_path).map_err(|_| missing())?;
         let text = decode_ini(&bytes);
-        let ini = Ini::parse(&text).map_err(|e| format!("invalid {}: {e}", ini_path.display()))?;
+        let ini = Ini::parse(&text).map_err(|_| {
+            format!(
+                "invalid {}: a line cannot be read (text before the first [section], a line                  without = or :, or a section or key that appears twice). The line is not shown                  because it may hold the key.",
+                ini_path.display()
+            )
+        })?;
         if !ini.has_section("agent") {
             return Err(missing());
         }
@@ -92,9 +98,13 @@ impl Config {
         })
     }
 
-    /// `agent_cfg.get(key)`: the interpolated `[agent]` value, `None` when absent.
+    /// `agent_cfg.get(key)`: the interpolated `[agent]` value, `None` when absent. The parser's
+    /// complaint about a bad `%` quotes the value (the key included), so the error names only the
+    /// setting.
     pub fn get(&self, key: &str) -> Result<Option<String>, String> {
-        self.ini.get("agent", key)
+        self.ini.get("agent", key).map_err(|_| {
+            format!("agent.ini [agent]: {key} has a bad %-reference (write %% for a literal %)")
+        })
     }
 
     /// `agent_cfg[key]`: like [`Config::get`] but a missing key is an error.
@@ -130,7 +140,8 @@ impl Config {
             Some(raw) => raw
                 .trim()
                 .parse::<f64>()
-                .map_err(|_| format!("agent.ini timeout = {}: not a number", repr_str(&raw)))?,
+                // the value is not quoted: `timeout = %(api_key)s` would print the key
+                .map_err(|_| "agent.ini timeout: not a number".to_string())?,
         };
         if timeout < MIN_TIMEOUT {
             return Err(format!(
