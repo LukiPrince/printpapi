@@ -66,8 +66,10 @@ pub fn applescript(argv: &[&str]) -> String {
     format!("do shell script \"{escaped}\" with administrator privileges")
 }
 
-/// `pkexec` exit codes: 126 (not authorised) and 127 (dialog dismissed) mean the person said no
-/// (pkexec(1), "RETURN VALUE").
+/// `pkexec` exit codes (pkexec(1), "RETURN VALUE",
+/// https://www.freedesktop.org/software/polkit/docs/latest/pkexec.1.html): 126 is the dialog
+/// dismissed, 127 is "not authorised, the login failed, or another error". Both read as a refusal
+/// here, so a 127 that has another cause is reported to the person as "not granted" as well.
 pub fn pkexec_result(code: Option<i32>) -> Result<(), Elevate> {
     match code {
         Some(0) => Ok(()),
@@ -81,7 +83,8 @@ pub fn pkexec_result(code: Option<i32>) -> Result<(), Elevate> {
 fn osascript_result(code: Option<i32>, stderr: &str) -> Result<(), Elevate> {
     match code {
         Some(0) => Ok(()),
-        _ if stderr.contains("-128") => Err(Elevate::Cancelled),
+        // the form osascript prints; a bare "-128" could be part of a path in an error text
+        _ if stderr.contains("(-128)") => Err(Elevate::Cancelled),
         Some(c) => Err(Elevate::Failed(format!("osascript exited with code {c}"))),
         None => Err(Elevate::Failed("osascript was stopped by a signal".into())),
     }
@@ -259,6 +262,85 @@ mod tests {
             script,
             "do shell script \"'/tmp/a\\\"b\\\\c' 'install'\" with administrator privileges"
         );
+    }
+
+    #[test]
+    fn osascript_reports_a_dismissed_dialog_as_cancelled() {
+        assert_eq!(osascript_result(Some(0), ""), Ok(()));
+        assert_eq!(
+            osascript_result(
+                Some(1),
+                "execution error: User canceled. (-128)
+"
+            ),
+            Err(Elevate::Cancelled)
+        );
+        assert!(matches!(
+            osascript_result(Some(1), "execution error: no such file (-43)"),
+            Err(Elevate::Failed(_))
+        ));
+        // a path that happens to contain 128 is not a cancellation
+        assert!(matches!(
+            osascript_result(
+                Some(1),
+                "cannot open /var/folders/printpapi-setup-128abc/agent"
+            ),
+            Err(Elevate::Failed(_))
+        ));
+        assert!(matches!(
+            osascript_result(None, ""),
+            Err(Elevate::Failed(_))
+        ));
+    }
+
+    /// What the agent (a Rust program) makes of the command line `run_windows` builds, read back
+    /// with the same Win32 parser the C runtime follows.
+    #[cfg(windows)]
+    #[test]
+    fn a_staging_path_survives_the_command_line_as_one_argument() {
+        use std::os::windows::ffi::{OsStrExt, OsStringExt};
+        use windows_sys::Win32::Foundation::LocalFree;
+        use windows_sys::Win32::UI::Shell::CommandLineToArgvW;
+
+        let read_back = |arg: &str| -> Vec<OsString> {
+            let line: Vec<u16> = OsStr::new("agent.exe install ")
+                .encode_wide()
+                .chain(windows_quote(OsStr::new(arg)).encode_wide())
+                .chain(std::iter::once(0))
+                .collect();
+            let mut count = 0;
+            // SAFETY: `line` is NUL-terminated; the array it returns holds `count` NUL-terminated
+            // strings and is freed once with LocalFree, as the documentation requires.
+            unsafe {
+                let argv = CommandLineToArgvW(line.as_ptr(), &mut count);
+                assert!(!argv.is_null());
+                let out = (0..count as usize)
+                    .map(|i| {
+                        let p = *argv.add(i);
+                        let len = (0..).take_while(|&n| *p.add(n) != 0).count();
+                        OsString::from_wide(std::slice::from_raw_parts(p, len))
+                    })
+                    .collect();
+                LocalFree(argv as _);
+                out
+            }
+        };
+        for path in [
+            r"C:\Users\Jürgen Müller\AppData\Local\Temp\printpapi-setup-x1",
+            r"C:\a b\",
+            r#"C:\with "quote" and \\"#,
+            r"C:\plain\path",
+        ] {
+            assert_eq!(
+                read_back(path),
+                [
+                    OsString::from("agent.exe"),
+                    OsString::from("install"),
+                    OsString::from(path)
+                ],
+                "{path}"
+            );
+        }
     }
 
     #[test]

@@ -13,7 +13,25 @@ use tauri::{Manager, RunEvent};
 
 use commands::AppState;
 
+/// What the person reads when the Microsoft Edge WebView2 Runtime is missing.
+const WEBVIEW_MISSING: &str = "This setup needs the Microsoft Edge WebView2 Runtime.\n\n\
+     https://developer.microsoft.com/microsoft-edge/webview2/";
+
+/// Is there a web view to show the window in? Tauri makes its windows only once the event loop
+/// runs, and a missing runtime then panics after Tauri's own dialog (tauri 2.12.5 `app.rs`,
+/// `tauri-runtime-wry` 2.12.3 `lib.rs`: "Could not find the WebView2 Runtime"), so `.build()` never
+/// reports it. This is the check Tauri makes itself, run first so that the person gets the text
+/// above. Other platforms ship their web view or fail to start before this point.
+fn startup_problem(webview: Result<String, String>, on_windows: bool) -> Option<&'static str> {
+    (on_windows && webview.is_err()).then_some(WEBVIEW_MISSING)
+}
+
 fn main() -> ExitCode {
+    let webview = tauri::webview_version().map_err(|e| e.to_string());
+    if let Some(problem) = startup_problem(webview, cfg!(windows)) {
+        fail(problem);
+        return ExitCode::FAILURE;
+    }
     let built = tauri::Builder::default()
         .manage(Mutex::new(AppState::default()))
         .invoke_handler(tauri::generate_handler![
@@ -35,7 +53,7 @@ fn main() -> ExitCode {
     let app = match built {
         Ok(app) => app,
         Err(e) => {
-            window_failed(&e.to_string());
+            fail(&format!("The setup window could not be opened: {e}"));
             return ExitCode::FAILURE;
         }
     };
@@ -50,11 +68,10 @@ fn main() -> ExitCode {
     ExitCode::SUCCESS
 }
 
-/// The window could not be made. On Windows that is almost always a missing WebView2 runtime
-/// (https://learn.microsoft.com/en-us/microsoft-edge/webview2/concepts/distribution), and a
-/// program without a console cannot say so on stderr.
-fn window_failed(error: &str) {
-    eprintln!("The setup window could not be opened: {error}");
+/// Say why the setup cannot start. A program without a console cannot say so on stderr, so on
+/// Windows a message box says it, too.
+fn fail(text: &str) {
+    eprintln!("{text}");
     #[cfg(windows)]
     {
         use std::os::windows::ffi::OsStrExt;
@@ -65,10 +82,7 @@ fn window_failed(error: &str) {
                 .chain(std::iter::once(0))
                 .collect()
         };
-        let text = wide(
-            "This setup needs the Microsoft Edge WebView2 Runtime.\n\n\
-             https://developer.microsoft.com/microsoft-edge/webview2/",
-        );
+        let text = wide(text);
         let title = wide("printpapi Agent Setup");
         // SAFETY: both buffers are NUL-terminated and outlive the call; no owner window.
         unsafe {
@@ -84,6 +98,21 @@ fn window_failed(error: &str) {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    #[test]
+    fn a_missing_web_view_on_windows_is_named_before_the_window_is_built() {
+        let problem = startup_problem(Err("no runtime".into()), true).expect("a problem");
+        assert!(problem.starts_with("This setup needs the Microsoft Edge WebView2 Runtime."));
+        assert!(
+            problem
+                .ends_with("Runtime.\n\nhttps://developer.microsoft.com/microsoft-edge/webview2/")
+        );
+        assert_eq!(startup_problem(Ok("130.0".into()), true), None);
+        // elsewhere the web view is part of the system or the program does not start at all
+        assert_eq!(startup_problem(Err("x".into()), false), None);
+    }
+
     /// The setup and the agent are released together: one number.
     #[test]
     fn version_matches_workspace() {
