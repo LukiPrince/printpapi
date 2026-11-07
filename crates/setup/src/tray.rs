@@ -257,7 +257,7 @@ pub fn lock_path() -> Option<PathBuf> {
 }
 
 /// Where the agent leaves its status file: `status.json` in the agent's own status folder.
-fn status_path() -> PathBuf {
+pub fn status_path() -> PathBuf {
     status::status_dir(Os::host()).join("status.json")
 }
 

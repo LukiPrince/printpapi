@@ -1,20 +1,27 @@
 // printpapi — self-hosted PrintNode alternative. Elastic License 2.0 (see LICENSE).
 "use client";
 
-import { Check, CircleAlert, CircleCheck, Info, TriangleAlert } from "lucide-react";
+import { Check, CircleAlert, CircleCheck, Info, PowerOff, TriangleAlert, type LucideIcon } from "lucide-react";
 import { Barcode, Logo } from "@/components/brand";
 import { cn } from "@/lib/utils";
+import type { AgentStatus } from "./api";
+import { statusWord } from "./model";
 
 // The breakpoint is 700px, not Tailwind's md (768px): the setup window is a fixed 760px wide and
 // must show the rail.
-/** The ink rail on the left with the steps, and the content column on the right. */
+export type NavItem = { id: string; label: string; icon: LucideIcon };
+
+/** The ink rail on the left with the steps (or, in the settings, the sections), and the content column on the right. */
 export function Shell({
   steps,
   current,
+  nav,
   children,
 }: {
   steps?: string[];
   current?: number;
+  /** Sections to choose from, for the settings of an installed agent. */
+  nav?: { label: string; items: NavItem[]; current: string; onSelect: (id: string) => void };
   children: React.ReactNode;
 }) {
   return (
@@ -51,6 +58,31 @@ export function Shell({
               );
             })}
           </ol>
+        )}
+        {nav && (
+          <nav aria-label={nav.label} className="mt-2">
+            <ul className="flex flex-wrap gap-1 min-[700px]:flex-col">
+              {nav.items.map(({ id, label, icon: Icon }) => {
+                const on = id === nav.current;
+                return (
+                  <li key={id}>
+                    <button
+                      type="button"
+                      aria-current={on ? "page" : undefined}
+                      onClick={() => nav.onSelect(id)}
+                      className={cn(
+                        "flex w-full items-center gap-2 rounded-md border-l-2 border-transparent px-2.5 py-1.5 text-left text-sm transition-colors outline-none hover:bg-sidebar-accent hover:text-sidebar-accent-foreground focus-visible:ring-2 focus-visible:ring-sidebar-ring",
+                        on && "border-sidebar-primary bg-sidebar-accent font-semibold text-sidebar-accent-foreground",
+                      )}
+                    >
+                      <Icon className="size-4 shrink-0" />
+                      {label}
+                    </button>
+                  </li>
+                );
+              })}
+            </ul>
+          </nav>
         )}
       </aside>
       <main className="px-4 py-6 min-[700px]:px-8 min-[700px]:py-8">
@@ -91,4 +123,21 @@ export function Notice({
 
 export function Actions({ children }: { children: React.ReactNode }) {
   return <div className="flex flex-wrap items-center justify-end gap-2 pt-2">{children}</div>;
+}
+
+const STATE_LOOK = {
+  online: { icon: CircleCheck, cls: "text-state-done" },
+  offline: { icon: CircleAlert, cls: "text-state-failed" },
+  not_running: { icon: PowerOff, cls: "text-muted-foreground" },
+} as const;
+
+/** The state of the agent as colour + icon + word. */
+export function AgentStateLine({ state }: { state: AgentStatus["state"] }) {
+  const { icon: Icon, cls } = STATE_LOOK[state];
+  return (
+    <span className={cn("inline-flex items-center gap-1.5 font-medium", cls)}>
+      <Icon className="size-4" />
+      {statusWord(state)}
+    </span>
+  );
 }

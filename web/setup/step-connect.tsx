@@ -8,18 +8,27 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { FieldLabel } from "@/components/bits";
 import { setup, toSetupError } from "./api";
-import { errorText } from "./model";
+import { errorText, needsNewName } from "./model";
 import { Actions, Notice } from "./bits";
 
 export type Connection = { serverUrl: string; apiKey: string; name: string };
 
+/** What the connection of an installed agent is now, when it is being replaced. */
+export type Replacing = { serverUrl: string; name: string };
+
+const SAME_SERVER_WARNING =
+  "A new key on the same server needs a new device name. The printers get new IDs, so integrations that use fixed printer IDs must be updated, and the old device stays in your dashboard.";
+
 /** Step 1. Checks the address and the key; nothing is created on the server yet. */
 export function StepConnect({
   initial,
+  replacing = null,
   notice,
   onNext,
 }: {
   initial: Connection | null;
+  /** Present when an installed agent gets another server or key. */
+  replacing?: Replacing | null;
   /** Shown when the install sent the window back here. */
   notice?: string | null;
   onNext: (c: Connection) => void;
@@ -49,7 +58,10 @@ export function StepConnect({
     };
   }, [initial]);
 
-  const filled = serverUrl.trim() !== "" && apiKey.trim() !== "" && name.trim() !== "";
+  // the server ties a name to one key: the same server needs another name
+  const sameServer = replacing !== null && needsNewName(replacing.serverUrl, serverUrl);
+  const keepsName = sameServer && name.trim() === replacing.name;
+  const filled = serverUrl.trim() !== "" && apiKey.trim() !== "" && name.trim() !== "" && !keepsName;
   const current = (): Connection => ({
     serverUrl: serverUrl.trim(),
     apiKey: apiKey.trim(),
@@ -129,6 +141,12 @@ export function StepConnect({
             <Input id="name" className="mt-1.5" autoComplete="off" value={name} onChange={edit(setName)} />
           </div>
 
+          {sameServer && (
+            <Notice tone="warn">
+              <p>{SAME_SERVER_WARNING}</p>
+              {keepsName && <p className="mt-1 font-medium">Pick a name other than {replacing.name}.</p>}
+            </Notice>
+          )}
           {askInsecure && (
             <Notice tone="warn">
               <p>This address is not encrypted. Your key would travel readable over the network.</p>

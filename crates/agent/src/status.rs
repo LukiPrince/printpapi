@@ -27,7 +27,7 @@ const DEFAULT_PROGRAM_DATA: &str = "C:\\ProgramData";
 /// `%ProgramData%`, which is `%SystemDrive%\ProgramData`.
 /// https://learn.microsoft.com/en-us/windows/win32/shell/knownfolderid (FOLDERID_ProgramData)
 /// https://learn.microsoft.com/en-us/windows/win32/api/shlobj_core/nf-shlobj_core-shgetknownfolderpath
-pub(crate) fn program_data() -> PathBuf {
+pub fn program_data() -> PathBuf {
     #[cfg(windows)]
     {
         use windows_sys::Win32::System::Com::CoTaskMemFree;

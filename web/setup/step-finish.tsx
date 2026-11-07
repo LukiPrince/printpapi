@@ -6,7 +6,7 @@ import { CircleCheck, Loader2, Rocket } from "lucide-react";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { setup, toSetupError, type Platform, type PrinterChoice } from "./api";
-import { connectMayHelp, errorText, logLocation, returnsToConnect } from "./model";
+import { connectMayHelp, errorText, logLocation, patchFor, returnsToConnect } from "./model";
 import { Actions, Notice } from "./bits";
 import type { Connection } from "./step-connect";
 
@@ -36,6 +36,7 @@ export function StepFinish({
   connection,
   deviceName,
   selected,
+  changeFrom,
   onBack,
   onBackToConnect,
   onOnline,
@@ -45,6 +46,8 @@ export function StepFinish({
   connection: Connection | null;
   deviceName: string;
   selected: PrinterChoice[];
+  /** The printers of the installed agent, when only they are being changed. */
+  changeFrom: PrinterChoice[];
   onBack: () => void;
   /** Back to step 1, with the reason when a refused key or name sent it there. */
   onBackToConnect?: (message?: string) => void;
@@ -71,12 +74,15 @@ export function StepFinish({
     setPhase({ at: "installing" });
     let baseline: number;
     try {
-      baseline = await setup.apply({
-        serverUrl: connection?.serverUrl ?? null,
-        apiKey: connection?.apiKey ?? null,
-        name: connection?.name ?? null,
-        printers: selected,
-      });
+      // a change of the installed agent names only what differs; a new connection is a new install
+      baseline = connection
+        ? await setup.apply({
+            serverUrl: connection.serverUrl,
+            apiKey: connection.apiKey,
+            name: connection.name,
+            printers: selected,
+          })
+        : await setup.applyPatch(patchFor({ printers: changeFrom }, { printers: selected }));
     } catch (e) {
       const err = toSetupError(e);
       if (onBackToConnect && returnsToConnect(err.code)) {

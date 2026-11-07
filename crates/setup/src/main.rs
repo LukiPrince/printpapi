@@ -4,6 +4,7 @@
 
 mod commands;
 mod elevate;
+mod settings;
 mod staging;
 mod tray;
 
@@ -75,6 +76,11 @@ fn main() -> ExitCode {
             commands::apply,
             commands::wait_online,
             commands::uninstall,
+            commands::read_status,
+            commands::read_log,
+            commands::apply_patch,
+            commands::restart_agent,
+            commands::header_values,
         ])
         .build(tauri::generate_context!());
     let app = match built {

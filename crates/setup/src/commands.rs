@@ -11,13 +11,13 @@ use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::{Mutex, MutexGuard, PoisonError};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use printpapi_agent::apply::{SUMATRA_EXE_SHA256, SUMATRA_URL, SUMATRA_ZIP_SHA256, verify_sha256};
 use printpapi_agent::client::Client;
 use printpapi_agent::config::{
-    Config, HttpSettings, IniUpdate, Printer, decode_ini, format_printers, parse_printers,
-    update_ini,
+    Config, HttpSettings, IniUpdate, Printer, apply_patch as merge_patch, decode_ini,
+    format_printers, parse_patch, parse_printers, update_ini,
 };
 use printpapi_agent::discover::discover;
 use printpapi_agent::install::{self, Installed, Layout, Os};
@@ -28,7 +28,9 @@ use serde_json::Value;
 use tauri::State;
 
 use crate::elevate::{self, Elevate};
+use crate::settings::{self, AgentStatus};
 use crate::staging::Staging;
+use crate::tray;
 
 /// How the window is told that something failed. `code` is a stable word it can branch on
 /// (`proxy`, `cancelled`, ...), `message` is text for the person.
@@ -631,33 +633,96 @@ fn apply_in(
     })
 }
 
+/// The tray icon program this window offers to the install: staged as `tray` unless this window
+/// already is the installed one (see `settings::stage_tray`). Unix paths are resolved first, so a
+/// link to the installed program is still that program.
+// ponytail: on Windows the running exe is compared as the system reports it, which is the long
+// path the installer wrote; a window started through an 8.3 short path of the install folder
+// would be taken for a copy. Ceiling: the window ends with the install then (taskkill by image).
+fn stage_own_tray_with(
+    os: Os,
+    exe: &Path,
+    appimage: Option<&OsStr>,
+    l: &Layout,
+    dir: &Path,
+    run: &Runner,
+) -> Result<bool, SetupError> {
+    let resolve = |p: &Path| {
+        if cfg!(windows) {
+            p.to_path_buf()
+        } else {
+            std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf())
+        }
+    };
+    let source = settings::tray_source(os, exe, appimage).map(|p| resolve(&p));
+    settings::stage_tray(os, source.as_deref(), &resolve(&l.tray), dir, run)
+        .map_err(|e| SetupError::io("cannot prepare the tray icon", e))
+}
+
+fn stage_own_tray(dir: &Path) -> Result<bool, SetupError> {
+    let exe = std::env::current_exe().map_err(|e| SetupError::io("cannot find this program", e))?;
+    stage_own_tray_with(
+        Os::host(),
+        &exe,
+        std::env::var_os("APPIMAGE").as_deref(),
+        &layout(),
+        dir,
+        &runner(),
+    )
+}
+
+/// Start the tray icon that was just installed, for the user of this window and without
+/// administrator rights. It is not waited for (it runs until the user quits it), and a failure is
+/// not an error of the install: the icon starts at the next logon anyway.
+fn start_installed_tray() {
+    let cmd = settings::tray_start_cmd(Os::host(), &layout());
+    let Some((program, args)) = cmd.argv.split_first() else {
+        return;
+    };
+    let mut command = std::process::Command::new(program);
+    command
+        .args(args)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    no_window(&mut command);
+    let _ = command.spawn();
+}
+
 #[tauri::command(async)]
 pub fn apply(state: Shared, request: ApplyRequest) -> Result<f64, SetupError> {
     let (agent, dir) = staged(&state)?;
+    let tray_staged = stage_own_tray(&dir)?;
     let existing = lock(&state).ini_text.clone();
     let applied = apply_in(&elevate::run, &agent, &dir, &request, existing.as_deref())?;
     if let Some(conn) = applied.conn {
         lock(&state).conn = Some(conn);
+    }
+    if tray_staged {
+        start_installed_tray();
     }
     Ok(applied.baseline)
 }
 
 #[tauri::command(async)]
 pub fn wait_online(state: Shared, baseline: f64) -> Result<bool, SetupError> {
-    let (url, key, name, settings) = {
-        let guard = lock(&state);
-        let Some(c) = &guard.conn else {
-            return Err(SetupError::new(
-                "system",
-                "There is no connection to check.",
-            ));
-        };
+    let conn = lock(&state).conn.as_ref().map(|c| {
         (
             c.server_url.clone(),
             c.api_key.clone(),
             c.name.clone(),
             c.settings.clone(),
         )
+    });
+    let Some((url, key, name, settings)) = conn else {
+        // After a change of settings the window has no key to ask the server with, so it waits for
+        // the agent's own word: a contact in the status file after `baseline`.
+        return Ok(poll_until(
+            ONLINE_WITHIN,
+            &Instant::now,
+            &|| std::thread::sleep(ONLINE_PAUSE),
+            &mut |_| settings::online_since_file(&tray::status_path(), SystemTime::now(), baseline),
+        ));
     };
     // a failed look (the network, a restart of the server) is "not yet", not the end
     Ok(poll_until(
@@ -683,6 +748,126 @@ pub fn uninstall(state: Shared) -> Result<(), SetupError> {
     guard.conn = None;
     guard.ini_text = None;
     Ok(())
+}
+
+// ---- the settings window
+
+/// What the window shows about the agent. Reads one small file, needs no administrator rights.
+#[tauri::command(async)]
+pub fn read_status() -> AgentStatus {
+    settings::status_from_file(&tray::status_path(), SystemTime::now())
+}
+
+/// The last `lines` lines of the agent's log (empty when it wrote none yet).
+#[tauri::command(async)]
+pub fn read_log(lines: usize) -> Result<String, SetupError> {
+    let path = install::service_log_path(Os::host(), &printpapi_agent::status::program_data());
+    settings::read_log_in(&path, lines).map_err(|e| SetupError::io("cannot read the log", e))
+}
+
+/// What the window may change in an installed `agent.ini`: only what is named.
+#[derive(Debug, Deserialize)]
+pub struct PatchRequest {
+    printers: Option<Vec<PrinterChoice>>,
+    timeout: Option<f64>,
+    /// `[name, value]` sets a header, `[name, null]` removes it.
+    headers: Option<Vec<(String, Option<String>)>>,
+}
+
+/// What the agent reads at start, with nothing else in it: a patch is tried on this before the
+/// administrator prompt, so that a header name the file cannot hold, a timeout that is too short or
+/// a printer list that cannot be read fail without a prompt.
+const PREFLIGHT_INI: &str =
+    "[agent]\nserver_url = https://example.invalid\napi_key = k\nprinters = p\n";
+
+/// The text of `patch.json` (the format of `config::parse_patch`), checked against the agent's
+/// own rules.
+pub fn patch_json(req: &PatchRequest) -> Result<String, SetupError> {
+    let mut obj = serde_json::Map::new();
+    if let Some(list) = &req.printers {
+        let printers: Vec<Printer> = list.iter().map(choice_to_printer).collect();
+        let text = format_printers(&printers).map_err(|m| SetupError::new("printers", m))?;
+        obj.insert("printers".into(), Value::String(text));
+    }
+    if let Some(t) = req.timeout {
+        // NaN and infinity have no JSON form and become null, which the agent refuses
+        obj.insert("timeout".into(), serde_json::json!(t));
+    }
+    if let Some(h) = &req.headers {
+        obj.insert("headers".into(), serde_json::json!(h));
+    }
+    let text = Value::Object(obj).to_string();
+    let change = |m: String| SetupError::new("change", m);
+    let patch = parse_patch(&text).map_err(change)?;
+    merge_patch(PREFLIGHT_INI, &patch).map_err(change)?;
+    Ok(text)
+}
+
+/// Stage the change as `patch.json` and have the elevated agent apply it to the installed
+/// `agent.ini`. One prompt, and the window never holds the file with the key. The patch can hold
+/// header values, so it is deleted whatever happened.
+fn apply_patch_in(
+    elevate: Elevator,
+    agent: &Path,
+    dir: &Path,
+    req: &PatchRequest,
+) -> Result<(), SetupError> {
+    let text = patch_json(req)?;
+    // the agent takes a staged agent.ini over a patch
+    match std::fs::remove_file(dir.join("agent.ini")) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+            return Err(SetupError::io("cannot clear the working folder", e));
+        }
+        _ => {}
+    }
+    crate::staging::write_private(dir, "patch.json", text.as_bytes())
+        .map_err(|e| SetupError::io("cannot write the change", e))?;
+    let ran = run_elevated(elevate, agent, dir, "install");
+    let _ = std::fs::remove_file(dir.join("patch.json"));
+    ran.map(|_| ())
+}
+
+/// Apply a change. Returns the time on this computer when the install was done, which
+/// `wait_online` then compares the agent's next contact with (the window has no key, so there is
+/// no server-side start time to give).
+#[tauri::command(async)]
+pub fn apply_patch(state: Shared, patch: PatchRequest) -> Result<f64, SetupError> {
+    let (agent, dir) = staged(&state)?;
+    let tray_staged = stage_own_tray(&dir)?;
+    apply_patch_in(&elevate::run, &agent, &dir, &patch)?;
+    // the wait that follows reads the status file, not a connection left over from the wizard
+    lock(&state).conn = None;
+    if tray_staged {
+        start_installed_tray();
+    }
+    Ok(settings::unix_secs(SystemTime::now()))
+}
+
+fn restart_in(elevate: Elevator, agent: &Path, dir: &Path) -> Result<(), SetupError> {
+    run_elevated(elevate, agent, dir, "restart").map(|_| ())
+}
+
+#[tauri::command(async)]
+pub fn restart_agent(state: Shared) -> Result<(), SetupError> {
+    let (agent, dir) = staged(&state)?;
+    restart_in(&elevate::run, &agent, &dir)
+}
+
+/// The `[headers]` of the installed file, read by an elevated `read-config` like the key would be.
+/// Only the headers go back to the window.
+fn header_values_in(
+    elevate: Elevator,
+    agent: &Path,
+    dir: &Path,
+) -> Result<Vec<(String, String)>, SetupError> {
+    let loaded = read_existing_in(elevate, agent, dir)?;
+    Ok(loaded.conn.settings.headers.into_iter().collect())
+}
+
+#[tauri::command(async)]
+pub fn header_values(state: Shared) -> Result<Vec<(String, String)>, SetupError> {
+    let (agent, dir) = staged(&state)?;
+    header_values_in(&elevate::run, &agent, &dir)
 }
 
 #[cfg(test)]
@@ -1289,6 +1474,204 @@ printers = Z = socket://nohost
             Some(INSTALLED),
         )
         .unwrap();
+    }
+
+    // ---- changes of the settings
+
+    fn patch_request(
+        printers: Option<Vec<PrinterChoice>>,
+        timeout: Option<f64>,
+        headers: Option<Vec<(&str, Option<&str>)>>,
+    ) -> PatchRequest {
+        PatchRequest {
+            printers,
+            timeout,
+            headers: headers.map(|h| {
+                h.into_iter()
+                    .map(|(n, v)| (n.to_string(), v.map(String::from)))
+                    .collect()
+            }),
+        }
+    }
+
+    #[test]
+    fn a_change_is_the_agents_own_patch_file_with_only_what_changed() {
+        let req = patch_request(
+            Some(vec![
+                choice("Büro Drucker", true, None),
+                choice("Zebra", false, Some("socket://10.0.0.5:9100")),
+            ]),
+            Some(45.0),
+            Some(vec![("CF-Access", Some("abc")), ("Old", None)]),
+        );
+        let text = patch_json(&req).unwrap();
+        let patch = parse_patch(&text).unwrap();
+        assert_eq!(
+            patch.printers.as_deref(),
+            Some("Büro Drucker|pdf ; Zebra = socket://10.0.0.5:9100")
+        );
+        assert_eq!(patch.timeout, Some(45.0));
+        assert_eq!(
+            patch.headers,
+            vec![
+                ("CF-Access".to_string(), Some("abc".to_string())),
+                ("Old".to_string(), None)
+            ]
+        );
+        // nothing named, nothing in the file
+        let text = patch_json(&patch_request(None, None, None)).unwrap();
+        assert_eq!(text, "{}");
+        assert_eq!(
+            parse_patch(&text).unwrap(),
+            printpapi_agent::config::Patch::default()
+        );
+    }
+
+    #[test]
+    fn a_change_the_agent_would_refuse_is_refused_before_the_prompt() {
+        let e = patch_json(&patch_request(
+            Some(vec![choice("a;b", false, None)]),
+            None,
+            None,
+        ))
+        .unwrap_err();
+        assert_eq!(e.code, "printers");
+        let e = patch_json(&patch_request(None, Some(10.0), None)).unwrap_err();
+        assert_eq!(e.code, "change");
+        assert!(e.message.contains("30"), "{}", e.message);
+        let e = patch_json(&patch_request(None, Some(f64::NAN), None)).unwrap_err();
+        assert_eq!(e.code, "change");
+        let e = patch_json(&patch_request(
+            None,
+            None,
+            Some(vec![("two words", Some("x"))]),
+        ))
+        .unwrap_err();
+        assert_eq!(e.code, "change");
+        let e = patch_json(&patch_request(
+            None,
+            None,
+            Some(vec![("Authorization", Some("x"))]),
+        ))
+        .unwrap_err();
+        assert_eq!(e.code, "change");
+    }
+
+    #[test]
+    fn a_change_reaches_the_agent_by_file_and_the_file_with_the_values_is_gone_afterwards() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        // an agent.ini of an earlier run would win over the patch in the agent
+        std::fs::write(dir.join("agent.ini"), "stale").unwrap();
+        let elevate = |_: &Path, args: &[&OsStr]| {
+            assert_eq!(args[0], "install");
+            assert!(!args[1].to_string_lossy().contains("SECRET"));
+            let dir = staging_dir_of(args);
+            assert!(!dir.join("agent.ini").exists());
+            let patch = std::fs::read_to_string(dir.join("patch.json")).unwrap();
+            assert!(patch.contains("SECRET"), "{patch}");
+            write_result(&dir, json!({"ok": true, "baseline_last_seen": 1.0}));
+            Ok(())
+        };
+        let req = patch_request(None, None, Some(vec![("X-Token", Some("SECRET"))]));
+        apply_patch_in(&elevate, Path::new("agent"), dir, &req).unwrap();
+        assert_eq!(names_in(dir), ["result.json"]);
+    }
+
+    #[test]
+    fn the_patch_is_deleted_after_a_failed_or_cancelled_run_and_a_bad_one_asks_nothing() {
+        for (outcome, result, code) in [
+            (
+                Err(Elevate::Failed("exit 1".into())),
+                Some(json!({"ok": false, "code": "unreachable", "message": "no route"})),
+                "unreachable",
+            ),
+            (Err(Elevate::Cancelled), None, "cancelled"),
+            (Ok(()), None, "system"),
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            let elevate = |_: &Path, args: &[&OsStr]| {
+                let dir = staging_dir_of(args);
+                assert!(dir.join("patch.json").exists());
+                if let Some(r) = &result {
+                    write_result(&dir, r.clone());
+                }
+                outcome.clone()
+            };
+            let req = patch_request(None, None, Some(vec![("X-Token", Some("SECRET"))]));
+            let e = apply_patch_in(&elevate, Path::new("agent"), tmp.path(), &req).unwrap_err();
+            assert_eq!(e.code, code);
+            assert!(!tmp.path().join("patch.json").exists(), "{code}");
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let asked = Cell::new(false);
+        let elevate = |_: &Path, _: &[&OsStr]| {
+            asked.set(true);
+            Ok(())
+        };
+        let req = patch_request(None, Some(1.0), None);
+        assert!(apply_patch_in(&elevate, Path::new("agent"), tmp.path(), &req).is_err());
+        assert!(!asked.get());
+        assert!(names_in(tmp.path()).is_empty());
+    }
+
+    #[test]
+    fn a_restart_is_one_elevated_run_of_the_restart_command() {
+        let tmp = tempfile::tempdir().unwrap();
+        let elevate = |_: &Path, args: &[&OsStr]| {
+            assert_eq!((args.len(), args[0]), (2, OsStr::new("restart")));
+            write_result(&staging_dir_of(args), json!({"ok": true}));
+            Ok(())
+        };
+        restart_in(&elevate, Path::new("agent"), tmp.path()).unwrap();
+        let elevate = |_: &Path, _: &[&OsStr]| Err(Elevate::Cancelled);
+        let e = restart_in(&elevate, Path::new("agent"), tmp.path()).unwrap_err();
+        assert_eq!(e.code, "cancelled");
+    }
+
+    #[test]
+    fn header_values_come_from_the_installed_file_and_the_key_stays_here() {
+        let tmp = tempfile::tempdir().unwrap();
+        let elevate = |_: &Path, args: &[&OsStr]| {
+            assert_eq!(args[0], "read-config");
+            let dir = staging_dir_of(args);
+            std::fs::write(
+                dir.join("agent.ini"),
+                INSTALLED.replace("CF-Access = abc", "CF-Access = abc\nX-Other = 100%"),
+            )
+            .unwrap();
+            write_result(&dir, json!({"ok": true}));
+            Ok(())
+        };
+        let values = header_values_in(&elevate, Path::new("agent"), tmp.path()).unwrap();
+        assert_eq!(
+            values,
+            vec![
+                ("cf-access".to_string(), "abc".to_string()),
+                ("x-other".to_string(), "100%".to_string())
+            ]
+        );
+        assert!(!serde_json::to_string(&values).unwrap().contains(KEY));
+        assert!(!tmp.path().join("agent.ini").exists());
+    }
+
+    // ---- the tray program and the wait
+
+    #[test]
+    fn a_window_that_runs_from_the_installed_tray_stages_none() {
+        let tmp = tempfile::tempdir().unwrap();
+        let run: Runner = Rc::new(|_| panic!("nothing is run"));
+        let l = install::layout(Os::Windows, Path::new("C:\\Program Files"));
+        let installed_exe = Path::new("C:\\Program Files\\printpapi\\printpapi-tray.exe");
+        let staged =
+            stage_own_tray_with(Os::Windows, installed_exe, None, &l, tmp.path(), &run).unwrap();
+        assert!(!staged);
+        assert!(names_in(tmp.path()).is_empty());
+        // a copy somewhere else is offered, and the install replaces the installed one with it
+        let elsewhere = tmp.path().join("printpapi-setup.exe");
+        std::fs::write(&elsewhere, b"exe").unwrap();
+        assert!(stage_own_tray_with(Os::Windows, &elsewhere, None, &l, tmp.path(), &run).unwrap());
+        assert_eq!(std::fs::read(tmp.path().join("tray")).unwrap(), b"exe");
     }
 
     // ---- the SumatraPDF download

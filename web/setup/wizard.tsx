@@ -19,17 +19,23 @@ const CHANGE_STEPS = ["Printers", "Test", "Finish"];
 export function Wizard({
   platform,
   existing,
+  replacing = null,
   onDone,
 }: {
   platform: Platform;
   /** Present when the printers of an installed agent are being changed. */
   existing: Existing | null;
+  /** Present when an installed agent gets another server or key: the four steps, from what is known. */
+  replacing?: Existing | null;
   onDone: () => void;
 }) {
   const steps = existing ? CHANGE_STEPS : NEW_STEPS;
   const [i, setI] = useState(0);
-  const [connection, setConnection] = useState<Connection | null>(null);
-  const [selected, setSelected] = useState<PrinterChoice[]>(existing?.printers ?? []);
+  // the key is never known here: the person types the new one
+  const [connection, setConnection] = useState<Connection | null>(
+    replacing ? { serverUrl: replacing.serverUrl, apiKey: "", name: replacing.name } : null,
+  );
+  const [selected, setSelected] = useState<PrinterChoice[]>((existing ?? replacing)?.printers ?? []);
   const [found, setFound] = useState<FoundPrinter[] | null>(null);
   const [sumatra, setSumatra] = useState(false);
   // the agent reported in: every step is done, none is current
@@ -76,6 +82,7 @@ export function Wizard({
       {step === "Connect" && (
         <StepConnect
           initial={connection}
+          replacing={replacing}
           notice={connectNotice}
           onNext={(c) => {
             setConnection(c);
@@ -105,6 +112,7 @@ export function Wizard({
           connection={existing ? null : connection}
           deviceName={existing ? existing.name : (connection?.name ?? "")}
           selected={selected}
+          changeFrom={existing?.printers ?? []}
           onBack={back}
           onBackToConnect={
             existing

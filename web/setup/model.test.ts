@@ -1,7 +1,7 @@
 // printpapi — self-hosted PrintNode alternative. Elastic License 2.0 (see LICENSE).
 import test from "node:test";
 import assert from "node:assert/strict";
-import { DEFAULT_RAW_PORT, addNetworkPrinter, canLeavePrinters, canSwitchOn, canTest, connectMayHelp, errorText, fromFound, logLocation, needsSumatra, returnsToConnect } from "./model.ts";
+import { DEFAULT_RAW_PORT, addNetworkPrinter, canLeavePrinters, canSwitchOn, canTest, connectMayHelp, errorText, fromFound, logLocation, needsNewName, needsSumatra, patchFor, returnsToConnect, statusWord, timeoutProblem } from "./model.ts";
 import type { FoundPrinter, PrinterChoice } from "./api.ts";
 
 const choice = (over: Partial<PrinterChoice> = {}): PrinterChoice => ({
@@ -129,4 +129,72 @@ test("a printer that is connected for one user only cannot be switched on, but c
   assert.equal(canSwitchOn(found(false), false), true);
   assert.equal(canSwitchOn(null, false), true);
   assert.equal(canSwitchOn({ ...found(false), usable: false }, false), false);
+});
+
+test("the state of the agent is a word, never only a colour", () => {
+  assert.equal(statusWord("online"), "Connected");
+  assert.equal(statusWord("offline"), "Offline");
+  assert.equal(statusWord("not_running"), "Not running");
+});
+
+test("a new key on the same server needs a new device name, another server does not", () => {
+  assert.equal(needsNewName("https://print.example.com", "https://print.example.com"), true);
+  // the way the agent reads the address: slashes at the end and the case of the host do not matter
+  assert.equal(needsNewName("https://print.example.com/", " HTTPS://Print.Example.com//"), true);
+  assert.equal(needsNewName("https://print.example.com", "https://other.example.com"), false);
+  assert.equal(needsNewName("https://print.example.com", "https://print.example.com/api"), false);
+  assert.equal(needsNewName("https://print.example.com", "http://print.example.com"), false);
+  // nothing known about the old server (no status file): nothing to compare
+  assert.equal(needsNewName("", "https://print.example.com"), false);
+});
+
+test("a change names only what is different", () => {
+  const same = { printers: [choice()], timeout: 60, headers: [["a", "1"]] as [string, string | null][] };
+  assert.deepEqual(patchFor(same, structuredClone(same)), {});
+  // locked is the window's own flag, not a setting
+  assert.deepEqual(patchFor(same, { ...same, printers: [choice({ locked: true })] }), {});
+  const printers = [choice(), choice({ name: "Lager", target: "socket://10.0.0.5:9100" })];
+  assert.deepEqual(patchFor(same, { ...same, printers }), { printers });
+  assert.deepEqual(patchFor(same, { ...same, printers: [choice({ pdf: true })] }), { printers: [choice({ pdf: true })] });
+  assert.deepEqual(patchFor(same, { ...same, timeout: 90 }), { timeout: 90 });
+  // a field that only one side has is not compared
+  assert.deepEqual(patchFor({ printers: [choice()] }, { printers: [choice()], timeout: 90 }), {});
+});
+
+test("a header is set when it is new or changed and removed when it is gone", () => {
+  const before: [string, string | null][] = [["keep", "1"], ["change", "old"], ["gone", "x"]];
+  const after: [string, string | null][] = [["keep", "1"], ["change", "new"], ["added", "y"]];
+  assert.deepEqual(patchFor({ headers: before }, { headers: after }), {
+    headers: [["change", "new"], ["added", "y"], ["gone", null]],
+  });
+  assert.deepEqual(patchFor({ headers: before }, { headers: before }), {});
+  // header names do not differ by case
+  assert.deepEqual(patchFor({ headers: [["X-Token", "1"]] }, { headers: [["x-token", "1"]] }), {});
+  assert.deepEqual(patchFor({ headers: [["X-Token", "1"]] }, { headers: [["x-token", "2"]] }), {
+    headers: [["x-token", "2"]],
+  });
+});
+
+test("a value that was never shown is unchanged unless it was typed", () => {
+  // before the admin prompt only the names are known: null is "unknown"
+  const before: [string, string | null][] = [["token", null], ["other", null]];
+  assert.deepEqual(patchFor({ headers: before }, { headers: before }), {});
+  assert.deepEqual(patchFor({ headers: before }, { headers: [["token", null]] }), {
+    headers: [["other", null]],
+  });
+  assert.deepEqual(patchFor({ headers: before }, { headers: [["token", "typed"], ["other", null]] }), {
+    headers: [["token", "typed"]],
+  });
+  // something unknown on the left, a removal on the right: the removal does not need the value
+  assert.deepEqual(patchFor({ headers: [["token", null]] }, { headers: [] }), { headers: [["token", null]] });
+});
+
+test("the timeout must be a number the agent accepts", () => {
+  assert.equal(timeoutProblem("60"), null);
+  assert.equal(timeoutProblem(" 30 "), null);
+  assert.equal(timeoutProblem("45.5"), null);
+  assert.match(timeoutProblem("29") ?? "", /30/);
+  for (const bad of ["", "abc", "6x", "Infinity", "-1"]) {
+    assert.notEqual(timeoutProblem(bad), null, bad);
+  }
 });
