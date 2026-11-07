@@ -175,15 +175,28 @@ struct Staged {
     sumatra: Option<Vec<u8>>,
 }
 
+/// An `[agent]` value. The parser's texts quote lines and raw values, and the key sits in those, so
+/// an error here becomes a fixed text that names only the setting.
+fn value(cfg: &Config, key: &str) -> Result<Option<String>, ApplyError> {
+    cfg.get(key)
+        .map_err(|_| bad(format!("agent.ini: {key} is not valid")))
+}
+
+fn required(cfg: &Config, key: &str) -> Result<String, ApplyError> {
+    value(cfg, key)?.ok_or_else(|| bad(format!("agent.ini: {key} is missing")))
+}
+
 fn read_staged(staging: &Path, sumatra_sha: &str) -> Result<Staged, ApplyError> {
     check_staging(staging)?;
     let bytes = std::fs::read(staging.join("agent.ini"))
         .map_err(|e| bad(format!("agent.ini cannot be read: {e}")))?;
     let text = decode_ini(&bytes);
-    let cfg = Config::from_text(&text).map_err(|e| bad(format!("agent.ini: {e}")))?;
-    let base = cfg
-        .require("server_url")
-        .map_err(bad)?
+    // No parser text goes into an error from here on: the key never shows up in an output, and
+    // the parsers quote the lines and values they choke on.
+    let cfg = Config::from_text(&text).map_err(|_| {
+        bad("agent.ini is not valid (a line that cannot be read, or a bad %-reference)")
+    })?;
+    let base = required(&cfg, "server_url")?
         .trim_end_matches('/')
         .to_string();
     let lower = base.to_ascii_lowercase();
@@ -192,13 +205,16 @@ fn read_staged(staging: &Path, sumatra_sha: &str) -> Result<Staged, ApplyError> 
             "agent.ini: server_url must start with http:// or https://",
         ));
     }
-    let key = cfg.require("api_key").map_err(bad)?;
-    let name = cfg
-        .get("name")
-        .map_err(bad)?
-        .unwrap_or_else(|| "agent".into());
-    let printers = parse_printers(&cfg.require("printers").map_err(bad)?).map_err(bad)?;
-    let settings = cfg.http_settings().map_err(bad)?;
+    let key = required(&cfg, "api_key")?;
+    if !key.is_empty() && base.contains(&key) {
+        return Err(bad("agent.ini: server_url must not contain the key"));
+    }
+    let name = value(&cfg, "name")?.unwrap_or_else(|| "agent".into());
+    let printers = parse_printers(&required(&cfg, "printers")?)
+        .map_err(|_| bad("agent.ini: printers is not valid"))?;
+    let settings = cfg
+        .http_settings()
+        .map_err(|_| bad("agent.ini: timeout or [headers] is not valid"))?;
     let sumatra = match std::fs::symlink_metadata(staging.join("SumatraPDF.exe")) {
         Ok(_) => {
             let exe = std::fs::read(staging.join("SumatraPDF.exe"))
@@ -237,6 +253,54 @@ fn retry<T>(
             }
         }
     }
+}
+
+/// Rights come from an explicit mode, never from the source file or the umask.
+#[cfg(unix)]
+fn set_mode(path: &Path, mode: u32) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
+}
+
+#[cfg(not(unix))]
+fn set_mode(_: &Path, _: u32) -> std::io::Result<()> {
+    Ok(())
+}
+
+/// Put a copy of `from` at `to` as a new file: copied next to it, given its rights (the service user
+/// has to be able to run it whatever the rights of the source were), then renamed over `to`. A new
+/// inode matters on macOS, where the kernel caches the code signature per vnode and kills a binary
+/// that was overwritten in place.
+fn install_binary(from: &Path, to: &Path) -> std::io::Result<()> {
+    let tmp = to.with_file_name(".printpapi-agent.new");
+    let result = std::fs::copy(from, &tmp)
+        .and_then(|_| set_mode(&tmp, 0o755))
+        .and_then(|()| std::fs::rename(&tmp, to));
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    result
+}
+
+/// Delete everything in `dir` but `keep`, entries that are already gone included.
+fn clear_dir_except(dir: &Path, keep: &Path) -> std::io::Result<()> {
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if path == keep {
+            continue;
+        }
+        let gone = if entry.file_type()?.is_dir() {
+            std::fs::remove_dir_all(&path)
+        } else {
+            std::fs::remove_file(&path)
+        };
+        match gone {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e),
+            _ => {}
+        }
+    }
+    Ok(())
 }
 
 /// Install. Returns `last_seen_at` of this device as read right after registering, which the
@@ -298,8 +362,10 @@ fn apply_with(staging: &Path, env: &Env, sumatra_sha: &str) -> Result<f64, Apply
     }
 
     std::fs::create_dir_all(&l.dir).map_err(|e| system("cannot create the install folder", e))?;
+    // the service user has to get into the folder whatever the umask of the caller is
+    set_mode(&l.dir, 0o755).map_err(|e| system("cannot set the install folder's rights", e))?;
     retry(FILE_ATTEMPTS, env.sleep, &mut || {
-        std::fs::copy(&env.self_exe, &l.binary).map(|_| ())
+        install_binary(&env.self_exe, &l.binary)
     })
     .map_err(|e| system("cannot copy the agent", e))?;
     if let Some(exe) = &staged.sumatra {
@@ -348,7 +414,9 @@ pub fn remove(env: &Env) -> Result<(), ApplyError> {
         let _ = (env.run)(&c);
     }
     // ponytail: a failing delete (task or unit already gone from an earlier half run) is not told
-    // apart from a stuck one. The folder goes next, so a leftover entry has nothing to start.
+    // apart from a stuck one. The folder goes next, so a leftover entry has nothing to start. A
+    // stuck one stays registered with nothing behind it, and `install::detect` then reports it as
+    // foreign until somebody removes it by hand.
     for c in install::remove_cmds(env.os, l, &env.sys) {
         let _ = (env.run)(&c);
     }
@@ -357,8 +425,18 @@ pub fn remove(env: &Env) -> Result<(), ApplyError> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         Err(e) => return Err(system("cannot delete the autostart file", e)),
     }
+    // The marker goes last: a locked file (a running exe, a hung SumatraPDF) stops the removal, and
+    // a second try must still find the marker instead of leaving the folder behind as "foreign".
     retry(FILE_ATTEMPTS, env.sleep, &mut || {
-        std::fs::remove_dir_all(&l.dir)
+        clear_dir_except(&l.dir, &l.marker)
+    })
+    .map_err(|e| system("cannot delete the install folder", e))?;
+    retry(FILE_ATTEMPTS, env.sleep, &mut || {
+        match std::fs::remove_file(&l.marker) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e),
+            _ => {}
+        }
+        std::fs::remove_dir(&l.dir)
     })
     .map_err(|e| system("cannot delete the install folder", e))
 }
@@ -376,11 +454,19 @@ pub fn write_result(staging: &Path, result: &Value) -> Result<(), String> {
     write_fresh(staging, "result.json", result.to_string().as_bytes()).map_err(|e| e.to_string())
 }
 
-/// Write `<dir>/<name>` as a new file: an entry that is already there (a planted link included) is
+/// Write `<dir>/<name>` as a new file in a folder that is no link: an entry that is already there (a planted link included) is
 /// removed, never followed, and the file is created with `create_new`, which refuses to open
 /// anything that appeared meanwhile. On Unix the file goes to the owner of `dir`, because this
 /// process runs as root and the setup, running as the user, has to read it.
 fn write_fresh(dir: &Path, name: &str, bytes: &[u8]) -> std::io::Result<()> {
+    // The folder itself must not be a link either: root would write into wherever it points.
+    // ponytail: a same-user swap between this check and the write stays possible, see `check_staging`.
+    let meta = std::fs::symlink_metadata(dir)?;
+    if is_link(&meta) || !meta.is_dir() {
+        return Err(std::io::Error::other(
+            "the folder is a link or not a folder",
+        ));
+    }
     let path = dir.join(name);
     if std::fs::symlink_metadata(&path).is_ok() {
         std::fs::remove_file(&path)?;
@@ -403,61 +489,58 @@ fn write_fresh(dir: &Path, name: &str, bytes: &[u8]) -> std::io::Result<()> {
     Ok(())
 }
 
-fn usage() -> ExitCode {
-    crate::err_line("usage: printpapi-agent install|uninstall|read-config <staging folder>");
-    ExitCode::from(2)
-}
-
 /// The admin subcommands. `None` when `args` (without the program name) is not one of them, so
 /// `main` runs the agent as before.
 pub fn cli(args: &[String]) -> Option<ExitCode> {
+    let program_files =
+        std::env::var("ProgramFiles").unwrap_or_else(|_| "C:\\Program Files".to_string());
+    let os = Os::host();
+    let http_for = |s: &HttpSettings| -> Box<dyn Http> { Box::new(Client::new(s)) };
+    let sleep = |secs: u64| std::thread::sleep(std::time::Duration::from_secs(secs));
+    let env = std::env::current_exe()
+        .map(|self_exe| Env {
+            os,
+            layout: install::layout(os, Path::new(&program_files)),
+            sys: install::system_dir(),
+            run: real_runner(),
+            http_for: &http_for,
+            self_exe,
+            sleep: &sleep,
+        })
+        .map_err(|e| system("cannot find the running program", e));
+    run_args(args, env.as_ref().map_err(Clone::clone)).map(ExitCode::from)
+}
+
+/// `cli` with the machine handed in, so tests never touch the real one. The exit code is 0 for
+/// success, 1 for a failure and 2 for a wrong call.
+fn run_args(args: &[String], env: Result<&Env, ApplyError>) -> Option<u8> {
     let command = match args.first().map(String::as_str) {
         Some(c @ ("install" | "uninstall" | "read-config")) => c,
         _ => return None,
     };
     let [_, dir] = args else {
-        return Some(usage());
+        crate::err_line("usage: printpapi-agent install|uninstall|read-config <staging folder>");
+        return Some(2);
     };
     let staging = Path::new(dir);
-    let os = Os::host();
-    let program_files =
-        std::env::var("ProgramFiles").unwrap_or_else(|_| "C:\\Program Files".to_string());
-    let http_for = |s: &HttpSettings| -> Box<dyn Http> { Box::new(Client::new(s)) };
-    let sleep = |secs: u64| std::thread::sleep(std::time::Duration::from_secs(secs));
-    let outcome = match std::env::current_exe() {
-        Err(e) => Err(system("cannot find the running program", e)),
-        Ok(self_exe) => {
-            let env = Env {
-                os,
-                layout: install::layout(os, Path::new(&program_files)),
-                sys: install::system_dir(),
-                run: real_runner(),
-                http_for: &http_for,
-                self_exe,
-                sleep: &sleep,
-            };
-            match command {
-                "install" => {
-                    apply(staging, &env).map(|b| json!({"ok": true, "baseline_last_seen": b}))
-                }
-                "uninstall" => remove(&env).map(|()| json!({"ok": true})),
-                _ => export_config(staging, &env).map(|()| json!({"ok": true})),
-            }
-        }
-    };
+    let outcome = env.and_then(|env| match command {
+        "install" => apply(staging, env).map(|b| json!({"ok": true, "baseline_last_seen": b})),
+        "uninstall" => remove(env).map(|()| json!({"ok": true})),
+        _ => export_config(staging, env).map(|()| json!({"ok": true})),
+    });
     let (result, code) = match outcome {
-        Ok(v) => (v, ExitCode::SUCCESS),
+        Ok(v) => (v, 0),
         Err(e) => {
             crate::err_line(&e.to_string());
             (
                 json!({"ok": false, "code": e.code(), "message": e.to_string()}),
-                ExitCode::from(1),
+                1,
             )
         }
     };
     if let Err(e) = write_result(staging, &result) {
         crate::err_line(&format!("cannot write result.json: {e}"));
-        return Some(ExitCode::from(1));
+        return Some(1);
     }
     Some(code)
 }
@@ -508,6 +591,8 @@ mod tests {
         register: Reply,
         computers: Reply,
         seen: Rc<RefCell<Vec<(String, String)>>>,
+        /// the settings each http client was made with
+        settings: Rc<RefCell<Vec<HttpSettings>>>,
         /// commands whose joined argv contains one of these fail
         failing: Rc<RefCell<Vec<String>>>,
         run: Runner,
@@ -547,6 +632,7 @@ mod tests {
                 {"id": 7, "name": "shop-pc", "last_seen_at": 123.5}
             ]})))));
             let seen: Rc<RefCell<Vec<(String, String)>>> = Rc::default();
+            let settings: Rc<RefCell<Vec<HttpSettings>>> = Rc::default();
             let failing: Rc<RefCell<Vec<String>>> = Rc::default();
             let run: Runner = {
                 let (events, failing) = (events.clone(), failing.clone());
@@ -575,13 +661,15 @@ mod tests {
                 })
             };
             let http_for: HttpFor = {
-                let (events, register, computers, seen) = (
+                let (events, register, computers, seen, settings) = (
                     events.clone(),
                     register.clone(),
                     computers.clone(),
                     seen.clone(),
+                    settings.clone(),
                 );
-                Box::new(move |_| {
+                Box::new(move |s| {
+                    settings.borrow_mut().push(s.clone());
                     Box::new(FakeHttp {
                         events: events.clone(),
                         register: register.clone(),
@@ -599,6 +687,7 @@ mod tests {
                 register,
                 computers,
                 seen,
+                settings,
                 failing,
                 run,
                 http_for,
@@ -784,21 +873,84 @@ mod tests {
     }
 
     #[test]
-    fn an_unparseable_ini_is_refused() {
-        for bad in [
-            "this is [not an ini",
-            "[agent]\nserver_url = https://x\nprinters = a | raw | file:///t\n", // no key
-            "[agent]\nserver_url = https://x\napi_key = SECRET\nprinters = a = socket://nohost\n",
-            "[agent]\nserver_url = ftp://x\napi_key = SECRET\nprinters = a | raw | file:///t\n",
-            "[agent]\nserver_url = https://x\napi_key = SECRET\nprinters = a | raw | file:///t\n[headers]\nAuthorization = x\n",
-        ] {
+    fn an_unparseable_ini_is_refused_without_leaking_the_key() {
+        let ok = "server_url = https://x\napi_key = SECRET\nprinters = a | raw | file:///t\n";
+        let cases = [
+            "this is [not an ini".to_string(),
+            "[agent]\nserver_url = https://x\nprinters = a | raw | file:///t\n".to_string(), // no key
+            "[agent]\nserver_url = https://x\napi_key = SECRET\nprinters = a = socket://nohost\n"
+                .to_string(),
+            "[agent]\nserver_url = ftp://x\napi_key = SECRET\nprinters = a | raw | file:///t\n"
+                .to_string(),
+            format!("[agent]\n{ok}[headers]\nAuthorization = x\n"),
+            // places where a parser quotes what it chokes on, with the key right there
+            "[agent]\nserver_url = https://x\napi_key = SECRET%(nope)s\nprinters = a | raw | file:///t\n"
+                .to_string(),
+            "[agent]\nserver_url = https://x\napi_key = SECRET%KEY\nprinters = a | raw | file:///t\n"
+                .to_string(),
+            format!("SECRET-KEY\n[agent]\n{ok}"),
+            format!("[agent]\n{ok}SECRET-KEY\n"),
+            format!("[agent]\n{ok}timeout = %(api_key)s\n"),
+            "[agent]\nserver_url = https://x\napi_key = SECRET\nprinters = a = socket://%(api_key)s\n"
+                .to_string(),
+            "[agent]\nserver_url = https://x/%(api_key)s\napi_key = SECRET\nprinters = a | raw | file:///t\n"
+                .to_string(),
+        ];
+        for bad in cases {
             let fx = Fixture::new(Os::Linux);
-            std::fs::write(fx.staging.join("agent.ini"), bad).unwrap();
+            std::fs::write(fx.staging.join("agent.ini"), &bad).unwrap();
+            crate::ERR_LINES.with(|l| l.borrow_mut().clear());
             let e = apply(&fx.staging, &fx.env()).unwrap_err();
             assert_eq!(e.code(), "bad_staging", "{bad}");
             assert!(fx.events().is_empty(), "{bad}");
-            assert!(!e.to_string().contains("SECRET"), "{e}");
+            assert!(!e.to_string().contains("SECRET"), "{bad}: {e}");
+            // and on the way out through the entry point: result.json and the console
+            let args = ["install".to_string(), fx.staging.display().to_string()];
+            assert_eq!(run_args(&args, Ok(&fx.env())), Some(1), "{bad}");
+            let result = std::fs::read_to_string(fx.staging.join("result.json")).unwrap();
+            assert!(result.contains("bad_staging"), "{result}");
+            assert!(!result.contains("SECRET"), "{bad}: {result}");
+            crate::ERR_LINES.with(|l| {
+                assert!(
+                    l.borrow().iter().all(|line| !line.contains("SECRET")),
+                    "{bad}: {:?}",
+                    l.borrow()
+                )
+            });
         }
+    }
+
+    #[test]
+    fn the_ini_settings_reach_the_http_client() {
+        let fx = Fixture::new(Os::Linux);
+        let ini = format!("{INI}timeout = 45\n[headers]\nX-Via = proxy 100%\n");
+        std::fs::write(fx.staging.join("agent.ini"), ini).unwrap();
+        apply(&fx.staging, &fx.env()).unwrap();
+        let settings = fx.settings.borrow();
+        assert_eq!(settings.len(), 1);
+        assert_eq!(settings[0].timeout, 45.0);
+        assert_eq!(
+            settings[0].headers.get("x-via").map(String::as_str),
+            Some("proxy 100%")
+        );
+    }
+
+    #[test]
+    fn an_ansi_ini_is_installed_as_utf8() {
+        let fx = Fixture::new(Os::Linux);
+        let (head, tail) = INI.split_once("Büro").unwrap();
+        let mut bytes = head.as_bytes().to_vec();
+        bytes.extend_from_slice(b"B\xfcro"); // cp1252, not valid UTF-8
+        bytes.extend_from_slice(tail.as_bytes());
+        std::fs::write(fx.staging.join("agent.ini"), bytes).unwrap();
+        apply(&fx.staging, &fx.env()).unwrap();
+        let installed = std::fs::read(&fx.layout.ini).unwrap();
+        assert!(
+            String::from_utf8(installed)
+                .unwrap()
+                .contains("Büro Drucker"),
+            "the installed ini must be UTF-8 with the umlaut"
+        );
     }
 
     #[test]
@@ -1067,5 +1219,250 @@ mod tests {
                 .unwrap();
         assert_eq!(result["ok"], json!(false));
         assert_eq!(result["code"], json!("bad_staging"));
+    }
+
+    /// A folder link: a symlink, or a junction on Windows.
+    fn link_dir(link: &Path, target: &Path) {
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(target, link).unwrap();
+        #[cfg(windows)]
+        {
+            let out = std::process::Command::new("cmd")
+                .args(["/C", "mklink", "/J"])
+                .arg(link)
+                .arg(target)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "{out:?}");
+        }
+    }
+
+    #[test]
+    fn a_linked_staging_folder_is_never_written_through() {
+        let fx = Fixture::new(Os::Linux);
+        apply(&fx.staging, &fx.env()).unwrap();
+        let real = fx.tmp.path().join("real");
+        std::fs::create_dir(&real).unwrap();
+        std::fs::write(real.join("agent.ini"), b"precious").unwrap();
+        let link = fx.tmp.path().join("link");
+        link_dir(&link, &real);
+
+        assert!(write_result(&link, &json!({"ok": true})).is_err());
+        assert_eq!(
+            export_config(&link, &fx.env()).unwrap_err().code(),
+            "system"
+        );
+        assert_eq!(std::fs::read(real.join("agent.ini")).unwrap(), b"precious");
+        assert!(!real.join("result.json").exists());
+
+        // none of the three subcommands writes its result through the link either
+        for command in ["install", "uninstall", "read-config"] {
+            let args = [command.to_string(), link.display().to_string()];
+            assert_eq!(run_args(&args, Ok(&fx.env())), Some(1), "{command}");
+            assert!(!real.join("result.json").exists(), "{command}");
+            assert_eq!(std::fs::read(real.join("agent.ini")).unwrap(), b"precious");
+        }
+    }
+
+    #[test]
+    fn the_agent_is_stopped_before_its_files_are_replaced() {
+        let fx = Fixture::new(Os::Linux);
+        let binary_there = Rc::new(RefCell::new(Vec::new()));
+        let mut env = fx.env();
+        env.run = {
+            let (binary_there, binary) = (binary_there.clone(), fx.layout.binary.clone());
+            Rc::new(move |c| {
+                if c.argv.join(" ").contains("stop") {
+                    binary_there.borrow_mut().push(binary.exists());
+                }
+                Ok(Vec::new())
+            })
+        };
+        apply(&fx.staging, &env).unwrap();
+        assert_eq!(*binary_there.borrow(), vec![false]);
+    }
+
+    #[test]
+    fn the_key_is_written_before_the_marker_and_the_marker_before_the_autostart_file() {
+        // a marker that cannot be written: the key is already in
+        let fx = Fixture::new(Os::Linux);
+        std::fs::create_dir_all(&fx.layout.marker).unwrap();
+        assert_eq!(apply(&fx.staging, &fx.env()).unwrap_err().code(), "system");
+        let ini = std::fs::read_to_string(&fx.layout.ini).unwrap();
+        assert!(ini.contains("api_key = SECRET-KEY"), "{ini}");
+        assert!(!fx.layout.autostart.exists());
+
+        // an autostart file that cannot be written: the marker is already there
+        let fx = Fixture::new(Os::Linux);
+        std::fs::create_dir_all(&fx.layout.autostart).unwrap();
+        assert_eq!(apply(&fx.staging, &fx.env()).unwrap_err().code(), "system");
+        assert!(fx.layout.marker.is_file());
+        assert!(fx.events().iter().all(|e| !e.contains("enable")));
+    }
+
+    #[test]
+    fn a_stuck_copy_is_tried_ten_times_and_leaves_nothing_behind() {
+        let fx = Fixture::new(Os::Linux);
+        // a folder where the binary should go: neither copying nor renaming over it works
+        std::fs::create_dir_all(&fx.layout.binary).unwrap();
+        let waits = RefCell::new(0);
+        let sleep = |_: u64| *waits.borrow_mut() += 1;
+        let mut env = fx.env();
+        env.sleep = &sleep;
+        assert_eq!(apply(&fx.staging, &env).unwrap_err().code(), "system");
+        assert_eq!(*waits.borrow(), 9);
+        assert!(!fx.layout.dir.join(".printpapi-agent.new").exists());
+        assert!(!fx.layout.marker.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_installed_agent_is_runnable_by_the_service_user_whatever_the_source_rights() {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        let fx = Fixture::new(Os::Linux);
+        let src = fx.tmp.path().join("self.exe");
+        std::fs::set_permissions(&src, std::fs::Permissions::from_mode(0o700)).unwrap();
+        // a folder an earlier run (or a strict umask) made unreadable for others
+        std::fs::create_dir_all(&fx.layout.dir).unwrap();
+        std::fs::set_permissions(&fx.layout.dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        apply(&fx.staging, &fx.env()).unwrap();
+        assert_eq!(mode(&fx.layout.binary), 0o755);
+        assert_eq!(mode(&fx.layout.dir), 0o755);
+        // and over an existing binary with other rights
+        std::fs::set_permissions(&fx.layout.binary, std::fs::Permissions::from_mode(0o700))
+            .unwrap();
+        apply(&fx.staging, &fx.env()).unwrap();
+        assert_eq!(mode(&fx.layout.binary), 0o755);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_binary_is_replaced_by_a_new_file_not_overwritten() {
+        use std::os::unix::fs::MetadataExt;
+        let fx = Fixture::new(Os::Linux);
+        apply(&fx.staging, &fx.env()).unwrap();
+        // keep the old file alive, or the next one could be handed the same inode number
+        let held = fx.layout.dir.join("held");
+        std::fs::hard_link(&fx.layout.binary, &held).unwrap();
+        let before = std::fs::metadata(&fx.layout.binary).unwrap().ino();
+        apply(&fx.staging, &fx.env()).unwrap();
+        assert_ne!(std::fs::metadata(&fx.layout.binary).unwrap().ino(), before);
+    }
+
+    /// Make deleting `layout.binary` fail until the returned guard is dropped. `None` when this
+    /// user cannot (root ignores folder rights).
+    fn lock_binary(fx: &Fixture) -> Option<Box<dyn std::any::Any>> {
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            let f = std::fs::OpenOptions::new()
+                .read(true)
+                .share_mode(0)
+                .open(&fx.layout.binary)
+                .unwrap();
+            Some(Box::new(f))
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            struct Restore(PathBuf);
+            impl Drop for Restore {
+                fn drop(&mut self) {
+                    let _ =
+                        std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o755));
+                }
+            }
+            let dir = fx.layout.dir.clone();
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+            let guard = Restore(dir.clone());
+            if std::fs::File::create(dir.join("probe")).is_ok() {
+                return None;
+            }
+            Some(Box::new(guard))
+        }
+    }
+
+    #[test]
+    fn a_failed_removal_can_be_repeated() {
+        let fx = Fixture::new(Os::Linux);
+        apply(&fx.staging, &fx.env()).unwrap();
+        let Some(guard) = lock_binary(&fx) else {
+            return;
+        };
+        let waits = RefCell::new(0);
+        let sleep = |_: u64| *waits.borrow_mut() += 1;
+        let mut env = fx.env();
+        env.sleep = &sleep;
+        assert_eq!(remove(&env).unwrap_err().code(), "system");
+        assert_eq!(*waits.borrow(), 9);
+        assert!(
+            fx.layout.marker.is_file(),
+            "the marker must outlive a failed removal"
+        );
+        assert!(fx.layout.binary.exists());
+        drop(guard);
+        remove(&fx.env()).unwrap();
+        assert!(!fx.layout.dir.exists());
+    }
+
+    #[test]
+    fn the_commands_report_through_result_json_and_the_exit_code() {
+        let fx = Fixture::new(Os::Linux);
+        let dir = fx.staging.display().to_string();
+        let result = |fx: &Fixture| -> Value {
+            serde_json::from_slice(&std::fs::read(fx.staging.join("result.json")).unwrap()).unwrap()
+        };
+        // not installed yet: uninstall and read-config fail and say why
+        for command in ["uninstall", "read-config"] {
+            let args = [command.to_string(), dir.clone()];
+            assert_eq!(run_args(&args, Ok(&fx.env())), Some(1), "{command}");
+            assert_eq!(result(&fx)["code"], json!("system"), "{command}");
+        }
+        let args = ["install".to_string(), dir.clone()];
+        assert_eq!(run_args(&args, Ok(&fx.env())), Some(0));
+        assert_eq!(
+            result(&fx),
+            json!({"ok": true, "baseline_last_seen": 123.5})
+        );
+        // read-config puts the installed ini in the folder, uninstall removes the install
+        std::fs::write(fx.staging.join("agent.ini"), b"old").unwrap();
+        let args = ["read-config".to_string(), dir.clone()];
+        assert_eq!(run_args(&args, Ok(&fx.env())), Some(0));
+        assert_eq!(result(&fx), json!({"ok": true}));
+        assert!(
+            std::fs::read_to_string(fx.staging.join("agent.ini"))
+                .unwrap()
+                .contains("api_key = SECRET-KEY")
+        );
+        assert!(fx.layout.dir.exists());
+        let args = ["uninstall".to_string(), dir.clone()];
+        assert_eq!(run_args(&args, Ok(&fx.env())), Some(0));
+        assert_eq!(result(&fx), json!({"ok": true}));
+        assert!(!fx.layout.dir.exists());
+    }
+
+    #[test]
+    fn a_missing_program_path_is_reported_in_result_json() {
+        let fx = Fixture::new(Os::Linux);
+        let args = ["uninstall".to_string(), fx.staging.display().to_string()];
+        let err = ApplyError::System("cannot find the running program: x".into());
+        assert_eq!(run_args(&args, Err(err)), Some(1));
+        let written = std::fs::read_to_string(fx.staging.join("result.json")).unwrap();
+        assert!(
+            written.contains("cannot find the running program"),
+            "{written}"
+        );
+    }
+
+    #[test]
+    fn a_wrong_number_of_arguments_is_a_usage_error() {
+        let fx = Fixture::new(Os::Linux);
+        let env = fx.env();
+        let words = |w: &[&str]| w.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(run_args(&words(&["install"]), Ok(&env)), Some(2));
+        assert_eq!(run_args(&words(&["install", "a", "b"]), Ok(&env)), Some(2));
+        assert!(run_args(&words(&["run"]), Ok(&env)).is_none());
+        assert!(fx.events().is_empty());
     }
 }
