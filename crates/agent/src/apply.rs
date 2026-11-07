@@ -838,25 +838,16 @@ pub(crate) fn dir_owner_sid(dir: &Path) -> std::io::Result<String> {
 /// service's data (on Windows the owners are Administrators and SYSTEM, see
 /// `trusted_windows_owner`).
 // ponytail: a user can still swap the folder between this check and the next step; the same gap
-// as in `check_staging`, closed together with it by roadmap 12.
+// as in `check_staging`, closed together with it by roadmap 12. `prepare_status_dir` narrows it:
+// it makes the folder itself, looks again after an `AlreadyExists`, and checks once more right
+// before every command and before the purge.
 fn vet_status_dir(dir: &Path, owners: &[u32]) -> Result<(), ApplyError> {
     let meta = match std::fs::symlink_metadata(dir) {
         Ok(meta) => meta,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(e) => return Err(system("cannot look at the status folder", e)),
     };
-    if is_link(&meta) {
-        return Err(ApplyError::System(format!(
-            "{} is a symbolic link, and the setup does not follow it. Remove the link and try again.",
-            dir.display()
-        )));
-    }
-    if !meta.is_dir() {
-        return Err(ApplyError::System(format!(
-            "{} is not a folder.",
-            dir.display()
-        )));
-    }
+    check_plain_dir(dir, &meta)?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
@@ -877,6 +868,60 @@ fn vet_status_dir(dir: &Path, owners: &[u32]) -> Result<(), ApplyError> {
     #[cfg(not(unix))]
     let _ = owners;
     Ok(())
+}
+
+/// A folder, not a link and not (Windows) a reparse point such as a junction.
+fn check_plain_dir(dir: &Path, meta: &std::fs::Metadata) -> Result<(), ApplyError> {
+    if is_link(meta) {
+        return Err(ApplyError::System(format!(
+            "{} is a symbolic link, and the setup does not follow it. Remove the link and try again.",
+            dir.display()
+        )));
+    }
+    if !meta.is_dir() {
+        return Err(ApplyError::System(format!(
+            "{} is not a folder.",
+            dir.display()
+        )));
+    }
+    Ok(())
+}
+
+/// The status folder must be there as a real folder: used right before the commands and the purge
+/// that act on the path. `icacls` without `/L` acts on the destination of a link ("/l: Performs the
+/// operation on a symbolic link instead of its destination",
+/// https://learn.microsoft.com/en-us/windows-server/administration/windows-commands/icacls), and
+/// `chown`, `chmod` and the purge follow it too, so a link here would carry an elevated change of
+/// owner and rights, and a deletion, into a folder that belongs to somebody else.
+// ponytail: this is a check, not a lock: a swap in the microseconds between it and the command
+// stays possible on Windows, where a user may create folders in `%ProgramData%` (and may then also
+// rename the empty folder we made, which belongs to Administrators). Closing it takes a handle held
+// across the commands, which `icacls` does not allow.
+fn ensure_plain_status_dir(dir: &Path) -> Result<(), ApplyError> {
+    let meta = std::fs::symlink_metadata(dir)
+        .map_err(|e| system("cannot look at the status folder", e))?;
+    check_plain_dir(dir, &meta)
+}
+
+/// Make the folder with a `create_dir` of its own, not `create_dirs`: that one takes an
+/// `AlreadyExists` as success, and then every later step would run on whatever a user put there
+/// between the check and now. The parent is never made (`%ProgramData%`, `/var/lib` and
+/// `/Library/Application Support` are always there); a missing parent is an error. A folder that
+/// was made by somebody in the gap is looked at again, and is only kept when it passes what
+/// [`vet_status_dir`] asks of a folder that was there before.
+fn make_status_dir(dir: &Path, owners: &[u32]) -> Result<(), ApplyError> {
+    match std::fs::create_dir(dir) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            vet_status_dir(dir, owners)?;
+            ensure_plain_status_dir(dir)
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err(ApplyError::System(format!(
+            "cannot create the status folder: the folder above {} is missing, and the setup does not make it.",
+            dir.display()
+        ))),
+        Err(e) => Err(system("cannot create the status folder", e)),
+    }
 }
 
 fn foreign_status_dir(dir: &Path) -> ApplyError {
@@ -917,18 +962,45 @@ fn purge_status_dir(
     Ok(())
 }
 
+#[cfg(test)]
+type StatusDirHook = Box<dyn Fn(&str, &Path)>;
+
+#[cfg(test)]
+thread_local! {
+    /// Tests only: runs at the named step of `prepare_status_dir` ("vetted", "created",
+    /// "rights_set"), which is where a user can swap the folder for a link.
+    static STATUS_DIR_HOOK: std::cell::RefCell<Option<StatusDirHook>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+fn status_dir_step(_step: &str, _dir: &Path) {
+    #[cfg(test)]
+    STATUS_DIR_HOOK.with(|h| {
+        if let Some(f) = &*h.borrow() {
+            f(_step, _dir);
+        }
+    });
+}
+
 /// Make the status folder (readable for everybody, writable for the agent only).
 fn prepare_status_dir(env: &Env) -> Result<(), ApplyError> {
     let dir = &env.layout.status_dir;
     vet_status_dir(dir, &status_dir_owners(env.os))?;
-    create_dirs(dir).map_err(|e| system("cannot create the status folder", e))?;
+    status_dir_step("vetted", dir);
+    make_status_dir(dir, &status_dir_owners(env.os))?;
+    status_dir_step("created", dir);
+    // chmod follows a link, so the folder is looked at first
+    ensure_plain_status_dir(dir)?;
     set_mode(dir, 0o755).map_err(|e| system("cannot set the status folder's rights", e))?;
     for c in install::status_dir_cmds(env.os, &env.layout, &env.sys) {
+        ensure_plain_status_dir(dir)?;
         (env.run)(&c).map_err(|e| system("cannot set the status folder's rights", e))?;
     }
+    status_dir_step("rights_set", dir);
     // ponytail: Windows only. Elsewhere the folder is made under `/var/lib` or `/Library/Application
     // Support`, which no user can write to, so nobody can slip a file in before the rights are set.
     if env.os == Os::Windows {
+        ensure_plain_status_dir(dir)?;
         purge_status_dir(dir, env.owner_sid)
             .map_err(|e| system("cannot clean the status folder", e))?;
     }
@@ -3602,6 +3674,148 @@ mod tests {
         std::os::unix::fs::symlink(&elsewhere, &fx2.layout.status_dir).unwrap();
         remove(&fx2.env()).unwrap();
         assert!(elsewhere.join("precious").exists());
+    }
+
+    /// Calls `f(step, status folder)` at each step of the status folder's preparation while the
+    /// guard lives.
+    struct StatusDirHookGuard;
+
+    impl StatusDirHookGuard {
+        fn new(f: impl Fn(&str, &Path) + 'static) -> Self {
+            STATUS_DIR_HOOK.with(|h| *h.borrow_mut() = Some(Box::new(f)));
+            StatusDirHookGuard
+        }
+    }
+
+    impl Drop for StatusDirHookGuard {
+        fn drop(&mut self) {
+            STATUS_DIR_HOOK.with(|h| *h.borrow_mut() = None);
+        }
+    }
+
+    /// A folder with a file in it that no install may touch: the target of a planted link.
+    fn protected_dir(fx: &Fixture) -> PathBuf {
+        let dir = fx.tmp.path().join("protected");
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::write(dir.join("precious"), b"x").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        dir
+    }
+
+    /// The install refused, no rights command touched the status folder, and nothing in the
+    /// protected folder changed.
+    fn assert_status_dir_untouched(fx: &Fixture, protected: &Path, e: &ApplyError, os: Os) {
+        assert_eq!(e.code(), "system", "{os:?}: {e}");
+        let dir = fx.layout.status_dir.display().to_string();
+        let ev = fx.events();
+        assert!(
+            ev.iter()
+                .all(|l| !l.contains(&dir) && !l.contains("enable --now")),
+            "{os:?}: {ev:?}"
+        );
+        assert_eq!(std::fs::read(protected.join("precious")).unwrap(), b"x");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let meta = std::fs::metadata(protected).unwrap();
+            assert_eq!(meta.mode() & 0o777, 0o700, "{os:?}");
+        }
+    }
+
+    #[test]
+    fn a_link_that_appears_after_the_check_is_refused_before_any_rights_are_set() {
+        for os in [Os::Linux, Os::Windows, Os::Macos] {
+            let fx = Fixture::new(os);
+            let protected = protected_dir(&fx);
+            let target = protected.clone();
+            // the folder is not there for the check; a user makes it a link right after
+            let _hook = StatusDirHookGuard::new(move |step, dir| {
+                if step == "vetted" {
+                    link_dir(dir, &target);
+                }
+            });
+            let e = apply(&fx.staging, &fx.env()).unwrap_err();
+            assert_status_dir_untouched(&fx, &protected, &e, os);
+        }
+    }
+
+    #[test]
+    fn a_folder_swapped_for_a_link_after_it_was_made_is_refused_before_any_rights_are_set() {
+        for os in [Os::Linux, Os::Windows, Os::Macos] {
+            let fx = Fixture::new(os);
+            let protected = protected_dir(&fx);
+            let target = protected.clone();
+            let _hook = StatusDirHookGuard::new(move |step, dir| {
+                if step == "created" {
+                    std::fs::remove_dir(dir).unwrap();
+                    link_dir(dir, &target);
+                }
+            });
+            let e = apply(&fx.staging, &fx.env()).unwrap_err();
+            assert_status_dir_untouched(&fx, &protected, &e, os);
+        }
+    }
+
+    #[test]
+    fn a_link_that_appears_after_the_rights_are_set_is_never_purged() {
+        let fx = Fixture::new(Os::Windows);
+        let protected = protected_dir(&fx);
+        let target = protected.clone();
+        let _hook = StatusDirHookGuard::new(move |step, dir| {
+            if step == "rights_set" {
+                std::fs::remove_dir(dir).unwrap();
+                link_dir(dir, &target);
+            }
+        });
+        let e = apply(&fx.staging, &fx.env()).unwrap_err();
+        assert_eq!(e.code(), "system", "{e}");
+        assert_eq!(std::fs::read(protected.join("precious")).unwrap(), b"x");
+        assert!(fx.events().iter().all(|l| !l.contains("enable --now")));
+    }
+
+    #[test]
+    fn a_missing_parent_of_the_status_folder_is_an_error_not_something_to_make() {
+        for os in [Os::Linux, Os::Windows, Os::Macos] {
+            let mut fx = Fixture::new(os);
+            let parent = fx.tmp.path().join("no-such-parent");
+            fx.layout.status_dir = parent.join("status");
+            let e = apply(&fx.staging, &fx.env()).unwrap_err();
+            assert_eq!(e.code(), "system", "{os:?}: {e}");
+            assert!(!parent.exists(), "{os:?}");
+            assert!(fx.events().iter().all(|l| !l.contains("enable --now")));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_folder_of_another_user_that_appears_after_the_check_is_refused_not_deleted() {
+        use std::os::unix::fs::chown;
+        let fx = Fixture::new(Os::Linux);
+        let handed = Rc::new(std::cell::Cell::new(false));
+        let seen = handed.clone();
+        let _hook = StatusDirHookGuard::new(move |step, dir| {
+            if step == "vetted" {
+                std::fs::create_dir(dir).unwrap();
+                std::fs::write(dir.join("status.json"), b"planted").unwrap();
+                seen.set(chown(dir, Some(54321), Some(54321)).is_ok());
+            }
+        });
+        let result = apply(&fx.staging, &fx.env());
+        let dir = &fx.layout.status_dir;
+        if handed.get() {
+            // only as root (the Docker run) can the folder be handed to another user
+            let e = result.unwrap_err();
+            assert!(e.to_string().contains("another user"), "{e}");
+            assert!(dir.join("status.json").exists());
+            let line = dir.display().to_string();
+            assert!(fx.events().iter().all(|l| !l.contains(&line)));
+        } else {
+            result.unwrap();
+        }
     }
 
     #[test]
