@@ -14,6 +14,8 @@ use crate::run::PollOutcome;
 
 const FILE_NAME: &str = "status.json";
 const TMP_NAME: &str = "status.json.tmp";
+/// Every file the agent writes into its status folder: what removal may delete, and nothing else.
+pub const FILES: [&str; 3] = [FILE_NAME, TMP_NAME, crate::log::LOG_NAME];
 /// An unchanged status is still written this often, so the tray sees a living agent (it calls a
 /// file older than 120 s "not running").
 const REFRESH_SECS: f64 = 60.0;
@@ -50,7 +52,7 @@ pub fn program_data() -> PathBuf {
     PathBuf::from(DEFAULT_PROGRAM_DATA)
 }
 
-/// The status folder of `os`: `<ProgramData>\printpapi` on Windows; elsewhere the standard place
+/// The status folder of `os`: `<ProgramData>\printpapi-agent` on Windows; elsewhere the standard place
 /// for state that outlives a run (`/Library/Application Support` is the macOS folder for
 /// application support files, `/var/lib` the FHS one for variable state data).
 /// https://refspecs.linuxfoundation.org/FHS_3.0/fhs/ch05s08.html
@@ -58,10 +60,13 @@ pub fn status_dir_in(os: Os, program_data: &Path) -> PathBuf {
     match os {
         Os::Windows => {
             let base = program_data.to_string_lossy();
-            PathBuf::from(format!("{}\\printpapi", base.trim_end_matches(['/', '\\'])))
+            PathBuf::from(format!(
+                "{}\\printpapi-agent",
+                base.trim_end_matches(['/', '\\'])
+            ))
         }
-        Os::Macos => PathBuf::from("/Library/Application Support/printpapi"),
-        Os::Linux => PathBuf::from("/var/lib/printpapi"),
+        Os::Macos => PathBuf::from("/Library/Application Support/printpapi-agent"),
+        Os::Linux => PathBuf::from("/var/lib/printpapi-agent"),
     }
 }
 
@@ -377,15 +382,15 @@ mod tests {
         let pd = std::path::Path::new("C:\\ProgramData");
         assert_eq!(
             status_dir_in(Os::Windows, pd),
-            std::path::PathBuf::from("C:\\ProgramData\\printpapi")
+            std::path::PathBuf::from("C:\\ProgramData\\printpapi-agent")
         );
         assert_eq!(
             status_dir_in(Os::Macos, pd),
-            std::path::PathBuf::from("/Library/Application Support/printpapi")
+            std::path::PathBuf::from("/Library/Application Support/printpapi-agent")
         );
         assert_eq!(
             status_dir_in(Os::Linux, pd),
-            std::path::PathBuf::from("/var/lib/printpapi")
+            std::path::PathBuf::from("/var/lib/printpapi-agent")
         );
     }
 

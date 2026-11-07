@@ -697,9 +697,10 @@ fn dir_owner_sid(dir: &Path) -> std::io::Result<String> {
 
 /// Look at the status folder before it is used: this runs elevated, and the folder is in a place
 /// where a user may have made it first. A link is refused (root would write where it points), and
-/// a folder that none of `owners` owns is deleted with what is in it and made again, so
-/// the install never keeps a folder another user controls (on Windows the owners are Administrators
-/// and SYSTEM, see `trusted_windows_owner`).
+/// so is a folder that none of `owners` owns: the install never keeps a folder another user
+/// controls, and it never deletes what it did not put there, because that may be another
+/// service's data (on Windows the owners are Administrators and SYSTEM, see
+/// `trusted_windows_owner`).
 // ponytail: a user can still swap the folder between this check and the next step; the same gap
 // as in `check_staging`, closed together with it by roadmap 12.
 fn vet_status_dir(dir: &Path, owners: &[u32]) -> Result<(), ApplyError> {
@@ -724,25 +725,29 @@ fn vet_status_dir(dir: &Path, owners: &[u32]) -> Result<(), ApplyError> {
     {
         use std::os::unix::fs::MetadataExt;
         if !owners.contains(&meta.uid()) {
-            std::fs::remove_dir_all(dir)
-                .map_err(|e| system("cannot replace the status folder of another user", e))?;
+            return Err(foreign_status_dir(dir));
         }
     }
     #[cfg(windows)]
     {
         // the same for Windows: a folder that is not Administrators' or SYSTEM's was made by a
         // user, who may still hold rights on it that the icacls calls after this do not take away
-        // (`remove_dir_all` does not follow a junction inside)
         let sid =
             dir_owner_sid(dir).map_err(|e| system("cannot read the status folder's owner", e))?;
         if !trusted_windows_owner(&sid) {
-            std::fs::remove_dir_all(dir)
-                .map_err(|e| system("cannot replace the status folder of another user", e))?;
+            return Err(foreign_status_dir(dir));
         }
     }
     #[cfg(not(unix))]
     let _ = owners;
     Ok(())
+}
+
+fn foreign_status_dir(dir: &Path) -> ApplyError {
+    ApplyError::System(format!(
+        "{} is a folder of another user. The setup neither uses nor deletes it. Look at what is in it, remove it if it is not needed, and try again.",
+        dir.display()
+    ))
 }
 
 /// Make the status folder (readable for everybody, writable for the agent only).
@@ -765,6 +770,27 @@ fn remove_tree(path: &Path) -> std::io::Result<()> {
         Ok(meta) if meta.is_dir() && !is_link(&meta) => std::fs::remove_dir_all(path),
         // a file or a link; a Windows junction is removed as a folder
         Ok(_) => std::fs::remove_file(path).or_else(|_| std::fs::remove_dir(path)),
+    }
+}
+
+/// Take the agent out of its status folder: the files the agent itself writes, then the folder if
+/// nothing else is in it. Whatever else is there is not ours and stays, folder included. A link
+/// (or a file) at that place is removed without being followed.
+fn remove_status_dir(dir: &Path) -> std::io::Result<()> {
+    match std::fs::symlink_metadata(dir) {
+        Ok(meta) if meta.is_dir() && !is_link(&meta) => {
+            for name in crate::status::FILES {
+                match std::fs::remove_file(dir.join(name)) {
+                    Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e),
+                    _ => {}
+                }
+            }
+            match std::fs::remove_dir(dir) {
+                Err(e) if e.kind() == std::io::ErrorKind::DirectoryNotEmpty => Ok(()),
+                other => other,
+            }
+        }
+        _ => remove_tree(dir),
     }
 }
 
@@ -904,10 +930,12 @@ pub fn remove(env: &Env) -> Result<(), ApplyError> {
         }
     }
     // the tray program (outside the install folder on macOS) and the status folder
-    for path in [&l.tray, &l.status_dir] {
-        retry(FILE_ATTEMPTS, env.sleep, &mut || remove_tree(path))
-            .map_err(|e| system("cannot delete the tray icon and the status folder", e))?;
-    }
+    retry(FILE_ATTEMPTS, env.sleep, &mut || remove_tree(&l.tray))
+        .map_err(|e| system("cannot delete the tray icon", e))?;
+    retry(FILE_ATTEMPTS, env.sleep, &mut || {
+        remove_status_dir(&l.status_dir)
+    })
+    .map_err(|e| system("cannot delete the status folder", e))?;
     // The marker goes last: a locked file (a running exe, a hung SumatraPDF) stops the removal, and
     // a second try must still find the marker instead of leaving the folder behind as "foreign".
     retry(FILE_ATTEMPTS, env.sleep, &mut || {
@@ -1430,6 +1458,7 @@ mod tests {
             b"the running binary"
         );
         // and once more over a finished install
+        fx.after_an_elevated_install();
         apply(&fx.staging, &fx.env()).unwrap();
         assert!(fx.layout.marker.exists());
     }
@@ -1670,6 +1699,7 @@ mod tests {
         std::fs::write(fx.staging.join("agent.ini"), changed).unwrap();
         // a leftover of a run that died
         std::fs::write(fx.layout.dir.join(".agent.ini.new"), b"half").unwrap();
+        fx.after_an_elevated_install();
         apply(&fx.staging, &fx.env()).unwrap();
         let ini = std::fs::read_to_string(&fx.layout.ini).unwrap();
         assert!(
@@ -2302,6 +2332,15 @@ mod tests {
     // ---- tray icon, status folder, patch and restart ----
 
     impl Fixture {
+        /// Before a second install on a Windows host: the real `icacls` of the first one makes
+        /// Administrators the owner of the status folder, which the faked runner cannot, so a
+        /// folder left by a first install in a test would be refused as one of another user.
+        fn after_an_elevated_install(&self) {
+            if cfg!(windows) {
+                std::fs::remove_dir_all(&self.layout.status_dir).ok();
+            }
+        }
+
         /// The tray program as the setup stages it: one file, on macOS an `.app` folder.
         fn stage_tray(&self, bytes: &[u8]) {
             let tray = self.staging.join("tray");
@@ -2453,6 +2492,8 @@ mod tests {
                 std::fs::create_dir_all(fx.layout.tray.join("Contents")).unwrap();
             }
             std::fs::write(fx.layout.status_dir.join("status.json"), b"{}").unwrap();
+            std::fs::write(fx.layout.status_dir.join("status.json.tmp"), b"{").unwrap();
+            std::fs::write(fx.layout.status_dir.join("print_agent-error.log"), b"x").unwrap();
             fx.events.borrow_mut().clear();
             remove(&fx.env()).unwrap();
             assert!(!fx.layout.dir.exists(), "{os:?}");
@@ -2611,17 +2652,18 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn a_status_dir_of_another_owner_is_replaced_on_windows() {
+    fn a_status_dir_of_another_owner_is_refused_on_windows() {
         let fx = Fixture::new(Os::Windows);
         let dir = &fx.layout.status_dir;
         std::fs::create_dir_all(dir).unwrap();
         std::fs::write(dir.join("planted"), b"x").unwrap();
         let sid = dir_owner_sid(dir).unwrap();
         assert!(sid.starts_with("S-1-5-"), "{sid}");
-        vet_status_dir(dir, &[]).unwrap();
-        // gone with its content exactly when the owner is not trusted: in a test run that is
-        // whoever made the folder, usually the user
-        assert_eq!(dir.join("planted").exists(), trusted_windows_owner(&sid));
+        // refused exactly when the owner is not trusted (in a test run that is whoever made the
+        // folder, usually the user), and what is in the folder is never deleted
+        let result = vet_status_dir(dir, &[]);
+        assert_eq!(result.is_ok(), trusted_windows_owner(&sid), "{result:?}");
+        assert!(dir.join("planted").exists());
         // nothing there is fine
         std::fs::remove_dir_all(dir).ok();
         vet_status_dir(dir, &[]).unwrap();
@@ -2629,7 +2671,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn a_pre_made_status_dir_is_taken_over_with_our_owner() {
+    fn a_pre_made_status_dir_of_another_user_is_refused_not_deleted() {
         use std::os::unix::fs::{MetadataExt, chown};
         let fx = Fixture::new(Os::Linux);
         std::fs::create_dir_all(&fx.layout.status_dir).unwrap();
@@ -2637,12 +2679,17 @@ mod tests {
         // as root the folder is handed to another user; as anybody else it is already the
         // runner's, which the install trusts, so only the root run (the Docker run) shows the case
         let handed = chown(&fx.layout.status_dir, Some(54321), Some(54321)).is_ok();
-        apply(&fx.staging, &fx.env()).unwrap();
+        let result = apply(&fx.staging, &fx.env());
         let meta = std::fs::metadata(&fx.layout.status_dir).unwrap();
         if handed {
-            assert_eq!(meta.uid(), 0, "the folder of another user must not be kept");
-            assert!(!fx.layout.status_dir.join("status.json").exists());
+            // another service's folder: not used, not touched, not deleted
+            let e = result.unwrap_err();
+            assert_eq!(e.code(), "system");
+            assert!(e.to_string().contains("another user"), "{e}");
+            assert_eq!(meta.uid(), 54321);
+            assert!(fx.layout.status_dir.join("status.json").exists());
         } else {
+            result.unwrap();
             assert_eq!(meta.uid(), unsafe { libc::geteuid() });
         }
     }
@@ -2658,10 +2705,12 @@ mod tests {
         std::fs::write(dir.join("keep"), b"x").unwrap();
         vet_status_dir(dir, &[mine]).unwrap();
         assert!(dir.join("keep").exists());
-        // nobody trusted: it goes, with what is in it
-        vet_status_dir(dir, &[]).unwrap();
-        assert!(!dir.exists());
+        // nobody trusted: refused, and what is in it stays
+        let e = vet_status_dir(dir, &[]).unwrap_err();
+        assert!(e.to_string().contains("another user"), "{e}");
+        assert!(dir.join("keep").exists());
         // nothing there is fine
+        std::fs::remove_dir_all(dir).unwrap();
         vet_status_dir(dir, &[]).unwrap();
     }
 
@@ -2687,6 +2736,30 @@ mod tests {
     }
 
     #[test]
+    fn remove_deletes_only_the_agents_own_files_from_the_status_folder() {
+        for os in [Os::Linux, Os::Windows, Os::Macos] {
+            let fx = Fixture::new(os);
+            apply(&fx.staging, &fx.env()).unwrap();
+            let dir = &fx.layout.status_dir;
+            for own in ["status.json", "status.json.tmp", "print_agent-error.log"] {
+                std::fs::write(dir.join(own), b"x").unwrap();
+            }
+            // what somebody else keeps there (a server database, say) is not ours to delete
+            std::fs::write(dir.join("printpapi.db"), b"precious").unwrap();
+            remove(&fx.env()).unwrap();
+            assert_eq!(
+                std::fs::read(dir.join("printpapi.db")).unwrap(),
+                b"precious",
+                "{os:?}"
+            );
+            for own in ["status.json", "status.json.tmp", "print_agent-error.log"] {
+                assert!(!dir.join(own).exists(), "{os:?}: {own}");
+            }
+            assert!(!fx.layout.dir.exists(), "{os:?}");
+        }
+    }
+
+    #[test]
     fn a_patch_merges_with_the_installed_ini() {
         let fx = Fixture::new(Os::Linux);
         apply(&fx.staging, &fx.env()).unwrap();
@@ -2694,6 +2767,7 @@ mod tests {
         fx.stage_patch(
             r#"{"printers": "Zebra GK420d", "timeout": 45, "headers": [["X-Via", "proxy 100%"]]}"#,
         );
+        fx.after_an_elevated_install();
         apply(&fx.staging, &fx.env()).unwrap();
         let ini = std::fs::read_to_string(&fx.layout.ini).unwrap();
         // what the patch names changed, what it does not name stayed

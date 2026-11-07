@@ -1292,14 +1292,17 @@ mod tests {
     fn service_logs() {
         // where `run` sends the crash log of a setup-installed agent: next to the status file
         let w = service_log_path(Os::Windows, Path::new("C:\\ProgramData"));
-        assert_eq!(p(&w), "C:\\ProgramData\\printpapi\\print_agent-error.log");
+        assert_eq!(
+            p(&w),
+            "C:\\ProgramData\\printpapi-agent\\print_agent-error.log"
+        );
         assert_eq!(
             p(&service_log_path(Os::Macos, Path::new("/"))),
-            "/Library/Application Support/printpapi/print_agent-error.log"
+            "/Library/Application Support/printpapi-agent/print_agent-error.log"
         );
         assert_eq!(
             p(&service_log_path(Os::Linux, Path::new("/"))),
-            "/var/lib/printpapi/print_agent-error.log"
+            "/var/lib/printpapi-agent/print_agent-error.log"
         );
     }
 
@@ -1314,7 +1317,7 @@ mod tests {
     #[test]
     fn tray_places_per_platform() {
         let w = win_with_data("C:\\Program Files", "C:\\ProgramData");
-        assert_eq!(p(&w.status_dir), "C:\\ProgramData\\printpapi");
+        assert_eq!(p(&w.status_dir), "C:\\ProgramData\\printpapi-agent");
         assert_eq!(
             p(&w.tray),
             "C:\\Program Files\\printpapi\\printpapi-tray.exe"
@@ -1322,7 +1325,7 @@ mod tests {
         // Windows starts the icon from the Run key, not from a file
         assert!(w.tray_autostart.is_none() && w.app_entry.is_none());
         let l = linux();
-        assert_eq!(p(&l.status_dir), "/var/lib/printpapi");
+        assert_eq!(p(&l.status_dir), "/var/lib/printpapi-agent");
         assert_eq!(p(&l.tray), "/opt/printpapi/printpapi-tray");
         assert_eq!(
             p(l.tray_autostart.as_ref().unwrap()),
@@ -1333,7 +1336,10 @@ mod tests {
             "/usr/share/applications/printpapi-agent.desktop"
         );
         let m = mac();
-        assert_eq!(p(&m.status_dir), "/Library/Application Support/printpapi");
+        assert_eq!(
+            p(&m.status_dir),
+            "/Library/Application Support/printpapi-agent"
+        );
         assert_eq!(p(&m.tray), "/Applications/printpapi Agent.app");
         assert_eq!(
             p(m.tray_autostart.as_ref().unwrap()),
@@ -1487,13 +1493,13 @@ mod tests {
             [
                 vec![
                     "C:\\Windows\\System32\\icacls.exe",
-                    "C:\\ProgramData\\printpapi",
+                    "C:\\ProgramData\\printpapi-agent",
                     "/setowner",
                     "*S-1-5-32-544"
                 ],
                 vec![
                     "C:\\Windows\\System32\\icacls.exe",
-                    "C:\\ProgramData\\printpapi",
+                    "C:\\ProgramData\\printpapi-agent",
                     "/inheritance:r",
                     "/grant:r",
                     "*S-1-5-18:(OI)(CI)F",
@@ -1519,8 +1525,8 @@ mod tests {
         assert_eq!(
             argvs(&status_dir_cmds(Os::Linux, &linux(), Path::new("/"))),
             [
-                vec!["chown", "printpapi", "/var/lib/printpapi"],
-                vec!["chmod", "755", "/var/lib/printpapi"],
+                vec!["chown", "printpapi", "/var/lib/printpapi-agent"],
+                vec!["chmod", "755", "/var/lib/printpapi-agent"],
             ]
         );
         assert_eq!(
@@ -1529,12 +1535,12 @@ mod tests {
                 vec![
                     "/usr/sbin/chown",
                     "root:wheel",
-                    "/Library/Application Support/printpapi"
+                    "/Library/Application Support/printpapi-agent"
                 ],
                 vec![
                     "/bin/chmod",
                     "755",
-                    "/Library/Application Support/printpapi"
+                    "/Library/Application Support/printpapi-agent"
                 ],
             ]
         );

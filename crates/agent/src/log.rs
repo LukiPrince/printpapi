@@ -98,7 +98,7 @@ mod tests {
 
     #[test]
     fn log_goes_to_the_set_dir() {
-        let set = PathBuf::from("/var/lib/printpapi");
+        let set = PathBuf::from("/var/lib/printpapi-agent");
         // a directory set by a setup-installed agent wins over %LOCALAPPDATA% (SYSTEM's profile)
         assert_eq!(target_dir(Some(&set), Some("C:/x".into())), set);
         assert_eq!(target_dir(None, Some("C:/x".into())), PathBuf::from("C:/x"));

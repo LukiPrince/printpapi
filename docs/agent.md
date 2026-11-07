@@ -27,8 +27,8 @@ SumatraPDF (Windows), Restart and Remove. Looking needs no administrator rights;
 for them once.
 
 - The icon only reads `status.json`, which the agent rewrites at least once a minute: Windows
-  `%ProgramData%\printpapi\`, macOS `/Library/Application Support/printpapi/`, Linux
-  `/var/lib/printpapi/`. The file holds the server, device name, state, last contact and job, the
+  `%ProgramData%\printpapi-agent\`, macOS `/Library/Application Support/printpapi-agent/`, Linux
+  `/var/lib/printpapi-agent/`. The file holds the server, device name, state, last contact and job, the
   printers and the header names, never the key and never a header value. A file that is missing or
   older than two minutes shows "not running". The agent still opens no port and takes no commands.
   The crash log of an agent the setup installed lives in the same folder.

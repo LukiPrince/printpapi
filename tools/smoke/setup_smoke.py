@@ -39,7 +39,7 @@ TRAY_RUN_VALUE = "printpapi-tray"
 if WIN:
     INSTALL_DIR = Path(os.environ.get("ProgramFiles", r"C:\Program Files")) / "printpapi"
     AUTOSTART = INSTALL_DIR / "printpapi-agent-task.xml"
-    STATUS_DIR = Path(os.environ.get("ProgramData", r"C:\ProgramData")) / "printpapi"
+    STATUS_DIR = Path(os.environ.get("ProgramData", r"C:\ProgramData")) / "printpapi-agent"
     TRAY = INSTALL_DIR / "printpapi-tray.exe"
     TRAY_AUTOSTART = None  # the registry, see tray_registered()
     APP_ENTRY = None
@@ -47,14 +47,14 @@ if WIN:
 elif LINUX:
     INSTALL_DIR = Path("/opt/printpapi")
     AUTOSTART = Path("/etc/systemd/system/printpapi-agent.service")
-    STATUS_DIR = Path("/var/lib/printpapi")
+    STATUS_DIR = Path("/var/lib/printpapi-agent")
     TRAY = INSTALL_DIR / "printpapi-tray"
     TRAY_AUTOSTART = Path("/etc/xdg/autostart/printpapi-tray.desktop")
     APP_ENTRY = Path("/usr/share/applications/printpapi-agent.desktop")
 else:
     INSTALL_DIR = Path("/opt/printpapi")
     AUTOSTART = Path("/Library/LaunchDaemons/com.printpapi.agent.plist")
-    STATUS_DIR = Path("/Library/Application Support/printpapi")
+    STATUS_DIR = Path("/Library/Application Support/printpapi-agent")
     TRAY = Path("/Applications/printpapi Agent.app")
     TRAY_AUTOSTART = Path("/Library/LaunchAgents/com.printpapi.tray.plist")
     APP_ENTRY = None

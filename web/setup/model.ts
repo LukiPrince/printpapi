@@ -83,11 +83,11 @@ export function canSwitchOn(found: FoundPrinter | null, on: boolean): boolean {
 export function logLocation(platform: Platform): string {
   switch (platform) {
     case "windows":
-      return "C:\\ProgramData\\printpapi\\print_agent-error.log";
+      return "C:\\ProgramData\\printpapi-agent\\print_agent-error.log";
     case "macos":
-      return "/Library/Application Support/printpapi/print_agent-error.log";
+      return "/Library/Application Support/printpapi-agent/print_agent-error.log";
     case "linux":
-      return "/var/lib/printpapi/print_agent-error.log";
+      return "/var/lib/printpapi-agent/print_agent-error.log";
   }
 }
 
