@@ -32,6 +32,9 @@ jobs:
         working-directory: web
       - run: npm run build:demo
         working-directory: web
+      # check:bundles also guards the setup window's build against the other two, so it needs it
+      - run: npm run build:setup
+        working-directory: web
       - run: npm run check:bundles
         working-directory: web
       - uses: cloudflare/wrangler-action@953926a2e2182532811c01a25e53647d93bf07c0 # v4.1.3
