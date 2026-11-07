@@ -1,7 +1,7 @@
 // printpapi — self-hosted PrintNode alternative. Elastic License 2.0 (see LICENSE).
 import test from "node:test";
 import assert from "node:assert/strict";
-import { DEFAULT_RAW_PORT, addNetworkPrinter, canLeavePrinters, canTest, errorText, fromFound, logLocation, needsSumatra } from "./model.ts";
+import { DEFAULT_RAW_PORT, addNetworkPrinter, canLeavePrinters, canTest, errorText, fromFound, logLocation, needsSumatra, returnsToConnect } from "./model.ts";
 import type { FoundPrinter, PrinterChoice } from "./api.ts";
 
 const choice = (over: Partial<PrinterChoice> = {}): PrinterChoice => ({
@@ -101,4 +101,13 @@ test("the log of the installed agent is named per platform", () => {
   );
   assert.equal(logLocation("linux"), "/tmp/print_agent-error.log");
   assert.equal(logLocation("macos"), "/var/log/printpapi-agent.log");
+});
+
+test("a refused key or name sends the window back to the first step, every other failure stays", () => {
+  assert.equal(returnsToConnect("key_in_use"), true);
+  assert.equal(returnsToConnect("name_taken"), true);
+  // nothing about the connection is wrong in these: another try, not another key
+  for (const code of ["proxy", "unreachable", "system", "bad_staging", "error"]) {
+    assert.equal(returnsToConnect(code), false, code);
+  }
 });

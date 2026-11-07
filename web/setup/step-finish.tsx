@@ -6,7 +6,7 @@ import { CircleCheck, Loader2, Rocket } from "lucide-react";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { setup, toSetupError, type Platform, type PrinterChoice } from "./api";
-import { errorText, logLocation } from "./model";
+import { errorText, logLocation, returnsToConnect } from "./model";
 import { Actions, Notice } from "./bits";
 import type { Connection } from "./step-connect";
 
@@ -37,7 +37,8 @@ export function StepFinish({
   deviceName: string;
   selected: PrinterChoice[];
   onBack: () => void;
-  onBackToConnect?: () => void;
+  /** Back to step 1, with the reason when a refused key or name sent it there. */
+  onBackToConnect?: (message?: string) => void;
   onDone: () => void;
 }) {
   const [phase, setPhase] = useState<Phase>({ at: "idle" });
@@ -63,7 +64,12 @@ export function StepFinish({
         printers: selected,
       });
     } catch (e) {
-      setPhase({ at: "failed", message: errorText(toSetupError(e)) });
+      const err = toSetupError(e);
+      if (onBackToConnect && returnsToConnect(err.code)) {
+        onBackToConnect(errorText(err));
+        return;
+      }
+      setPhase({ at: "failed", message: errorText(err) });
       return;
     }
     await wait(baseline);
@@ -147,7 +153,7 @@ export function StepFinish({
             </Button>
           )}
           {phase.at === "failed" && onBackToConnect && (
-            <Button type="button" variant="outline" onClick={onBackToConnect}>
+            <Button type="button" variant="outline" onClick={() => onBackToConnect()}>
               Change server or key
             </Button>
           )}

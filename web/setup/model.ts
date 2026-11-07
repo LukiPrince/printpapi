@@ -54,6 +54,14 @@ export function errorText(e: SetupError): string {
   return e.message;
 }
 
+/**
+ * Failures of the install's own register call that only another key or name fixes. The window goes
+ * back to step 1 for them (a proxy, the network or the machine are not fixed there).
+ */
+export function returnsToConnect(code: string): boolean {
+  return code === "key_in_use" || code === "name_taken";
+}
+
 /** Where the installed agent writes its log; mirrors `service_log_path` in crates/agent/src/install.rs. */
 export function logLocation(platform: Platform): string {
   switch (platform) {

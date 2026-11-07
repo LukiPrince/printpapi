@@ -32,6 +32,8 @@ export function Wizard({
   const [selected, setSelected] = useState<PrinterChoice[]>(existing?.printers ?? []);
   const [found, setFound] = useState<FoundPrinter[] | null>(null);
   const [sumatra, setSumatra] = useState(false);
+  // why step 1 is shown again: the install found the key taken, revoked or the name another key's
+  const [connectNotice, setConnectNotice] = useState<string | null>(null);
 
   // A machine without printers, or without lpstat, comes back as an empty list, not an error.
   useEffect(() => {
@@ -72,8 +74,10 @@ export function Wizard({
       {step === "Connect" && (
         <StepConnect
           initial={connection}
+          notice={connectNotice}
           onNext={(c) => {
             setConnection(c);
+            setConnectNotice(null);
             next();
           }}
         />
@@ -100,7 +104,14 @@ export function Wizard({
           deviceName={existing ? existing.name : (connection?.name ?? "")}
           selected={selected}
           onBack={back}
-          onBackToConnect={existing ? undefined : () => setI(0)}
+          onBackToConnect={
+            existing
+              ? undefined
+              : (message) => {
+                  setConnectNotice(message ?? null);
+                  setI(0);
+                }
+          }
           onDone={onDone}
         />
       )}

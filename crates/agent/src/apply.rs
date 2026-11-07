@@ -43,7 +43,8 @@ pub enum ApplyError {
     BadStaging(String),
     /// `409` from register: the key belongs to another device.
     KeyInUse,
-    /// `401` from register: the name belongs to another key.
+    /// `401` from register. The server sends it for a refused (revoked) key and for a name that
+    /// belongs to another key, and the setup cannot tell the two apart.
     NameTaken,
     /// `403` from register: a proxy or WAF in front of `/agent/*`.
     Proxy,
@@ -72,7 +73,7 @@ impl fmt::Display for ApplyError {
                 "This key already belongs to another device. Create a new key in the dashboard.",
             ),
             ApplyError::NameTaken => f.write_str(
-                "This device name belongs to a different key. Pick another name or use that key.",
+                "The server refused this key. Either the key was revoked, or this device name                  belongs to a different key. Check the key on the Keys page of your dashboard,                  or pick another name.",
             ),
             ApplyError::Proxy => f.write_str(
                 "A proxy or firewall in front of the server refused the agent's request. Add the \
@@ -769,6 +770,16 @@ mod tests {
             assert!(!fx.layout.dir.exists(), "{status}");
             assert!(!fx.layout.autostart.exists(), "{status}");
         }
+    }
+
+    #[test]
+    fn a_401_names_both_causes() {
+        // the server answers 401 to a refused (revoked) key as well as to a name that belongs to
+        // another key, and the setup cannot tell them apart
+        let text = ApplyError::NameTaken.to_string();
+        assert!(text.contains("revoked"), "{text}");
+        assert!(text.contains("name"), "{text}");
+        assert_eq!(ApplyError::NameTaken.code(), "name_taken");
     }
 
     #[test]

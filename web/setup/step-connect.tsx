@@ -16,16 +16,19 @@ export type Connection = { serverUrl: string; apiKey: string; name: string };
 /** Step 1. Checks the address and the key; nothing is created on the server yet. */
 export function StepConnect({
   initial,
+  notice,
   onNext,
 }: {
   initial: Connection | null;
+  /** Shown when the install sent the window back here. */
+  notice?: string | null;
   onNext: (c: Connection) => void;
 }) {
   const [serverUrl, setServerUrl] = useState(initial?.serverUrl ?? "");
   const [apiKey, setApiKey] = useState(initial?.apiKey ?? "");
   const [name, setName] = useState(initial?.name ?? "");
   const [busy, setBusy] = useState(false);
-  const [error, setError] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(notice ?? null);
   // the address the user agreed to send the key to unencrypted
   const [confirmedUrl, setConfirmedUrl] = useState<string | null>(null);
   const [askInsecure, setAskInsecure] = useState(false);
