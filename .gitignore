@@ -32,9 +32,10 @@ target/
 # Tauri's generated capability schemas (crates/setup)
 crates/setup/gen/
 
-# Maintainer-only working docs (plans, specs, handoff, release routine): kept locally, not published
+# Maintainer-only working docs (plans, specs, handoff, release routine, open items): kept locally, not published
 docs/superpowers/
 HANDOFF.md
+TODO.md
 RELEASE_CHECKLIST.md
 docs/design-v0-homelab.md
 .impeccable/
