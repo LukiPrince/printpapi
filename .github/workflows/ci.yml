@@ -150,8 +150,8 @@ jobs:
             echo "no usable base commit — skipping drift check"; exit 0
           fi
           changed=$(git diff --name-only "$base" HEAD)
-          # demo-only files cannot change the embedded bundle (off.ts and surface.ts can)
-          ui=$(echo "$changed" | grep '^web/'             | grep -Ev '^web/demo/(off\.ts|surface\.ts)$' | grep -Ev '^web/demo/'             | grep -Ev '^web/(wrangler\.jsonc|scripts/build-demo\.mjs|scripts/build-setup\.mjs|scripts/check-bundles\.mjs)$' || true)
+          # demo-only and setup-window-only files cannot change the embedded bundle (off.ts and surface.ts can)
+          ui=$(echo "$changed" | grep '^web/'             | grep -Ev '^web/demo/(off\.ts|surface\.ts)$' | grep -Ev '^web/demo/'             | grep -Ev '^web/(setup/|app/.*\.setup\.tsx$)' | grep -Ev '^web/(wrangler\.jsonc|scripts/build-demo\.mjs|scripts/build-setup\.mjs|scripts/check-bundles\.mjs)$' || true)
           ui="$ui$(echo "$changed" | grep -E '^web/demo/(off\.ts|surface\.ts)$' || true)"
           if [ -n "$ui" ] && ! echo "$changed" | grep -q '^crates/server/web/'; then
             echo "::error::web/ changed but crates/server/web/ was not regenerated."
