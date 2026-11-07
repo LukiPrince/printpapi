@@ -11,12 +11,20 @@ import { Switch } from "@/components/ui/switch";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { EmptyState, FieldLabel } from "@/components/bits";
 import { setup, toSetupError, type FoundPrinter, type Platform, type PrinterChoice } from "./api";
-import { DEFAULT_RAW_PORT, addNetworkPrinter, canLeavePrinters, errorText, fromFound, needsSumatra } from "./model";
+import {
+  DEFAULT_RAW_PORT,
+  addNetworkPrinter,
+  canLeavePrinters,
+  canSwitchOn,
+  errorText,
+  fromFound,
+  needsSumatra,
+} from "./model";
 import { Actions, Notice } from "./bits";
 
 const KINDS = {
   raw: { label: "Raw (ZPL, ESC/POS)", help: "Zebra, receipt printers. Not DYMO or Brother QL." },
-  pdf: { label: "PDF through its driver", help: "Laser, inkjet, and the label printers DYMO and Brother QL" },
+  pdf: { label: "PDF through its driver", help: "Laser, inkjet, and the label printers DYMO and Brother QL." },
 } as const;
 
 type Row = { name: string; found: FoundPrinter | null; choice: PrinterChoice | null };
@@ -224,7 +232,7 @@ function PrinterRow({
         <Switch
           size="sm"
           checked={on}
-          disabled={locked || unusable}
+          disabled={locked || unusable || !canSwitchOn(found, on)}
           onCheckedChange={onToggle}
           aria-label={`Use ${row.name}`}
         />
@@ -237,7 +245,8 @@ function PrinterRow({
             <SelectTrigger size="sm" aria-label={`Kind of ${row.name}`} className="w-52">
               <SelectValue>{KINDS[kind].label}</SelectValue>
             </SelectTrigger>
-            <SelectContent>
+            {/* popper: opens below its trigger, not over the next row; the width of the trigger keeps it in the window */}
+            <SelectContent position="popper" align="end" className="w-(--radix-select-trigger-width)">
               {(Object.keys(KINDS) as (keyof typeof KINDS)[]).map((k) => (
                 <SelectItem key={k} value={k}>
                   <span className="flex flex-col items-start">

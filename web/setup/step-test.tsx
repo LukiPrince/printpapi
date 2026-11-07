@@ -85,7 +85,7 @@ export function StepTest({
                 )}
                 {r?.state === "failed" && (
                   <p role="alert" className="mt-1 flex items-start gap-1.5 text-xs text-state-failed">
-                    <CircleAlert className="mt-0.5 size-3 shrink-0" /> Failed: {r.message}
+                    <CircleAlert className="mt-0.5 size-3 shrink-0" /> Not printed: {r.message}
                   </p>
                 )}
               </li>
