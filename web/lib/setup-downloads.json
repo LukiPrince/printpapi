@@ -1,0 +1,9 @@
+[
+  { "platform": "windows", "label": "Windows", "asset": "printpapi-setup-windows-x86_64.exe", "beta": false },
+  { "platform": "macos", "label": "macOS Apple Silicon", "asset": "printpapi-setup-macos-aarch64.dmg", "beta": true },
+  { "platform": "macos", "label": "macOS Intel", "asset": "printpapi-setup-macos-x86_64.dmg", "beta": true },
+  { "platform": "linux", "label": "Linux x86_64 (.deb)", "asset": "printpapi-setup-linux-x86_64.deb", "beta": false },
+  { "platform": "linux", "label": "Linux x86_64 (AppImage)", "asset": "printpapi-setup-linux-x86_64.AppImage", "beta": false },
+  { "platform": "linux", "label": "Linux aarch64 (.deb)", "asset": "printpapi-setup-linux-aarch64.deb", "beta": true },
+  { "platform": "linux", "label": "Linux aarch64 (AppImage)", "asset": "printpapi-setup-linux-aarch64.AppImage", "beta": true }
+]

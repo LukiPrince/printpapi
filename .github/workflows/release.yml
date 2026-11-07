@@ -2,6 +2,8 @@ name: release
 # On a version tag: build the agent and the server for every platform and attach them to the
 # GitHub release of that tag. A missing release is created as a *draft*, so the notes are still
 # written by hand before it goes public; an existing one just gets the assets (re)uploaded.
+# The setup downloads (printpapi-setup-*) are listed in web/lib/setup-downloads.json, which also
+# feeds the downloads page: a file is uploaded under its listed label, "(Beta)" appended when set.
 on:
   push:
     tags: ["v*"]
@@ -48,8 +50,102 @@ jobs:
           name: ${{ matrix.name }}
           path: dist/*
 
+  # The setup window (crates/setup, not a workspace member) embeds the agent binary of the same
+  # target, so the agent is built first. Windows ships the bare exe (no installer in front of the
+  # setup); the others ship Tauri bundles. Bundle names are not matched exactly: each format has
+  # one file in its folder, renamed to the scheme of web/lib/setup-downloads.json.
+  # Linux libraries: https://v2.tauri.app/start/prerequisites/ ; AppImage extras (patchelf,
+  # xdg-utils) as in https://v2.tauri.app/distribute/pipelines/github/.
+  setup:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: windows-latest, target: x86_64-pc-windows-msvc, name: windows-x86_64, exe: .exe }
+          - { os: ubuntu-latest, target: x86_64-unknown-linux-gnu, name: linux-x86_64, exe: "" }
+          - { os: ubuntu-24.04-arm, target: aarch64-unknown-linux-gnu, name: linux-aarch64, exe: "" }
+          - { os: macos-latest, target: aarch64-apple-darwin, name: macos-aarch64, exe: "" }
+          - { os: macos-latest, target: x86_64-apple-darwin, name: macos-x86_64, exe: "" }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+          workspaces: |
+            . -> target
+            crates/setup -> target
+      - name: Linux libraries for the window
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev libxdo-dev patchelf xdg-utils
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - run: npm ci
+        working-directory: web
+      - run: npm run build:setup
+        working-directory: web
+      - run: cargo build --release --locked --target ${{ matrix.target }} -p printpapi-agent
+      - run: cargo install tauri-cli --version "^2" --locked
+      - name: build the setup (Windows exe)
+        if: runner.os == 'Windows'
+        working-directory: crates/setup
+        env:
+          PRINTPAPI_AGENT_BIN: ${{ github.workspace }}/target/${{ matrix.target }}/release/printpapi-agent${{ matrix.exe }}
+        run: cargo tauri build --no-bundle --target ${{ matrix.target }}
+      - name: build the setup (.deb)
+        if: runner.os == 'Linux'
+        working-directory: crates/setup
+        env:
+          PRINTPAPI_AGENT_BIN: ${{ github.workspace }}/target/${{ matrix.target }}/release/printpapi-agent
+        run: cargo tauri build --target ${{ matrix.target }} --bundles deb
+      # linuxdeploy cannot cross-compile, and WebKitGTK in an aarch64 AppImage is not proven. If it
+      # fails there, only that file is missing: the .deb and the release stay.
+      - name: build the setup (AppImage)
+        if: runner.os == 'Linux'
+        continue-on-error: ${{ matrix.name == 'linux-aarch64' }}
+        working-directory: crates/setup
+        env:
+          PRINTPAPI_AGENT_BIN: ${{ github.workspace }}/target/${{ matrix.target }}/release/printpapi-agent
+        run: cargo tauri build --target ${{ matrix.target }} --bundles appimage
+      - name: build the setup (.dmg)
+        if: runner.os == 'macOS'
+        working-directory: crates/setup
+        env:
+          PRINTPAPI_AGENT_BIN: ${{ github.workspace }}/target/${{ matrix.target }}/release/printpapi-agent
+        run: cargo tauri build --target ${{ matrix.target }} --bundles dmg
+      - name: name the files
+        shell: bash
+        run: |
+          set -eux
+          rel=crates/setup/target/${{ matrix.target }}/release
+          mkdir dist
+          case "$RUNNER_OS" in
+            Windows) cp "$rel/printpapi-setup.exe" dist/printpapi-setup-${{ matrix.name }}.exe ;;
+            macOS) cp "$rel"/bundle/dmg/*.dmg dist/printpapi-setup-${{ matrix.name }}.dmg ;;
+            Linux)
+              cp "$rel"/bundle/deb/*.deb dist/printpapi-setup-${{ matrix.name }}.deb
+              # a failed (allowed) aarch64 AppImage leaves no file; publish skips what is missing
+              if ls "$rel"/bundle/appimage/*.AppImage >/dev/null 2>&1; then
+                cp "$rel"/bundle/appimage/*.AppImage dist/printpapi-setup-${{ matrix.name }}.AppImage
+              fi ;;
+          esac
+          ls -l dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: setup-${{ matrix.name }}
+          path: dist/*
+          if-no-files-found: error
+
   publish:
-    needs: build
+    needs: [build, setup]
     # Publish whatever built: one broken platform must not hold back the others' archives.
     if: ${{ !cancelled() && startsWith(github.ref, 'refs/tags/') }}
     runs-on: ubuntu-latest
@@ -81,4 +177,13 @@ jobs:
           gh release view "$TAG" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1 \
             || gh release create "$TAG" -R "$GITHUB_REPOSITORY" --verify-tag \
                  --title "$(cat title.txt)" --notes-file notes.md
-          gh release upload "$TAG" dist/* -R "$GITHUB_REPOSITORY" --clobber
+          gh release upload "$TAG" dist/printpapi-agent-* dist/printpapi-server-* \
+            -R "$GITHUB_REPOSITORY" --clobber
+          # The setup downloads, one display label each ("file#label"). The file name stays the
+          # same when "(Beta)" later falls away, so the download links stay stable. Files that did
+          # not build are skipped, like the archives above.
+          while IFS=$'\t' read -r asset label beta; do
+            if [ ! -f "dist/$asset" ]; then echo "skipping $asset (not built)"; continue; fi
+            if [ "$beta" = true ]; then label="$label (Beta)"; fi
+            gh release upload "$TAG" "dist/$asset#$label" -R "$GITHUB_REPOSITORY" --clobber
+          done < <(jq -r '.[] | [.asset, .label, .beta] | @tsv' web/lib/setup-downloads.json)
