@@ -117,7 +117,8 @@ printers = Zebra GK420d ; HP LaserJet|pdf ; netz-bixolon = socket://192.168.1.50
           <CardTitle>Set up with one double-click</CardTitle>
           <CardDescription>
             Download the setup for the machine the printers are attached to, open it and follow the
-            four steps. It installs the agent and starts it with the machine.
+            four steps. It installs the agent and starts it with the machine, plus a small icon in
+            the taskbar or menu bar that shows whether the agent runs and opens its settings.
           </CardDescription>
         </CardHeader>
         <CardContent className="space-y-5">

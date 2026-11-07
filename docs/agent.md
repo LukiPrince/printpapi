@@ -14,6 +14,32 @@ It writes `agent.ini`, installs the agent to `%ProgramFiles%\printpapi\` (Window
 on Windows, a launchd daemon `com.printpapi.agent` on macOS, a systemd unit
 `printpapi-agent.service` on Linux. Open the setup again to change the printers or remove the agent.
 
+### Tray icon and settings
+
+The setup also installs a small icon (next to the clock on Windows, in the menu bar on macOS, in
+the status area on Linux) that starts with every user's login. Its colour, symbol and word show
+the agent: connected, offline, or not running. Its menu has the status line, **Settings...**,
+**Open dashboard** and **Quit**; Quit ends only the icon, the agent keeps printing.
+
+**Settings...** opens a window with Overview, Printers (add, remove, change the kind, test print),
+Connection (another server or key), Advanced (`timeout` and the `[headers]` values), Log,
+SumatraPDF (Windows), Restart and Remove. Looking needs no administrator rights; each change asks
+for them once.
+
+- The icon only reads `status.json`, which the agent rewrites at least once a minute: Windows
+  `%ProgramData%\printpapi\`, macOS `/Library/Application Support/printpapi/`, Linux
+  `/var/lib/printpapi/`. The file holds the server, device name, state, last contact and job, the
+  printers and the header names, never the key and never a header value. A file that is missing or
+  older than two minutes shows "not running". The agent still opens no port and takes no commands.
+  The crash log of an agent the setup installed lives in the same folder.
+- A new key on the same server needs a new device name, because the server ties a name to its
+  key. The printers then get new ids and the old device stays in the dashboard; the window warns
+  before it does that.
+- GNOME shows no tray icons without the
+  [AppIndicator extension](https://extensions.gnome.org/extension/615/appindicator-support/).
+  The application menu has a **printpapi Agent** entry that opens the settings window directly.
+- Removing the agent removes the icon, its autostart entry and the status folder too.
+
 - The setup is not code-signed yet, so the system warns first. Windows: *More info*, then *Run
   anyway*. macOS: System Settings, Privacy & Security, *Open Anyway*. macOS and the aarch64 Linux
   builds are marked Beta on the downloads page until someone has run them by hand.
@@ -87,7 +113,9 @@ On start the agent registers until it succeeds (backoff 1 s … 5 min), so a mac
 before its network is up simply waits instead of exiting. Each failed register try, the first poll
 error after a working stretch (and the matching "poll recovered"), a rejected `agent.ini` and every
 crash are appended to `%LOCALAPPDATA%\print_agent-error.log` (Windows) or the temp dir - that file
-is the first thing to read over remote desktop.
+is the first thing to read over remote desktop. (An agent the setup installed writes it next to
+its `status.json` instead, see [Tray icon and settings](#tray-icon-and-settings), and the settings
+window shows it under Log.)
 
 `api_key` is a key issued for the agent — on the dashboard's **Keys** page or with
 `POST /apikeys` — and the agent lands in that key's org. A made-up key is refused (`401`) since

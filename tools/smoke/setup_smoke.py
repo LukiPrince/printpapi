@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 # printpapi — self-hosted PrintNode alternative. Elastic License 2.0 (see LICENSE).
-"""CI smoke test of the agent setup: install, autostart, a job that arrives, uninstall.
+"""CI smoke test of the agent setup: install, autostart, tray icon, a job, restart, uninstall.
 
 Starts the server, installs the agent with `printpapi-agent install` (a `file://` printer, so no
-paper is needed), waits until the agent is online, sends a raw job and waits for `job-<id>.prn`,
-then runs `uninstall`. Runs elevated: administrator on Windows, `sudo` on Linux and macOS.
+paper is needed) together with a placeholder tray program, waits until the agent is online, checks
+the status file and the tray autostart, sends a raw job and waits for `job-<id>.prn`, runs
+`restart` and waits until the agent is online again, then runs `uninstall` and checks that
+everything is gone. Runs elevated: administrator on Windows, `sudo` on Linux and macOS.
 
 DO NOT RUN THIS ON A MACHINE YOU CARE ABOUT. It creates a SYSTEM task / systemd unit / launchd
 daemon and writes to the real install folder. It is meant for the throwaway CI runners only.
@@ -30,19 +32,34 @@ WIN = os.name == "nt"
 LINUX = sys.platform.startswith("linux")
 WAIT_S = 60
 
-# the crash log of a setup-installed agent lives next to its status file
+# The status file and the crash log of a setup-installed agent live in one folder. The places are
+# those of `crates/agent/src/install.rs` (`layout_with`) and `status.rs` (`status_dir_in`).
+TRAY_RUN_KEY = r"HKLM\Software\Microsoft\Windows\CurrentVersion\Run"
+TRAY_RUN_VALUE = "printpapi-tray"
 if WIN:
     INSTALL_DIR = Path(os.environ.get("ProgramFiles", r"C:\Program Files")) / "printpapi"
     AUTOSTART = INSTALL_DIR / "printpapi-agent-task.xml"
-    SERVICE_LOG = Path(os.environ.get("ProgramData", r"C:\ProgramData")) / "printpapi" / "print_agent-error.log"
+    STATUS_DIR = Path(os.environ.get("ProgramData", r"C:\ProgramData")) / "printpapi"
+    TRAY = INSTALL_DIR / "printpapi-tray.exe"
+    TRAY_AUTOSTART = None  # the registry, see tray_registered()
+    APP_ENTRY = None
+    REG = Path(os.environ.get("SystemRoot", r"C:\Windows")) / "System32" / "reg.exe"
 elif LINUX:
     INSTALL_DIR = Path("/opt/printpapi")
     AUTOSTART = Path("/etc/systemd/system/printpapi-agent.service")
-    SERVICE_LOG = Path("/var/lib/printpapi/print_agent-error.log")
+    STATUS_DIR = Path("/var/lib/printpapi")
+    TRAY = INSTALL_DIR / "printpapi-tray"
+    TRAY_AUTOSTART = Path("/etc/xdg/autostart/printpapi-tray.desktop")
+    APP_ENTRY = Path("/usr/share/applications/printpapi-agent.desktop")
 else:
     INSTALL_DIR = Path("/opt/printpapi")
     AUTOSTART = Path("/Library/LaunchDaemons/com.printpapi.agent.plist")
-    SERVICE_LOG = Path("/Library/Application Support/printpapi/print_agent-error.log")
+    STATUS_DIR = Path("/Library/Application Support/printpapi")
+    TRAY = Path("/Applications/printpapi Agent.app")
+    TRAY_AUTOSTART = Path("/Library/LaunchAgents/com.printpapi.tray.plist")
+    APP_ENTRY = None
+STATUS_FILE = STATUS_DIR / "status.json"
+SERVICE_LOG = STATUS_DIR / "print_agent-error.log"
 
 
 class Fail(Exception):
@@ -87,6 +104,39 @@ def open_dir(path, mode):
     path.mkdir(parents=True, exist_ok=True)
     if not WIN:
         os.chmod(path, mode)
+
+
+def stage_tray(staging):
+    """A placeholder for the tray program: install only copies it, nothing here starts it."""
+    tray = staging / "tray"
+    if sys.platform == "darwin":  # macOS takes a whole .app folder
+        (tray / "Contents" / "MacOS").mkdir(parents=True, exist_ok=True)
+        (tray / "Contents" / "MacOS" / "printpapi-setup").write_bytes(b"placeholder")
+    else:
+        tray.write_bytes(b"placeholder")
+
+
+def tray_registered():
+    """Is the tray icon's autostart entry there? Windows asks the registry, the others a file."""
+    if WIN:
+        q = subprocess.run([str(REG), "query", TRAY_RUN_KEY, "/v", TRAY_RUN_VALUE],
+                           capture_output=True)
+        return q.returncode == 0
+    return TRAY_AUTOSTART.is_file()
+
+
+def check_status_file(secret_values):
+    """The status file the tray icon reads: JSON, online, and without any secret."""
+    text = STATUS_FILE.read_text(encoding="utf-8")
+    try:
+        status = json.loads(text)
+    except ValueError as e:
+        raise Fail(f"{STATUS_FILE} is not JSON: {e}")
+    if status.get("state") != "online":
+        raise Fail(f"the status file does not say online: {status.get('state')!r}")
+    for secret in secret_values:
+        if secret in text:
+            raise Fail("the status file contains a secret (key or header value)")
 
 
 def agent_cmd(agent, sub, staging):
@@ -149,17 +199,26 @@ def main():
         name = "smoke-" + secrets.token_hex(3)
         # the ini parser reads `%` as an interpolation, so a percent-escape in the URI needs %%
         target = archive.resolve().as_uri().replace("%", "%%")
+        # a header value is a secret as well: it must not reach the status file
+        header_value = "smoke-header-" + secrets.token_hex(8)
         (staging / "agent.ini").write_text(
             f"[agent]\nserver_url = {base}\napi_key = {key}\nname = {name}\n"
-            f"printers = archive = {target}\n", encoding="utf-8")
+            f"printers = archive = {target}\n\n[headers]\nX-Smoke = {header_value}\n",
+            encoding="utf-8")
 
         # twice: a second run over a finished (or half-finished) install has to work as well
         installed = True
+        stage_tray(staging)
         run_agent(agent, "install", staging)
+        stage_tray(staging)  # the first run may have used up what is staged
         result = run_agent(agent, "install", staging)
         baseline = result["baseline_last_seen"]
         if not INSTALL_DIR.is_dir() or not AUTOSTART.is_file():
             raise Fail(f"install left no {INSTALL_DIR} / {AUTOSTART}")
+        if not TRAY.exists() or not tray_registered():
+            raise Fail(f"install left no tray program {TRAY} or no tray autostart")
+        if APP_ENTRY is not None and not APP_ENTRY.is_file():
+            raise Fail(f"install left no {APP_ENTRY}")
         if not WIN:
             # the service runs the binary as root (macOS) or as a user that must not own it: a copy
             # that kept the starting user's ownership would let that user replace what root runs
@@ -172,6 +231,8 @@ def main():
                 if c["name"] == name and (c.get("last_seen_at") or 0) > baseline:
                     return c
         wait_for("the agent to come online", online)
+        wait_for("the status file", STATUS_FILE.is_file)
+        check_status_file([key, header_value])
 
         def printer_id():
             for p in call(base, token, "GET", "/printers")["printers"]:
@@ -187,11 +248,25 @@ def main():
         if out.read_bytes() != zpl:
             raise Fail(f"{out.name} has the wrong content")
 
+        # restart: the old process is stopped when the command returns, so a contact newer than
+        # the one read right after it can only come from the new process
+        def last_seen():
+            for c in call(base, token, "GET", "/computers")["computers"]:
+                if c["name"] == name:
+                    return c.get("last_seen_at") or 0
+            return 0
+        run_agent(agent, "restart", staging)
+        before = last_seen()
+        wait_for("the agent to come online after the restart", lambda: last_seen() > before)
+
         run_agent(agent, "uninstall", staging)
         installed = False
-        left = [p for p in (INSTALL_DIR, AUTOSTART) if p.exists()]
+        left = [p for p in (INSTALL_DIR, AUTOSTART, TRAY, STATUS_DIR, TRAY_AUTOSTART, APP_ENTRY)
+                if p is not None and p.exists()]
         if left:
             raise Fail(f"uninstall left {left}")
+        if tray_registered():
+            raise Fail("uninstall left the tray autostart")
         if WIN:
             q = subprocess.run(["schtasks", "/Query", "/TN", "printpapi-agent"],
                                capture_output=True)

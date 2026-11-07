@@ -58,10 +58,14 @@ cd web && npm run build:app     # after any web/ change; commit crates/server/we
   one is right depends on the driver.
 - `agent/print_agent.py` is the legacy Python agent for locked-down Windows, kept until the Rust
   exe is code-signed. Keep its tests green.
-- The `install`, `uninstall` and `read-config` subcommands (what the setup app calls) run as admin.
-  They never trust the staging folder, which any user can write: absolute program paths only,
+- The `install`, `uninstall`, `read-config` and `restart` subcommands (what the setup app calls)
+  run as admin. They never trust the staging folder, which any user can write: absolute program paths only,
   the key never in argv or output. Test them with a fake `Runner`, never against the real
   scheduler, systemd or launchd.
+- The agent writes `status.json` (never the key, never a header value) into the status folder
+  (`status::status_dir_in`) only when the `.installed-by-setup` marker sits next to it. It is what
+  the tray icon reads: it opens no port and takes no commands. Keep secrets out of it, and keep
+  its test for that.
 
 ## Setup (`crates/setup`)
 
@@ -71,6 +75,10 @@ cd web && npm run build:app     # after any web/ change; commit crates/server/we
 - Its window is the third Next build, `npm run build:setup` (`web/out-setup`), embedded at compile
   time. It never talks to a local server, and `npm run check:bundles` keeps its code out of the
   dashboard and demo.
+- `--tray` is the second mode of the same program: the icon and its menu (`src/tray.rs`), with
+  the settings window (`web/setup/settings*.tsx`) behind "Settings...". A change from the window
+  stages only the changed fields (`patch.json`) and goes through the admin subcommands, so it asks
+  for elevation once. "Quit" ends the icon, never the agent.
 - `web/lib/setup-downloads.json` is the one list of setup files. The downloads page and
   `release.yml` both read it; a variant nobody has run by hand is `"beta": true`.
 
