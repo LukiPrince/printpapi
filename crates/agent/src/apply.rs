@@ -238,13 +238,85 @@ fn staged_ini_text(staging: &Path, env: &Env) -> Result<String, ApplyError> {
     }
 }
 
+/// Does a link in the folder `dir` (relative to the app) with this `target` stay inside the app, by
+/// its text alone? Absolute targets and too many `..` do not. Pure; the folders on the way may be
+/// links themselves, which this does not see, so [`check_app_links`] looks at what the system makes
+/// of every link first.
+fn link_stays_inside(dir: &Path, target: &Path) -> bool {
+    use std::path::Component;
+    let mut depth = dir
+        .components()
+        .filter(|c| matches!(c, Component::Normal(_)))
+        .count() as i64;
+    for part in target.components() {
+        match part {
+            Component::Normal(_) => depth += 1,
+            Component::ParentDir => {
+                depth -= 1;
+                if depth < 0 {
+                    return false;
+                }
+            }
+            Component::CurDir => {}
+            Component::RootDir | Component::Prefix(_) => return false,
+        }
+    }
+    true
+}
+
+/// Refuse a macOS `.app` folder with a symbolic link that points out of it. `ditto` copies links as
+/// they are, and the LaunchAgent starts the app's program at every logon of every user: a link
+/// inside the bundle to a file outside would let whoever owns that file change what runs. A link
+/// counts as inside when it resolves to a place below the app (what `canonicalize` makes of it, so
+/// a folder that is a link on the way does not fool it); one that does not resolve (nothing there
+/// yet) is judged by its text, [`link_stays_inside`]. A folder that is not there is fine: there is
+/// nothing to check.
+fn check_app_links(app: &Path) -> Result<(), String> {
+    let Ok(root) = std::fs::canonicalize(app) else {
+        return Ok(());
+    };
+    fn walk(dir: &Path, rel: &Path, root: &Path) -> Result<(), String> {
+        let out = |p: &Path| {
+            format!(
+                "the tray app contains a link ({}) that points out of the app",
+                p.display()
+            )
+        };
+        let entries = std::fs::read_dir(dir).map_err(|e| e.to_string())?;
+        for entry in entries {
+            let entry = entry.map_err(|e| e.to_string())?;
+            let meta = entry.metadata().map_err(|e| e.to_string())?;
+            let path = entry.path();
+            let here = rel.join(entry.file_name());
+            if meta.file_type().is_symlink() {
+                let inside = match std::fs::canonicalize(&path) {
+                    Ok(real) => real.starts_with(root),
+                    Err(_) => std::fs::read_link(&path)
+                        .map(|t| link_stays_inside(rel, &t))
+                        .unwrap_or(false),
+                };
+                if !inside {
+                    return Err(out(&here));
+                }
+            } else if meta.is_dir() {
+                walk(&path, &here, root)?;
+            }
+        }
+        Ok(())
+    }
+    walk(app, Path::new(""), &root)
+}
+
 /// The staged tray program, if any. It must be what this system installs: a file, on macOS an
 /// `.app` folder (a link was refused by `check_staging`).
 fn staged_tray(staging: &Path, os: Os) -> Result<Option<TrayStaged>, ApplyError> {
     let path = staging.join("tray");
     match std::fs::symlink_metadata(&path) {
         Err(_) => Ok(None),
-        Ok(meta) if os == Os::Macos && meta.is_dir() => Ok(Some(TrayStaged::App(path))),
+        Ok(meta) if os == Os::Macos && meta.is_dir() => {
+            check_app_links(&path).map_err(bad)?;
+            Ok(Some(TrayStaged::App(path)))
+        }
         Ok(meta) if os != Os::Macos && meta.is_file() => {
             let bytes =
                 std::fs::read(&path).map_err(|e| bad(format!("tray cannot be read: {e}")))?;
@@ -962,6 +1034,12 @@ fn install_tray(env: &Env, tray: &TrayStaged) -> Result<(), ApplyError> {
                 {
                     return Err(system("cannot copy the tray icon", e));
                 }
+            }
+            // The staging folder is writable by the user who started the setup, and can change
+            // between the check and the copy. The copy is root's: what is in it is what counts.
+            if let Err(e) = check_app_links(&l.tray) {
+                let _ = remove_tree(&l.tray);
+                return Err(ApplyError::System(e));
             }
         }
     }
@@ -3067,6 +3145,114 @@ mod tests {
         assert_eq!(*seen.borrow(), vec!["false".to_string()]);
         let plist = tray_text(fx.layout.tray_autostart.as_ref().unwrap());
         assert!(plist.contains("com.printpapi.tray"), "{plist}");
+    }
+
+    #[test]
+    fn a_link_stays_inside_the_app_only_when_its_target_does() {
+        let inside = |dir: &str, target: &str| link_stays_inside(Path::new(dir), Path::new(target));
+        // links a real bundle has: a framework's `Current`, a resource next door
+        assert!(inside("Contents/Frameworks/X.framework/Versions", "A"));
+        assert!(inside(
+            "Contents/Frameworks/X.framework",
+            "Versions/Current/X"
+        ));
+        assert!(inside("Contents/Resources", "../MacOS/x"));
+        assert!(inside("Contents/Resources", "./a/../b"));
+        assert!(inside("Contents", ".."));
+        assert!(inside("", "Contents"));
+        // out of the app, by an absolute path or by going up too far
+        assert!(!inside("Contents/Resources", "/etc/passwd"));
+        assert!(!inside("Contents/Resources", "/"));
+        assert!(!inside("Contents/Resources", "../../.."));
+        assert!(!inside("", ".."));
+        assert!(!inside("Contents", "../../x"));
+        assert!(!inside("Contents/Resources", "a/../../../../x"));
+    }
+
+    #[cfg(unix)]
+    fn stage_app_with_link(fx: &Fixture, dir: &str, name: &str, target: &str) {
+        fx.stage_tray(b"plist");
+        let dir = fx.staging.join("tray").join(dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::os::unix::fs::symlink(target, dir.join(name)).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_staged_app_with_a_link_that_points_out_of_it_is_refused_before_anything_happens() {
+        let outside = tempfile::tempdir().unwrap();
+        let out = outside.path().display().to_string();
+        for (dir, target) in [
+            // absolute, relative and a link that goes out through a folder that is a link inside
+            ("Contents/Resources", "/etc/passwd".to_string()),
+            (
+                "Contents/Resources",
+                "../../../../../../../../etc".to_string(),
+            ),
+            ("Contents/MacOS", out.clone()),
+            ("Contents", "Frameworks/back/../..".to_string()),
+        ] {
+            let fx = Fixture::new(Os::Macos);
+            stage_app_with_link(&fx, dir, "evil", &target);
+            // `back` points to the app's own folder and is fine; `Frameworks/back/../..` is not
+            // fooled by it: the lexical path stays inside, the real one is the parent of the app
+            let frameworks = fx.staging.join("tray").join("Contents").join("Frameworks");
+            std::fs::create_dir_all(&frameworks).unwrap();
+            std::os::unix::fs::symlink("../..", frameworks.join("back")).unwrap();
+            let e = apply(&fx.staging, &fx.env()).unwrap_err();
+            assert_eq!(e.code(), "bad_staging", "{dir} -> {target}");
+            assert!(e.to_string().contains("points out of"), "{e}");
+            // nothing was touched: not the server, not a command
+            assert!(fx.events().is_empty(), "{dir} -> {target}");
+            assert!(!fx.layout.dir.exists());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn links_that_stay_inside_the_app_and_a_dangling_one_inside_are_fine() {
+        let fx = Fixture::new(Os::Macos);
+        fx.stage_tray(b"plist");
+        let app = fx.staging.join("tray");
+        let versions = app
+            .join("Contents")
+            .join("Frameworks")
+            .join("X.framework")
+            .join("Versions");
+        std::fs::create_dir_all(versions.join("A")).unwrap();
+        std::os::unix::fs::symlink("A", versions.join("Current")).unwrap();
+        // not there (yet), but inside
+        std::os::unix::fs::symlink("A/missing", versions.join("Later")).unwrap();
+        apply(&fx.staging, &fx.env()).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_link_that_appears_in_the_copy_is_found_there_and_the_copy_is_removed() {
+        // staging was fine when it was read; the copy is what counts, and root owns it
+        let fx = Fixture::new(Os::Macos);
+        fx.stage_tray(b"plist");
+        let app = fx.layout.tray.clone();
+        let inner = fx.run.clone();
+        let run: Runner = Rc::new(move |c| {
+            if c.argv[0].ends_with("ditto") {
+                std::fs::create_dir_all(app.join("Contents")).unwrap();
+                std::os::unix::fs::symlink("/etc/passwd", app.join("Contents").join("evil"))
+                    .unwrap();
+            }
+            inner(c)
+        });
+        let mut env = fx.env();
+        env.run = run;
+        let e = apply(&fx.staging, &env).unwrap_err();
+        assert_eq!(e.code(), "system");
+        assert!(e.to_string().contains("points out of"), "{e}");
+        assert!(
+            !fx.layout.tray.exists(),
+            "the app with the link must not stay"
+        );
+        // and no autostart that would start it
+        assert!(!fx.layout.tray_autostart.as_ref().unwrap().exists());
     }
 
     #[test]
