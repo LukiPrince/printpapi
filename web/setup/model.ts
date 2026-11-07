@@ -79,14 +79,14 @@ export function canSwitchOn(found: FoundPrinter | null, on: boolean): boolean {
   return found === null || (found.usable && !found.per_user);
 }
 
-/** Where the installed agent writes its log; mirrors `service_log_path` in crates/agent/src/install.rs. */
+/** Where the installed agent writes its crash log, next to its status file; mirrors `service_log_path` in crates/agent/src/install.rs. */
 export function logLocation(platform: Platform): string {
   switch (platform) {
     case "windows":
-      return "C:\\Windows\\System32\\config\\systemprofile\\AppData\\Local\\print_agent-error.log";
+      return "C:\\ProgramData\\printpapi\\print_agent-error.log";
     case "macos":
-      return "/var/log/printpapi-agent.log";
+      return "/Library/Application Support/printpapi/print_agent-error.log";
     case "linux":
-      return "/tmp/print_agent-error.log";
+      return "/var/lib/printpapi/print_agent-error.log";
   }
 }

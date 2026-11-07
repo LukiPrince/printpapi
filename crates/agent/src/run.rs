@@ -964,9 +964,18 @@ mod tests {
             std::rc::Rc::new(RefCell::new(Vec::<u64>::new())),
         );
         let l = logged.clone();
-        poll_while(&mut next, &mut |_| {}, &*collect(&slept), &move |m| {
-            l.borrow_mut().push(m.to_string())
-        });
+        let mut observed = Vec::new();
+        poll_while(
+            &mut next,
+            &mut |o| observed.push(o.clone()),
+            &*collect(&slept),
+            &move |m| l.borrow_mut().push(m.to_string()),
+        );
+        // the status file sees every outcome, not only the transitions
+        assert_eq!(
+            observed,
+            vec![Err("down".to_string()), Err("down".to_string()), Ok(None)]
+        );
         assert_eq!(*logged.borrow(), vec!["poll error: down", "poll recovered"]);
         assert_eq!(*slept.borrow(), vec![2, 2]); // only the two failing calls sleep
     }

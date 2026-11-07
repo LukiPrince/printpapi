@@ -1144,6 +1144,24 @@ mod tests {
     }
 
     #[test]
+    fn a_header_is_found_whatever_its_case() {
+        // the status file lists header names lowercase (`http_settings` lowercases them), and the
+        // settings window sends them back like that: no second entry may appear
+        let p = patch(r#"{"headers":[["cf-access-client-id","id2"]]}"#);
+        let text = apply_patch(INSTALLED, &p).unwrap();
+        assert_eq!(
+            text.to_lowercase().matches("cf-access-client-id").count(),
+            1
+        );
+        let s = Config::from_text(&text).unwrap().http_settings().unwrap();
+        assert_eq!(s.headers.len(), 2);
+        assert_eq!(
+            s.headers.get("cf-access-client-id").map(String::as_str),
+            Some("id2")
+        );
+    }
+
+    #[test]
     fn headers_section_appears_when_missing() {
         let installed = "[agent]\nserver_url = https://x\napi_key = k\nprinters = a\n";
         let p = patch(r#"{"headers":[["X-Token","abc"],["X-Gone",null]]}"#);

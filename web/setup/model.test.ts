@@ -97,10 +97,10 @@ test("errorText explains a proxy refusal and passes every other message through"
 test("the log of the installed agent is named per platform", () => {
   assert.equal(
     logLocation("windows"),
-    "C:\\Windows\\System32\\config\\systemprofile\\AppData\\Local\\print_agent-error.log",
+    "C:\\ProgramData\\printpapi\\print_agent-error.log",
   );
-  assert.equal(logLocation("linux"), "/tmp/print_agent-error.log");
-  assert.equal(logLocation("macos"), "/var/log/printpapi-agent.log");
+  assert.equal(logLocation("linux"), "/var/lib/printpapi/print_agent-error.log");
+  assert.equal(logLocation("macos"), "/Library/Application Support/printpapi/print_agent-error.log");
 });
 
 test("a refused key or name sends the window back to the first step, every other failure stays", () => {

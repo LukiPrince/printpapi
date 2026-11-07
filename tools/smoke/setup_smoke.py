@@ -30,19 +30,19 @@ WIN = os.name == "nt"
 LINUX = sys.platform.startswith("linux")
 WAIT_S = 60
 
+# the crash log of a setup-installed agent lives next to its status file
 if WIN:
     INSTALL_DIR = Path(os.environ.get("ProgramFiles", r"C:\Program Files")) / "printpapi"
     AUTOSTART = INSTALL_DIR / "printpapi-agent-task.xml"
-    SERVICE_LOG = (Path(os.environ.get("SystemRoot", r"C:\Windows")) / "System32" / "config"
-                   / "systemprofile" / "AppData" / "Local" / "print_agent-error.log")
+    SERVICE_LOG = Path(os.environ.get("ProgramData", r"C:\ProgramData")) / "printpapi" / "print_agent-error.log"
 elif LINUX:
     INSTALL_DIR = Path("/opt/printpapi")
     AUTOSTART = Path("/etc/systemd/system/printpapi-agent.service")
-    SERVICE_LOG = Path("/tmp/print_agent-error.log")
+    SERVICE_LOG = Path("/var/lib/printpapi/print_agent-error.log")
 else:
     INSTALL_DIR = Path("/opt/printpapi")
     AUTOSTART = Path("/Library/LaunchDaemons/com.printpapi.agent.plist")
-    SERVICE_LOG = Path("/var/log/printpapi-agent.log")
+    SERVICE_LOG = Path("/Library/Application Support/printpapi/print_agent-error.log")
 
 
 class Fail(Exception):

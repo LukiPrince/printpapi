@@ -125,7 +125,7 @@ impl Status {
         Status {
             version: env!("CARGO_PKG_VERSION").to_string(),
             name: mask_key(name, &key),
-            server: mask_key(server.trim_end_matches('/').to_string(), &key),
+            server: mask_key(without_credentials(server.trim_end_matches('/')), &key),
             state: "offline",
             last_contact: None,
             last_job: None,
@@ -134,6 +134,19 @@ impl Status {
             header_names: settings.headers.into_keys().collect(),
             error: None,
         }
+    }
+}
+
+/// `url` without `user:password@` in its authority: the file is readable by every local user.
+fn without_credentials(url: &str) -> String {
+    let Some(start) = url.find("://").map(|i| i + 3) else {
+        return url.to_string();
+    };
+    let rest = &url[start..];
+    let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    match rest[..end].rfind('@') {
+        Some(at) => format!("{}{}", &url[..start], &rest[at + 1..]),
+        None => url.to_string(),
     }
 }
 
@@ -236,6 +249,12 @@ impl Reporter {
         self.status.state = "online";
         self.status.last_contact = Some(now);
         self.status.error = None;
+        self.flush(now);
+    }
+
+    /// Time has passed with nothing to report (the register back-off): lets the writer refresh
+    /// the file, so the tray does not read a waiting agent as a dead one.
+    pub fn tick(&mut self, now: f64) {
         self.flush(now);
     }
 
@@ -432,6 +451,12 @@ mod tests {
     fn status_file_is_world_readable() {
         use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
+        // A leftover temporary file with a closed mode: writing into it keeps that mode, so only
+        // the explicit chmod makes the result readable (a fresh file would get 0644 from the
+        // usual umask anyway).
+        let tmp = dir.path().join("status.json.tmp");
+        std::fs::write(&tmp, "old").unwrap();
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600)).unwrap();
         let mut w = StatusWriter::new(dir.path().to_path_buf());
         w.update(&Status::from_config(&config()), 1.0);
         let mode = std::fs::metadata(dir.path().join("status.json"))
@@ -499,7 +524,62 @@ mod tests {
 
     #[test]
     fn without_a_writer_nothing_is_written() {
+        let dir = tempfile::tempdir().unwrap();
+        // a reporter without a writer next to an empty folder: nothing may appear in it
         let mut r = Reporter::new(Status::from_config(&config()), None, KEY.to_string());
-        r.polled(&Ok(None), 1.0); // no panic, no file
+        r.registered(1.0);
+        r.register_failed("x", 2.0);
+        r.polled(&Ok(None), 3.0);
+        r.tick(4.0);
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn a_tick_refreshes_an_unchanged_status_after_60_s() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut r = reporter(dir.path());
+        r.register_failed("register failed", 0.0);
+        std::fs::remove_file(dir.path().join("status.json")).unwrap();
+        r.tick(30.0);
+        assert!(!dir.path().join("status.json").exists());
+        r.tick(60.0);
+        let v = read(dir.path());
+        assert_eq!(v["state"], "offline");
+        assert_eq!(v["error"], "register failed");
+    }
+
+    #[test]
+    fn credentials_in_the_server_address_never_reach_the_file() {
+        let cases = [
+            (
+                "https://user:pass@print.example.com/",
+                "https://print.example.com",
+            ),
+            (
+                "https://tok@print.example.com:8443/base",
+                "https://print.example.com:8443/base",
+            ),
+            // an @ after the authority belongs to the path or query
+            (
+                "https://print.example.com/a@b",
+                "https://print.example.com/a@b",
+            ),
+            (
+                "https://print.example.com/?u=a@b",
+                "https://print.example.com/?u=a@b",
+            ),
+            ("print.example.com", "print.example.com"),
+        ];
+        for (given, shown) in cases {
+            let cfg = Config::from_text(&format!(
+                "[agent]
+server_url = {given}
+api_key = {KEY}
+printers = p
+"
+            ))
+            .unwrap();
+            assert_eq!(Status::from_config(&cfg).server, shown, "{given}");
+        }
     }
 }

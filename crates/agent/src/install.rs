@@ -557,19 +557,15 @@ fn task_file_present(found: std::io::Result<bool>) -> bool {
     !matches!(found, Ok(false))
 }
 
-/// The log of the installed agent, for "see the log" in an error message. Windows: the crash log
-/// in SYSTEM's `%LOCALAPPDATA%`. macOS: the file the plist writes to. Linux: the crash log in the
-/// temp dir (the unit sets no `PrivateTmp`).
-pub fn service_log_path(os: Os, sys: &Path) -> PathBuf {
-    match os {
-        Os::Windows => join(
-            os,
-            sys,
-            "config\\systemprofile\\AppData\\Local\\print_agent-error.log",
-        ),
-        Os::Linux => PathBuf::from("/tmp/print_agent-error.log"),
-        Os::Macos => PathBuf::from("/var/log/printpapi-agent.log"),
-    }
+/// The log of the installed agent, for "see the log" in an error message: the crash log next to
+/// the status file (see `status::status_dir_in`; `program_data` is only used on Windows). On
+/// macOS the plist's `StandardErrorPath` file holds what the agent prints to the console as well.
+pub fn service_log_path(os: Os, program_data: &Path) -> PathBuf {
+    join(
+        os,
+        &crate::status::status_dir_in(os, program_data),
+        crate::log::LOG_NAME,
+    )
 }
 
 #[cfg(test)]
@@ -810,11 +806,6 @@ mod tests {
         ] {
             assert!(text.contains(needle), "{needle} missing in {text}");
         }
-        // `service_log_path` points at the file the plist writes to
-        assert!(text.contains(&format!(
-            "<string>{}</string>",
-            service_log_path(Os::Macos, Path::new("/")).display()
-        )));
     }
 
     #[test]
@@ -1036,18 +1027,16 @@ mod tests {
 
     #[test]
     fn service_logs() {
-        let w = service_log_path(Os::Windows, Path::new(WIN_SYS));
-        assert_eq!(
-            p(&w),
-            "C:\\Windows\\System32\\config\\systemprofile\\AppData\\Local\\print_agent-error.log"
-        );
+        // where `run` sends the crash log of a setup-installed agent: next to the status file
+        let w = service_log_path(Os::Windows, Path::new("C:\\ProgramData"));
+        assert_eq!(p(&w), "C:\\ProgramData\\printpapi\\print_agent-error.log");
         assert_eq!(
             p(&service_log_path(Os::Macos, Path::new("/"))),
-            "/var/log/printpapi-agent.log"
+            "/Library/Application Support/printpapi/print_agent-error.log"
         );
         assert_eq!(
             p(&service_log_path(Os::Linux, Path::new("/"))),
-            "/tmp/print_agent-error.log"
+            "/var/lib/printpapi/print_agent-error.log"
         );
     }
 

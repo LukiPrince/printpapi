@@ -9,7 +9,7 @@ use std::sync::OnceLock;
 
 /// Python wrote the log in text mode, so on Windows every line ended in CRLF (old Notepad needs it).
 const EOL: &str = if cfg!(windows) { "\r\n" } else { "\n" };
-const LOG_NAME: &str = "print_agent-error.log";
+pub(crate) const LOG_NAME: &str = "print_agent-error.log";
 
 /// `%LOCALAPPDATA%` when set and non-empty, else the temp dir.
 pub fn log_dir(local_app_data: Option<OsString>) -> PathBuf {

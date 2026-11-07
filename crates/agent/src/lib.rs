@@ -138,6 +138,8 @@ impl Fatal {
 pub struct Hooks<'a> {
     pub caps: &'a dyn Fn(&str) -> Option<Capabilities>,
     pub register: &'a RegisterFn<'a>,
+    /// Called once the printers are bound to their ids, right before polling starts.
+    pub registered: &'a dyn Fn(),
     pub poll: &'a dyn Fn(&str, &str, &PrinterMap),
 }
 
@@ -176,6 +178,7 @@ pub fn start(cfg: &Config, hooks: &Hooks) -> Result<(), Fatal> {
         pyrepr::py_str(&reg["computer_id"]),
         printer_by_id.repr()
     ));
+    (hooks.registered)();
     (hooks.poll)(&base, &key, &printer_by_id);
     Ok(())
 }
@@ -202,10 +205,31 @@ fn setup_data_dir(base_dir: &Path, os: install::Os) -> Option<PathBuf> {
         .then(|| status::status_dir(os))
 }
 
+/// The folder only if it exists. Setup creates it with its permissions; an agent must not create
+/// one that setup did not, and a log line sent to a missing folder would be lost.
+fn existing_dir(dir: &Option<PathBuf>) -> Option<&PathBuf> {
+    dir.as_ref().filter(|d| d.is_dir())
+}
+
+/// Longest stretch the register back-off sleeps without letting the status writer refresh its
+/// file (the writer rewrites an unchanged status after 60 s, the tray calls 120 s "not running").
+const TICK_SECS: u64 = 30;
+
+/// Sleep `secs` in steps of at most [`TICK_SECS`], calling `tick` after each.
+fn sleep_ticking(secs: u64, sleep: &dyn Fn(u64), tick: &dyn Fn()) {
+    let mut left = secs;
+    while left > 0 {
+        let step = left.min(TICK_SECS);
+        sleep(step);
+        left -= step;
+        tick();
+    }
+}
+
 /// The agent: load `<base_dir>/agent.ini`, register, poll forever. Only returns on failure.
 pub fn run(base_dir: &Path) -> Result<(), Fatal> {
     let data_dir = setup_data_dir(base_dir, install::Os::host());
-    if let Some(dir) = &data_dir {
+    if let Some(dir) = existing_dir(&data_dir) {
         log::set_log_dir(dir.clone());
     }
     let cfg = Config::load(base_dir).map_err(Fatal::Exit)?;
@@ -223,25 +247,25 @@ pub fn run(base_dir: &Path) -> Result<(), Fatal> {
     let (raw, pdf) = select_backend(platform, &sumatra, runner);
     let fns = Fns::native(raw, pdf);
     let sleep = |secs: u64| std::thread::sleep(std::time::Duration::from_secs(secs));
+    let wait = |secs: u64| sleep_ticking(secs, &sleep, &|| reporter.borrow_mut().tick(unix_now()));
     let hooks = Hooks {
         caps: &*caps,
         register: &|base, key, name, printers| {
-            let reg = register_with_retry(
+            register_with_retry(
                 &http,
                 base,
                 key,
                 name,
                 printers,
-                &sleep,
+                &wait,
                 &|msg| {
                     log::log_error(msg);
                     reporter.borrow_mut().register_failed(msg, unix_now());
                 },
                 300,
-            );
-            reporter.borrow_mut().registered(unix_now());
-            reg
+            )
         },
+        registered: &|| reporter.borrow_mut().registered(unix_now()),
         poll: &|base, key, map| {
             poll_forever(
                 base,
@@ -334,6 +358,7 @@ mod tests {
                     .push(format!("register {base} {key} {name} {:?}", printers));
                 serde_json::json!({"computer_id": 9, "printer_ids": {"p": 1}})
             },
+            registered: &|| calls.borrow_mut().push("registered".to_string()),
             poll: &|base, key, map| {
                 calls
                     .borrow_mut()
@@ -346,8 +371,10 @@ mod tests {
             calls[0],
             "register https://x k agent [Printer { name: \"p\", can_pdf: false, target: \"p\", capabilities: None }]"
         );
+        // "registered" only once the printers are bound, right before the poll
+        assert_eq!(calls[1], "registered");
         assert_eq!(
-            calls[1],
+            calls[2],
             "poll https://x k {1: {'name': 'p', 'can_pdf': False, 'target': 'p'}}"
         );
     }
@@ -366,6 +393,7 @@ mod tests {
                 *seen.borrow_mut() = Some(printers.to_vec());
                 serde_json::json!({"computer_id": 1, "printer_ids": {}})
             },
+            registered: &|| {},
             poll: &|_, _, _| {},
         };
         start(
@@ -404,6 +432,100 @@ mod tests {
         // with the file, either way
         std::fs::write(dir.path().join("SumatraPDF.exe"), "x").unwrap();
         assert_eq!(sumatra_program(dir.path()), abs);
+    }
+
+    #[test]
+    fn registered_is_not_reported_when_the_printers_cannot_be_bound() {
+        let cfg = cfg("[agent]
+server_url=https://x
+api_key=k
+printers=p
+");
+        let called = RefCell::new(Vec::<&str>::new());
+        let hooks = Hooks {
+            caps: &|_| None,
+            // a reply that names a printer the agent never sent
+            register: &|_, _, _, _| serde_json::json!({"computer_id": 1, "printer_ids": {"zzz": 1}}),
+            registered: &|| called.borrow_mut().push("registered"),
+            poll: &|_, _, _| called.borrow_mut().push("poll"),
+        };
+        assert!(matches!(start(&cfg, &hooks), Err(Fatal::Crash(_))));
+        assert!(called.borrow().is_empty());
+    }
+
+    #[test]
+    fn the_register_back_off_keeps_the_status_file_fresh_and_offline() {
+        use std::cell::Cell;
+        let dir = tempfile::tempdir().unwrap();
+        let key = "SECRET-KEY-123";
+        let cfg = cfg(&format!(
+            "[agent]
+server_url=https://x
+api_key={key}
+printers=p
+"
+        ));
+        let reporter = RefCell::new(Reporter::new(
+            Status::from_config(&cfg),
+            Some(StatusWriter::new(dir.path().to_path_buf())),
+            key.to_string(),
+        ));
+        let status = dir.path().join("status.json");
+        let clock = Cell::new(1000.0);
+        reporter
+            .borrow_mut()
+            .register_failed("register failed (try 9), retry in 300s: 401", clock.get());
+        // the file as the tray would see it: removed after each look, so a rewrite shows up
+        let (rewritten_at, last_write) = (RefCell::new(Vec::new()), Cell::new(clock.get()));
+        let sleep = |secs: u64| clock.set(clock.get() + secs as f64);
+        let tick = || {
+            reporter.borrow_mut().tick(clock.get());
+            if status.exists() {
+                last_write.set(clock.get());
+                rewritten_at.borrow_mut().push(clock.get());
+                std::fs::remove_file(&status).unwrap();
+            }
+            assert!(
+                clock.get() - last_write.get() <= 60.0,
+                "file stale at {}",
+                clock.get()
+            );
+        };
+        // the wait the 9th retry sleeps, and the longest one after it
+        sleep_ticking(300, &sleep, &tick);
+        sleep_ticking(300, &sleep, &tick);
+        assert_eq!(clock.get(), 1600.0);
+        assert!(rewritten_at.borrow().len() >= 9, "{rewritten_at:?}");
+        // and a last look at what was written
+        reporter.borrow_mut().tick(clock.get() + 60.0);
+        let v: Value = serde_json::from_str(&std::fs::read_to_string(&status).unwrap()).unwrap();
+        assert_eq!(v["state"], "offline");
+        assert_eq!(v["error"], "register failed (try 9), retry in 300s: 401");
+    }
+
+    #[test]
+    fn sleep_ticking_sleeps_the_whole_time_in_short_steps() {
+        let slept = RefCell::new(Vec::new());
+        let ticks = RefCell::new(0);
+        sleep_ticking(75, &|s| slept.borrow_mut().push(s), &|| {
+            *ticks.borrow_mut() += 1
+        });
+        assert_eq!(*slept.borrow(), vec![30, 30, 15]);
+        assert_eq!(*ticks.borrow(), 3);
+        slept.borrow_mut().clear();
+        sleep_ticking(2, &|s| slept.borrow_mut().push(s), &|| {});
+        assert_eq!(*slept.borrow(), vec![2]);
+        sleep_ticking(0, &|_| panic!("no time to sleep"), &|| panic!("no tick"));
+    }
+
+    #[test]
+    fn the_log_only_moves_into_a_folder_that_exists() {
+        let dir = tempfile::tempdir().unwrap();
+        let there = Some(dir.path().to_path_buf());
+        assert_eq!(existing_dir(&there), there.as_ref());
+        // a missing folder (setup has not made it, or it was deleted) keeps the old log place
+        assert_eq!(existing_dir(&Some(dir.path().join("gone"))), None);
+        assert_eq!(existing_dir(&None), None);
     }
 
     #[test]
