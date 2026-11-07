@@ -73,7 +73,9 @@ impl fmt::Display for ApplyError {
                 "This key already belongs to another device. Create a new key in the dashboard.",
             ),
             ApplyError::NameTaken => f.write_str(
-                "The server refused this key. Either the key was revoked, or this device name                  belongs to a different key. Check the key on the Keys page of your dashboard,                  or pick another name.",
+                "The server refused this key. Either the key was revoked, or this device name \
+                 belongs to a different key. Check the key on the Keys page of your dashboard, \
+                 or pick another name.",
             ),
             ApplyError::Proxy => f.write_str(
                 "A proxy or firewall in front of the server refused the agent's request. Add the \
@@ -913,6 +915,22 @@ mod tests {
         assert!(text.contains("revoked"), "{text}");
         assert!(text.contains("name"), "{text}");
         assert_eq!(ApplyError::NameTaken.code(), "name_taken");
+    }
+
+    #[test]
+    fn no_message_has_a_run_of_spaces() {
+        let all = [
+            ApplyError::BadStaging("x".into()),
+            ApplyError::KeyInUse,
+            ApplyError::NameTaken,
+            ApplyError::Proxy,
+            ApplyError::Unreachable("x".into()),
+            ApplyError::System("x".into()),
+        ];
+        for e in all {
+            let text = e.to_string();
+            assert!(!text.contains("  "), "{text}");
+        }
     }
 
     #[test]
