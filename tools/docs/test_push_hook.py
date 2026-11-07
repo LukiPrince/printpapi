@@ -1,237 +1,241 @@
 # printpapi — self-hosted PrintNode alternative. Elastic License 2.0 (see LICENSE).
-"""Tests of tools/docs/push_hook.py: command classification, decide(), and the hook as a process."""
-import json
+"""Tests of tools/docs/push_hook.py and tools/githooks/pre-push: decide() on its own, then the
+real thing, a git push into a bare repository through the hook."""
+import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
 
 import pytest
 
-from push_hook import CHAINED, NONE, PUSH, classify, decide, is_push
+from push_hook import decide, parse_updates
 
-HOOK = Path(__file__).with_name("push_hook.py")
-SHA = "a" * 40
-
-
-@pytest.mark.parametrize("command", [
-    "git push",
-    "git push -u origin x",
-    "cd a && git push",
-    "git -C /p push",
-    r'git -C "C:\Program Files\repo" push',
-    "git -c 'a=b c' push",
-    "git -c core.x=1 push origin main",
-    "git -p push",
-    "git --no-pager push",
-    "git --git-dir=/x/.git --work-tree /x push",
-    "git --namespace n --bare push",
-    "git.exe push",
-    "GIT.EXE push",
-    r'"C:\Program Files\Git\cmd\git.exe" push',
-    "/usr/bin/git push",
-    "FOO=1 git push",
-    "FOO=1 BAR=2 git push",
-    "git push origin HEAD",
-    "echo hi; git   push --force-with-lease",
-    "true || git push",
-    "(git push)",
-    "ls | git push",
-    "sleep 1 &\ngit push",
-    "echo hi\ngit push",
-    "git push 2>&1",
-    "git \\\n push",
-    "echo $(git push)",
-    "cat <<EOF\ngit push\nEOF",  # ponytail: a heredoc body line is read as a command
-])
-def test_is_push_true(command):
-    assert is_push(command)
-    assert classify(command) in (PUSH, CHAINED)
+REPO = Path(__file__).resolve().parents[2]
+A, B, C = "a" * 40, "b" * 40, "c" * 40
+ZERO = "0" * 40
 
 
-@pytest.mark.parametrize("command", [
-    "git status",
-    "echo pushed",
-    "git log --grep=push",
-    'grep -rn "git push" AGENTS.md',
-    'git commit -m "explain git push hook"',
-    "echo 'git push'",
-    "man git push",
-    """curl -X POST -d '{"cmd": "git push"}' https://x.example/hook""",
-    "git stash push",
-    "gitpush",
-    "git pushd",
-    "git push --dry-run",
-    "git push --dry-run origin main",
-    "git push -n",
-    "npm run push",
-    "echo hi # git push",
-    "",
-])
-def test_is_push_false(command):
-    assert not is_push(command)
-    assert classify(command) == NONE
+# --- parse_updates and decide ----------------------------------------------------------------
+
+def test_parse_updates_skips_deletions_and_noise():
+    text = (f"refs/heads/main {A} refs/heads/main {B}\n"
+            f"(delete) {ZERO} refs/heads/old {C}\n"
+            f"refs/tags/v1 {C} refs/tags/v1 {ZERO}\n\nnot a line\n")
+    assert parse_updates(text) == [(A, B), (C, ZERO)]
 
 
-def test_unbalanced_quotes_decide_conservatively():
-    assert is_push("git push 'origin")
-    assert is_push('echo "x && git push')  # cannot tell what is quoted: hold it
-    assert not is_push('git commit -m "explain git push hook')
-    assert not is_push("echo 'oops")
+def test_decide_allows_clean_docs_outside_claude():
+    assert decide([(A, B)], {A: []}, set(), in_claude=False) is None
 
 
-@pytest.mark.parametrize("command", [
-    "git add -A && git commit -m x && git push",
-    "git push && git status",
-    "git fetch; git push",
-    "git -C /p commit -m x\ngit push",
-    "git commit -m x || git push",
-])
-def test_push_chained_with_another_git_command(command):
-    assert classify(command) == CHAINED
+def test_decide_allows_nothing_to_push():
+    assert decide([], {}, set(), in_claude=True) is None
 
 
-@pytest.mark.parametrize("command", [
-    "git push && git push --tags",
-    "cd a && git push",
-    "git --version && git push",  # no subcommand is not "another git command"
-    "git push --dry-run && git push",
-    "echo a && git push && echo b",
-])
-def test_push_not_chained(command):
-    assert classify(command) == PUSH
+def test_decide_findings_abort_with_and_without_claude():
+    for in_claude in (False, True):
+        reason = decide([(A, B)], {A: ["README.md:3: broken link x"]}, {A}, in_claude)
+        assert reason and "README.md:3: broken link x" in reason
 
 
-def test_decide_allows_non_push_without_looking_at_state():
-    assert decide("git status", None, None, ["x"]) is None
+def test_decide_lists_the_findings_of_every_commit_once():
+    reason = decide([(A, B), (A, ZERO), (C, B)], {A: ["a:1: bad"], C: ["c:2: bad"]}, set(), False)
+    assert reason.count("a:1: bad") == 1 and "c:2: bad" in reason
 
 
-def test_decide_blocks_on_findings_and_lists_them():
-    reason = decide("git push", SHA, SHA, ["README.md:3: broken link", "docs/a.md:1: bad"])
-    assert reason and "README.md:3: broken link" in reason and "docs/a.md:1: bad" in reason
-
-
-def test_decide_blocks_without_marker_and_tells_what_to_do():
-    reason = decide("git push", SHA, None, [])
+def test_decide_in_claude_needs_the_marker():
+    reason = decide([(A, B)], {A: []}, set(), in_claude=True)
     assert reason
-    for needle in ("README.md", "docs/", "git log origin/main..HEAD", "git diff origin/main...HEAD",
-                   "python tools/docs/push_hook.py --mark", "command of its own", "--mark && git push"):
+    for needle in ("README.md", "docs/", f"git log {B}..{A}", f"git diff {B}..{A}",
+                   "python tools/docs/push_hook.py --mark", "--mark <rev>", "push again"):
         assert needle in reason
 
 
-def test_decide_blocks_on_stale_marker():
-    assert decide("git push", SHA, "b" * 40, []) is not None
+def test_decide_new_remote_ref_compares_with_origin_main():
+    reason = decide([(A, ZERO)], {A: []}, set(), in_claude=True)
+    assert f"git log origin/main..{A}" in reason
 
 
-def test_decide_allows_matching_marker_ignoring_whitespace():
-    assert decide("git push", SHA, SHA + "\n", []) is None
+def test_decide_marked_commit_passes_in_claude():
+    assert decide([(A, B)], {A: []}, {A}, in_claude=True) is None
 
 
-def test_decide_blocks_a_chained_push_even_with_a_matching_marker():
-    reason = decide("git add -A && git commit -m x && git push", SHA, SHA, [])
-    assert reason and "run git push as a command of its own" in reason
-    assert "HEAD before the command runs" in reason
+def test_decide_asks_only_for_the_unmarked_commits():
+    reason = decide([(A, B), (C, ZERO)], {A: [], C: []}, {A}, in_claude=True)
+    assert f"origin/main..{C}" in reason and f"{B}..{A}" not in reason
 
 
-# --- the hook as a process -----------------------------------------------------------------
+def test_decide_findings_come_before_the_marker():
+    reason = decide([(A, B)], {A: ["x:1: bad"]}, set(), in_claude=True)
+    assert "x:1: bad" in reason and "--mark" not in reason
 
-def git(cwd, *args):
-    return subprocess.run(
-        ["git", "-c", "user.name=t", "-c", "user.email=t@t", "-c", "commit.gpgsign=false", *args],
-        cwd=cwd, check=True, capture_output=True, text=True,
-    ).stdout.strip()
+
+# --- end to end: real git, a bare remote, a clone with the hook on -------------------------------
+
+GOOD_README = "# Title\n\nSee [the list](web/lib/setup-downloads.json).\n"
+BAD_README = "# Title\n\nSee [nothing](missing.md).\n"
+SETUP_JSON = '[{"asset": "printpapi-setup-windows-x86_64.exe"}]\n'
+
+
+def make_env(claude: bool) -> dict[str, str]:
+    env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_") and k != "CLAUDECODE"}
+    env.update(GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@t", GIT_COMMITTER_NAME="t",
+               GIT_COMMITTER_EMAIL="t@t", GIT_TERMINAL_PROMPT="0")
+    if claude:
+        env["CLAUDECODE"] = "1"
+    return env
+
+
+class Clone:
+    def __init__(self, tmp: Path):
+        self.remote = tmp / "remote.git"
+        self.dir = tmp / "work"
+        self.dir.mkdir()
+        subprocess.run(["git", "init", "--bare", "-b", "main", str(self.remote)], check=True,
+                       capture_output=True, env=make_env(False))
+        self.git("init", "-b", "main")
+        self.git("remote", "add", "origin", str(self.remote))
+        self.git("config", "core.hooksPath", "tools/githooks")  # this clone only
+        (self.dir / "tools" / "docs").mkdir(parents=True)
+        (self.dir / "tools" / "githooks").mkdir()
+        (self.dir / "web" / "lib").mkdir(parents=True)
+        for name in ("check_docs.py", "push_hook.py"):
+            shutil.copy(REPO / "tools" / "docs" / name, self.dir / "tools" / "docs" / name)
+        hook = self.dir / "tools" / "githooks" / "pre-push"
+        shutil.copy(REPO / "tools" / "githooks" / "pre-push", hook)
+        hook.chmod(0o755)
+        (self.dir / "web" / "lib" / "setup-downloads.json").write_text(SETUP_JSON, newline="\n")
+
+    def run(self, cmd: list[str], claude: bool = False, **kw) -> subprocess.CompletedProcess:
+        return subprocess.run(cmd, cwd=self.dir, capture_output=True, text=True, encoding="utf-8",
+                              env=make_env(claude), **kw)
+
+    def git(self, *args: str, claude: bool = False) -> subprocess.CompletedProcess:
+        out = self.run(["git", *args], claude)
+        assert out.returncode == 0, out.stderr
+        return out
+
+    def commit(self, readme: str = GOOD_README, msg: str = "c") -> str:
+        (self.dir / "README.md").write_text(readme, newline="\n")
+        self.git("add", "-A")
+        self.git("commit", "-m", msg)
+        return self.git("rev-parse", "HEAD").stdout.strip()
+
+    def push(self, *refspec: str, claude: bool = False) -> subprocess.CompletedProcess:
+        return self.run(["git", "push", "origin", *(refspec or ("HEAD:refs/heads/main",))], claude)
+
+    def mark(self, *rev: str) -> subprocess.CompletedProcess:
+        return self.run([sys.executable, "tools/docs/push_hook.py", "--mark", *rev], claude=True)
+
+    def remote_ref(self, ref: str) -> str | None:
+        out = subprocess.run(["git", "--git-dir", str(self.remote), "rev-parse", "--verify", "-q", ref],
+                             capture_output=True, text=True, env=make_env(False))
+        return out.stdout.strip() or None
 
 
 @pytest.fixture
-def work(tmp_path):
-    """A repo that has the hook (the hook only acts in a repo that does)."""
-    git(tmp_path, "init", "-q")
-    (tmp_path / "tools" / "docs").mkdir(parents=True)
-    (tmp_path / "tools" / "docs" / "push_hook.py").write_text("# stand-in\n")
-    (tmp_path / "README.md").write_text("# T\n", encoding="utf-8")
-    git(tmp_path, "add", "README.md")
-    git(tmp_path, "commit", "-q", "-m", "init")
-    return tmp_path
+def clone(tmp_path):
+    return Clone(tmp_path)
 
 
-def run_hook(cwd, command=None, *argv):
-    payload = {"hook_event_name": "PreToolUse", "tool_name": "Bash",
-               "tool_input": {"command": command}, "cwd": str(cwd)}
-    return subprocess.run([sys.executable, str(HOOK), *argv], input=json.dumps(payload), cwd=cwd,
-                          capture_output=True, text=True)
+@pytest.mark.parametrize("claude", [False, True])
+def test_broken_link_rejects_the_push(clone, claude):
+    clone.commit(BAD_README)
+    out = clone.push(claude=claude)
+    assert out.returncode != 0
+    assert "README.md:3: broken link" in out.stderr
+    assert clone.remote_ref("refs/heads/main") is None
 
 
-def test_hook_non_push_exits_0_even_outside_a_repo(tmp_path):
-    done = run_hook(tmp_path, "git status")
-    assert done.returncode == 0 and done.stderr == ""
+@pytest.mark.parametrize("claude", [False, True])
+def test_broken_link_rejects_even_when_marked(clone, claude):
+    clone.commit(BAD_README)
+    clone.mark()
+    assert clone.push(claude=claude).returncode != 0
 
 
-def test_hook_push_without_marker_blocks_then_mark_allows(work):
-    done = run_hook(work, "git push")
-    assert done.returncode == 2 and "--mark" in done.stderr
-    marked = run_hook(work, None, "--mark")
-    assert marked.returncode == 0
-    marker = Path(git(work, "rev-parse", "--git-path", "docs-checked"))
-    marker = marker if marker.is_absolute() else work / marker
-    assert marker.read_text().strip() == git(work, "rev-parse", "HEAD")
-    assert run_hook(work, "git push").returncode == 0
+def test_clean_docs_without_claude_are_pushed(clone):
+    sha = clone.commit()
+    out = clone.push()
+    assert out.returncode == 0, out.stderr
+    assert clone.remote_ref("refs/heads/main") == sha
 
 
-def test_hook_mark_and_push_in_one_command_can_never_pass(work):
-    done = run_hook(work, "python tools/docs/push_hook.py --mark && git push")
-    assert done.returncode == 2 and "command of its own" in done.stderr
+def test_claude_without_marker_is_held_and_told_what_to_do(clone):
+    sha = clone.commit()
+    out = clone.push(claude=True)
+    assert out.returncode != 0
+    assert "--mark" in out.stderr and f"origin/main..{sha}" in out.stderr
+    assert clone.remote_ref("refs/heads/main") is None
 
 
-def test_hook_chained_push_is_blocked_with_its_reason(work):
-    run_hook(work, None, "--mark")
-    done = run_hook(work, "git add -A && git commit -m x && git push")
-    assert done.returncode == 2 and "own" in done.stderr
+def test_claude_with_marker_is_pushed(clone):
+    sha = clone.commit()
+    assert clone.mark().returncode == 0
+    out = clone.push(claude=True)
+    assert out.returncode == 0, out.stderr
+    assert clone.remote_ref("refs/heads/main") == sha
 
 
-def test_hook_new_commit_invalidates_marker(work):
-    run_hook(work, None, "--mark")
-    git(work, "commit", "-q", "--allow-empty", "-m", "more")
-    assert run_hook(work, "git push").returncode == 2
+def test_a_new_commit_needs_a_new_marker_and_names_the_remote_range(clone):
+    first = clone.commit()
+    clone.mark()
+    assert clone.push(claude=True).returncode == 0
+    second = clone.commit(GOOD_README + "\nMore.\n", "more")
+    out = clone.push(claude=True)
+    assert out.returncode != 0 and f"{first}..{second}" in out.stderr
+    clone.mark()
+    assert clone.push(claude=True).returncode == 0
 
 
-def test_hook_blocks_on_broken_link_even_with_marker(work):
-    (work / "README.md").write_text("# T\n\n[x](nope.md)\n", encoding="utf-8")
-    git(work, "commit", "-q", "-am", "bad")
-    run_hook(work, None, "--mark")
-    done = run_hook(work, "git push")
-    assert done.returncode == 2 and "README.md:3:" in done.stderr
+def test_mark_takes_a_rev_and_does_not_duplicate(clone):
+    first = clone.commit()
+    clone.commit(GOOD_README + "\nMore.\n", "more")
+    assert clone.mark("HEAD~1").returncode == 0
+    assert clone.mark("HEAD~1").returncode == 0
+    marker = Path(clone.git("rev-parse", "--absolute-git-dir").stdout.strip()) / "docs-checked"
+    assert marker.read_text().split() == [first]
+    assert clone.mark("no-such-rev").returncode == 1
 
 
-def test_hook_checks_head_not_the_working_tree(work):
-    run_hook(work, None, "--mark")
-    (work / "README.md").write_text("# T\n\n[x](nope.md)\n", encoding="utf-8")  # not committed
-    assert run_hook(work, "git push").returncode == 0
-    (work / "README.md").write_text("# T\n", encoding="utf-8")
-    (work / "local.md").write_text("# L\n")  # untracked: not pushed, not checked
-    (work / "README.md").write_text("# T\n\n[x](local.md)\n", encoding="utf-8")
-    git(work, "commit", "-q", "-am", "link to a file git does not have")
-    run_hook(work, None, "--mark")
-    done = run_hook(work, "git push")
-    assert done.returncode == 2 and "not in git at HEAD" in done.stderr
+def test_deleting_a_remote_branch_is_allowed(clone):
+    sha = clone.commit()
+    assert clone.push("HEAD:refs/heads/feature").returncode == 0
+    assert clone.remote_ref("refs/heads/feature") == sha
+    out = clone.push(":refs/heads/feature", claude=True)  # no marker, nothing to check
+    assert out.returncode == 0, out.stderr
+    assert clone.remote_ref("refs/heads/feature") is None
 
 
-def test_hook_unusable_cwd_falls_back_to_the_process_cwd(work):
-    payload = {"tool_name": "Bash", "tool_input": {"command": "git push"}, "cwd": "/no/such/dir"}
-    done = subprocess.run([sys.executable, str(HOOK)], input=json.dumps(payload), cwd=work,
-                          capture_output=True, text=True)
-    assert done.returncode == 2 and "--mark" in done.stderr
+def test_annotated_tag_on_a_marked_commit_is_allowed(clone):
+    sha = clone.commit()
+    clone.mark()
+    clone.git("tag", "-a", "v1", "-m", "v1")
+    out = clone.push("refs/tags/v1", claude=True)
+    assert out.returncode == 0, out.stderr
+    assert clone.remote_ref("refs/tags/v1^{commit}") == sha
 
 
-def test_hook_fails_open_on_garbage_input(tmp_path):
-    done = subprocess.run([sys.executable, str(HOOK)], input="not json", cwd=tmp_path,
-                          capture_output=True, text=True)
-    assert done.returncode == 1 and done.stderr
+def test_annotated_tag_on_an_unmarked_commit_is_held(clone):
+    sha = clone.commit()
+    clone.git("tag", "-a", "v1", "-m", "v1")
+    out = clone.push("refs/tags/v1", claude=True)
+    assert out.returncode != 0 and sha in out.stderr
 
 
-def test_hook_push_outside_a_repo_is_allowed(tmp_path):
-    assert run_hook(tmp_path, "git push").returncode == 0
+def test_wrapper_without_the_script_lets_the_push_through(clone):
+    clone.commit(BAD_README)
+    (clone.dir / "tools" / "docs" / "push_hook.py").unlink()
+    out = clone.push(claude=True)
+    assert out.returncode == 0, out.stderr
+    assert clone.remote_ref("refs/heads/main")
 
 
-def test_hook_only_acts_in_a_repo_that_has_it(work):
-    (work / "tools" / "docs" / "push_hook.py").unlink()
-    done = run_hook(work, "git push")
-    assert done.returncode == 0 and done.stderr == ""
+def test_unexpected_error_fails_open(clone):
+    clone.commit()
+    line = f"refs/heads/main {'f' * 40} refs/heads/main {ZERO}\n"  # an object that does not exist
+    out = clone.run([sys.executable, "tools/docs/push_hook.py", "origin", str(clone.remote)],
+                    claude=True, input=line)
+    assert out.returncode == 0 and "unexpected error" in out.stderr
+

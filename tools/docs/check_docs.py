@@ -14,7 +14,7 @@ there for CI or for a reader of the repo, so it is a finding locally exactly as 
      that file, computed like GitHub does (see `slug`);
   c. a literal setup file name (printpapi-setup-...) is one of the assets in
      web/lib/setup-downloads.json (at the same revision);
-  d. "open source" only next to a "not" or "never": the project is "source available".
+  d. "open source" only in a paragraph with a "not" or "never": the project is "source available".
 
 Fenced code blocks and inline code spans (which may span the lines of a paragraph) are ignored for
 links and headings; file names (c) and wording (d) are checked everywhere. `check` is pure: it
@@ -51,7 +51,7 @@ HTML_REF = re.compile(r"""\b(?:src|href)\s*=\s*(?:"([^"]*)"|'([^']*)')""", re.I)
 HTML_ANCHOR = re.compile(r"""<[A-Za-z][^>]*?\b(?:name|id)\s*=\s*["']([^"']+)["']""", re.I)
 SCHEME = re.compile(r"^(?:[A-Za-z][A-Za-z0-9+.-]*:|//)")
 SETUP_NAME = re.compile(r"printpapi-setup-[A-Za-z0-9_.-]*[A-Za-z0-9_]")
-OPEN_SOURCE = re.compile(r"open[ -]source", re.I)
+OPEN_SOURCE = re.compile(r"open[\s-]+source", re.I)  # \s: the docs are hard-wrapped
 NOT_WORD = re.compile(r"\b(?:not|never)\b", re.I)
 
 
@@ -78,30 +78,63 @@ def blank_code(text: str) -> str:
     return CODE_SPAN.sub(lambda m: re.sub(r"[^\n]", " ", m.group(0)), text)
 
 
+def blocks_of(text: str):
+    """Yield (block, in_fence), a block being a list of (line number, line).
+
+    A prose block is a paragraph: consecutive non-blank lines, cut at a fence and around an ATX
+    heading (a heading is a block of its own). Every line of a fence is a block of its own.
+    """
+    block: list[tuple[int, str]] = []
+    for no, line, in_fence in lines_of(text):
+        if in_fence:
+            if block:
+                yield block, False
+                block = []
+            yield [(no, line)], True
+        elif not line.strip():
+            if block:
+                yield block, False
+                block = []
+        elif HEADING.match(line):
+            if block:
+                yield block, False
+            block = []
+            yield [(no, line)], False
+        else:
+            block.append((no, line))
+    if block:
+        yield block, False
+
+
 def prose_lines(text: str) -> dict[int, str]:
     """Line number -> the line with inline code blanked, for the lines outside fences.
 
     A code span can cross a line break inside a hard-wrapped paragraph, so the code is blanked per
-    paragraph: consecutive non-blank lines, cut at a fence and around an ATX heading.
+    prose block (see `blocks_of`).
     """
     out: dict[int, str] = {}
-    block: list[tuple[int, str]] = []
-
-    def flush():
-        if block:
+    for block, in_fence in blocks_of(text):
+        if not in_fence:
             blanked = blank_code("\n".join(line for _, line in block)).split("\n")
             out.update((no, line) for (no, _), line in zip(block, blanked))
-            block.clear()
+    return out
 
-    for no, line, in_fence in lines_of(text):
-        if in_fence or not line.strip():
-            flush()
-        elif HEADING.match(line):
-            flush()
-            out[no] = blank_code(line)
-        else:
-            block.append((no, line))
-    flush()
+
+def wording_findings(text: str) -> list[tuple[int, str]]:
+    """(line number, message) for every "open source" in a block without a "not" or "never".
+
+    The docs are hard-wrapped, so the rule works per paragraph, not per line.
+    """
+    out = []
+    for block, _ in blocks_of(text):
+        joined = "\n".join(line for _, line in block)
+        # ponytail: a paragraph with "not" or "never" anywhere passes, even if it says something
+        # else ("not only open source"). A word list per paragraph, not a parse.
+        if NOT_WORD.search(joined):
+            continue
+        for m in OPEN_SOURCE.finditer(joined):
+            no = block[joined.count("\n", 0, m.start())][0]
+            out.append((no, '"open source": the project is source available (say "not" or "never")'))
     return out
 
 
@@ -197,15 +230,12 @@ def check(md_files: list[str], read: Callable[[str], str], tracked: set[str],
     for md in md_files:
         text = read(md)
         prose = prose_lines(text)
+        findings += [f"{md}:{no}: {msg}" for no, msg in wording_findings(text)]
         for no, line, in_fence in lines_of(text):
             where = f"{md}:{no}: "
             for name in SETUP_NAME.findall(line):
                 if name not in setup_assets:
                     findings.append(f"{where}setup file name {name} is not in {SETUP_JSON}")
-            # ponytail: a line with "not" or "never" next to "open source" passes, even if it says
-            # something else ("not only open source"). A word list, not a parse.
-            if OPEN_SOURCE.search(line) and not NOT_WORD.search(line):
-                findings.append(f'{where}"open source": the project is source available (say "not" or "never")')
             if in_fence:
                 continue
             for target in link_targets(prose.get(no, "")):

@@ -292,6 +292,27 @@ def test_not_must_be_a_word():
     assert len(repo({"README.md": "We note this open source thing\n"})) == 1
 
 
+def test_wording_works_per_paragraph_for_hard_wrapped_docs():
+    text = 'The project is source available and never\n"open source" in the OSI sense.\n'
+    assert repo({"README.md": text}) == []
+    assert repo({"README.md": "Sadly not a\nsurprise: it is open\nsource.\n"}) == []
+
+
+def test_wrapped_open_source_without_not_fails_at_the_match_line():
+    out = repo({"README.md": "# T\n\nA tool that\nis open\nsource, truly.\n"})
+    assert len(out) == 1 and out[0].startswith("README.md:4: ")
+
+
+def test_not_in_another_paragraph_does_not_excuse():
+    out = repo({"README.md": "It is not a toy.\n\nWe are open source.\n"})
+    assert len(out) == 1 and out[0].startswith("README.md:3: ")
+
+
+def test_open_source_in_a_fence_is_checked_per_line():
+    out = repo({"README.md": "```\nnot this\nopen source\n```\n"})
+    assert len(out) == 1 and out[0].startswith("README.md:3: ")
+
+
 # --- helpers -------------------------------------------------------------------------------
 
 def test_crlf_line_endings():

@@ -31,8 +31,9 @@ jobs:
       - run: pip install pytest
       - run: python -m pytest -q agent/tests
 
-  # The docs follow the code, checked mechanically on what git has at HEAD: relative links and
-  # anchors that resolve to files in git, setup file names, source-available wording (never "open source").
+  # The docs follow the code. The same check as tools/githooks/pre-push, on what git has at HEAD:
+  # relative links and anchors that resolve to files in git, setup file names, source-available
+  # wording (never "open source").
   docs:
     runs-on: ubuntu-latest
     steps:
