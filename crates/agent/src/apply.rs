@@ -306,6 +306,28 @@ fn read_staged(staging: &Path, env: &Env, sumatra_sha: &str) -> Result<Staged, A
     })
 }
 
+/// `create_dir_all` for a folder the whole system walks through (the install folder, the autostart
+/// folders): every folder this call makes gets exactly 0755, not what the umask of the caller
+/// leaves (pkexec does not reset it, and 077 would keep the service user and every other user out
+/// of a new `/etc/xdg/autostart` or `/usr/share/applications`). Folders that were there are left
+/// alone.
+fn create_dirs(path: &Path) -> std::io::Result<()> {
+    let mut missing = Vec::new();
+    let mut at = Some(path);
+    while let Some(p) = at.filter(|p| !p.as_os_str().is_empty() && !p.exists()) {
+        missing.push(p);
+        at = p.parent();
+    }
+    for dir in missing.into_iter().rev() {
+        match std::fs::create_dir(dir) {
+            Err(e) if e.kind() != std::io::ErrorKind::AlreadyExists => return Err(e),
+            _ => {}
+        }
+        set_mode(dir, 0o755)?;
+    }
+    Ok(())
+}
+
 /// `f` until it works, at most `attempts` times, with a second between tries.
 fn retry<T>(
     attempts: u32,
@@ -566,7 +588,7 @@ fn replace_install(
 ) -> Result<Baselines, ApplyError> {
     let l = &env.layout;
 
-    std::fs::create_dir_all(&l.dir).map_err(|e| system("cannot create the install folder", e))?;
+    create_dirs(&l.dir).map_err(|e| system("cannot create the install folder", e))?;
     // the service user has to get into the folder whatever the umask of the caller is
     set_mode(&l.dir, 0o755).map_err(|e| system("cannot set the install folder's rights", e))?;
     retry(FILE_ATTEMPTS, env.sleep, &mut || {
@@ -583,8 +605,7 @@ fn replace_install(
     // The marker before the autostart file: a run that dies in between is found as ours next time.
     place_file(&l.marker, b"", 0o644).map_err(|e| system("cannot write the marker", e))?;
     if let Some(parent) = l.autostart.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|e| system("cannot create the autostart folder", e))?;
+        create_dirs(parent).map_err(|e| system("cannot create the autostart folder", e))?;
     }
     place_file(&l.autostart, &install::autostart_file(env.os, l), 0o644)
         .map_err(|e| system("cannot write the autostart file", e))?;
@@ -805,7 +826,7 @@ fn purge_status_dir(dir: &Path) -> std::io::Result<()> {
 fn prepare_status_dir(env: &Env) -> Result<(), ApplyError> {
     let dir = &env.layout.status_dir;
     vet_status_dir(dir, &status_dir_owners(env.os))?;
-    std::fs::create_dir_all(dir).map_err(|e| system("cannot create the status folder", e))?;
+    create_dirs(dir).map_err(|e| system("cannot create the status folder", e))?;
     set_mode(dir, 0o755).map_err(|e| system("cannot set the status folder's rights", e))?;
     for c in install::status_dir_cmds(env.os, &env.layout, &env.sys) {
         (env.run)(&c).map_err(|e| system("cannot set the status folder's rights", e))?;
@@ -956,7 +977,7 @@ fn install_tray(env: &Env, tray: &TrayStaged) -> Result<(), ApplyError> {
             continue;
         };
         if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)
+            create_dirs(parent)
                 .map_err(|e| system("cannot create the folder of the tray autostart", e))?;
         }
         place_file(path, &bytes, 0o644)
@@ -1985,9 +2006,36 @@ mod tests {
         // This is the only test that touches the umask, so nothing here races with another.
         let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o7777;
         let before = unsafe { libc::umask(0) };
-        let fx = Fixture::new(Os::Linux);
+        let mut fx = Fixture::new(Os::Linux);
+        // system folders that do not exist yet (a minimal system has no /etc/xdg/autostart), two
+        // levels deep: the umask must not decide who may walk into them
+        let root = fx.tmp.path().to_path_buf();
+        fx.layout.autostart = root.join("etc").join("systemd").join("system").join("unit");
+        fx.layout.tray_autostart = Some(root.join("xdg").join("autostart").join("t.desktop"));
+        fx.layout.app_entry = Some(
+            root.join("usr")
+                .join("share")
+                .join("applications")
+                .join("a.desktop"),
+        );
+        fx.stage_tray(b"the tray");
         std::fs::write(fx.staging.join("SumatraPDF.exe"), b"abc").unwrap();
         let result = apply_with(&fx.staging, &fx.env(), ABC_SHA);
+        let made: Vec<(String, u32)> = [
+            "etc",
+            "etc/systemd",
+            "etc/systemd/system",
+            "xdg",
+            "xdg/autostart",
+            "usr",
+            "usr/share",
+            "usr/share/applications",
+            "opt",
+            "status",
+        ]
+        .iter()
+        .map(|d| (d.to_string(), mode(&root.join(d))))
+        .collect();
         let l = &fx.layout;
         let seen = [
             mode(&l.dir),
@@ -2001,6 +2049,9 @@ mod tests {
         result.unwrap();
         // the ini is 0600 until the (faked) chown and chmod run, never wider than that
         assert_eq!(seen, [0o755, 0o755, 0o755, 0o644, 0o644, 0o600]);
+        for (dir, mode) in made {
+            assert_eq!(mode, 0o755, "{dir} is {mode:o}");
+        }
     }
 
     #[test]
