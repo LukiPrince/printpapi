@@ -616,19 +616,90 @@ fn status_dir_owners(os: Os) -> Vec<u32> {
     owners
 }
 
-// ponytail: Windows has no owner check here. `status_dir_cmds` takes the folder's owner and ACL over
-// with icacls, but a file that a user planted inside keeps its own owner; the worst it can do is
-// show a false status for itself, because the tray only reads, and the agent replaces the file by
-// renaming.
 #[cfg(not(unix))]
 fn status_dir_owners(_: Os) -> Vec<u32> {
     Vec::new()
 }
 
+/// Whether a Windows folder owned by `sid` (the `S-1-5-...` text) may stay as the status folder:
+/// only Administrators and SYSTEM, what an elevated install makes. A folder that a standard user
+/// made first is theirs (they hold WRITE_DAC as owner, and icacls `/grant:r` leaves explicit
+/// entries for other SIDs alone), so it has to go, not be fixed up. Pure, so it is tested on every
+/// system.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn trusted_windows_owner(sid: &str) -> bool {
+    let star = format!("*{sid}");
+    star == install::SID_ADMINISTRATORS || star == install::SID_SYSTEM
+}
+
+/// The owner of `dir` as an `S-1-5-...` text.
+/// https://learn.microsoft.com/en-us/windows/win32/api/aclapi/nf-aclapi-getnamedsecurityinfow
+/// (the owner SID points into the returned security descriptor, which `LocalFree` releases) and
+/// https://learn.microsoft.com/en-us/windows/win32/api/sddl/nf-sddl-convertsidtostringsidw
+/// (the text is released with `LocalFree` too).
+#[cfg(windows)]
+fn dir_owner_sid(dir: &Path) -> std::io::Result<String> {
+    use std::os::windows::ffi::OsStrExt;
+    use std::ptr::null_mut;
+    use windows_sys::Win32::Foundation::{ERROR_SUCCESS, LocalFree};
+    use windows_sys::Win32::Security::Authorization::{
+        ConvertSidToStringSidW, GetNamedSecurityInfoW, SE_FILE_OBJECT,
+    };
+    use windows_sys::Win32::Security::{OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID};
+
+    let wide: Vec<u16> = dir.as_os_str().encode_wide().chain(Some(0)).collect();
+    let mut owner: PSID = null_mut();
+    let mut descriptor: PSECURITY_DESCRIPTOR = null_mut();
+    // SAFETY: `wide` is a NUL-terminated string that outlives the call; the group, DACL and SACL
+    // out-pointers are optional and NULL; `owner` and `descriptor` are valid for writes
+    let err = unsafe {
+        GetNamedSecurityInfoW(
+            wide.as_ptr(),
+            SE_FILE_OBJECT,
+            OWNER_SECURITY_INFORMATION,
+            &mut owner,
+            null_mut(),
+            null_mut(),
+            null_mut(),
+            &mut descriptor,
+        )
+    };
+    if err != ERROR_SUCCESS {
+        return Err(std::io::Error::from_raw_os_error(err as i32));
+    }
+    let result = if owner.is_null() {
+        Err(std::io::Error::other("the folder has no owner"))
+    } else {
+        let mut text: windows_sys::core::PWSTR = null_mut();
+        // SAFETY: `owner` points into `descriptor`, which is still alive; `text` is valid for
+        // writes
+        if unsafe { ConvertSidToStringSidW(owner, &mut text) } == 0 {
+            Err(std::io::Error::last_os_error())
+        } else {
+            // SAFETY: on success `text` is a NUL-terminated UTF-16 string, read once and freed
+            // right after
+            let sid = unsafe {
+                let mut len = 0;
+                while *text.add(len) != 0 {
+                    len += 1;
+                }
+                let sid = String::from_utf16_lossy(std::slice::from_raw_parts(text, len));
+                LocalFree(text.cast());
+                sid
+            };
+            Ok(sid)
+        }
+    };
+    // SAFETY: `descriptor` was allocated by GetNamedSecurityInfoW and is not used any more
+    unsafe { LocalFree(descriptor) };
+    result
+}
+
 /// Look at the status folder before it is used: this runs elevated, and the folder is in a place
 /// where a user may have made it first. A link is refused (root would write where it points), and
-/// on Unix a folder that none of `owners` owns is deleted with what is in it and made again, so
-/// the install never keeps a folder another user controls.
+/// a folder that none of `owners` owns is deleted with what is in it and made again, so
+/// the install never keeps a folder another user controls (on Windows the owners are Administrators
+/// and SYSTEM, see `trusted_windows_owner`).
 // ponytail: a user can still swap the folder between this check and the next step; the same gap
 // as in `check_staging`, closed together with it by roadmap 12.
 fn vet_status_dir(dir: &Path, owners: &[u32]) -> Result<(), ApplyError> {
@@ -653,6 +724,18 @@ fn vet_status_dir(dir: &Path, owners: &[u32]) -> Result<(), ApplyError> {
     {
         use std::os::unix::fs::MetadataExt;
         if !owners.contains(&meta.uid()) {
+            std::fs::remove_dir_all(dir)
+                .map_err(|e| system("cannot replace the status folder of another user", e))?;
+        }
+    }
+    #[cfg(windows)]
+    {
+        // the same for Windows: a folder that is not Administrators' or SYSTEM's was made by a
+        // user, who may still hold rights on it that the icacls calls after this do not take away
+        // (`remove_dir_all` does not follow a junction inside)
+        let sid =
+            dir_owner_sid(dir).map_err(|e| system("cannot read the status folder's owner", e))?;
+        if !trusted_windows_owner(&sid) {
             std::fs::remove_dir_all(dir)
                 .map_err(|e| system("cannot replace the status folder of another user", e))?;
         }
@@ -2497,12 +2580,51 @@ mod tests {
         apply(&fx.staging, &fx.env()).unwrap();
         let ev = fx.events().join("\n");
         let dir = fx.layout.status_dir.display().to_string();
-        assert!(
-            ev.contains(&format!(
-                "icacls.exe {dir} /inheritance:r /setowner *S-1-5-32-544"
-            )),
-            "{ev}"
-        );
+        // two calls: icacls refuses /setowner together with the other switches
+        let owner = ev.find(&format!(
+            "icacls.exe {dir} /setowner *S-1-5-32-544
+"
+        ));
+        let grant = ev.find(&format!(
+            "icacls.exe {dir} /inheritance:r /grant:r *S-1-5-18:(OI)(CI)F "
+        ));
+        assert!(owner.is_some() && grant.is_some(), "{ev}");
+        assert!(owner < grant, "{ev}");
+    }
+
+    #[test]
+    fn only_administrators_and_system_may_own_the_status_dir() {
+        assert!(trusted_windows_owner("S-1-5-32-544"));
+        assert!(trusted_windows_owner("S-1-5-18"));
+        // a standard user, Users, Everyone, Authenticated Users, CREATOR OWNER, empty
+        for sid in [
+            "S-1-5-21-1-2-3-1001",
+            "S-1-5-32-545",
+            "S-1-1-0",
+            "S-1-5-11",
+            "S-1-3-0",
+            "",
+        ] {
+            assert!(!trusted_windows_owner(sid), "{sid}");
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_status_dir_of_another_owner_is_replaced_on_windows() {
+        let fx = Fixture::new(Os::Windows);
+        let dir = &fx.layout.status_dir;
+        std::fs::create_dir_all(dir).unwrap();
+        std::fs::write(dir.join("planted"), b"x").unwrap();
+        let sid = dir_owner_sid(dir).unwrap();
+        assert!(sid.starts_with("S-1-5-"), "{sid}");
+        vet_status_dir(dir, &[]).unwrap();
+        // gone with its content exactly when the owner is not trusted: in a test run that is
+        // whoever made the folder, usually the user
+        assert_eq!(dir.join("planted").exists(), trusted_windows_owner(&sid));
+        // nothing there is fine
+        std::fs::remove_dir_all(dir).ok();
+        vet_status_dir(dir, &[]).unwrap();
     }
 
     #[cfg(unix)]

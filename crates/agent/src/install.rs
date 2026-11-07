@@ -30,8 +30,8 @@ const MACOS_TRAY_EXE: &str = "printpapi-setup";
 const WIN_RUN_KEY: &str = "HKLM\\Software\\Microsoft\\Windows\\CurrentVersion\\Run";
 const SID_USERS: &str = "*S-1-5-32-545";
 
-const SID_SYSTEM: &str = "*S-1-5-18";
-const SID_ADMINISTRATORS: &str = "*S-1-5-32-544";
+pub(crate) const SID_SYSTEM: &str = "*S-1-5-18";
+pub(crate) const SID_ADMINISTRATORS: &str = "*S-1-5-32-544";
 const CMD_TIMEOUT: u64 = 60;
 /// Exists while systemd is the running init (see sd_booted(3)).
 const SYSTEMD_RUN_DIR: &str = "/run/systemd/system";
@@ -612,6 +612,9 @@ pub fn tray_unregister_cmds(os: Os, _l: &Layout, sys: &Path) -> Vec<Cmd> {
 /// is locked on Windows). The caller ignores failures: there may be none running.
 /// https://learn.microsoft.com/en-us/windows-server/administration/windows-commands/taskkill
 /// (`/im` names the image, `/f` ends it forcefully); `pkill -f` matches the whole command line.
+// ponytail: this also ends a settings window of the same program, it is the same image and path.
+// Whoever starts an install from that window must not stage a `tray` (then nothing is stopped), and
+// a removal from it ends the window by design, because its exe is locked on Windows anyway.
 pub fn tray_stop_cmds(os: Os, l: &Layout, sys: &Path) -> Vec<Cmd> {
     match os {
         Os::Windows => vec![cmd(vec![
@@ -622,32 +625,46 @@ pub fn tray_stop_cmds(os: Os, l: &Layout, sys: &Path) -> Vec<Cmd> {
         ])],
         Os::Linux => vec![cmd(vec!["pkill".into(), "-f".into(), s(&l.tray)])],
         Os::Macos => {
-            let app = s(&l.tray);
-            let name = app.rsplit('/').next().unwrap_or(&app).to_string();
-            vec![cmd(vec![tool(os, sys, "usr/bin/pkill"), "-f".into(), name])]
+            // the full path of the app's programs, as on Linux; `pkill -f` takes a regex, so the
+            // dot of ".app" is escaped, and a copy elsewhere (Downloads) or an editor that has the
+            // bundle open is not hit
+            let pattern = format!("{}/Contents/MacOS/", s(&l.tray).replace('.', r"\."));
+            vec![cmd(vec![
+                tool(os, sys, "usr/bin/pkill"),
+                "-f".into(),
+                pattern,
+            ])]
         }
     }
 }
 
 /// The rights of `layout.status_dir`, set after the folder exists: readable by every local user,
-/// writable only by whoever runs the agent. On Windows by SID, as in [`ini_acl_cmds`]: SYSTEM and
-/// Administrators full (inherited by what is created inside), Users read and execute, and the
-/// owner is taken over from whoever made the folder.
+/// writable only by whoever runs the agent. On Windows by SID, as in [`ini_acl_cmds`]: the owner
+/// is taken over (Administrators), then inheritance is cut and SYSTEM and Administrators get full
+/// access (inherited by what is created inside) and Users read and execute. Two commands, because
+/// icacls refuses `/setowner` together with `/inheritance` or `/grant` in one call (checked on
+/// Windows 11: "Ungültiger Parameter", exit 87); the docs list them in separate syntax lines.
 /// https://learn.microsoft.com/en-us/windows-server/administration/windows-commands/icacls
 pub fn status_dir_cmds(os: Os, l: &Layout, sys: &Path) -> Vec<Cmd> {
     let dir = s(&l.status_dir);
     match os {
-        Os::Windows => vec![cmd(vec![
-            tool(os, sys, "icacls.exe"),
-            dir,
-            "/inheritance:r".into(),
-            "/setowner".into(),
-            SID_ADMINISTRATORS.into(),
-            "/grant:r".into(),
-            format!("{SID_SYSTEM}:(OI)(CI)F"),
-            format!("{SID_ADMINISTRATORS}:(OI)(CI)F"),
-            format!("{SID_USERS}:(OI)(CI)RX"),
-        ])],
+        Os::Windows => vec![
+            cmd(vec![
+                tool(os, sys, "icacls.exe"),
+                dir.clone(),
+                "/setowner".into(),
+                SID_ADMINISTRATORS.into(),
+            ]),
+            cmd(vec![
+                tool(os, sys, "icacls.exe"),
+                dir,
+                "/inheritance:r".into(),
+                "/grant:r".into(),
+                format!("{SID_SYSTEM}:(OI)(CI)F"),
+                format!("{SID_ADMINISTRATORS}:(OI)(CI)F"),
+                format!("{SID_USERS}:(OI)(CI)RX"),
+            ]),
+        ],
         Os::Linux => vec![
             cmd(vec!["chown".into(), SERVICE_USER.into(), dir.clone()]),
             cmd(vec!["chmod".into(), "755".into(), dir]),
@@ -1453,7 +1470,11 @@ mod tests {
         );
         assert_eq!(
             argvs(&tray_stop_cmds(Os::Macos, &mac(), Path::new("/"))),
-            [vec!["/usr/bin/pkill", "-f", "printpapi Agent.app"]]
+            [vec![
+                "/usr/bin/pkill",
+                "-f",
+                r"/Applications/printpapi Agent\.app/Contents/MacOS/"
+            ]]
         );
     }
 
@@ -1463,23 +1484,34 @@ mod tests {
         let cmds = status_dir_cmds(Os::Windows, &l, Path::new(WIN_SYS));
         assert_eq!(
             argvs(&cmds),
-            [vec![
-                "C:\\Windows\\System32\\icacls.exe",
-                "C:\\ProgramData\\printpapi",
-                "/inheritance:r",
-                "/setowner",
-                "*S-1-5-32-544",
-                "/grant:r",
-                "*S-1-5-18:(OI)(CI)F",
-                "*S-1-5-32-544:(OI)(CI)F",
-                "*S-1-5-32-545:(OI)(CI)RX"
-            ]]
+            [
+                vec![
+                    "C:\\Windows\\System32\\icacls.exe",
+                    "C:\\ProgramData\\printpapi",
+                    "/setowner",
+                    "*S-1-5-32-544"
+                ],
+                vec![
+                    "C:\\Windows\\System32\\icacls.exe",
+                    "C:\\ProgramData\\printpapi",
+                    "/inheritance:r",
+                    "/grant:r",
+                    "*S-1-5-18:(OI)(CI)F",
+                    "*S-1-5-32-544:(OI)(CI)F",
+                    "*S-1-5-32-545:(OI)(CI)RX"
+                ]
+            ]
         );
-        let a = &cmds[0].argv;
-        assert!(
-            !a.iter()
-                .any(|x| x.contains("Users") || x.contains("SYSTEM"))
-        );
+        // icacls refuses /setowner next to any other switch, so it stands alone
+        for c in &cmds {
+            let setowner = c.argv.iter().any(|x| x == "/setowner");
+            assert!(!setowner || c.argv.len() == 4, "{:?}", c.argv);
+            assert!(
+                !c.argv
+                    .iter()
+                    .any(|x| x.contains("Users") || x.contains("SYSTEM"))
+            );
+        }
     }
 
     #[test]
@@ -1555,7 +1587,7 @@ mod tests {
         all.extend(tray_unregister_cmds(Os::Windows, &l, sys));
         all.extend(tray_stop_cmds(Os::Windows, &l, sys));
         all.extend(status_dir_cmds(Os::Windows, &l, sys));
-        assert_eq!(all.len(), 4);
+        assert_eq!(all.len(), 5);
         for c in all {
             assert!(c.argv[0].starts_with(WIN_SYS), "{:?}", c.argv);
         }
