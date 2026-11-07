@@ -36,6 +36,8 @@ const STALE_SECS: f64 = 120.0;
 const MAX_STATUS_BYTES: u64 = 64 * 1024;
 /// How often the file is read.
 const POLL: Duration = Duration::from_secs(5);
+/// How long a starting icon waits for the lock of an old one: a [`POLL`] and a margin.
+pub const LOCK_WAIT: Duration = Duration::from_secs(8);
 /// What the tooltip says first; with the status line (at most [`LINE_MAX`] characters) it stays
 /// below the 127 characters a Windows tooltip holds.
 /// https://learn.microsoft.com/en-us/windows/win32/api/shellapi/ns-shellapi-notifyicondataw
@@ -211,6 +213,22 @@ pub fn single_instance(lock: &Path) -> Option<File> {
         .ok()?;
     file.try_lock().ok()?;
     Some(file)
+}
+
+/// `single_instance`, tried again for up to `within`. An update or a removal that was asked for
+/// by a window leaves the old icon alone on Linux (see `apply::stop_trays`): it ends itself within
+/// [`POLL`], and the new icon the window starts right away must not give up before.
+pub fn single_instance_within(lock: &Path, within: Duration) -> Option<File> {
+    let start = std::time::Instant::now();
+    loop {
+        if let Some(file) = single_instance(lock) {
+            return Some(file);
+        }
+        if start.elapsed() >= within {
+            return None;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
 }
 
 /// The text of the status file, or `None` when it is missing, unreadable, not UTF-8, or has not
@@ -771,6 +789,27 @@ mod tests {
         assert!(single_instance(&lock).is_none(), "a second icon stays away");
         drop(first);
         assert!(single_instance(&lock).is_some(), "the lock is free again");
+    }
+
+    #[test]
+    fn a_new_icon_waits_for_an_old_one_that_is_about_to_end() {
+        let dir = tempfile::tempdir().unwrap();
+        let lock = dir.path().join("printpapi-tray.lock");
+        let old = single_instance(&lock).unwrap();
+        let ending = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(300));
+            drop(old);
+        });
+        assert!(single_instance_within(&lock, Duration::from_secs(10)).is_some());
+        ending.join().unwrap();
+        // an icon that stays does not let it in
+        let _held = single_instance(&dir.path().join("other.lock")).unwrap();
+        let t = std::time::Instant::now();
+        assert!(
+            single_instance_within(&dir.path().join("other.lock"), Duration::from_millis(250))
+                .is_none()
+        );
+        assert!(t.elapsed() >= Duration::from_millis(250));
     }
 
     #[test]

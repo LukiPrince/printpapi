@@ -30,9 +30,13 @@ fn startup_problem(webview: Result<String, String>, on_windows: bool) -> Option<
 
 fn main() -> ExitCode {
     let tray_mode = std::env::args().skip(1).any(|a| a == "--tray");
-    // The icon lives as long as the process; a second icon of this user ends at once.
+    // The icon lives as long as the process; a second icon of this user ends, once the first one
+    // has had time to end itself after an update (see `tray::single_instance_within`).
     let _single = if tray_mode {
-        match tray::lock_path().as_deref().and_then(tray::single_instance) {
+        match tray::lock_path()
+            .as_deref()
+            .and_then(|lock| tray::single_instance_within(lock, tray::LOCK_WAIT))
+        {
             Some(lock) => Some(lock),
             None => return ExitCode::SUCCESS,
         }
