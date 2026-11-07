@@ -85,7 +85,10 @@ docker run -e PRINTAPI_TOKEN=change-me -p 3460:3460 ghcr.io/lukiprince/printpapi
 Or `docker compose up -d`, which keeps the DB in a volume (see [`docker-compose.yml`](docker-compose.yml)).
 Prefer to build it yourself? `docker build -t printpapi .`
 
-**Agent**, on the machine with the printers:
+**Agent**, on the machine with the printers. The easiest way is the setup app: download
+`printpapi-setup-<platform>` from the
+[latest release](https://github.com/LukiPrince/printpapi/releases/latest), open it and follow the four
+steps ([docs](docs/agent.md#setup-app)). Or by hand:
 
 1. Download the `printpapi-agent-<platform>` archive from the
    [latest release](https://github.com/LukiPrince/printpapi/releases/latest) and unpack it (Windows

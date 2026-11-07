@@ -21,6 +21,7 @@ export embedded into the server binary.
 
 ```bash
 cargo test --workspace          # from the repo root
+cd crates/setup && cargo test   # the setup app, not a workspace member
 python -m pytest agent/tests    # legacy Python agent
 cd web && npm run build:app     # after any web/ change; commit crates/server/web with it
 ```
@@ -57,6 +58,21 @@ cd web && npm run build:app     # after any web/ change; commit crates/server/we
   one is right depends on the driver.
 - `agent/print_agent.py` is the legacy Python agent for locked-down Windows, kept until the Rust
   exe is code-signed. Keep its tests green.
+- The `install`, `uninstall` and `read-config` subcommands (what the setup app calls) run as admin.
+  They never trust the staging folder, which any user can write: absolute program paths only,
+  the key never in argv or output. Test them with a fake `Runner`, never against the real
+  scheduler, systemd or launchd.
+
+## Setup (`crates/setup`)
+
+- Tauri v2 shell around the agent, **outside the workspace** (it needs WebView and system
+  libraries, so `cargo test --workspace` never builds it). Test it from `crates/setup`. All logic
+  that can be tested lives in `crates/agent`; keep the shell thin.
+- Its window is the third Next build, `npm run build:setup` (`web/out-setup`), embedded at compile
+  time. It never talks to a local server, and `npm run check:bundles` keeps its code out of the
+  dashboard and demo.
+- `web/lib/setup-downloads.json` is the one list of setup files. The downloads page and
+  `release.yml` both read it; a variant nobody has run by hand is `"beta": true`.
 
 ## Dashboard (`web/`)
 

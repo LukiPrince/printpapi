@@ -1,14 +1,48 @@
 "use client";
 
 import { motion } from "motion/react";
-import { Apple, MonitorCheck, Terminal } from "lucide-react";
+import { Apple, Download, FlaskConical, MonitorCheck, Terminal } from "lucide-react";
+import { Badge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { CopyButton } from "@/components/copy-button";
 import { DEMO_SERVER_URL } from "printpapi-demo";
 import { useClientValue } from "@/hooks/use-client-value";
+import { setupDownloads, type SetupDownload } from "@/lib/setup-downloads";
 
 const RELEASES = "https://github.com/LukiPrince/printpapi/releases/latest";
+
+const SETUP_PLATFORMS: {
+  platform: SetupDownload["platform"];
+  name: string;
+  icon: typeof Apple;
+  notes: string[];
+}[] = [
+  {
+    platform: "windows",
+    name: "Windows",
+    icon: MonitorCheck,
+    notes: [
+      "Windows may warn about an unknown publisher. Click More info, then Run anyway.",
+      "Smart App Control blocks unsigned programs with no way around it. Use the Python agent below.",
+    ],
+  },
+  {
+    platform: "macos",
+    name: "macOS",
+    icon: Apple,
+    notes: [
+      "macOS blocks the app first. Open System Settings, Privacy & Security, click Open Anyway and enter your password.",
+    ],
+  },
+  {
+    platform: "linux",
+    name: "Linux",
+    icon: Terminal,
+    notes: ["Linux without a desktop still needs the manual steps below."],
+  },
+];
 
 const STEPS = [
   {
@@ -71,8 +105,52 @@ name = office-pc
 ; or file:///path/to/dir to write the job to disk instead of printing it.
 printers = Zebra GK420d ; HP LaserJet|pdf ; netz-bixolon = socket://192.168.1.50:9100`;
 
+  const downloads = setupDownloads();
+
   return (
     <div className="max-w-3xl space-y-4">
+      <Card>
+        <CardHeader>
+          <CardTitle>Set up with one double-click</CardTitle>
+          <CardDescription>
+            Download the setup for the machine the printers are attached to, open it and follow the
+            four steps. It installs the agent and starts it with the machine.
+          </CardDescription>
+        </CardHeader>
+        <CardContent className="space-y-5">
+          {SETUP_PLATFORMS.map(({ platform, name, icon: Icon, notes }) => (
+            <div key={platform} className="space-y-2">
+              <p className="flex items-center gap-2 font-medium">
+                <Icon className="size-4" aria-hidden /> {name}
+              </p>
+              <div className="flex flex-wrap gap-2">
+                {downloads
+                  .filter((d) => d.platform === platform)
+                  .map((d) => (
+                    <Button key={d.url} asChild variant="outline" size="sm">
+                      <a href={d.url} target="_blank" rel="noreferrer">
+                        <Download aria-hidden /> {d.label}
+                        {d.beta && (
+                          <Badge variant="secondary" className="gap-1">
+                            <FlaskConical aria-hidden /> Beta
+                          </Badge>
+                        )}
+                      </a>
+                    </Button>
+                  ))}
+              </div>
+              {notes.map((note) => (
+                <p key={note} className="text-sm text-muted-foreground">
+                  {note}
+                </p>
+              ))}
+            </div>
+          ))}
+        </CardContent>
+      </Card>
+
+      <h2 className="pt-2 text-lg font-semibold">Set up by hand</h2>
+
       <Card>
         <CardHeader>
           <CardTitle>Install the agent</CardTitle>

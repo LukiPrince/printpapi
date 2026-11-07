@@ -4,6 +4,25 @@ The agent runs on the machine with the printers. It registers its printers with 
 then long-polls for jobs, prints them, and reports the result. It makes **outbound connections
 only** — nothing listens on the printer's machine, so NAT/firewalls are no problem.
 
+## Setup app
+
+The easiest way on Windows, macOS and Linux with a desktop: download `printpapi-setup-<platform>`
+from the [latest release](https://github.com/LukiPrince/printpapi/releases/latest), open it and go
+through four steps (connect to the server with an agent key, pick the printers, test print, done).
+It writes `agent.ini`, installs the agent to `%ProgramFiles%\printpapi\` (Windows) or
+`/opt/printpapi/` (macOS, Linux) and starts it with the machine: a scheduled task `printpapi-agent`
+on Windows, a launchd daemon `com.printpapi.agent` on macOS, a systemd unit
+`printpapi-agent.service` on Linux. Open the setup again to change the printers or remove the agent.
+
+- The setup is not code-signed yet, so the system warns first. Windows: *More info*, then *Run
+  anyway*. macOS: System Settings, Privacy & Security, *Open Anyway*. macOS and the aarch64 Linux
+  builds are marked Beta on the downloads page until someone has run them by hand.
+- Smart App Control and WDAC block the unsigned exe with no way around it. Use the Python agent
+  ([Locked-down Windows](#locked-down-windows)).
+- Linux without a desktop or without systemd: use the manual steps below.
+- An agent you set up by hand is not taken over: the setup stops and says so, so a job is never
+  printed twice.
+
 ## Install
 
 The agent is a single Rust binary, `printpapi-agent`. No Python, no runtime.
