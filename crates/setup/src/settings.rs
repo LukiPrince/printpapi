@@ -595,13 +595,13 @@ mod tests {
     fn a_window_run_from_the_installed_place_stages_no_tray() {
         let tmp = tempfile::tempdir().unwrap();
         let (run, calls) = recorder();
-        let installed = Path::new("C:\\Program Files\\printpapi\\printpapi-tray.exe");
+        let installed = Path::new("C:\\Program Files\\printpapi-agent\\printpapi-tray.exe");
         // the case of a Windows path does not matter
-        let source = Path::new("c:\\program files\\PRINTPAPI\\printpapi-tray.exe");
+        let source = Path::new("c:\\program files\\PRINTPAPI-AGENT\\printpapi-tray.exe");
         assert!(!stage_tray(Os::Windows, Some(source), installed, tmp.path(), &run).unwrap());
         assert!(!tmp.path().join("tray").exists());
         // Linux: the AppImage that was installed
-        let l = Path::new("/opt/printpapi/printpapi-tray");
+        let l = Path::new("/opt/printpapi-agent/printpapi-tray");
         assert!(!stage_tray(Os::Linux, Some(l), l, tmp.path(), &run).unwrap());
         // macOS: the installed bundle
         let app = Path::new("/Applications/printpapi Agent.app");
@@ -622,7 +622,7 @@ mod tests {
         // an earlier copy goes
         std::fs::write(staging.join("tray"), b"old").unwrap();
         let (run, calls) = recorder();
-        let installed = Path::new("/opt/printpapi/printpapi-tray");
+        let installed = Path::new("/opt/printpapi-agent/printpapi-tray");
         assert!(stage_tray(Os::Linux, Some(&src), installed, &staging, &run).unwrap());
         assert_eq!(
             std::fs::read(staging.join("tray")).unwrap(),
@@ -662,12 +662,15 @@ mod tests {
         let win = layout(Os::Windows, Path::new("C:\\Program Files"));
         assert_eq!(
             tray_start_cmd(Os::Windows, &win).argv,
-            ["C:\\Program Files\\printpapi\\printpapi-tray.exe", "--tray"]
+            [
+                "C:\\Program Files\\printpapi-agent\\printpapi-tray.exe",
+                "--tray"
+            ]
         );
         let lin = layout(Os::Linux, Path::new("/unused"));
         assert_eq!(
             tray_start_cmd(Os::Linux, &lin).argv,
-            ["/opt/printpapi/printpapi-tray", "--tray"]
+            ["/opt/printpapi-agent/printpapi-tray", "--tray"]
         );
         let mac = layout(Os::Macos, Path::new("/unused"));
         assert_eq!(

@@ -9,10 +9,14 @@ only** — nothing listens on the printer's machine, so NAT/firewalls are no pro
 The easiest way on Windows, macOS and Linux with a desktop: download `printpapi-setup-<platform>`
 from the [latest release](https://github.com/LukiPrince/printpapi/releases/latest), open it and go
 through four steps (connect to the server with an agent key, pick the printers, test print, done).
-It writes `agent.ini`, installs the agent to `%ProgramFiles%\printpapi\` (Windows) or
-`/opt/printpapi/` (macOS, Linux) and starts it with the machine: a scheduled task `printpapi-agent`
-on Windows, a launchd daemon `com.printpapi.agent` on macOS, a systemd unit
-`printpapi-agent.service` on Linux. Open the setup again to change the printers or remove the agent.
+It writes `agent.ini`, installs the agent to `%ProgramFiles%\printpapi-agent\` (Windows) or
+`/opt/printpapi-agent/` (macOS, Linux) and starts it with the machine: a scheduled task
+`printpapi-agent` on Windows, a launchd daemon `com.printpapi.agent` on macOS, a systemd unit
+`printpapi-agent.service` (running as the system user `printpapi-agent`) on Linux. The folder and
+the user are not the ones of a printpapi server on the same machine (`/opt/printpapi`, user
+`printpapi`, see the [migration guide](migration.md)), so the two do not touch each other. Open the
+setup again to change the printers or remove the agent; the removal deletes only what the setup
+installed, and the folder only when nothing else is in it.
 
 ### Tray icon and settings
 
@@ -38,7 +42,8 @@ for them once.
 - GNOME shows no tray icons without the
   [AppIndicator extension](https://extensions.gnome.org/extension/615/appindicator-support/).
   The application menu has a **printpapi Agent** entry that opens the settings window directly.
-- Removing the agent removes the icon, its autostart entry and the status folder too.
+- Removing the agent removes the icon, its autostart entry and the status folder too (the files
+  the agent wrote there; anything else in that folder stays).
 
 - The setup is not code-signed yet, so the system warns first. Windows: *More info*, then *Run
   anyway*. macOS: System Settings, Privacy & Security, *Open Anyway*. macOS and the aarch64 Linux

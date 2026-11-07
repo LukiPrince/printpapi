@@ -37,7 +37,7 @@ WAIT_S = 60
 TRAY_RUN_KEY = r"HKLM\Software\Microsoft\Windows\CurrentVersion\Run"
 TRAY_RUN_VALUE = "printpapi-tray"
 if WIN:
-    INSTALL_DIR = Path(os.environ.get("ProgramFiles", r"C:\Program Files")) / "printpapi"
+    INSTALL_DIR = Path(os.environ.get("ProgramFiles", r"C:\Program Files")) / "printpapi-agent"
     AUTOSTART = INSTALL_DIR / "printpapi-agent-task.xml"
     STATUS_DIR = Path(os.environ.get("ProgramData", r"C:\ProgramData")) / "printpapi-agent"
     TRAY = INSTALL_DIR / "printpapi-tray.exe"
@@ -45,14 +45,14 @@ if WIN:
     APP_ENTRY = None
     REG = Path(os.environ.get("SystemRoot", r"C:\Windows")) / "System32" / "reg.exe"
 elif LINUX:
-    INSTALL_DIR = Path("/opt/printpapi")
+    INSTALL_DIR = Path("/opt/printpapi-agent")
     AUTOSTART = Path("/etc/systemd/system/printpapi-agent.service")
     STATUS_DIR = Path("/var/lib/printpapi-agent")
     TRAY = INSTALL_DIR / "printpapi-tray"
     TRAY_AUTOSTART = Path("/etc/xdg/autostart/printpapi-tray.desktop")
     APP_ENTRY = Path("/usr/share/applications/printpapi-agent.desktop")
 else:
-    INSTALL_DIR = Path("/opt/printpapi")
+    INSTALL_DIR = Path("/opt/printpapi-agent")
     AUTOSTART = Path("/Library/LaunchDaemons/com.printpapi.agent.plist")
     STATUS_DIR = Path("/Library/Application Support/printpapi-agent")
     TRAY = Path("/Applications/printpapi Agent.app")
@@ -139,6 +139,28 @@ def check_status_file(secret_values):
             raise Fail("the status file contains a secret (key or header value)")
 
 
+def plant_foreign_file():
+    """A file in the install folder that the installation did not make (a server binary, say).
+    The removal must leave it, and the folder with it."""
+    foreign = INSTALL_DIR / "printpapi"
+    if WIN:
+        foreign.write_bytes(b"not the agent's")
+    else:
+        subprocess.run(["sudo", "sh", "-c", f"echo not the agent > '{foreign}'"], check=True)
+    return foreign
+
+
+def remove_foreign_file(foreign):
+    if WIN:
+        foreign.unlink(missing_ok=True)
+    else:
+        subprocess.run(["sudo", "rm", "-f", str(foreign)], check=True)
+    try:
+        INSTALL_DIR.rmdir()
+    except OSError:
+        pass
+
+
 def agent_cmd(agent, sub, staging):
     cmd = [str(agent), sub, str(staging)]
     return cmd if WIN else ["sudo", *cmd]
@@ -189,6 +211,7 @@ def main():
                PRINT_PORT=str(port))
     server = None
     installed = False
+    foreign = None
     try:
         with server_log.open("wb") as log:
             server = subprocess.Popen([args.server], env=env, stdout=log, stderr=log)
@@ -259,8 +282,14 @@ def main():
         before = last_seen()
         wait_for("the agent to come online after the restart", lambda: last_seen() > before)
 
+        foreign = plant_foreign_file()
         run_agent(agent, "uninstall", staging)
         installed = False
+        # only what the install made is deleted: the foreign file and its folder stay
+        if sorted(p.name for p in INSTALL_DIR.iterdir()) != [foreign.name]:
+            raise Fail(f"uninstall left {sorted(INSTALL_DIR.iterdir())} in {INSTALL_DIR}")
+        remove_foreign_file(foreign)
+        foreign = None
         left = [p for p in (INSTALL_DIR, AUTOSTART, TRAY, STATUS_DIR, TRAY_AUTOSTART, APP_ENTRY)
                 if p is not None and p.exists()]
         if left:
@@ -283,6 +312,11 @@ def main():
             try:
                 subprocess.run(agent_cmd(agent, "uninstall", staging), capture_output=True,
                                timeout=300)
+            except (OSError, subprocess.SubprocessError):
+                pass
+        if foreign is not None:
+            try:
+                remove_foreign_file(foreign)
             except (OSError, subprocess.SubprocessError):
                 pass
         if server:

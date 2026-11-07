@@ -395,25 +395,27 @@ fn write_ini(env: &Env, text: &str) -> Result<(), ApplyError> {
     result
 }
 
-/// Delete everything in `dir` but `keep`, entries that are already gone included.
-fn clear_dir_except(dir: &Path, keep: &Path) -> std::io::Result<()> {
-    for entry in std::fs::read_dir(dir)? {
-        let entry = entry?;
-        let path = entry.path();
-        if path == keep {
+/// The files the installation creates directly in the install folder (not the marker, which goes
+/// last), each with the `.<name>.new` that a run which died while placing it leaves behind. The
+/// removal deletes these and nothing else: the folder may be shared with something that is not
+/// ours (a server binary, say).
+fn own_files_in_dir(l: &Layout) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    for path in [&l.binary, &l.ini, &l.sumatra, &l.autostart, &l.tray] {
+        // the autostart file and the tray are elsewhere on some systems
+        if path.parent() != Some(l.dir.as_path()) {
             continue;
         }
-        let gone = if entry.file_type()?.is_dir() {
-            std::fs::remove_dir_all(&path)
-        } else {
-            std::fs::remove_file(&path)
-        };
-        match gone {
-            Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e),
-            _ => {}
-        }
+        out.push(path.clone());
+        out.push(leftover_of(path));
     }
-    Ok(())
+    out
+}
+
+/// What `place_file` and `write_ini` write before they rename it over `path`.
+fn leftover_of(path: &Path) -> PathBuf {
+    let name = path.file_name().unwrap_or_default().to_string_lossy();
+    path.with_file_name(format!(".{name}.new"))
 }
 
 /// What an earlier run left at the install folder and `agent.ini` is looked at before anything is
@@ -938,16 +940,18 @@ pub fn remove(env: &Env) -> Result<(), ApplyError> {
     .map_err(|e| system("cannot delete the status folder", e))?;
     // The marker goes last: a locked file (a running exe, a hung SumatraPDF) stops the removal, and
     // a second try must still find the marker instead of leaving the folder behind as "foreign".
+    // Only what the installation made is deleted; the folder goes only when that leaves it empty.
     retry(FILE_ATTEMPTS, env.sleep, &mut || {
-        clear_dir_except(&l.dir, &l.marker)
+        own_files_in_dir(l).iter().try_for_each(|f| remove_tree(f))
     })
     .map_err(|e| system("cannot delete the install folder", e))?;
     retry(FILE_ATTEMPTS, env.sleep, &mut || {
-        match std::fs::remove_file(&l.marker) {
-            Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e),
-            _ => {}
+        remove_tree(&l.marker)?;
+        remove_tree(&leftover_of(&l.marker))?;
+        match std::fs::remove_dir(&l.dir) {
+            Err(e) if e.kind() == std::io::ErrorKind::DirectoryNotEmpty => Ok(()),
+            other => other,
         }
-        std::fs::remove_dir(&l.dir)
     })
     .map_err(|e| system("cannot delete the install folder", e))
 }
@@ -1351,13 +1355,13 @@ mod tests {
             vec![
                 "POST /agent/register".to_string(),
                 "GET /computers".to_string(),
-                "run id -u printpapi".to_string(),
+                "run id -u printpapi-agent".to_string(),
                 "run systemctl stop printpapi-agent".to_string(),
                 // the new file is empty while the ACL is set, the key comes after
-                format!("run chown root:printpapi {ini}"),
+                format!("run chown root:printpapi-agent {ini}"),
                 format!("run chmod 640 {ini} [ini len Ok(0)]"),
                 // the agent writes its status and log there: the folder and its rights come first
-                format!("run chown printpapi {status}"),
+                format!("run chown printpapi-agent {status}"),
                 format!("run chmod 755 {status}"),
                 // read again once the old agent is stopped, right before the new one starts
                 "GET /computers".to_string(),
@@ -1371,7 +1375,7 @@ mod tests {
         assert!(ini.contains("Büro Drucker"), "{ini}");
         assert!(fx.layout.marker.exists());
         let unit = std::fs::read_to_string(&fx.layout.autostart).unwrap();
-        assert!(unit.contains("User=printpapi"), "{unit}");
+        assert!(unit.contains("User=printpapi-agent"), "{unit}");
     }
 
     #[test]
@@ -1843,6 +1847,49 @@ mod tests {
         );
         assert!(!fx.layout.dir.exists());
         assert!(!fx.layout.autostart.exists());
+    }
+
+    #[test]
+    fn remove_keeps_what_the_installation_did_not_create() {
+        for os in [Os::Linux, Os::Windows, Os::Macos] {
+            let fx = Fixture::new(os);
+            apply(&fx.staging, &fx.env()).unwrap();
+            std::fs::write(&fx.layout.sumatra, b"sumatra").unwrap();
+            // what somebody else keeps in this folder (the server binary, if the folder is shared)
+            std::fs::write(fx.layout.dir.join("printpapi"), b"the server").unwrap();
+            std::fs::create_dir(fx.layout.dir.join("data")).unwrap();
+            std::fs::write(fx.layout.dir.join("data").join("printpapi.db"), b"db").unwrap();
+            // a leftover of a run that died while it placed a file
+            let leftover = leftover_of(&fx.layout.binary);
+            std::fs::write(&leftover, b"x").unwrap();
+            remove(&fx.env()).unwrap();
+            assert_eq!(
+                std::fs::read(fx.layout.dir.join("printpapi")).unwrap(),
+                b"the server",
+                "{os:?}"
+            );
+            assert!(fx.layout.dir.join("data").join("printpapi.db").is_file());
+            for own in [
+                &fx.layout.binary,
+                &fx.layout.ini,
+                &fx.layout.marker,
+                &fx.layout.sumatra,
+                &leftover,
+            ] {
+                assert!(!own.exists(), "{os:?}: {own:?}");
+            }
+            if os != Os::Macos {
+                assert!(!fx.layout.tray.exists(), "{os:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn remove_deletes_the_folder_when_nothing_foreign_is_in_it() {
+        let fx = Fixture::new(Os::Linux);
+        apply(&fx.staging, &fx.env()).unwrap();
+        remove(&fx.env()).unwrap();
+        assert!(!fx.layout.dir.exists());
     }
 
     #[test]
@@ -2599,7 +2646,7 @@ mod tests {
         let dir = fx.layout.status_dir.display().to_string();
         let chown = ev
             .iter()
-            .position(|e| *e == format!("run chown printpapi {dir}"))
+            .position(|e| *e == format!("run chown printpapi-agent {dir}"))
             .unwrap();
         let chmod = ev
             .iter()
@@ -2609,7 +2656,7 @@ mod tests {
         assert!(chown < chmod && chmod < start, "{ev:?}");
         // and a failing rights command stops the install, not the agent's later silence
         let fx = Fixture::new(Os::Linux);
-        fx.failing.borrow_mut().push("chown printpapi".into());
+        fx.failing.borrow_mut().push("chown printpapi-agent".into());
         let e = apply(&fx.staging, &fx.env()).unwrap_err();
         assert_eq!(e.code(), "system");
         assert!(fx.events().iter().all(|e| !e.contains("enable --now")));

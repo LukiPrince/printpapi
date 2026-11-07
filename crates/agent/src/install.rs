@@ -15,8 +15,12 @@ use crate::proc::{Cmd, Runner};
 pub const TASK_NAME: &str = "printpapi-agent";
 /// launchd label.
 pub const LAUNCHD_LABEL: &str = "com.printpapi.agent";
-/// Linux service user.
-pub const SERVICE_USER: &str = "printpapi";
+/// Linux service user. Not `printpapi`: `docs/migration.md` runs the server as that user, and the
+/// agent must not share its identity.
+pub const SERVICE_USER: &str = "printpapi-agent";
+/// Name of the install folder. Not `printpapi`: the server may live in `/opt/printpapi`
+/// (`docs/migration.md`), and the removal of the agent must never reach it.
+pub const INSTALL_DIR_NAME: &str = "printpapi-agent";
 /// File that tells a later run of the setup "this installation is mine".
 pub const MARKER_NAME: &str = ".installed-by-setup";
 /// Name of the registry value (Windows) that starts the tray icon at every logon.
@@ -97,7 +101,7 @@ pub fn layout(os: Os, program_files: &Path) -> Layout {
 
 /// The folders and files of an installation. `program_files` is `%ProgramFiles%` and
 /// `program_data` is `%ProgramData%`; both only matter on Windows. macOS and Linux install to
-/// `/opt/printpapi`.
+/// `/opt/printpapi-agent`.
 ///
 /// The places of the tray icon's autostart follow the platforms' own rules:
 /// - Windows: the `Run` key, https://learn.microsoft.com/en-us/windows/win32/setupapi/run-and-runonce-registry-keys
@@ -108,8 +112,8 @@ pub fn layout(os: Os, program_files: &Path) -> Layout {
 ///   https://developer.apple.com/library/archive/documentation/MacOSX/Conceptual/BPSystemStartup/Chapters/CreatingLaunchdJobs.html
 pub fn layout_with(os: Os, program_files: &Path, program_data: &Path) -> Layout {
     let dir = match os {
-        Os::Windows => join(os, program_files, "printpapi"),
-        Os::Linux | Os::Macos => PathBuf::from("/opt/printpapi"),
+        Os::Windows => join(os, program_files, INSTALL_DIR_NAME),
+        Os::Linux | Os::Macos => PathBuf::from(format!("/opt/{INSTALL_DIR_NAME}")),
     };
     let binary_name = if os == Os::Windows {
         "printpapi-agent.exe"
@@ -301,7 +305,7 @@ fn task_xml(l: &Layout) -> Vec<u8> {
     bytes
 }
 
-/// Same text as `docs/agent.md#run-as-a-service`.
+/// Like `docs/agent.md#run-as-a-service`, with the setup's own folder and user.
 fn systemd_unit(l: &Layout) -> String {
     format!(
         "[Unit]\nDescription=printpapi agent\nAfter=network-online.target cups.service\n\n\
@@ -311,7 +315,7 @@ fn systemd_unit(l: &Layout) -> String {
     )
 }
 
-/// Same text as `docs/agent.md#run-as-a-service`.
+/// Like `docs/agent.md#run-as-a-service`, with the setup's own folder.
 fn launchd_plist(l: &Layout) -> String {
     format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
@@ -414,8 +418,8 @@ fn supported_at(os: Os, systemd_dir: &Path) -> bool {
     }
 }
 
-/// Restrict `ini`, an `agent.ini` or the new file that is about to become one (it holds the key): SYSTEM and Administrators on Windows, `root:printpapi`
-/// 0640 on Linux, root 0600 on macOS. Windows uses SIDs, because group names are localised
+/// Restrict `ini`, an `agent.ini` or the new file that is about to become one (it holds the key): SYSTEM and Administrators on Windows,
+/// `root:printpapi-agent` 0640 on Linux, root 0600 on macOS. Windows uses SIDs, because group names are localised
 /// ("Administratoren" on a German Windows). icacls takes a SID with a leading `*`
 /// (https://learn.microsoft.com/en-us/windows-server/administration/windows-commands/icacls).
 pub fn ini_acl_cmds(os: Os, ini: &Path, sys: &Path) -> Vec<Cmd> {
@@ -870,39 +874,50 @@ mod tests {
     }
 
     #[test]
+    fn the_agent_shares_neither_folder_nor_user_with_the_server() {
+        // docs/migration.md runs the server from /opt/printpapi as the user `printpapi`
+        assert_ne!(SERVICE_USER, "printpapi");
+        for l in [linux(), mac()] {
+            assert_ne!(p(&l.dir), "/opt/printpapi");
+            assert!(!l.binary.starts_with("/opt/printpapi/"));
+        }
+        assert!(!p(&win_layout("C:\\Program Files").dir).ends_with("\\printpapi"));
+    }
+
+    #[test]
     fn layouts_per_platform() {
         let w = win_layout("C:\\Program Files");
-        assert_eq!(p(&w.dir), "C:\\Program Files\\printpapi");
+        assert_eq!(p(&w.dir), "C:\\Program Files\\printpapi-agent");
         assert_eq!(
             p(&w.binary),
-            "C:\\Program Files\\printpapi\\printpapi-agent.exe"
+            "C:\\Program Files\\printpapi-agent\\printpapi-agent.exe"
         );
-        assert_eq!(p(&w.ini), "C:\\Program Files\\printpapi\\agent.ini");
+        assert_eq!(p(&w.ini), "C:\\Program Files\\printpapi-agent\\agent.ini");
         assert_eq!(
             p(&w.marker),
-            "C:\\Program Files\\printpapi\\.installed-by-setup"
+            "C:\\Program Files\\printpapi-agent\\.installed-by-setup"
         );
         assert_eq!(
             p(&w.sumatra),
-            "C:\\Program Files\\printpapi\\SumatraPDF.exe"
+            "C:\\Program Files\\printpapi-agent\\SumatraPDF.exe"
         );
         assert_eq!(
             p(&w.autostart),
-            "C:\\Program Files\\printpapi\\printpapi-agent-task.xml"
+            "C:\\Program Files\\printpapi-agent\\printpapi-agent-task.xml"
         );
         // a trailing backslash does not double up
-        assert_eq!(p(&win_layout("C:\\PF\\").dir), "C:\\PF\\printpapi");
+        assert_eq!(p(&win_layout("C:\\PF\\").dir), "C:\\PF\\printpapi-agent");
         let l = linux();
-        assert_eq!(p(&l.dir), "/opt/printpapi");
-        assert_eq!(p(&l.binary), "/opt/printpapi/printpapi-agent");
-        assert_eq!(p(&l.ini), "/opt/printpapi/agent.ini");
-        assert_eq!(p(&l.marker), "/opt/printpapi/.installed-by-setup");
+        assert_eq!(p(&l.dir), "/opt/printpapi-agent");
+        assert_eq!(p(&l.binary), "/opt/printpapi-agent/printpapi-agent");
+        assert_eq!(p(&l.ini), "/opt/printpapi-agent/agent.ini");
+        assert_eq!(p(&l.marker), "/opt/printpapi-agent/.installed-by-setup");
         assert_eq!(
             p(&l.autostart),
             "/etc/systemd/system/printpapi-agent.service"
         );
         let m = mac();
-        assert_eq!(p(&m.binary), "/opt/printpapi/printpapi-agent");
+        assert_eq!(p(&m.binary), "/opt/printpapi-agent/printpapi-agent");
         assert_eq!(
             p(&m.autostart),
             "/Library/LaunchDaemons/com.printpapi.agent.plist"
@@ -935,9 +950,9 @@ mod tests {
             assert!(text.contains(needle), "{needle} missing in {text}");
         }
         assert!(text.starts_with("<?xml version=\"1.0\" encoding=\"UTF-16\"?>"));
-        assert!(
-            text.contains("<Command>C:\\Program Files\\printpapi\\printpapi-agent.exe</Command>")
-        );
+        assert!(text.contains(
+            "<Command>C:\\Program Files\\printpapi-agent\\printpapi-agent.exe</Command>"
+        ));
     }
 
     #[test]
@@ -947,7 +962,7 @@ mod tests {
             &win_layout("C:\\Programme & Ü"),
         ));
         assert!(
-            text.contains("C:\\Programme &amp; Ü\\printpapi\\printpapi-agent.exe"),
+            text.contains("C:\\Programme &amp; Ü\\printpapi-agent\\printpapi-agent.exe"),
             "{text}"
         );
     }
@@ -978,7 +993,7 @@ mod tests {
         assert_eq!(
             a[1..],
             [
-                "C:\\Program Files\\printpapi\\agent.ini",
+                "C:\\Program Files\\printpapi-agent\\agent.ini",
                 "/inheritance:r",
                 "/grant:r",
                 "*S-1-5-18:F",
@@ -1003,7 +1018,7 @@ mod tests {
                 "/tn",
                 "printpapi-agent",
                 "/xml",
-                "C:\\Users\\Jürgen Müller\\Programme\\printpapi\\printpapi-agent-task.xml",
+                "C:\\Users\\Jürgen Müller\\Programme\\printpapi-agent\\printpapi-agent-task.xml",
                 "/f"
             ]
         );
@@ -1041,13 +1056,13 @@ mod tests {
     }
 
     #[test]
-    fn systemd_unit_runs_as_printpapi() {
+    fn systemd_unit_runs_as_printpapi_agent() {
         let text = String::from_utf8(autostart_file(Os::Linux, &linux())).unwrap();
         for needle in [
-            "User=printpapi",
+            "User=printpapi-agent",
             "Restart=always",
             "RestartSec=5",
-            "ExecStart=/opt/printpapi/printpapi-agent",
+            "ExecStart=/opt/printpapi-agent/printpapi-agent",
             "After=network-online.target cups.service",
             "WantedBy=multi-user.target",
             "Description=printpapi agent",
@@ -1063,7 +1078,7 @@ mod tests {
             "<key>Label</key><string>com.printpapi.agent</string>",
             "<key>RunAtLoad</key><true/>",
             "<key>KeepAlive</key><true/>",
-            "<string>/opt/printpapi/printpapi-agent</string>",
+            "<string>/opt/printpapi-agent/printpapi-agent</string>",
             "<key>StandardOutPath</key><string>/var/log/printpapi-agent.log</string>",
             "<key>StandardErrorPath</key><string>/var/log/printpapi-agent.log</string>",
         ] {
@@ -1104,10 +1119,16 @@ mod tests {
         }
     }
 
-    /// The texts say "same as docs/agent.md"; this keeps them from drifting apart.
+    /// The texts say "like docs/agent.md"; this keeps them from drifting apart. The manual steps
+    /// there use `/opt/printpapi` and the user `printpapi`, the setup its own folder and user (so
+    /// that removing the agent cannot reach a server in `/opt/printpapi`): those two are the only
+    /// difference allowed.
     #[test]
     fn unit_and_plist_are_the_text_of_the_docs() {
-        let doc = include_str!("../../../docs/agent.md").replace("\r\n", "\n");
+        let doc = include_str!("../../../docs/agent.md")
+            .replace("\r\n", "\n")
+            .replace("/opt/printpapi/", "/opt/printpapi-agent/")
+            .replace("User=printpapi\n", "User=printpapi-agent\n");
         let unit = String::from_utf8(autostart_file(Os::Linux, &linux())).unwrap();
         assert!(
             doc.contains(&unit),
@@ -1134,8 +1155,12 @@ mod tests {
         assert_eq!(
             argvs(&cmds),
             [
-                vec!["chown", "root:printpapi", "/opt/printpapi/agent.ini"],
-                vec!["chmod", "640", "/opt/printpapi/agent.ini"],
+                vec![
+                    "chown",
+                    "root:printpapi-agent",
+                    "/opt/printpapi-agent/agent.ini"
+                ],
+                vec!["chmod", "640", "/opt/printpapi-agent/agent.ini"],
             ]
         );
     }
@@ -1145,7 +1170,7 @@ mod tests {
         let cmds = ini_acl_cmds(Os::Macos, &mac().ini, Path::new("/"));
         assert_eq!(
             argvs(&cmds),
-            [vec!["/bin/chmod", "600", "/opt/printpapi/agent.ini"]]
+            [vec!["/bin/chmod", "600", "/opt/printpapi-agent/agent.ini"]]
         );
     }
 
@@ -1170,7 +1195,7 @@ mod tests {
         );
         assert_eq!(
             identity_check(Os::Linux).unwrap().argv,
-            ["id", "-u", "printpapi"]
+            ["id", "-u", "printpapi-agent"]
         );
         assert_eq!(
             argvs(&identity_cmds(Os::Linux)),
@@ -1180,7 +1205,7 @@ mod tests {
                 "--no-create-home",
                 "--shell",
                 "/usr/sbin/nologin",
-                "printpapi"
+                "printpapi-agent"
             ]]
         );
     }
@@ -1196,7 +1221,7 @@ mod tests {
                     "/usr/bin/xattr",
                     "-d",
                     "com.apple.quarantine",
-                    "/opt/printpapi/printpapi-agent"
+                    "/opt/printpapi-agent/printpapi-agent"
                 ],
                 vec![
                     "/bin/launchctl",
@@ -1320,13 +1345,13 @@ mod tests {
         assert_eq!(p(&w.status_dir), "C:\\ProgramData\\printpapi-agent");
         assert_eq!(
             p(&w.tray),
-            "C:\\Program Files\\printpapi\\printpapi-tray.exe"
+            "C:\\Program Files\\printpapi-agent\\printpapi-tray.exe"
         );
         // Windows starts the icon from the Run key, not from a file
         assert!(w.tray_autostart.is_none() && w.app_entry.is_none());
         let l = linux();
         assert_eq!(p(&l.status_dir), "/var/lib/printpapi-agent");
-        assert_eq!(p(&l.tray), "/opt/printpapi/printpapi-tray");
+        assert_eq!(p(&l.tray), "/opt/printpapi-agent/printpapi-tray");
         assert_eq!(
             p(l.tray_autostart.as_ref().unwrap()),
             "/etc/xdg/autostart/printpapi-tray.desktop"
@@ -1356,14 +1381,14 @@ mod tests {
             "[Desktop Entry]\n",
             "Type=Application\n",
             "Name=printpapi Agent\n",
-            "Exec=\"/opt/printpapi/printpapi-tray\" --tray\n",
+            "Exec=\"/opt/printpapi-agent/printpapi-tray\" --tray\n",
         ] {
             assert!(auto.contains(needle), "{needle} missing in {auto}");
         }
         // the application menu entry opens the window directly: no --tray
         let entry = String::from_utf8(app_entry_file(&l)).unwrap();
         assert!(
-            entry.contains("Exec=\"/opt/printpapi/printpapi-tray\"\n"),
+            entry.contains("Exec=\"/opt/printpapi-agent/printpapi-tray\"\n"),
             "{entry}"
         );
         assert!(!entry.contains("--tray"), "{entry}");
@@ -1432,7 +1457,7 @@ mod tests {
                 "/t",
                 "REG_SZ",
                 "/d",
-                "\"C:\\Program Files\\printpapi\\printpapi-tray.exe\" --tray",
+                "\"C:\\Program Files\\printpapi-agent\\printpapi-tray.exe\" --tray",
                 "/f"
             ]]
         );
@@ -1472,7 +1497,7 @@ mod tests {
         );
         assert_eq!(
             argvs(&tray_stop_cmds(Os::Linux, &linux(), Path::new("/"))),
-            [vec!["pkill", "-f", "/opt/printpapi/printpapi-tray"]]
+            [vec!["pkill", "-f", "/opt/printpapi-agent/printpapi-tray"]]
         );
         assert_eq!(
             argvs(&tray_stop_cmds(Os::Macos, &mac(), Path::new("/"))),
@@ -1525,7 +1550,7 @@ mod tests {
         assert_eq!(
             argvs(&status_dir_cmds(Os::Linux, &linux(), Path::new("/"))),
             [
-                vec!["chown", "printpapi", "/var/lib/printpapi-agent"],
+                vec!["chown", "printpapi-agent", "/var/lib/printpapi-agent"],
                 vec!["chmod", "755", "/var/lib/printpapi-agent"],
             ]
         );

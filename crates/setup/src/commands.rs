@@ -1672,7 +1672,7 @@ printers = Z = socket://nohost
         let tmp = tempfile::tempdir().unwrap();
         let run: Runner = Rc::new(|_| panic!("nothing is run"));
         let l = install::layout(Os::Windows, Path::new("C:\\Program Files"));
-        let installed_exe = Path::new("C:\\Program Files\\printpapi\\printpapi-tray.exe");
+        let installed_exe = Path::new("C:\\Program Files\\printpapi-agent\\printpapi-tray.exe");
         let staged =
             stage_own_tray_with(Os::Windows, installed_exe, None, None, &l, tmp.path(), &run)
                 .unwrap();
