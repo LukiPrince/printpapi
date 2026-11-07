@@ -499,7 +499,11 @@ mod tests {
         assert!(!online_since(Some(&with_start(NOW - 600.0)), NOW, baseline));
         assert!(online_since(Some(&with_start(NOW - 4.0)), NOW, baseline));
         // a file without the field (an agent from before it) is judged by its contact alone
-        assert!(online_since(Some(&file("online", NOW - 1.0)), NOW, baseline));
+        assert!(online_since(
+            Some(&file("online", NOW - 1.0)),
+            NOW,
+            baseline
+        ));
     }
 
     #[test]
