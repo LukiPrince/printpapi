@@ -370,38 +370,68 @@ pub fn format_printers(printers: &[Printer]) -> Result<String, String> {
     Ok(entries.join(" ; "))
 }
 
-/// What [`update_ini`] sets. `None` leaves the key as it is; `printers` is always set. The values
-/// are plain text: `update_ini` escapes `%` itself.
+/// What [`update_ini`] sets. `None` leaves a key as it is. The `[agent]` values are plain text:
+/// `update_ini` escapes `%` itself. `headers` changes the `[headers]` section: `Some(value)` sets a
+/// header, `None` removes it, a header that is not named stays. Header values are read raw, so they
+/// are written without escaping.
 pub struct IniUpdate<'a> {
     pub server_url: Option<&'a str>,
     pub api_key: Option<&'a str>,
     pub name: Option<&'a str>,
-    pub printers: &'a str,
+    pub printers: Option<&'a str>,
+    pub timeout: Option<&'a str>,
+    pub headers: Option<&'a [(String, Option<String>)]>,
 }
 
 /// `existing` with the `[agent]` keys of `update` set, as text. Works line by line: a replaced
 /// key loses its indented continuation lines, a missing key is added at the end of `[agent]`
 /// (the section is added when absent), and every other line - comments, `[headers]`, `timeout` -
-/// stays as it is. `%` is doubled because `[agent]` reads through `BasicInterpolation`; line
-/// breaks in a value become blanks so one value never becomes two lines.
+/// stays as it is unless `update` names it. `%` is doubled because `[agent]` reads through
+/// `BasicInterpolation`; line breaks in a value become blanks so one value never becomes two lines.
 pub fn update_ini(existing: Option<&str>, update: &IniUpdate) -> String {
-    let mut wanted: Vec<(&str, String)> = Vec::new();
+    const SECTIONS: [&str; 2] = ["agent", "headers"];
+    // Per section: (lower-cased key, the new line or None to remove the key).
+    let mut wanted: [Vec<(String, Option<String>)>; 2] = [Vec::new(), Vec::new()];
     for (key, value) in [
         ("server_url", update.server_url),
         ("api_key", update.api_key),
         ("name", update.name),
-        ("printers", Some(update.printers)),
+        ("printers", update.printers),
+        ("timeout", update.timeout),
     ] {
         if let Some(v) = value {
-            wanted.push((key, v.replace(['\r', '\n'], " ").replace('%', "%%")));
+            let v = v.replace(['\r', '\n'], " ").replace('%', "%%");
+            wanted[0].push((key.to_string(), Some(format!("{key} = {v}"))));
         }
     }
+    for (name, value) in update.headers.unwrap_or_default() {
+        let name = name.replace(['\r', '\n'], " ");
+        let line = value
+            .as_ref()
+            .map(|v| format!("{name} = {}", v.replace(['\r', '\n'], " ")));
+        wanted[1].push((name.trim().to_lowercase(), line));
+    }
+    let new_section = |i: usize, lines: Vec<String>| -> Vec<String> {
+        let mut out = vec![format!("[{}]", SECTIONS[i])];
+        out.extend(lines);
+        out
+    };
+    let additions = |i: usize, done: &[String]| -> Vec<String> {
+        wanted[i]
+            .iter()
+            .filter(|(k, _)| !done.contains(k))
+            .filter_map(|(_, line)| line.clone())
+            .collect()
+    };
     let Some(existing) = existing else {
-        let mut out = String::from("[agent]\n");
-        for (key, v) in &wanted {
-            out.push_str(&format!("{key} = {v}\n"));
+        let mut out: Vec<String> = Vec::new();
+        for i in 0..2 {
+            let lines = additions(i, &[]);
+            if i == 0 || !lines.is_empty() {
+                out.extend(new_section(i, lines));
+            }
         }
-        return out;
+        return out.join("\n") + "\n";
     };
 
     let section_of = |line: &str| {
@@ -416,29 +446,33 @@ pub fn update_ini(existing: Option<&str>, update: &IniUpdate) -> String {
 
     let lines: Vec<&str> = existing.lines().collect();
     let mut out: Vec<String> = Vec::new();
-    let mut done: Vec<&str> = Vec::new();
-    // Index in `out` just after the last content line of `[agent]`, where new keys go.
-    let mut agent_end: Option<usize> = None;
-    let mut in_agent = false;
+    let mut done: [Vec<String>; 2] = [Vec::new(), Vec::new()];
+    // Index in `out` just after the last content line of each section, where new keys go.
+    let mut ends: [Option<usize>; 2] = [None, None];
+    // The section being read, when `update` wants something from it.
+    let mut cur: Option<usize> = None;
     let mut i = 0;
     while i < lines.len() {
         let line = lines[i];
         if let Some(section) = section_of(line) {
-            in_agent = section == "agent";
+            cur = SECTIONS
+                .iter()
+                .position(|s| *s == section)
+                .filter(|&s| !wanted[s].is_empty());
             out.push(line.to_string());
-            if in_agent {
-                agent_end = Some(out.len());
+            if let Some(s) = cur {
+                ends[s] = Some(out.len());
             }
             i += 1;
             continue;
         }
-        let Some(key_pos) = line
-            .find(['=', ':'])
-            .filter(|_| in_agent && !is_skippable(line))
+        let Some((s, key_pos)) = cur.zip(line.find(['=', ':']).filter(|_| !is_skippable(line)))
         else {
             out.push(line.to_string());
-            if in_agent && !is_skippable(line) {
-                agent_end = Some(out.len());
+            if let Some(s) = cur
+                && !is_skippable(line)
+            {
+                ends[s] = Some(out.len());
             }
             i += 1;
             continue;
@@ -460,9 +494,11 @@ pub fn update_ini(existing: Option<&str>, update: &IniUpdate) -> String {
             }
         }
         let run = &lines[i..=last];
-        if let Some((k, v)) = wanted.iter().find(|(k, _)| *k == key) {
-            out.push(format!("{k} = {v}"));
-            done.push(k);
+        if let Some((k, new)) = wanted[s].iter().find(|(k, _)| *k == key) {
+            if let Some(new) = new {
+                out.push(new.clone());
+            }
+            done[s].push(k.clone());
             // comments between the dropped lines survive
             out.extend(
                 run[1..]
@@ -473,29 +509,148 @@ pub fn update_ini(existing: Option<&str>, update: &IniUpdate) -> String {
         } else {
             out.extend(run.iter().map(|l| l.to_string()));
         }
-        agent_end = Some(out.len());
+        ends[s] = Some(out.len());
         i = last + 1;
     }
-    let missing: Vec<String> = wanted
-        .iter()
-        .filter(|(k, _)| !done.contains(k))
-        .map(|(k, v)| format!("{k} = {v}"))
-        .collect();
-    match agent_end {
-        Some(at) => {
-            out.splice(at..at, missing);
-        }
-        None => {
-            if out.last().is_some_and(|l| !l.trim().is_empty()) {
-                out.push(String::new());
+    // Missing keys go into their section, the later one first so the indexes stay valid. A section
+    // that is absent is added at the end, but only when it has something to hold.
+    let mut appended: Vec<(usize, Vec<String>)> = Vec::new();
+    for s in (0..2).rev() {
+        let missing = additions(s, &done[s]);
+        match ends[s] {
+            Some(at) => {
+                out.splice(at..at, missing);
             }
-            out.push("[agent]".into());
-            out.extend(missing);
+            None if !missing.is_empty() => appended.push((s, missing)),
+            None => {}
         }
+    }
+    for (s, missing) in appended.into_iter().rev() {
+        if out.last().is_some_and(|l| !l.trim().is_empty()) {
+            out.push(String::new());
+        }
+        out.extend(new_section(s, missing));
     }
     let mut text = out.join("\n");
     text.push('\n');
     text
+}
+
+/// A change to an installed agent.ini: only what is named is touched. The window stages it as
+/// `patch.json` and the admin command merges it into the installed file, so a change asks for
+/// administrator rights once and never needs the file's secrets in the window.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct Patch {
+    /// The `printers` value, already in the `name [|pdf] [= target]` grammar.
+    pub printers: Option<String>,
+    pub timeout: Option<f64>,
+    /// `Some(value)` sets a header, `None` removes it.
+    pub headers: Vec<(String, Option<String>)>,
+}
+
+/// `{"printers": "...", "timeout": 60, "headers": [["Name", "value"], ["Other", null]]}`, every
+/// field optional. Anything else is refused: the file is staged where a user can write.
+pub fn parse_patch(json: &str) -> Result<Patch, String> {
+    let bad = |what: &str| format!("invalid patch: {what}");
+    let v: Value = serde_json::from_str(json).map_err(|_| bad("not JSON"))?;
+    let obj = v.as_object().ok_or_else(|| bad("not an object"))?;
+    let mut patch = Patch::default();
+    for (key, value) in obj {
+        match key.as_str() {
+            "printers" => {
+                let s = value.as_str().ok_or_else(|| bad("printers is not text"))?;
+                patch.printers = Some(s.to_string());
+            }
+            "timeout" => {
+                let t = value
+                    .as_f64()
+                    .ok_or_else(|| bad("timeout is not a number"))?;
+                patch.timeout = Some(t);
+            }
+            "headers" => {
+                let list = value
+                    .as_array()
+                    .ok_or_else(|| bad("headers is not a list"))?;
+                for item in list {
+                    let pair = item
+                        .as_array()
+                        .filter(|p| p.len() == 2)
+                        .ok_or_else(|| bad("a header is not a [name, value] pair"))?;
+                    let name = pair[0]
+                        .as_str()
+                        .ok_or_else(|| bad("a header name is not text"))?;
+                    let value = match &pair[1] {
+                        Value::Null => None,
+                        Value::String(s) => Some(s.clone()),
+                        _ => return Err(bad("a header value is neither text nor null")),
+                    };
+                    patch.headers.push((name.to_string(), value));
+                }
+            }
+            other => return Err(bad(&format!("unknown field {other:?}"))),
+        }
+    }
+    Ok(patch)
+}
+
+/// An HTTP token without a leading `#`: what can stand left of `=` in `[headers]` without
+/// becoming a comment, a second key or a section.
+fn valid_header_name(name: &str) -> bool {
+    !name.is_empty()
+        && !name.starts_with('#')
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&b))
+}
+
+/// `installed` with `patch` merged in. The result must pass what the agent reads at start:
+/// `Config::from_text`, `http_settings` and `parse_printers`, otherwise `Err` and the installed file
+/// stays as it is. Errors never quote the file: it holds the key.
+pub fn apply_patch(installed: &str, patch: &Patch) -> Result<String, String> {
+    let mut seen: Vec<String> = Vec::new();
+    for (name, value) in &patch.headers {
+        if !valid_header_name(name) {
+            return Err(format!(
+                "header name {name:?} cannot be written to agent.ini"
+            ));
+        }
+        if value
+            .as_ref()
+            .is_some_and(|v| v.chars().any(char::is_control))
+        {
+            return Err(format!(
+                "the value of header {name} has a control character"
+            ));
+        }
+        let lower = name.to_lowercase();
+        if seen.contains(&lower) {
+            return Err(format!("header {name} appears twice in the change"));
+        }
+        seen.push(lower);
+    }
+    if patch
+        .printers
+        .as_ref()
+        .is_some_and(|p| p.chars().any(char::is_control))
+    {
+        return Err("printers has a control character".into());
+    }
+    let timeout = patch.timeout.map(|t| t.to_string());
+    let update = IniUpdate {
+        server_url: None,
+        api_key: None,
+        name: None,
+        printers: patch.printers.as_deref(),
+        timeout: timeout.as_deref(),
+        headers: Some(&patch.headers),
+    };
+    let text = update_ini(Some(installed), &update);
+    // The parser's own complaint quotes the offending line, and that can be the `api_key` line.
+    let cfg =
+        Config::from_text(&text).map_err(|_| "the changed agent.ini cannot be read".to_string())?;
+    cfg.http_settings()?;
+    parse_printers(&cfg.require("printers")?)?;
+    Ok(text)
 }
 
 #[cfg(test)]
@@ -833,7 +988,9 @@ mod tests {
                 server_url: Some("https://x"),
                 api_key: Some("ab%cd"),
                 name: Some("pc"),
-                printers: "50% Drucker",
+                printers: Some("50% Drucker"),
+                timeout: None,
+                headers: None,
             },
         );
         let cfg = Config::from_text(&text).unwrap();
@@ -850,7 +1007,9 @@ mod tests {
                 server_url: None,
                 api_key: None,
                 name: None,
-                printers: "c",
+                printers: Some("c"),
+                timeout: None,
+                headers: None,
             },
         );
         assert!(
@@ -874,7 +1033,9 @@ mod tests {
             server_url: Some("https://x"),
             api_key: None,
             name: None,
-            printers: "p",
+            printers: Some("p"),
+            timeout: None,
+            headers: None,
         };
         let text = update_ini(Some("[agent]\nnote = 1\n\n[headers]\nA = b\n"), &up);
         let cfg = Config::from_text(&text).unwrap();
@@ -897,7 +1058,9 @@ mod tests {
                 server_url: None,
                 api_key: None,
                 name: Some("new"),
-                printers: "c",
+                printers: Some("c"),
+                timeout: None,
+                headers: None,
             },
         );
         assert!(text.contains("[headers]\nprinters = keep"));
@@ -914,7 +1077,9 @@ mod tests {
                 server_url: None,
                 api_key: Some("a\nprinters = evil"),
                 name: None,
-                printers: "p",
+                printers: Some("p"),
+                timeout: None,
+                headers: None,
             },
         );
         assert_eq!(
@@ -924,5 +1089,193 @@ mod tests {
                 .unwrap(),
             "p"
         );
+    }
+
+    const INSTALLED: &str = "; set up by hand\n[agent]\nserver_url = https://x\napi_key = SECRET%%KEY\nname = pc\nprinters = a ; b|pdf\n\n[headers]\nCF-Access-Client-Id = id1\nCF-Access-Client-Secret = s3\n";
+
+    fn patch(json: &str) -> Patch {
+        parse_patch(json).unwrap()
+    }
+
+    #[test]
+    fn apply_patch_changes_only_what_it_names() {
+        let p =
+            patch(r#"{"printers":"c|pdf","timeout":90,"headers":[["CF-Access-Client-Id","id2"]]}"#);
+        let text = apply_patch(INSTALLED, &p).unwrap();
+        assert!(text.starts_with("; set up by hand\n"));
+        assert!(text.contains("api_key = SECRET%%KEY"));
+        assert!(text.contains("name = pc"));
+        // the header the patch does not name stays as it was
+        assert!(text.contains("CF-Access-Client-Secret = s3"));
+        let cfg = Config::from_text(&text).unwrap();
+        assert_eq!(cfg.require("api_key").unwrap(), "SECRET%KEY");
+        assert_eq!(cfg.require("printers").unwrap(), "c|pdf");
+        let s = cfg.http_settings().unwrap();
+        assert_eq!(s.timeout, 90.0);
+        assert_eq!(
+            s.headers.get("cf-access-client-id").map(String::as_str),
+            Some("id2")
+        );
+        assert_eq!(
+            s.headers.get("cf-access-client-secret").map(String::as_str),
+            Some("s3")
+        );
+    }
+
+    #[test]
+    fn an_empty_patch_changes_nothing() {
+        let text = apply_patch(INSTALLED, &patch("{}")).unwrap();
+        assert_eq!(text, INSTALLED);
+    }
+
+    #[test]
+    fn a_header_set_to_none_is_removed() {
+        let p = patch(r#"{"headers":[["cf-access-client-secret",null],["Not-There",null]]}"#);
+        let text = apply_patch(INSTALLED, &p).unwrap();
+        let s = Config::from_text(&text).unwrap().http_settings().unwrap();
+        assert_eq!(s.headers.len(), 1);
+        assert!(s.headers.contains_key("cf-access-client-id"));
+        assert!(text.contains("[headers]"));
+        // nothing but the removed header changed
+        assert_eq!(
+            text,
+            INSTALLED.replace("CF-Access-Client-Secret = s3\n", "")
+        );
+    }
+
+    #[test]
+    fn headers_section_appears_when_missing() {
+        let installed = "[agent]\nserver_url = https://x\napi_key = k\nprinters = a\n";
+        let p = patch(r#"{"headers":[["X-Token","abc"],["X-Gone",null]]}"#);
+        let text = apply_patch(installed, &p).unwrap();
+        assert!(text.starts_with(installed));
+        let s = Config::from_text(&text).unwrap().http_settings().unwrap();
+        assert_eq!(s.headers.len(), 1);
+        assert_eq!(s.headers.get("x-token").map(String::as_str), Some("abc"));
+        // removing from a file with no [headers] adds no empty section
+        let p = patch(r#"{"headers":[["X-Gone",null]]}"#);
+        assert_eq!(apply_patch(installed, &p).unwrap(), installed);
+    }
+
+    #[test]
+    fn a_patch_without_an_agent_section_in_the_file_is_refused() {
+        let p = patch(r#"{"timeout":60}"#);
+        assert!(apply_patch("[other]\nk = v\n", &p).is_err());
+    }
+
+    #[test]
+    fn a_patch_with_a_reserved_header_is_refused() {
+        for name in [
+            "authorization",
+            "Authorization",
+            "User-Agent",
+            "content-type",
+        ] {
+            let p = patch(&format!(r#"{{"headers":[["{name}","x"]]}}"#));
+            assert!(apply_patch(INSTALLED, &p).is_err(), "{name}");
+        }
+    }
+
+    #[test]
+    fn timeout_below_30_is_refused() {
+        assert!(apply_patch(INSTALLED, &patch(r#"{"timeout":29.9}"#)).is_err());
+        assert!(apply_patch(INSTALLED, &patch(r#"{"timeout":0}"#)).is_err());
+        assert!(apply_patch(INSTALLED, &patch(r#"{"timeout":-5}"#)).is_err());
+        assert!(apply_patch(INSTALLED, &patch(r#"{"timeout":1e300}"#)).is_err());
+        let text = apply_patch(INSTALLED, &patch(r#"{"timeout":30}"#)).unwrap();
+        assert_eq!(
+            Config::from_text(&text)
+                .unwrap()
+                .http_settings()
+                .unwrap()
+                .timeout,
+            30.0
+        );
+    }
+
+    #[test]
+    fn header_values_keep_percent() {
+        let p = patch(r#"{"headers":[["X-Token","a%b%%c"]]}"#);
+        let text = apply_patch(INSTALLED, &p).unwrap();
+        let s = Config::from_text(&text).unwrap().http_settings().unwrap();
+        assert_eq!(s.headers.get("x-token").map(String::as_str), Some("a%b%%c"));
+        assert!(text.contains("X-Token = a%b%%c"));
+    }
+
+    #[test]
+    fn a_patch_cannot_smuggle_lines_through_a_header_or_printers() {
+        for json in [
+            r#"{"headers":[["X-A\nprinters","x"]]}"#,
+            r#"{"headers":[["X-A=b","x"]]}"#,
+            r#"{"headers":[["[agent]","x"]]}"#,
+            r##"{"headers":[["#c","x"]]}"##,
+            r#"{"headers":[["","x"]]}"#,
+            r#"{"headers":[["X A","x"]]}"#,
+            r#"{"headers":[["X-A","v\nprinters = evil"]]}"#,
+            r#"{"printers":"a\nname = evil"}"#,
+        ] {
+            assert!(apply_patch(INSTALLED, &patch(json)).is_err(), "{json}");
+        }
+    }
+
+    #[test]
+    fn a_patch_with_a_bad_printers_value_is_refused() {
+        let p = patch(r#"{"printers":"n = socket://10.0.0.5"}"#);
+        assert!(apply_patch(INSTALLED, &p).is_err());
+    }
+
+    #[test]
+    fn duplicate_header_names_in_a_patch_are_refused() {
+        let p = patch(r#"{"headers":[["X-A","1"],["x-a","2"]]}"#);
+        assert!(apply_patch(INSTALLED, &p).is_err());
+    }
+
+    #[test]
+    fn a_broken_installed_file_is_refused_without_quoting_it() {
+        let e =
+            apply_patch("[agent]\napi_key = SECRET-KEY\nbroken line\n", &patch("{}")).unwrap_err();
+        assert!(!e.contains("SECRET-KEY"), "{e}");
+    }
+
+    #[test]
+    fn parse_patch_refuses_what_it_does_not_know() {
+        assert!(parse_patch("").is_err());
+        assert!(parse_patch("[]").is_err());
+        assert!(parse_patch(r#"{"api_key":"x"}"#).is_err());
+        assert!(parse_patch(r#"{"timeout":"60"}"#).is_err());
+        assert!(parse_patch(r#"{"printers":5}"#).is_err());
+        assert!(parse_patch(r#"{"headers":{"a":"b"}}"#).is_err());
+        assert!(parse_patch(r#"{"headers":[["a"]]}"#).is_err());
+        assert!(parse_patch(r#"{"headers":[["a",5]]}"#).is_err());
+        let p = parse_patch(r#"{"printers":"p","timeout":45.5,"headers":[["a","b"],["c",null]]}"#)
+            .unwrap();
+        assert_eq!(p.printers.as_deref(), Some("p"));
+        assert_eq!(p.timeout, Some(45.5));
+        assert_eq!(
+            p.headers,
+            vec![
+                ("a".to_string(), Some("b".to_string())),
+                ("c".to_string(), None)
+            ]
+        );
+    }
+
+    #[test]
+    fn update_ini_sets_timeout_and_headers() {
+        let h = [("X-Token".to_string(), Some("a%b".to_string()))];
+        let text = update_ini(
+            None,
+            &IniUpdate {
+                server_url: Some("https://x"),
+                api_key: Some("k"),
+                name: Some("pc"),
+                printers: Some("p"),
+                timeout: Some("45"),
+                headers: Some(&h),
+            },
+        );
+        let s = Config::from_text(&text).unwrap().http_settings().unwrap();
+        assert_eq!(s.timeout, 45.0);
+        assert_eq!(s.headers.get("x-token").map(String::as_str), Some("a%b"));
     }
 }

@@ -268,7 +268,9 @@ pub fn build_ini(
         server_url: conn.map(|c| c.0),
         api_key: conn.map(|c| c.1),
         name: conn.map(|c| c.2),
-        printers: &printers,
+        printers: Some(&printers),
+        timeout: None,
+        headers: None,
     };
     Ok(update_ini(existing, &update))
 }
