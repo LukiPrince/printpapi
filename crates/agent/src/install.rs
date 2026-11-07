@@ -19,6 +19,16 @@ pub const LAUNCHD_LABEL: &str = "com.printpapi.agent";
 pub const SERVICE_USER: &str = "printpapi";
 /// File that tells a later run of the setup "this installation is mine".
 pub const MARKER_NAME: &str = ".installed-by-setup";
+/// Name of the registry value (Windows) that starts the tray icon at every logon.
+pub const TRAY_RUN_VALUE: &str = "printpapi-tray";
+/// launchd label of the tray icon's LaunchAgent.
+pub const TRAY_LAUNCHD_LABEL: &str = "com.printpapi.tray";
+/// The executable inside the macOS `.app`. Tauri 2 names it after the Cargo binary
+/// (`printpapi-setup`), not after `productName` ("the binary name is no longer renamed to match
+/// `productName`", https://v2.tauri.app/start/migrate/from-tauri-1/).
+const MACOS_TRAY_EXE: &str = "printpapi-setup";
+const WIN_RUN_KEY: &str = "HKLM\\Software\\Microsoft\\Windows\\CurrentVersion\\Run";
+const SID_USERS: &str = "*S-1-5-32-545";
 
 const SID_SYSTEM: &str = "*S-1-5-18";
 const SID_ADMINISTRATORS: &str = "*S-1-5-32-544";
@@ -58,6 +68,14 @@ pub struct Layout {
     pub marker: PathBuf,
     pub sumatra: PathBuf,
     pub autostart: PathBuf,
+    /// Where the agent writes `status.json` and its crash log, and the tray icon reads them.
+    pub status_dir: PathBuf,
+    /// The tray icon program: a file, on macOS the `.app` folder.
+    pub tray: PathBuf,
+    /// The file that starts the tray icon at logon. Windows uses the registry (`None` here).
+    pub tray_autostart: Option<PathBuf>,
+    /// Linux only: the application menu entry that opens the window without the icon.
+    pub app_entry: Option<PathBuf>,
 }
 
 /// `base` + `name` with the separator of `os`, whatever the host's own is.
@@ -71,9 +89,24 @@ fn s(p: &Path) -> String {
     p.to_string_lossy().into_owned()
 }
 
-/// The folders and files of an installation. `program_files` is `%ProgramFiles%` and only
-/// matters on Windows; macOS and Linux install to `/opt/printpapi`.
+/// The folders and files of an installation on this machine: [`layout_with`] with the real
+/// `ProgramData` folder.
 pub fn layout(os: Os, program_files: &Path) -> Layout {
+    layout_with(os, program_files, &crate::status::program_data())
+}
+
+/// The folders and files of an installation. `program_files` is `%ProgramFiles%` and
+/// `program_data` is `%ProgramData%`; both only matter on Windows. macOS and Linux install to
+/// `/opt/printpapi`.
+///
+/// The places of the tray icon's autostart follow the platforms' own rules:
+/// - Windows: the `Run` key, https://learn.microsoft.com/en-us/windows/win32/setupapi/run-and-runonce-registry-keys
+/// - Linux: `$XDG_CONFIG_DIRS/autostart`, `/etc/xdg/autostart` by default,
+///   https://specifications.freedesktop.org/autostart/latest/ ; the menu entry belongs in
+///   `/usr/share/applications`, https://specifications.freedesktop.org/desktop-entry/latest/
+/// - macOS: `/Library/LaunchAgents` holds agents for all users,
+///   https://developer.apple.com/library/archive/documentation/MacOSX/Conceptual/BPSystemStartup/Chapters/CreatingLaunchdJobs.html
+pub fn layout_with(os: Os, program_files: &Path, program_data: &Path) -> Layout {
     let dir = match os {
         Os::Windows => join(os, program_files, "printpapi"),
         Os::Linux | Os::Macos => PathBuf::from("/opt/printpapi"),
@@ -88,12 +121,30 @@ pub fn layout(os: Os, program_files: &Path) -> Layout {
         Os::Linux => PathBuf::from("/etc/systemd/system/printpapi-agent.service"),
         Os::Macos => PathBuf::from("/Library/LaunchDaemons/com.printpapi.agent.plist"),
     };
+    let tray = match os {
+        Os::Windows => join(os, &dir, "printpapi-tray.exe"),
+        Os::Linux => join(os, &dir, "printpapi-tray"),
+        Os::Macos => PathBuf::from("/Applications/printpapi Agent.app"),
+    };
+    let tray_autostart = match os {
+        Os::Windows => None,
+        Os::Linux => Some(PathBuf::from("/etc/xdg/autostart/printpapi-tray.desktop")),
+        Os::Macos => Some(PathBuf::from(
+            "/Library/LaunchAgents/com.printpapi.tray.plist",
+        )),
+    };
+    let app_entry =
+        (os == Os::Linux).then(|| PathBuf::from("/usr/share/applications/printpapi-agent.desktop"));
     Layout {
         binary: join(os, &dir, binary_name),
         ini: join(os, &dir, "agent.ini"),
         marker: join(os, &dir, MARKER_NAME),
         sumatra: join(os, &dir, "SumatraPDF.exe"),
         autostart,
+        status_dir: crate::status::status_dir_in(os, program_data),
+        tray,
+        tray_autostart,
+        app_entry,
         dir,
     }
 }
@@ -449,6 +500,201 @@ pub fn remove_cmds(os: Os, _l: &Layout, sys: &Path) -> Vec<Cmd> {
         ])],
         Os::Linux => vec![cmd(argv(&["systemctl", "disable", "printpapi-agent"]))],
         Os::Macos => Vec::new(),
+    }
+}
+
+/// `arg` as one argument of a Desktop Entry `Exec` line: in double quotes, with `"`, `` ` ``, `$` and
+/// `\` escaped by a backslash, then every backslash doubled again because the value is a string
+/// first (the spec asks for four in the file), and `%` as `%%` so it is no field code.
+/// https://specifications.freedesktop.org/desktop-entry/latest/exec-variables.html
+fn desktop_exec_quote(arg: &str) -> String {
+    let mut out = String::from("\"");
+    for c in arg.chars() {
+        match c {
+            '\\' => out.push_str("\\\\\\\\"),
+            '"' | '`' | '$' => {
+                out.push_str("\\\\");
+                out.push(c);
+            }
+            '%' => out.push_str("%%"),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
+/// A Desktop Entry file that runs the tray program with `extra` arguments.
+fn desktop_entry(l: &Layout, extra: &str) -> Vec<u8> {
+    format!(
+        "[Desktop Entry]\nType=Application\nName=printpapi Agent\nComment=printpapi agent status and settings\nExec={}{extra}\nTerminal=false\n",
+        desktop_exec_quote(&s(&l.tray))
+    )
+    .into_bytes()
+}
+
+/// launchd plist of the tray icon. `LimitLoadToSessionType` `Aqua` loads it only into a graphical
+/// login session (launchd.plist(5)). No `KeepAlive`: "Quit" in the menu must stay quit.
+fn tray_launchd_plist(l: &Layout) -> String {
+    format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>{TRAY_LAUNCHD_LABEL}</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>{}/Contents/MacOS/{MACOS_TRAY_EXE}</string>
+    <string>--tray</string>
+  </array>
+  <key>RunAtLoad</key><true/>
+  <key>LimitLoadToSessionType</key><string>Aqua</string>
+</dict>
+</plist>
+"#,
+        xml_escape(&s(&l.tray))
+    )
+}
+
+/// The bytes of the file at `layout.tray_autostart`: the Linux autostart entry or the macOS
+/// LaunchAgent. `None` on Windows, which uses [`tray_register_cmds`].
+pub fn tray_autostart_file(os: Os, l: &Layout) -> Option<Vec<u8>> {
+    match os {
+        Os::Windows => None,
+        Os::Linux => Some(desktop_entry(l, " --tray")),
+        Os::Macos => Some(tray_launchd_plist(l).into_bytes()),
+    }
+}
+
+/// Linux: the entry in the application menu. It opens the window directly (no `--tray`), so the
+/// settings stay reachable on a desktop that shows no tray icons (GNOME without AppIndicator).
+pub fn app_entry_file(l: &Layout) -> Vec<u8> {
+    desktop_entry(l, "")
+}
+
+/// Windows: make the tray icon start at every logon, with a value in the `Run` key of all users
+/// (`HKLM`). The data is the command line, `"<tray>" --tray`.
+/// https://learn.microsoft.com/en-us/windows-server/administration/windows-commands/reg-add
+pub fn tray_register_cmds(os: Os, l: &Layout, sys: &Path) -> Vec<Cmd> {
+    match os {
+        Os::Windows => vec![cmd(vec![
+            tool(os, sys, "reg.exe"),
+            "add".into(),
+            WIN_RUN_KEY.into(),
+            "/v".into(),
+            TRAY_RUN_VALUE.into(),
+            "/t".into(),
+            "REG_SZ".into(),
+            "/d".into(),
+            format!("\"{}\" --tray", s(&l.tray)),
+            "/f".into(),
+        ])],
+        Os::Linux | Os::Macos => Vec::new(),
+    }
+}
+
+/// The reverse of [`tray_register_cmds`]. The caller ignores a failure: the value may be gone.
+pub fn tray_unregister_cmds(os: Os, _l: &Layout, sys: &Path) -> Vec<Cmd> {
+    match os {
+        Os::Windows => vec![cmd(vec![
+            tool(os, sys, "reg.exe"),
+            "delete".into(),
+            WIN_RUN_KEY.into(),
+            "/v".into(),
+            TRAY_RUN_VALUE.into(),
+            "/f".into(),
+        ])],
+        Os::Linux | Os::Macos => Vec::new(),
+    }
+}
+
+/// End the tray icons of all sessions, before the program is replaced or removed (a running exe
+/// is locked on Windows). The caller ignores failures: there may be none running.
+/// https://learn.microsoft.com/en-us/windows-server/administration/windows-commands/taskkill
+/// (`/im` names the image, `/f` ends it forcefully); `pkill -f` matches the whole command line.
+pub fn tray_stop_cmds(os: Os, l: &Layout, sys: &Path) -> Vec<Cmd> {
+    match os {
+        Os::Windows => vec![cmd(vec![
+            tool(os, sys, "taskkill.exe"),
+            "/f".into(),
+            "/im".into(),
+            "printpapi-tray.exe".into(),
+        ])],
+        Os::Linux => vec![cmd(vec!["pkill".into(), "-f".into(), s(&l.tray)])],
+        Os::Macos => {
+            let app = s(&l.tray);
+            let name = app.rsplit('/').next().unwrap_or(&app).to_string();
+            vec![cmd(vec![tool(os, sys, "usr/bin/pkill"), "-f".into(), name])]
+        }
+    }
+}
+
+/// The rights of `layout.status_dir`, set after the folder exists: readable by every local user,
+/// writable only by whoever runs the agent. On Windows by SID, as in [`ini_acl_cmds`]: SYSTEM and
+/// Administrators full (inherited by what is created inside), Users read and execute, and the
+/// owner is taken over from whoever made the folder.
+/// https://learn.microsoft.com/en-us/windows-server/administration/windows-commands/icacls
+pub fn status_dir_cmds(os: Os, l: &Layout, sys: &Path) -> Vec<Cmd> {
+    let dir = s(&l.status_dir);
+    match os {
+        Os::Windows => vec![cmd(vec![
+            tool(os, sys, "icacls.exe"),
+            dir,
+            "/inheritance:r".into(),
+            "/setowner".into(),
+            SID_ADMINISTRATORS.into(),
+            "/grant:r".into(),
+            format!("{SID_SYSTEM}:(OI)(CI)F"),
+            format!("{SID_ADMINISTRATORS}:(OI)(CI)F"),
+            format!("{SID_USERS}:(OI)(CI)RX"),
+        ])],
+        Os::Linux => vec![
+            cmd(vec!["chown".into(), SERVICE_USER.into(), dir.clone()]),
+            cmd(vec!["chmod".into(), "755".into(), dir]),
+        ],
+        Os::Macos => vec![
+            cmd(vec![
+                tool(os, sys, "usr/sbin/chown"),
+                "root:wheel".into(),
+                dir.clone(),
+            ]),
+            cmd(vec![tool(os, sys, "bin/chmod"), "755".into(), dir]),
+        ],
+    }
+}
+
+/// macOS: put the `.app` folder `from` at `layout.tray`. `ditto` copies a bundle with its
+/// metadata; what it does with the owner of the source is not relied on, so the copy is handed to
+/// root explicitly, made unwritable for others, and freed of the quarantine flag (the second
+/// command, which the caller lets fail: a local copy may not carry it). Empty elsewhere, where the
+/// tray is one file that is written directly.
+pub fn tray_copy_cmds(os: Os, from: &Path, l: &Layout, sys: &Path) -> Vec<Cmd> {
+    match os {
+        Os::Macos => {
+            let app = s(&l.tray);
+            vec![
+                cmd(vec![tool(os, sys, "usr/bin/ditto"), s(from), app.clone()]),
+                cmd(vec![
+                    tool(os, sys, "usr/bin/xattr"),
+                    "-dr".into(),
+                    "com.apple.quarantine".into(),
+                    app.clone(),
+                ]),
+                cmd(vec![
+                    tool(os, sys, "usr/sbin/chown"),
+                    "-R".into(),
+                    "root:wheel".into(),
+                    app.clone(),
+                ]),
+                cmd(vec![
+                    tool(os, sys, "bin/chmod"),
+                    "-R".into(),
+                    "go-w".into(),
+                    app,
+                ]),
+            ]
+        }
+        Os::Windows | Os::Linux => Vec::new(),
     }
 }
 
@@ -1040,6 +1286,293 @@ mod tests {
         );
     }
 
+    fn win_with_data(program_files: &str, program_data: &str) -> Layout {
+        layout_with(
+            Os::Windows,
+            Path::new(program_files),
+            Path::new(program_data),
+        )
+    }
+
+    #[test]
+    fn tray_places_per_platform() {
+        let w = win_with_data("C:\\Program Files", "C:\\ProgramData");
+        assert_eq!(p(&w.status_dir), "C:\\ProgramData\\printpapi");
+        assert_eq!(
+            p(&w.tray),
+            "C:\\Program Files\\printpapi\\printpapi-tray.exe"
+        );
+        // Windows starts the icon from the Run key, not from a file
+        assert!(w.tray_autostart.is_none() && w.app_entry.is_none());
+        let l = linux();
+        assert_eq!(p(&l.status_dir), "/var/lib/printpapi");
+        assert_eq!(p(&l.tray), "/opt/printpapi/printpapi-tray");
+        assert_eq!(
+            p(l.tray_autostart.as_ref().unwrap()),
+            "/etc/xdg/autostart/printpapi-tray.desktop"
+        );
+        assert_eq!(
+            p(l.app_entry.as_ref().unwrap()),
+            "/usr/share/applications/printpapi-agent.desktop"
+        );
+        let m = mac();
+        assert_eq!(p(&m.status_dir), "/Library/Application Support/printpapi");
+        assert_eq!(p(&m.tray), "/Applications/printpapi Agent.app");
+        assert_eq!(
+            p(m.tray_autostart.as_ref().unwrap()),
+            "/Library/LaunchAgents/com.printpapi.tray.plist"
+        );
+        assert!(m.app_entry.is_none());
+    }
+
+    #[test]
+    fn linux_tray_autostart_and_app_entry() {
+        let l = linux();
+        let auto = String::from_utf8(tray_autostart_file(Os::Linux, &l).unwrap()).unwrap();
+        for needle in [
+            "[Desktop Entry]\n",
+            "Type=Application\n",
+            "Name=printpapi Agent\n",
+            "Exec=\"/opt/printpapi/printpapi-tray\" --tray\n",
+        ] {
+            assert!(auto.contains(needle), "{needle} missing in {auto}");
+        }
+        // the application menu entry opens the window directly: no --tray
+        let entry = String::from_utf8(app_entry_file(&l)).unwrap();
+        assert!(
+            entry.contains("Exec=\"/opt/printpapi/printpapi-tray\"\n"),
+            "{entry}"
+        );
+        assert!(!entry.contains("--tray"), "{entry}");
+        assert!(entry.contains("Type=Application\n") && entry.contains("Name=printpapi Agent\n"));
+        // a path with a space stays one argument
+        let mut spaced = linux();
+        spaced.tray = PathBuf::from("/opt/my dir/printpapi-tray");
+        let auto = String::from_utf8(tray_autostart_file(Os::Linux, &spaced).unwrap()).unwrap();
+        assert!(
+            auto.contains("Exec=\"/opt/my dir/printpapi-tray\" --tray\n"),
+            "{auto}"
+        );
+    }
+
+    /// Desktop Entry spec, "The Exec key": an argument with a space is in double quotes, and
+    /// `"`, `` ` ``, `$` and `\` in it get a backslash; a backslash in a value is written twice
+    /// again (four in the file); `%` is `%%`.
+    /// https://specifications.freedesktop.org/desktop-entry/latest/exec-variables.html
+    #[test]
+    fn desktop_exec_quoting_follows_the_spec() {
+        assert_eq!(desktop_exec_quote("/a b/c"), "\"/a b/c\"");
+        assert_eq!(desktop_exec_quote("a\"b"), "\"a\\\\\"b\"");
+        assert_eq!(desktop_exec_quote("a$b"), "\"a\\\\$b\"");
+        assert_eq!(desktop_exec_quote("a`b"), "\"a\\\\`b\"");
+        assert_eq!(desktop_exec_quote("a\\b"), "\"a\\\\\\\\b\"");
+        assert_eq!(desktop_exec_quote("100%"), "\"100%%\"");
+    }
+
+    #[test]
+    fn macos_tray_autostart_is_a_launch_agent_for_gui_sessions() {
+        let text = String::from_utf8(tray_autostart_file(Os::Macos, &mac()).unwrap()).unwrap();
+        for needle in [
+            "<key>Label</key><string>com.printpapi.tray</string>",
+            "<string>/Applications/printpapi Agent.app/Contents/MacOS/printpapi-setup</string>",
+            "<string>--tray</string>",
+            "<key>RunAtLoad</key><true/>",
+            "<key>LimitLoadToSessionType</key><string>Aqua</string>",
+        ] {
+            assert!(text.contains(needle), "{needle} missing in {text}");
+        }
+        // an agent that only runs in the graphical session must not be kept alive in others
+        assert!(!text.contains("KeepAlive"), "{text}");
+        let mut odd = mac();
+        odd.tray = PathBuf::from("/Applications/a & b.app");
+        let text = String::from_utf8(tray_autostart_file(Os::Macos, &odd).unwrap()).unwrap();
+        assert!(
+            text.contains("/Applications/a &amp; b.app/Contents/MacOS/"),
+            "{text}"
+        );
+        assert!(tray_autostart_file(Os::Windows, &win_layout("C:\\PF")).is_none());
+    }
+
+    #[test]
+    fn reg_uses_absolute_path_and_hklm_run() {
+        let l = win_layout("C:\\Program Files");
+        let sys = Path::new(WIN_SYS);
+        let add = tray_register_cmds(Os::Windows, &l, sys);
+        assert_eq!(
+            argvs(&add),
+            [vec![
+                "C:\\Windows\\System32\\reg.exe",
+                "add",
+                "HKLM\\Software\\Microsoft\\Windows\\CurrentVersion\\Run",
+                "/v",
+                "printpapi-tray",
+                "/t",
+                "REG_SZ",
+                "/d",
+                "\"C:\\Program Files\\printpapi\\printpapi-tray.exe\" --tray",
+                "/f"
+            ]]
+        );
+        let del = tray_unregister_cmds(Os::Windows, &l, sys);
+        assert_eq!(
+            argvs(&del),
+            [vec![
+                "C:\\Windows\\System32\\reg.exe",
+                "delete",
+                "HKLM\\Software\\Microsoft\\Windows\\CurrentVersion\\Run",
+                "/v",
+                "printpapi-tray",
+                "/f"
+            ]]
+        );
+        // the other systems register with a file, not with commands
+        for os in [Os::Linux, Os::Macos] {
+            assert!(tray_register_cmds(os, &linux(), Path::new("/")).is_empty());
+            assert!(tray_unregister_cmds(os, &linux(), Path::new("/")).is_empty());
+        }
+    }
+
+    #[test]
+    fn tray_stop_commands() {
+        assert_eq!(
+            argvs(&tray_stop_cmds(
+                Os::Windows,
+                &win_layout("C:\\Program Files"),
+                Path::new(WIN_SYS)
+            )),
+            [vec![
+                "C:\\Windows\\System32\\taskkill.exe",
+                "/f",
+                "/im",
+                "printpapi-tray.exe"
+            ]]
+        );
+        assert_eq!(
+            argvs(&tray_stop_cmds(Os::Linux, &linux(), Path::new("/"))),
+            [vec!["pkill", "-f", "/opt/printpapi/printpapi-tray"]]
+        );
+        assert_eq!(
+            argvs(&tray_stop_cmds(Os::Macos, &mac(), Path::new("/"))),
+            [vec!["/usr/bin/pkill", "-f", "printpapi Agent.app"]]
+        );
+    }
+
+    #[test]
+    fn status_dir_rights_use_sids() {
+        let l = win_with_data("C:\\Program Files", "C:\\ProgramData");
+        let cmds = status_dir_cmds(Os::Windows, &l, Path::new(WIN_SYS));
+        assert_eq!(
+            argvs(&cmds),
+            [vec![
+                "C:\\Windows\\System32\\icacls.exe",
+                "C:\\ProgramData\\printpapi",
+                "/inheritance:r",
+                "/setowner",
+                "*S-1-5-32-544",
+                "/grant:r",
+                "*S-1-5-18:(OI)(CI)F",
+                "*S-1-5-32-544:(OI)(CI)F",
+                "*S-1-5-32-545:(OI)(CI)RX"
+            ]]
+        );
+        let a = &cmds[0].argv;
+        assert!(
+            !a.iter()
+                .any(|x| x.contains("Users") || x.contains("SYSTEM"))
+        );
+    }
+
+    #[test]
+    fn status_dir_rights_on_unix() {
+        assert_eq!(
+            argvs(&status_dir_cmds(Os::Linux, &linux(), Path::new("/"))),
+            [
+                vec!["chown", "printpapi", "/var/lib/printpapi"],
+                vec!["chmod", "755", "/var/lib/printpapi"],
+            ]
+        );
+        assert_eq!(
+            argvs(&status_dir_cmds(Os::Macos, &mac(), Path::new("/"))),
+            [
+                vec![
+                    "/usr/sbin/chown",
+                    "root:wheel",
+                    "/Library/Application Support/printpapi"
+                ],
+                vec![
+                    "/bin/chmod",
+                    "755",
+                    "/Library/Application Support/printpapi"
+                ],
+            ]
+        );
+    }
+
+    #[test]
+    fn the_macos_app_is_copied_with_ditto_and_given_to_root() {
+        let m = mac();
+        let from = Path::new("/var/folders/x y/staging/tray");
+        let cmds = tray_copy_cmds(Os::Macos, from, &m, Path::new("/"));
+        assert_eq!(
+            argvs(&cmds),
+            [
+                vec![
+                    "/usr/bin/ditto",
+                    "/var/folders/x y/staging/tray",
+                    "/Applications/printpapi Agent.app"
+                ],
+                vec![
+                    "/usr/bin/xattr",
+                    "-dr",
+                    "com.apple.quarantine",
+                    "/Applications/printpapi Agent.app"
+                ],
+                vec![
+                    "/usr/sbin/chown",
+                    "-R",
+                    "root:wheel",
+                    "/Applications/printpapi Agent.app"
+                ],
+                vec![
+                    "/bin/chmod",
+                    "-R",
+                    "go-w",
+                    "/Applications/printpapi Agent.app"
+                ],
+            ]
+        );
+        assert!(tray_copy_cmds(Os::Linux, from, &linux(), Path::new("/")).is_empty());
+        assert!(
+            tray_copy_cmds(Os::Windows, from, &win_layout("C:\\PF"), Path::new(WIN_SYS)).is_empty()
+        );
+    }
+
+    #[test]
+    fn the_tray_commands_are_absolute_where_they_must_be() {
+        let l = win_layout("C:\\Program Files");
+        let sys = Path::new(WIN_SYS);
+        let mut all = tray_register_cmds(Os::Windows, &l, sys);
+        all.extend(tray_unregister_cmds(Os::Windows, &l, sys));
+        all.extend(tray_stop_cmds(Os::Windows, &l, sys));
+        all.extend(status_dir_cmds(Os::Windows, &l, sys));
+        assert_eq!(all.len(), 4);
+        for c in all {
+            assert!(c.argv[0].starts_with(WIN_SYS), "{:?}", c.argv);
+        }
+        let m = mac();
+        let mut all = tray_stop_cmds(Os::Macos, &m, Path::new("/"));
+        all.extend(status_dir_cmds(Os::Macos, &m, Path::new("/")));
+        all.extend(tray_copy_cmds(
+            Os::Macos,
+            Path::new("/s/tray"),
+            &m,
+            Path::new("/"),
+        ));
+        for c in all {
+            assert!(c.argv[0].starts_with('/'), "{:?}", c.argv);
+        }
+    }
+
     /// A layout inside a temp dir, to try `detect` against real files.
     fn temp_layout(dir: &Path) -> Layout {
         Layout {
@@ -1049,6 +1582,10 @@ mod tests {
             marker: dir.join(MARKER_NAME),
             sumatra: dir.join("SumatraPDF.exe"),
             autostart: dir.join("autostart"),
+            status_dir: dir.join("status"),
+            tray: dir.join("printpapi-tray"),
+            tray_autostart: None,
+            app_entry: None,
         }
     }
 

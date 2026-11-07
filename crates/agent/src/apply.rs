@@ -1,7 +1,12 @@
 // printpapi — self-hosted PrintNode alternative. Elastic License 2.0 (see LICENSE).
-//! The three subcommands that run with administrator rights: `install <dir>`, `uninstall <dir>`
-//! and `read-config <dir>`. They get one argument, the path of a private staging folder, and treat
-//! everything in it as untrusted because the user who started the setup can write there.
+//! The four subcommands that run with administrator rights: `install <dir>`, `uninstall <dir>`,
+//! `read-config <dir>` and `restart <dir>`. They get one argument, the path of a private staging
+//! folder, and treat everything in it as untrusted because the user who started the setup can
+//! write there.
+//!
+//! `install` also takes an optional `tray` (the tray icon program, on macOS an `.app` folder) and,
+//! instead of a whole `agent.ini`, an optional `patch.json` that it merges into the installed
+//! `agent.ini` itself, so a change needs the key neither in the window nor in a second prompt.
 //!
 //! The key lives in `<dir>/agent.ini`, never in argv. The outcome goes back as `<dir>/result.json`
 //! (the elevation prompt separates the output from the calling window).
@@ -18,7 +23,9 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
 use crate::client::{Client, Http, HttpError, http_status};
-use crate::config::{Config, HttpSettings, Printer, decode_ini, parse_printers};
+use crate::config::{
+    Config, HttpSettings, Printer, apply_patch, decode_ini, parse_patch, parse_printers,
+};
 use crate::install::{self, Layout, Os};
 use crate::proc::{Runner, real_runner};
 
@@ -176,6 +183,15 @@ struct Staged {
     settings: HttpSettings,
     printers: Vec<Printer>,
     sumatra: Option<Vec<u8>>,
+    tray: Option<TrayStaged>,
+}
+
+/// The tray icon program as staged.
+enum TrayStaged {
+    /// Windows and Linux: the program file.
+    File(Vec<u8>),
+    /// macOS: the `.app` folder, copied by `ditto`.
+    App(PathBuf),
 }
 
 /// An `[agent]` value. The parser's texts quote lines and raw values, and the key sits in those, so
@@ -189,11 +205,51 @@ fn required(cfg: &Config, key: &str) -> Result<String, ApplyError> {
     value(cfg, key)?.ok_or_else(|| bad(format!("agent.ini: {key} is missing")))
 }
 
-fn read_staged(staging: &Path, sumatra_sha: &str) -> Result<Staged, ApplyError> {
+/// The `agent.ini` text to install: the staged file, or, when only a `patch.json` is staged, the
+/// installed file with the patch merged in. The installed file is looked at only after the install
+/// folder passed its checks, because this runs as root and would follow a planted link.
+fn staged_ini_text(staging: &Path, env: &Env) -> Result<String, ApplyError> {
+    match std::fs::read(staging.join("agent.ini")) {
+        Ok(bytes) => Ok(decode_ini(&bytes)),
+        Err(e)
+            if e.kind() == std::io::ErrorKind::NotFound
+                && std::fs::symlink_metadata(staging.join("patch.json")).is_ok() =>
+        {
+            let json = std::fs::read(staging.join("patch.json"))
+                .map_err(|e| bad(format!("patch.json cannot be read: {e}")))?;
+            let json = String::from_utf8(json).map_err(|_| bad("patch.json is not UTF-8"))?;
+            let patch = parse_patch(&json).map_err(bad)?;
+            check_install_dir(&env.layout)?;
+            let installed = std::fs::read(&env.layout.ini)
+                .map_err(|e| system("cannot read the installed agent.ini", e))?;
+            // the messages of `apply_patch` never quote the file: it holds the key
+            apply_patch(&decode_ini(&installed), &patch).map_err(bad)
+        }
+        Err(e) => Err(bad(format!("agent.ini cannot be read: {e}"))),
+    }
+}
+
+/// The staged tray program, if any. It must be what this system installs: a file, on macOS an
+/// `.app` folder (a link was refused by `check_staging`).
+fn staged_tray(staging: &Path, os: Os) -> Result<Option<TrayStaged>, ApplyError> {
+    let path = staging.join("tray");
+    match std::fs::symlink_metadata(&path) {
+        Err(_) => Ok(None),
+        Ok(meta) if os == Os::Macos && meta.is_dir() => Ok(Some(TrayStaged::App(path))),
+        Ok(meta) if os != Os::Macos && meta.is_file() => {
+            let bytes =
+                std::fs::read(&path).map_err(|e| bad(format!("tray cannot be read: {e}")))?;
+            Ok(Some(TrayStaged::File(bytes)))
+        }
+        Ok(_) => Err(bad(
+            "tray is not what this system installs (a program file, on macOS an .app folder)",
+        )),
+    }
+}
+
+fn read_staged(staging: &Path, env: &Env, sumatra_sha: &str) -> Result<Staged, ApplyError> {
     check_staging(staging)?;
-    let bytes = std::fs::read(staging.join("agent.ini"))
-        .map_err(|e| bad(format!("agent.ini cannot be read: {e}")))?;
-    let text = decode_ini(&bytes);
+    let text = staged_ini_text(staging, env)?;
     // No parser text goes into an error from here on: the key never shows up in an output, and
     // the parsers quote the lines and values they choke on.
     let cfg = Config::from_text(&text).map_err(|_| {
@@ -228,6 +284,7 @@ fn read_staged(staging: &Path, sumatra_sha: &str) -> Result<Staged, ApplyError> 
         }
         Err(_) => None,
     };
+    let tray = staged_tray(staging, env.os)?;
     Ok(Staged {
         text,
         base,
@@ -236,6 +293,7 @@ fn read_staged(staging: &Path, sumatra_sha: &str) -> Result<Staged, ApplyError> 
         settings,
         printers,
         sumatra,
+        tray,
     })
 }
 
@@ -415,7 +473,7 @@ pub fn apply(staging: &Path, env: &Env) -> Result<f64, ApplyError> {
 }
 
 fn apply_with(staging: &Path, env: &Env, sumatra_sha: &str) -> Result<f64, ApplyError> {
-    let staged = read_staged(staging, sumatra_sha)?;
+    let staged = read_staged(staging, env, sumatra_sha)?;
     let l = &env.layout;
     // before the server or the machine is touched
     check_install_dir(l)?;
@@ -460,6 +518,13 @@ fn apply_with(staging: &Path, env: &Env, sumatra_sha: &str) -> Result<f64, Apply
     for c in install::stop_cmds(env.os, l, &env.sys) {
         let _ = (env.run)(&c);
     }
+    // The icons of all sessions go before their program is replaced: a running exe is locked on
+    // Windows. Only when a new one comes; a change of printers leaves the icons alone.
+    if staged.tray.is_some() {
+        for c in install::tray_stop_cmds(env.os, l, &env.sys) {
+            let _ = (env.run)(&c);
+        }
+    }
     replace_install(env, &staged, &*http, computer_id, first_seen).inspect_err(|_| {
         if was_installed {
             // best effort: the original error is the one the window shows
@@ -503,10 +568,24 @@ fn replace_install(
     }
     place_file(&l.autostart, &install::autostart_file(env.os, l), 0o644)
         .map_err(|e| system("cannot write the autostart file", e))?;
+    // the agent writes its status and log there from its first second
+    prepare_status_dir(env)?;
+    if let Some(tray) = &staged.tray {
+        install_tray(env, tray)?;
+    }
     // The old agent is stopped by now. Its long-poll bumped last_seen_at until then, so the value
     // the window compares against is read here, not before. A failing read keeps the first one.
     let baseline = last_seen(http, staged, computer_id).unwrap_or(first_seen);
-    for (i, c) in install::start_cmds(env.os, l, &env.sys).iter().enumerate() {
+    start_agent(env)?;
+    Ok(baseline)
+}
+
+/// Register the autostart and start the agent.
+fn start_agent(env: &Env) -> Result<(), ApplyError> {
+    for (i, c) in install::start_cmds(env.os, &env.layout, &env.sys)
+        .iter()
+        .enumerate()
+    {
         // the first macOS command removes the quarantine attribute, which a local file may lack
         let optional = env.os == Os::Macos && i == 0;
         if let Err(e) = (env.run)(c)
@@ -515,7 +594,162 @@ fn replace_install(
             return Err(system("cannot start the agent", e));
         }
     }
-    Ok(baseline)
+    Ok(())
+}
+
+/// The user ids that may own the status folder: whoever runs this (root, elevated) and, on Linux,
+/// the service user the agent runs as.
+#[cfg(unix)]
+fn status_dir_owners(os: Os) -> Vec<u32> {
+    // SAFETY: geteuid has no arguments and cannot fail
+    let mut owners = vec![unsafe { libc::geteuid() }];
+    if os == Os::Linux
+        && let Ok(name) = std::ffi::CString::new(install::SERVICE_USER)
+    {
+        // SAFETY: `name` is a valid C string; the returned record is read at once, before any
+        // other call could reuse it
+        let entry = unsafe { libc::getpwnam(name.as_ptr()) };
+        if !entry.is_null() {
+            owners.push(unsafe { (*entry).pw_uid });
+        }
+    }
+    owners
+}
+
+// ponytail: Windows has no owner check here. `status_dir_cmds` takes the folder's owner and ACL over
+// with icacls, but a file that a user planted inside keeps its own owner; the worst it can do is
+// show a false status for itself, because the tray only reads, and the agent replaces the file by
+// renaming.
+#[cfg(not(unix))]
+fn status_dir_owners(_: Os) -> Vec<u32> {
+    Vec::new()
+}
+
+/// Look at the status folder before it is used: this runs elevated, and the folder is in a place
+/// where a user may have made it first. A link is refused (root would write where it points), and
+/// on Unix a folder that none of `owners` owns is deleted with what is in it and made again, so
+/// the install never keeps a folder another user controls.
+// ponytail: a user can still swap the folder between this check and the next step; the same gap
+// as in `check_staging`, closed together with it by roadmap 12.
+fn vet_status_dir(dir: &Path, owners: &[u32]) -> Result<(), ApplyError> {
+    let meta = match std::fs::symlink_metadata(dir) {
+        Ok(meta) => meta,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(system("cannot look at the status folder", e)),
+    };
+    if is_link(&meta) {
+        return Err(ApplyError::System(format!(
+            "{} is a symbolic link, and the setup does not follow it. Remove the link and try again.",
+            dir.display()
+        )));
+    }
+    if !meta.is_dir() {
+        return Err(ApplyError::System(format!(
+            "{} is not a folder.",
+            dir.display()
+        )));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if !owners.contains(&meta.uid()) {
+            std::fs::remove_dir_all(dir)
+                .map_err(|e| system("cannot replace the status folder of another user", e))?;
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = owners;
+    Ok(())
+}
+
+/// Make the status folder (readable for everybody, writable for the agent only).
+fn prepare_status_dir(env: &Env) -> Result<(), ApplyError> {
+    let dir = &env.layout.status_dir;
+    vet_status_dir(dir, &status_dir_owners(env.os))?;
+    std::fs::create_dir_all(dir).map_err(|e| system("cannot create the status folder", e))?;
+    set_mode(dir, 0o755).map_err(|e| system("cannot set the status folder's rights", e))?;
+    for c in install::status_dir_cmds(env.os, &env.layout, &env.sys) {
+        (env.run)(&c).map_err(|e| system("cannot set the status folder's rights", e))?;
+    }
+    Ok(())
+}
+
+/// Delete `path` whatever it is, without following a link. A missing path is fine.
+fn remove_tree(path: &Path) -> std::io::Result<()> {
+    match std::fs::symlink_metadata(path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e),
+        Ok(meta) if meta.is_dir() && !is_link(&meta) => std::fs::remove_dir_all(path),
+        // a file or a link; a Windows junction is removed as a folder
+        Ok(_) => std::fs::remove_file(path).or_else(|_| std::fs::remove_dir(path)),
+    }
+}
+
+/// The tray icon: the program, its autostart for all users and, on Linux, the menu entry.
+fn install_tray(env: &Env, tray: &TrayStaged) -> Result<(), ApplyError> {
+    let l = &env.layout;
+    match tray {
+        TrayStaged::File(bytes) => {
+            retry(FILE_ATTEMPTS, env.sleep, &mut || {
+                place_file(&l.tray, bytes, 0o755)
+            })
+            .map_err(|e| system("cannot copy the tray icon", e))?;
+        }
+        TrayStaged::App(from) => {
+            // the old app goes first, so nothing of it stays inside the new one
+            retry(FILE_ATTEMPTS, env.sleep, &mut || remove_tree(&l.tray))
+                .map_err(|e| system("cannot remove the old tray icon", e))?;
+            for (i, c) in install::tray_copy_cmds(env.os, from, l, &env.sys)
+                .iter()
+                .enumerate()
+            {
+                // the second command removes the quarantine flag, which a local copy may lack
+                if let Err(e) = (env.run)(c)
+                    && i != 1
+                {
+                    return Err(system("cannot copy the tray icon", e));
+                }
+            }
+        }
+    }
+    let files = [
+        (
+            l.tray_autostart.as_ref(),
+            install::tray_autostart_file(env.os, l),
+        ),
+        (l.app_entry.as_ref(), Some(install::app_entry_file(l))),
+    ];
+    for (path, bytes) in files {
+        let (Some(path), Some(bytes)) = (path, bytes) else {
+            continue;
+        };
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| system("cannot create the folder of the tray autostart", e))?;
+        }
+        place_file(path, &bytes, 0o644)
+            .map_err(|e| system("cannot write the tray autostart file", e))?;
+    }
+    for c in install::tray_register_cmds(env.os, l, &env.sys) {
+        (env.run)(&c).map_err(|e| system("cannot register the tray icon", e))?;
+    }
+    Ok(())
+}
+
+/// Restart: stop the agent and start it again, so a changed `agent.ini` takes effect. Only for an
+/// installation this setup made.
+pub fn restart(env: &Env) -> Result<(), ApplyError> {
+    let l = &env.layout;
+    check_install_dir(l)?;
+    if !l.marker.is_file() {
+        return Err(ApplyError::System(
+            "This agent was not installed by the setup, so the setup leaves it alone.".into(),
+        ));
+    }
+    for c in install::stop_cmds(env.os, l, &env.sys) {
+        let _ = (env.run)(&c);
+    }
+    start_agent(env)
 }
 
 /// `last_seen_at` of this device on the server.
@@ -547,6 +781,10 @@ pub fn remove(env: &Env) -> Result<(), ApplyError> {
     for c in install::stop_cmds(env.os, l, &env.sys) {
         let _ = (env.run)(&c);
     }
+    // the icons go too: on Windows their exe is locked, and "Quit" in a menu is not the removal
+    for c in install::tray_stop_cmds(env.os, l, &env.sys) {
+        let _ = (env.run)(&c);
+    }
     // A stop that failed leaves the process alive, and deleting its files would let it print on
     // without anything left to remove it. Nothing is deleted yet, so a second try stays possible.
     // A failing check means "not running".
@@ -565,10 +803,27 @@ pub fn remove(env: &Env) -> Result<(), ApplyError> {
     for c in install::remove_cmds(env.os, l, &env.sys) {
         let _ = (env.run)(&c);
     }
-    match std::fs::remove_file(&l.autostart) {
-        Ok(()) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => return Err(system("cannot delete the autostart file", e)),
+    for c in install::tray_unregister_cmds(env.os, l, &env.sys) {
+        let _ = (env.run)(&c);
+    }
+    for file in [
+        Some(&l.autostart),
+        l.tray_autostart.as_ref(),
+        l.app_entry.as_ref(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        match std::fs::remove_file(file) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(system("cannot delete the autostart file", e)),
+        }
+    }
+    // the tray program (outside the install folder on macOS) and the status folder
+    for path in [&l.tray, &l.status_dir] {
+        retry(FILE_ATTEMPTS, env.sleep, &mut || remove_tree(path))
+            .map_err(|e| system("cannot delete the tray icon and the status folder", e))?;
     }
     // The marker goes last: a locked file (a running exe, a hung SumatraPDF) stops the removal, and
     // a second try must still find the marker instead of leaving the folder behind as "foreign".
@@ -659,17 +914,20 @@ pub fn cli(args: &[String]) -> Option<ExitCode> {
 /// success, 1 for a failure and 2 for a wrong call.
 fn run_args(args: &[String], env: Result<&Env, ApplyError>) -> Option<u8> {
     let command = match args.first().map(String::as_str) {
-        Some(c @ ("install" | "uninstall" | "read-config")) => c,
+        Some(c @ ("install" | "uninstall" | "read-config" | "restart")) => c,
         _ => return None,
     };
     let [_, dir] = args else {
-        crate::err_line("usage: printpapi-agent install|uninstall|read-config <staging folder>");
+        crate::err_line(
+            "usage: printpapi-agent install|uninstall|read-config|restart <staging folder>",
+        );
         return Some(2);
     };
     let staging = Path::new(dir);
     let outcome = env.and_then(|env| match command {
         "install" => apply(staging, env).map(|b| json!({"ok": true, "baseline_last_seen": b})),
         "uninstall" => remove(env).map(|()| json!({"ok": true})),
+        "restart" => restart(env).map(|()| json!({"ok": true})),
         _ => export_config(staging, env).map(|()| json!({"ok": true})),
     });
     let (result, code) = match outcome {
@@ -771,6 +1029,20 @@ mod tests {
                 marker: dir.join(".installed-by-setup"),
                 sumatra: dir.join("SumatraPDF.exe"),
                 autostart: tmp.path().join("etc").join("autostart-file"),
+                status_dir: tmp.path().join("status"),
+                tray: if os == Os::Macos {
+                    tmp.path().join("Applications").join("printpapi Agent.app")
+                } else {
+                    dir.join(if os == Os::Windows {
+                        "printpapi-tray.exe"
+                    } else {
+                        "printpapi-tray"
+                    })
+                },
+                tray_autostart: (os != Os::Windows)
+                    .then(|| tmp.path().join("xdg").join("printpapi-tray-autostart")),
+                app_entry: (os == Os::Linux)
+                    .then(|| tmp.path().join("apps").join("printpapi-agent.desktop")),
                 dir,
             };
             let staging = tmp.path().join("staging");
@@ -799,10 +1071,12 @@ mod tests {
                     // what the disk looks like at the moment this command runs
                     if line.contains("chmod") || line.contains("icacls") {
                         // the file the command is about: it is empty while its rights are set
+                        // (the status folder is not in the install folder and has no note)
                         let dir = layout.dir.display().to_string();
-                        let file = c.argv.iter().find(|a| a.starts_with(&dir)).unwrap();
-                        let len = std::fs::metadata(file).map(|m| m.len());
-                        note.push_str(&format!(" [ini len {len:?}]"));
+                        if let Some(file) = c.argv.iter().find(|a| a.starts_with(&dir)) {
+                            let len = std::fs::metadata(file).map(|m| m.len());
+                            note.push_str(&format!(" [ini len {len:?}]"));
+                        }
                     }
                     if line.contains("enable") || line.contains("/create") {
                         note.push_str(&format!(
@@ -960,6 +1234,7 @@ mod tests {
         // the rights are set on the new file, which replaces agent.ini only once it is complete
         let ini = fx.layout.dir.join(".agent.ini.new");
         let ini = ini.display();
+        let status = fx.layout.status_dir.display();
         assert_eq!(
             fx.events(),
             vec![
@@ -970,6 +1245,9 @@ mod tests {
                 // the new file is empty while the ACL is set, the key comes after
                 format!("run chown root:printpapi {ini}"),
                 format!("run chmod 640 {ini} [ini len Ok(0)]"),
+                // the agent writes its status and log there: the folder and its rights come first
+                format!("run chown printpapi {status}"),
+                format!("run chmod 755 {status}"),
                 // read again once the old agent is stopped, right before the new one starts
                 "GET /computers".to_string(),
                 "run systemctl daemon-reload".to_string(),
@@ -1444,9 +1722,10 @@ mod tests {
         assert_eq!(
             fx.events(),
             vec![
-                "run systemctl stop printpapi-agent",
-                "run systemctl is-active --quiet printpapi-agent",
-                "run systemctl disable printpapi-agent"
+                "run systemctl stop printpapi-agent".to_string(),
+                format!("run pkill -f {}", fx.layout.tray.display()),
+                "run systemctl is-active --quiet printpapi-agent".to_string(),
+                "run systemctl disable printpapi-agent".to_string()
             ]
         );
         assert!(!fx.layout.dir.exists());
@@ -1935,5 +2214,531 @@ mod tests {
         assert_eq!(run_args(&words(&["install", "a", "b"]), Ok(&env)), Some(2));
         assert!(run_args(&words(&["run"]), Ok(&env)).is_none());
         assert!(fx.events().is_empty());
+    }
+
+    // ---- tray icon, status folder, patch and restart ----
+
+    impl Fixture {
+        /// The tray program as the setup stages it: one file, on macOS an `.app` folder.
+        fn stage_tray(&self, bytes: &[u8]) {
+            let tray = self.staging.join("tray");
+            if self.os == Os::Macos {
+                std::fs::create_dir_all(tray.join("Contents")).unwrap();
+                std::fs::write(tray.join("Contents").join("Info.plist"), bytes).unwrap();
+            } else {
+                std::fs::write(tray, bytes).unwrap();
+            }
+        }
+
+        /// Stage a change instead of a whole agent.ini.
+        fn stage_patch(&self, json: &str) {
+            std::fs::remove_file(self.staging.join("agent.ini")).unwrap();
+            std::fs::write(self.staging.join("patch.json"), json).unwrap();
+        }
+
+        /// `run` that notes what `watch` says about the disk whenever a command whose line
+        /// contains one of `needles` runs.
+        fn run_watching(
+            &self,
+            needles: &'static [&'static str],
+            watch: impl Fn() -> String + 'static,
+        ) -> (Runner, Rc<RefCell<Vec<String>>>) {
+            let seen: Rc<RefCell<Vec<String>>> = Rc::default();
+            let inner = self.run.clone();
+            let log = seen.clone();
+            let run: Runner = Rc::new(move |c| {
+                let line = c.argv.join(" ");
+                if needles.iter().any(|n| line.contains(n)) {
+                    log.borrow_mut().push(watch());
+                }
+                inner(c)
+            });
+            (run, seen)
+        }
+    }
+
+    fn tray_text(path: &Path) -> String {
+        std::fs::read(path)
+            .map(|b| String::from_utf8_lossy(&b).into_owned())
+            .unwrap_or_else(|_| "gone".into())
+    }
+
+    #[test]
+    fn the_tray_is_installed_with_its_autostart() {
+        for os in [Os::Linux, Os::Windows] {
+            let fx = Fixture::new(os);
+            fx.stage_tray(b"the tray");
+            apply(&fx.staging, &fx.env()).unwrap();
+            assert_eq!(
+                std::fs::read(&fx.layout.tray).unwrap(),
+                b"the tray",
+                "{os:?}"
+            );
+            let ev = fx.events().join("\n");
+            if os == Os::Windows {
+                assert!(fx.layout.tray_autostart.is_none());
+                assert!(ev.contains("reg.exe add HKLM"), "{ev}");
+                assert!(ev.contains("printpapi-tray.exe\" --tray /f"), "{ev}");
+            } else {
+                let auto = tray_text(fx.layout.tray_autostart.as_ref().unwrap());
+                assert!(auto.contains("--tray"), "{auto}");
+                assert!(auto.contains("printpapi-tray"), "{auto}");
+                let entry = tray_text(fx.layout.app_entry.as_ref().unwrap());
+                assert!(
+                    entry.contains("Type=Application") && !entry.contains("--tray"),
+                    "{entry}"
+                );
+                assert!(!ev.contains("reg.exe"), "{ev}");
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_tray_file_is_runnable_for_everybody() {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        let fx = Fixture::new(Os::Linux);
+        fx.stage_tray(b"the tray");
+        let before = unsafe { libc::umask(0) };
+        let result = apply(&fx.staging, &fx.env());
+        unsafe { libc::umask(before) };
+        result.unwrap();
+        assert_eq!(mode(&fx.layout.tray), 0o755);
+        assert_eq!(mode(fx.layout.tray_autostart.as_ref().unwrap()), 0o644);
+        assert_eq!(mode(fx.layout.app_entry.as_ref().unwrap()), 0o644);
+        assert_eq!(mode(&fx.layout.status_dir), 0o755);
+    }
+
+    #[test]
+    fn an_install_without_a_staged_tray_leaves_the_tray_alone() {
+        let fx = Fixture::new(Os::Linux);
+        apply(&fx.staging, &fx.env()).unwrap();
+        let ev = fx.events().join("\n");
+        assert!(!ev.contains("pkill"), "{ev}");
+        assert!(!fx.layout.tray.exists());
+        assert!(!fx.layout.tray_autostart.as_ref().unwrap().exists());
+        // the agent still gets its status folder
+        assert!(fx.layout.status_dir.is_dir());
+    }
+
+    #[test]
+    fn tray_is_stopped_before_it_is_replaced() {
+        for os in [Os::Linux, Os::Windows] {
+            let fx = Fixture::new(os);
+            std::fs::create_dir_all(&fx.layout.dir).unwrap();
+            std::fs::write(&fx.layout.tray, b"old tray").unwrap();
+            fx.stage_tray(b"new tray");
+            let tray = fx.layout.tray.clone();
+            let (run, seen) = fx.run_watching(&["pkill", "taskkill"], move || tray_text(&tray));
+            let mut env = fx.env();
+            env.run = run;
+            apply(&fx.staging, &env).unwrap();
+            assert_eq!(*seen.borrow(), vec!["old tray".to_string()], "{os:?}");
+            assert_eq!(tray_text(&fx.layout.tray), "new tray", "{os:?}");
+        }
+    }
+
+    #[test]
+    fn tray_is_stopped_before_it_is_removed() {
+        for os in [Os::Linux, Os::Windows] {
+            let fx = Fixture::new(os);
+            fx.stage_tray(b"the tray");
+            apply(&fx.staging, &fx.env()).unwrap();
+            fx.events.borrow_mut().clear();
+            let tray = fx.layout.tray.clone();
+            let (run, seen) = fx.run_watching(&["pkill", "taskkill"], move || tray_text(&tray));
+            let mut env = fx.env();
+            env.run = run;
+            remove(&env).unwrap();
+            assert_eq!(*seen.borrow(), vec!["the tray".to_string()], "{os:?}");
+            assert!(
+                !fx.layout.tray.exists() && !fx.layout.dir.exists(),
+                "{os:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn remove_takes_the_tray_the_status_folder_and_the_autostart_with_it() {
+        for os in [Os::Linux, Os::Windows, Os::Macos] {
+            let fx = Fixture::new(os);
+            fx.stage_tray(b"the tray");
+            apply(&fx.staging, &fx.env()).unwrap();
+            if os == Os::Macos {
+                // the faked `ditto` copied nothing: put an app where it would be
+                std::fs::create_dir_all(fx.layout.tray.join("Contents")).unwrap();
+            }
+            std::fs::write(fx.layout.status_dir.join("status.json"), b"{}").unwrap();
+            fx.events.borrow_mut().clear();
+            remove(&fx.env()).unwrap();
+            assert!(!fx.layout.dir.exists(), "{os:?}");
+            assert!(!fx.layout.tray.exists(), "{os:?}");
+            assert!(!fx.layout.status_dir.exists(), "{os:?}");
+            for extra in [&fx.layout.tray_autostart, &fx.layout.app_entry]
+                .into_iter()
+                .flatten()
+            {
+                assert!(!extra.exists(), "{os:?}: {extra:?}");
+            }
+            let ev = fx.events().join("\n");
+            assert_eq!(
+                ev.contains("reg.exe delete HKLM"),
+                os == Os::Windows,
+                "{ev}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_removal_that_cannot_stop_the_agent_keeps_the_tray_files() {
+        let fx = Fixture::new(Os::Linux);
+        fx.stage_tray(b"the tray");
+        apply(&fx.staging, &fx.env()).unwrap();
+        fx.running.set(true);
+        assert!(remove(&fx.env()).is_err());
+        assert!(fx.layout.tray.is_file());
+        assert!(fx.layout.status_dir.is_dir());
+        assert!(fx.layout.tray_autostart.as_ref().unwrap().is_file());
+    }
+
+    #[test]
+    fn the_tray_app_on_macos_is_copied_by_ditto_after_the_old_one_is_stopped() {
+        let fx = Fixture::new(Os::Macos);
+        std::fs::create_dir_all(fx.layout.tray.join("Contents")).unwrap();
+        std::fs::write(fx.layout.tray.join("old"), b"x").unwrap();
+        fx.stage_tray(b"plist");
+        // a missing quarantine flag is no reason to fail
+        fx.failing.borrow_mut().push("xattr -dr".into());
+        let tray = fx.layout.tray.clone();
+        let (run, seen) = fx.run_watching(&["usr/bin/ditto"], move || {
+            tray.join("old").exists().to_string()
+        });
+        let mut env = fx.env();
+        env.run = run;
+        apply(&fx.staging, &env).unwrap();
+        let ev = fx.events();
+        let pos = |needle: &str| ev.iter().position(|e| e.contains(needle)).unwrap();
+        let app = fx.layout.tray.display().to_string();
+        assert!(pos("pkill") < pos("ditto"), "{ev:?}");
+        assert_eq!(
+            ev[pos("ditto")],
+            format!(
+                "run /usr/bin/ditto {} {app}",
+                fx.staging.join("tray").display()
+            )
+        );
+        assert!(pos("ditto") < pos("chown -R root:wheel"), "{ev:?}");
+        assert!(pos("chown -R root:wheel") < pos("chmod -R go-w"), "{ev:?}");
+        // the old app is gone before ditto lays the new one down, so nothing old stays inside
+        assert_eq!(*seen.borrow(), vec!["false".to_string()]);
+        let plist = tray_text(fx.layout.tray_autostart.as_ref().unwrap());
+        assert!(plist.contains("com.printpapi.tray"), "{plist}");
+    }
+
+    #[test]
+    fn a_tray_of_the_wrong_shape_is_refused_before_anything_happens() {
+        // a folder where a file is expected, and a file where the macOS app folder is expected
+        for (os, make_dir) in [(Os::Linux, true), (Os::Windows, true), (Os::Macos, false)] {
+            let fx = Fixture::new(os);
+            let tray = fx.staging.join("tray");
+            if make_dir {
+                std::fs::create_dir(&tray).unwrap();
+            } else {
+                std::fs::write(&tray, b"file").unwrap();
+            }
+            let e = apply(&fx.staging, &fx.env()).unwrap_err();
+            assert_eq!(e.code(), "bad_staging", "{os:?}");
+            assert!(fx.events().is_empty(), "{os:?}");
+            assert!(!fx.layout.dir.exists(), "{os:?}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_linked_tray_in_staging_is_refused() {
+        let fx = Fixture::new(Os::Linux);
+        std::os::unix::fs::symlink("/bin/sh", fx.staging.join("tray")).unwrap();
+        assert_eq!(
+            apply(&fx.staging, &fx.env()).unwrap_err().code(),
+            "bad_staging"
+        );
+        assert!(fx.events().is_empty());
+    }
+
+    #[test]
+    fn the_status_folder_gets_its_rights_before_the_agent_starts() {
+        let fx = Fixture::new(Os::Linux);
+        apply(&fx.staging, &fx.env()).unwrap();
+        assert!(fx.layout.status_dir.is_dir());
+        let ev = fx.events();
+        let dir = fx.layout.status_dir.display().to_string();
+        let chown = ev
+            .iter()
+            .position(|e| *e == format!("run chown printpapi {dir}"))
+            .unwrap();
+        let chmod = ev
+            .iter()
+            .position(|e| *e == format!("run chmod 755 {dir}"))
+            .unwrap();
+        let start = ev.iter().position(|e| e.contains("enable --now")).unwrap();
+        assert!(chown < chmod && chmod < start, "{ev:?}");
+        // and a failing rights command stops the install, not the agent's later silence
+        let fx = Fixture::new(Os::Linux);
+        fx.failing.borrow_mut().push("chown printpapi".into());
+        let e = apply(&fx.staging, &fx.env()).unwrap_err();
+        assert_eq!(e.code(), "system");
+        assert!(fx.events().iter().all(|e| !e.contains("enable --now")));
+    }
+
+    #[test]
+    fn windows_sets_the_status_folder_rights_with_icacls() {
+        let fx = Fixture::new(Os::Windows);
+        apply(&fx.staging, &fx.env()).unwrap();
+        let ev = fx.events().join("\n");
+        let dir = fx.layout.status_dir.display().to_string();
+        assert!(
+            ev.contains(&format!(
+                "icacls.exe {dir} /inheritance:r /setowner *S-1-5-32-544"
+            )),
+            "{ev}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_pre_made_status_dir_is_taken_over_with_our_owner() {
+        use std::os::unix::fs::{MetadataExt, chown};
+        let fx = Fixture::new(Os::Linux);
+        std::fs::create_dir_all(&fx.layout.status_dir).unwrap();
+        std::fs::write(fx.layout.status_dir.join("status.json"), b"planted").unwrap();
+        // as root the folder is handed to another user; as anybody else it is already the
+        // runner's, which the install trusts, so only the root run (the Docker run) shows the case
+        let handed = chown(&fx.layout.status_dir, Some(54321), Some(54321)).is_ok();
+        apply(&fx.staging, &fx.env()).unwrap();
+        let meta = std::fs::metadata(&fx.layout.status_dir).unwrap();
+        if handed {
+            assert_eq!(meta.uid(), 0, "the folder of another user must not be kept");
+            assert!(!fx.layout.status_dir.join("status.json").exists());
+        } else {
+            assert_eq!(meta.uid(), unsafe { libc::geteuid() });
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_status_dir_check_keeps_its_own_and_trusted_owners() {
+        use std::os::unix::fs::MetadataExt;
+        let fx = Fixture::new(Os::Linux);
+        let dir = &fx.layout.status_dir;
+        std::fs::create_dir_all(dir).unwrap();
+        let mine = std::fs::metadata(dir).unwrap().uid();
+        std::fs::write(dir.join("keep"), b"x").unwrap();
+        vet_status_dir(dir, &[mine]).unwrap();
+        assert!(dir.join("keep").exists());
+        // nobody trusted: it goes, with what is in it
+        vet_status_dir(dir, &[]).unwrap();
+        assert!(!dir.exists());
+        // nothing there is fine
+        vet_status_dir(dir, &[]).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_status_dir_is_refused() {
+        let fx = Fixture::new(Os::Linux);
+        let elsewhere = fx.tmp.path().join("elsewhere");
+        std::fs::create_dir(&elsewhere).unwrap();
+        std::fs::write(elsewhere.join("precious"), b"x").unwrap();
+        std::os::unix::fs::symlink(&elsewhere, &fx.layout.status_dir).unwrap();
+        let e = apply(&fx.staging, &fx.env()).unwrap_err();
+        assert_eq!(e.code(), "system");
+        assert!(e.to_string().contains("symbolic link"), "{e}");
+        assert!(elsewhere.join("precious").exists());
+        // and the removal does not follow it either
+        let fx2 = Fixture::new(Os::Linux);
+        apply(&fx2.staging, &fx2.env()).unwrap();
+        std::fs::remove_dir_all(&fx2.layout.status_dir).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, &fx2.layout.status_dir).unwrap();
+        remove(&fx2.env()).unwrap();
+        assert!(elsewhere.join("precious").exists());
+    }
+
+    #[test]
+    fn a_patch_merges_with_the_installed_ini() {
+        let fx = Fixture::new(Os::Linux);
+        apply(&fx.staging, &fx.env()).unwrap();
+        fx.events.borrow_mut().clear();
+        fx.stage_patch(
+            r#"{"printers": "Zebra GK420d", "timeout": 45, "headers": [["X-Via", "proxy 100%"]]}"#,
+        );
+        apply(&fx.staging, &fx.env()).unwrap();
+        let ini = std::fs::read_to_string(&fx.layout.ini).unwrap();
+        // what the patch names changed, what it does not name stayed
+        assert!(ini.contains("api_key = SECRET-KEY"), "{ini}");
+        assert!(ini.contains("name = shop-pc"), "{ini}");
+        assert!(
+            ini.contains("server_url = https://print.example.com/"),
+            "{ini}"
+        );
+        assert!(
+            ini.contains("Zebra GK420d") && !ini.contains("Büro Drucker"),
+            "{ini}"
+        );
+        let settings = fx.settings.borrow();
+        let last = settings.last().unwrap();
+        assert_eq!(last.timeout, 45.0);
+        assert_eq!(
+            last.headers.get("x-via").map(String::as_str),
+            Some("proxy 100%")
+        );
+        // it is an ordinary install of the merged file: registered with the server first
+        assert_eq!(fx.events()[0], "POST /agent/register");
+        assert!(
+            std::fs::read_dir(&fx.layout.dir)
+                .unwrap()
+                .all(|e| { !e.unwrap().file_name().to_string_lossy().ends_with(".new") })
+        );
+    }
+
+    #[test]
+    fn a_bad_patch_touches_nothing() {
+        let bad_ones = [
+            r#"{"headers": [["authorization", "x"]]}"#,
+            r#"{"timeout": 5}"#,
+            r#"{"printers": "a = socket://nohost"}"#,
+            r#"{"unknown": 1}"#,
+            "not json",
+        ];
+        for bad in bad_ones {
+            let fx = Fixture::new(Os::Linux);
+            apply(&fx.staging, &fx.env()).unwrap();
+            let installed = std::fs::read(&fx.layout.ini).unwrap();
+            fx.events.borrow_mut().clear();
+            fx.stage_patch(bad);
+            crate::ERR_LINES.with(|l| l.borrow_mut().clear());
+            let e = apply(&fx.staging, &fx.env()).unwrap_err();
+            assert_eq!(e.code(), "bad_staging", "{bad}: {e}");
+            assert!(!e.to_string().contains("SECRET"), "{bad}: {e}");
+            assert!(fx.events().is_empty(), "{bad}: {:?}", fx.events());
+            assert_eq!(std::fs::read(&fx.layout.ini).unwrap(), installed, "{bad}");
+        }
+    }
+
+    #[test]
+    fn a_patch_without_an_installed_ini_is_a_system_error() {
+        let fx = Fixture::new(Os::Linux);
+        fx.stage_patch(r#"{"timeout": 45}"#);
+        let e = apply(&fx.staging, &fx.env()).unwrap_err();
+        assert_eq!(e.code(), "system");
+        assert!(fx.events().is_empty());
+        assert!(!fx.layout.dir.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_patch_never_reads_a_symlinked_installed_ini() {
+        let fx = Fixture::new(Os::Linux);
+        std::fs::create_dir_all(&fx.layout.dir).unwrap();
+        let victim = fx.tmp.path().join("victim");
+        std::fs::write(&victim, INI).unwrap();
+        std::os::unix::fs::symlink(&victim, &fx.layout.ini).unwrap();
+        fx.stage_patch(r#"{"timeout": 45}"#);
+        let e = apply(&fx.staging, &fx.env()).unwrap_err();
+        assert!(e.to_string().contains("symbolic link"), "{e}");
+        assert!(fx.events().is_empty());
+    }
+
+    #[test]
+    fn a_staged_ini_wins_over_a_staged_patch() {
+        let fx = Fixture::new(Os::Linux);
+        std::fs::write(fx.staging.join("patch.json"), r#"{"timeout": 45}"#).unwrap();
+        apply(&fx.staging, &fx.env()).unwrap();
+        let ini = std::fs::read_to_string(&fx.layout.ini).unwrap();
+        assert!(!ini.contains("timeout"), "{ini}");
+    }
+
+    #[test]
+    fn restart_needs_the_marker() {
+        let fx = Fixture::new(Os::Linux);
+        std::fs::create_dir_all(&fx.layout.dir).unwrap();
+        std::fs::write(&fx.layout.binary, b"hand made").unwrap();
+        let e = restart(&fx.env()).unwrap_err();
+        assert_eq!(e.code(), "system");
+        assert!(fx.events().is_empty());
+    }
+
+    #[test]
+    fn restart_runs_stop_then_start() {
+        for os in [Os::Linux, Os::Macos, Os::Windows] {
+            let fx = Fixture::new(os);
+            apply(&fx.staging, &fx.env()).unwrap();
+            fx.events.borrow_mut().clear();
+            restart(&fx.env()).unwrap();
+            let ev = fx.events();
+            let stop = ev
+                .iter()
+                .position(|e| e.contains("stop") || e.contains("bootout") || e.contains("/end"))
+                .unwrap();
+            let start = ev
+                .iter()
+                .position(|e| {
+                    e.contains("enable --now") || e.contains("bootstrap") || e.contains("/run")
+                })
+                .unwrap();
+            assert!(stop < start, "{os:?}: {ev:?}");
+            // it only restarts: no server, no files
+            assert!(
+                ev.iter()
+                    .all(|e| !e.starts_with("POST") && !e.starts_with("GET")),
+                "{ev:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn restart_ignores_a_failing_stop_but_not_a_failing_start() {
+        let fx = Fixture::new(Os::Linux);
+        apply(&fx.staging, &fx.env()).unwrap();
+        fx.failing.borrow_mut().push("systemctl stop".into());
+        restart(&fx.env()).unwrap();
+        fx.failing.borrow_mut().push("enable --now".into());
+        let e = restart(&fx.env()).unwrap_err();
+        assert_eq!(e.code(), "system");
+        assert!(e.to_string().contains("cannot start the agent"), "{e}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn restart_refuses_a_symlinked_install_folder() {
+        let fx = Fixture::new(Os::Linux);
+        let elsewhere = fx.tmp.path().join("elsewhere");
+        std::fs::create_dir(&elsewhere).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, &fx.layout.dir).unwrap();
+        assert!(
+            restart(&fx.env())
+                .unwrap_err()
+                .to_string()
+                .contains("symbolic link")
+        );
+        assert!(fx.events().is_empty());
+    }
+
+    #[test]
+    fn restart_reports_through_result_json_and_the_exit_code() {
+        let fx = Fixture::new(Os::Linux);
+        let dir = fx.staging.display().to_string();
+        let result = || -> Value {
+            serde_json::from_slice(&std::fs::read(fx.staging.join("result.json")).unwrap()).unwrap()
+        };
+        let args = ["restart".to_string(), dir.clone()];
+        // not installed: it says why
+        assert_eq!(run_args(&args, Ok(&fx.env())), Some(1));
+        assert_eq!(result()["code"], json!("system"));
+        apply(&fx.staging, &fx.env()).unwrap();
+        assert_eq!(run_args(&args, Ok(&fx.env())), Some(0));
+        assert_eq!(result(), json!({"ok": true}));
+        // one argument only, like the others
+        assert_eq!(run_args(&["restart".to_string()], Ok(&fx.env())), Some(2));
     }
 }
