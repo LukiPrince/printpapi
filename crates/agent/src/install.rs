@@ -315,6 +315,26 @@ pub fn identity_check(os: Os) -> Option<Cmd> {
     (os == Os::Linux).then(|| cmd(argv(&["id", "-u", SERVICE_USER])))
 }
 
+/// Is the agent still running after `stop_cmds`? Success of the command means it is. `None` on
+/// Windows: a running exe is locked there, so deleting its folder fails anyway.
+pub fn running_check(os: Os) -> Option<Cmd> {
+    match os {
+        Os::Linux => Some(cmd(argv(&[
+            "systemctl",
+            "is-active",
+            "--quiet",
+            "printpapi-agent",
+        ]))),
+        // after `bootout` the label is gone, so `print` fails; it succeeds while the job is loaded
+        Os::Macos => Some(cmd(vec![
+            "/bin/launchctl".into(),
+            "print".into(),
+            format!("system/{LAUNCHD_LABEL}"),
+        ])),
+        Os::Windows => None,
+    }
+}
+
 /// Create what `identity_check` found missing: the Linux system user.
 pub fn identity_cmds(os: Os) -> Vec<Cmd> {
     match os {
@@ -748,6 +768,20 @@ mod tests {
     }
 
     #[test]
+    fn running_check_asks_the_service_manager() {
+        assert_eq!(
+            running_check(Os::Linux).unwrap().argv,
+            ["systemctl", "is-active", "--quiet", "printpapi-agent"]
+        );
+        assert_eq!(
+            running_check(Os::Macos).unwrap().argv,
+            ["/bin/launchctl", "print", "system/com.printpapi.agent"]
+        );
+        // a locked exe stops the removal on Windows anyway
+        assert!(running_check(Os::Windows).is_none());
+    }
+
+    #[test]
     fn systemd_unit_runs_as_printpapi() {
         let text = String::from_utf8(autostart_file(Os::Linux, &linux())).unwrap();
         for needle in [
@@ -804,6 +838,7 @@ mod tests {
             all.extend(remove_cmds(os, &l, sys));
             all.extend(identity_cmds(os));
             all.extend(identity_check(os));
+            all.extend(running_check(os));
             assert!(!all.is_empty());
             for c in all {
                 assert!(

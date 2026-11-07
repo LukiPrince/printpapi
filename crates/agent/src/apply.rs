@@ -523,6 +523,17 @@ pub fn remove(env: &Env) -> Result<(), ApplyError> {
     for c in install::stop_cmds(env.os, l, &env.sys) {
         let _ = (env.run)(&c);
     }
+    // A stop that failed leaves the process alive, and deleting its files would let it print on
+    // without anything left to remove it. Nothing is deleted yet, so a second try stays possible.
+    // A failing check means "not running".
+    if let Some(check) = install::running_check(env.os)
+        && (env.run)(&check).is_ok()
+    {
+        return Err(ApplyError::System(
+            "The agent could not be stopped and is still running, so nothing was removed. Stop it (or restart the computer) and try again."
+                .into(),
+        ));
+    }
     // ponytail: a failing delete (task or unit already gone from an earlier half run) is not told
     // apart from a stuck one. The folder goes next, so a leftover entry has nothing to start. A
     // stuck one stays registered with nothing behind it, and `install::detect` then reports it as
@@ -712,6 +723,8 @@ mod tests {
         settings: Rc<RefCell<Vec<HttpSettings>>>,
         /// commands whose joined argv contains one of these fail
         failing: Rc<RefCell<Vec<String>>>,
+        /// what the check "is the agent still running?" answers
+        running: Rc<std::cell::Cell<bool>>,
         run: Runner,
         http_for: HttpFor,
         sleep: Box<dyn Fn(u64)>,
@@ -752,8 +765,9 @@ mod tests {
             let seen: Rc<RefCell<Vec<(String, String)>>> = Rc::default();
             let settings: Rc<RefCell<Vec<HttpSettings>>> = Rc::default();
             let failing: Rc<RefCell<Vec<String>>> = Rc::default();
+            let running: Rc<std::cell::Cell<bool>> = Rc::default();
             let run: Runner = {
-                let (events, failing) = (events.clone(), failing.clone());
+                let (events, failing, running) = (events.clone(), failing.clone(), running.clone());
                 let layout = layout.clone();
                 Rc::new(move |c| {
                     let line = c.argv.join(" ");
@@ -774,6 +788,14 @@ mod tests {
                         ));
                     }
                     events.borrow_mut().push(note);
+                    // success of the check means "still running"; the agent is stopped by default
+                    if install::running_check(os).as_ref() == Some(c) {
+                        return if running.get() {
+                            Ok(Vec::new())
+                        } else {
+                            Err(format!("not running: {line}"))
+                        };
+                    }
                     if failing.borrow().iter().any(|f| line.contains(f.as_str())) {
                         Err(format!("failed: {line}"))
                     } else {
@@ -813,6 +835,7 @@ mod tests {
                 seen,
                 settings,
                 failing,
+                running,
                 run,
                 http_for,
                 sleep: Box::new(|_| {}),
@@ -1343,11 +1366,52 @@ mod tests {
             fx.events(),
             vec![
                 "run systemctl stop printpapi-agent",
+                "run systemctl is-active --quiet printpapi-agent",
                 "run systemctl disable printpapi-agent"
             ]
         );
         assert!(!fx.layout.dir.exists());
         assert!(!fx.layout.autostart.exists());
+    }
+
+    #[test]
+    fn remove_deletes_nothing_while_the_agent_still_runs() {
+        for os in [Os::Linux, Os::Macos] {
+            let fx = Fixture::new(os);
+            apply(&fx.staging, &fx.env()).unwrap();
+            fx.events.borrow_mut().clear();
+            // the stop failed and the process lives on: it would keep printing without its files
+            fx.running.set(true);
+            fx.failing.borrow_mut().push("stop".into());
+            fx.failing.borrow_mut().push("bootout".into());
+            let e = remove(&fx.env()).unwrap_err();
+            assert_eq!(e.code(), "system", "{os:?}");
+            assert!(e.to_string().contains("still running"), "{os:?}: {e}");
+            assert!(fx.layout.dir.is_dir(), "{os:?}");
+            assert!(fx.layout.binary.is_file(), "{os:?}");
+            assert!(fx.layout.marker.is_file(), "{os:?}");
+            assert!(fx.layout.autostart.is_file(), "{os:?}");
+            let ev = fx.events();
+            assert!(
+                ev.iter()
+                    .all(|e| !e.contains("disable") && !e.contains("remove")),
+                "{os:?}: {ev:?}"
+            );
+            // a second try works once the agent is down
+            fx.running.set(false);
+            remove(&fx.env()).unwrap();
+            assert!(!fx.layout.dir.exists(), "{os:?}");
+        }
+    }
+
+    #[test]
+    fn a_check_that_fails_means_the_agent_is_not_running() {
+        let fx = Fixture::new(Os::Linux);
+        apply(&fx.staging, &fx.env()).unwrap();
+        // `systemctl is-active` exits non-zero for a stopped unit
+        fx.failing.borrow_mut().push("systemctl".into());
+        remove(&fx.env()).unwrap();
+        assert!(!fx.layout.dir.exists());
     }
 
     #[test]
