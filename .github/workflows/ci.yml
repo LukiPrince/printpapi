@@ -47,6 +47,31 @@ jobs:
       - run: cargo build --release --locked -p printpapi-server
       - run: python tools/parity/parity.py --rust target/release/printpapi
 
+  # Installs the agent for real on a throwaway runner (the runners are fresh VMs with admin rights),
+  # through the same subcommands the setup uses, and removes it again. Covers the install plans,
+  # the autostart entry and the removal on all three systems, aarch64 included. Never run the script
+  # on a machine you care about: it creates a SYSTEM task / systemd unit / launchd daemon.
+  setup-smoke:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: cargo build --release --locked -p printpapi-server -p printpapi-agent
+      - name: install, print, uninstall
+        shell: bash
+        run: |
+          ext=''
+          if [ "$RUNNER_OS" = "Windows" ]; then ext='.exe'; fi
+          python tools/smoke/setup_smoke.py             --server "target/release/printpapi$ext"             --agent "target/release/printpapi-agent$ext"
+
   # The dashboard bundle in crates/server/web is committed (so a plain `cargo build` checkout has
   # a UI without Node). This job proves the source in web/ still builds, and that nobody changed
   # the source without regenerating the bundle that actually ships.
