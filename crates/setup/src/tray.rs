@@ -336,6 +336,54 @@ fn open_dashboard(url: Option<String>) {
     });
 }
 
+/// Run `build`, and turn a panic into an error. The platform library behind the Linux tray icon
+/// panics, instead of returning an error, when `libayatana-appindicator3` (or `libappindicator3`)
+/// is not on the system (libappindicator-sys 0.9 `src/lib.rs`: "Failed to load
+/// ayatana-appindicator3 or appindicator3 dynamic library"). An icon that is started at every
+/// logon must not crash each time on such a system.
+fn build_guarded<T, E: std::fmt::Display>(
+    build: impl FnOnce() -> Result<T, E>,
+) -> Result<T, String> {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(build)) {
+        Ok(built) => built.map_err(|e| e.to_string()),
+        Err(payload) => Err(payload
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| payload.downcast_ref::<&str>().copied())
+            .unwrap_or("the tray library panicked")
+            .to_string()),
+    }
+}
+
+/// What the icon writes in its log when it cannot be built: one line, whatever the reason has.
+fn no_icon_sentence(why: &str) -> String {
+    let why = why.split_whitespace().collect::<Vec<_>>().join(" ");
+    format!(
+        "The tray icon cannot be shown and ends here (on Linux it needs libayatana-appindicator3 or libappindicator3): {why}"
+    )
+}
+
+/// The icon's own log: `printpapi-tray.log` in the folder of its lock file.
+fn log_path_beside(lock: &Path) -> PathBuf {
+    lock.with_file_name("printpapi-tray.log")
+}
+
+/// Append `<unix time> <message>` to `log`; the folder is made if needed and every error is
+/// ignored, a log that cannot be written is not a reason to fail.
+fn append_icon_log(log: &Path, message: &str) {
+    use std::io::Write;
+    if let Some(dir) = log.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(log)
+    {
+        let _ = writeln!(file, "{} {message}", now_secs() as u64);
+    }
+}
+
 /// Build the icon and its menu and keep both up to date. Called from Tauri's `setup`, in `--tray`
 /// mode only; there is no window.
 pub fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
@@ -361,24 +409,39 @@ pub fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
     // the address of "Open dashboard": the last server the status file named
     let address: Arc<Mutex<Option<String>>> = Arc::default();
     let for_menu = Arc::clone(&address);
-    let tray = TrayIconBuilder::with_id("printpapi-agent")
-        .icon(Image::from_bytes(icon_bytes(TrayState::NotRunning))?)
-        .tooltip(format!("{TOOLTIP_PREFIX}Agent is not running"))
-        .menu(&menu)
-        .show_menu_on_left_click(true)
-        .on_menu_event(move |app, event| match event.id.as_ref() {
-            "settings" => open_settings(),
-            "dashboard" => open_dashboard(
-                for_menu
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner)
-                    .clone(),
-            ),
-            // the icon only; the agent is a service of its own
-            "quit" => app.exit(0),
-            _ => {}
-        })
-        .build(app)?;
+    let built = build_guarded(|| {
+        TrayIconBuilder::with_id("printpapi-agent")
+            .icon(Image::from_bytes(icon_bytes(TrayState::NotRunning))?)
+            .tooltip(format!("{TOOLTIP_PREFIX}Agent is not running"))
+            .menu(&menu)
+            .show_menu_on_left_click(true)
+            .on_menu_event(move |app, event| match event.id.as_ref() {
+                "settings" => open_settings(),
+                "dashboard" => open_dashboard(
+                    for_menu
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .clone(),
+                ),
+                // the icon only; the agent is a service of its own
+                "quit" => app.exit(0),
+                _ => {}
+            })
+            .build(app)
+            .map_err(Box::<dyn std::error::Error>::from)
+    });
+    let tray = match built {
+        Ok(tray) => tray,
+        Err(why) => {
+            // Ending is not a failure: the icon starts at every logon, and a system without the
+            // library would crash it each time. The reason is in the icon's log.
+            if let Some(lock) = lock_path() {
+                append_icon_log(&log_path_beside(&lock), &no_icon_sentence(&why));
+            }
+            eprintln!("{}", no_icon_sentence(&why));
+            std::process::exit(0);
+        }
+    };
     let handle = app.handle().clone();
     std::thread::spawn(move || watch(&handle, &tray, &line, &dashboard, &address));
     Ok(())
@@ -457,6 +520,59 @@ mod tests {
             "null",
             "https://print.example.com",
         )
+    }
+
+    #[test]
+    fn an_icon_that_cannot_be_built_is_an_error_not_a_crash() {
+        // the platform library panics when it cannot load libayatana-appindicator
+        let panicked: Result<(), String> = build_guarded(|| -> Result<(), String> {
+            panic!("Failed to load ayatana-appindicator3")
+        });
+        let why = panicked.unwrap_err();
+        assert!(
+            why.contains("Failed to load ayatana-appindicator3"),
+            "{why}"
+        );
+        // an error is passed on in its words, a success as it is
+        let failed: Result<(), String> = build_guarded(|| Err::<(), _>("no tray host"));
+        assert_eq!(failed.unwrap_err(), "no tray host");
+        assert_eq!(build_guarded(|| Ok::<_, String>(7)), Ok(7));
+    }
+
+    #[test]
+    fn the_sentence_in_the_log_names_the_library_and_why() {
+        let line = no_icon_sentence("Failed to load ayatana-appindicator3 or appindicator3");
+        assert!(line.contains("libayatana-appindicator3"), "{line}");
+        assert!(
+            line.contains("Failed to load ayatana-appindicator3 or appindicator3"),
+            "{line}"
+        );
+        // one sentence on one line
+        assert_eq!(line.lines().count(), 1, "{line:?}");
+        // a multi-line reason (the loader prints one line per library tried) stays on that line
+        let line = no_icon_sentence("first\nsecond\r\nthird");
+        assert_eq!(line.lines().count(), 1, "{line:?}");
+        assert!(line.contains("first second third"), "{line}");
+    }
+
+    #[test]
+    fn the_icons_own_log_is_beside_its_lock_file_and_grows_by_a_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let lock = dir.path().join("printpapi").join("printpapi-tray.lock");
+        let log = log_path_beside(&lock);
+        assert_eq!(log, dir.path().join("printpapi").join("printpapi-tray.log"));
+        // the folder may not exist yet, and a second line is appended, not written over the first
+        append_icon_log(&log, "first sentence.");
+        append_icon_log(&log, "second sentence.");
+        let text = std::fs::read_to_string(&log).unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 2, "{text}");
+        assert!(lines[0].ends_with(" first sentence."), "{text}");
+        assert!(lines[1].ends_with(" second sentence."), "{text}");
+        // a folder that cannot be made is no reason to crash
+        let blocked = dir.path().join("file");
+        std::fs::write(&blocked, "x").unwrap();
+        append_icon_log(&blocked.join("sub").join("x.log"), "nobody reads this");
     }
 
     #[test]
