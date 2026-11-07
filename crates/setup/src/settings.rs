@@ -200,14 +200,29 @@ pub fn read_log_in(path: &Path, lines: usize) -> std::io::Result<String> {
 // ---- the tray icon program
 
 /// The program a setup run offers as the tray icon: this program itself. Windows: the running
-/// exe. Linux: the AppImage file when run from one (`$APPIMAGE`, the running exe is then inside a
-/// mount that is gone with the process), else the running exe. macOS: the `.app` folder around
-/// the running exe, `None` outside one.
-pub fn tray_source(os: Os, current_exe: &Path, appimage: Option<&OsStr>) -> Option<PathBuf> {
+/// exe. Linux: the AppImage file when this very program runs from one (`$APPIMAGE`; the running
+/// exe is then inside the mount `$APPDIR`, which is gone with the process), else the running exe.
+/// The AppImage runtime sets both variables, and every child process inherits them, so
+/// `$APPIMAGE` alone proves nothing: a .deb-installed setup started from a terminal or launcher
+/// that is itself an AppImage would otherwise install that foreign AppImage as the tray icon. It
+/// counts only when `current_exe` lies below `$APPDIR` (both resolved by the caller).
+/// https://github.com/AppImage/type2-runtime/blob/main/src/runtime/runtime.c (`setenv` of
+/// `APPIMAGE` and `APPDIR` before the `execv` of `AppRun`)
+/// macOS: the `.app` folder around the running exe, `None` outside one.
+pub fn tray_source(
+    os: Os,
+    current_exe: &Path,
+    appimage: Option<&OsStr>,
+    appdir: Option<&OsStr>,
+) -> Option<PathBuf> {
     match os {
         Os::Windows => Some(current_exe.to_path_buf()),
-        Os::Linux => match appimage {
-            Some(a) if !a.is_empty() => Some(PathBuf::from(a)),
+        Os::Linux => match (appimage, appdir) {
+            (Some(a), Some(d))
+                if !a.is_empty() && !d.is_empty() && current_exe.starts_with(Path::new(d)) =>
+            {
+                Some(PathBuf::from(a))
+            }
             _ => Some(current_exe.to_path_buf()),
         },
         Os::Macos => current_exe
@@ -504,27 +519,54 @@ mod tests {
     #[test]
     fn the_program_offered_as_tray_icon_is_this_program() {
         let win = Path::new("C:\\Users\\a\\Downloads\\printpapi-setup.exe");
-        assert_eq!(tray_source(Os::Windows, win, None).as_deref(), Some(win));
+        assert_eq!(
+            tray_source(Os::Windows, win, None, None).as_deref(),
+            Some(win)
+        );
         let exe = Path::new("/tmp/.mount_x/usr/bin/printpapi-setup");
+        let image = OsStr::new("/home/a/printpapi.AppImage");
+        let mount = OsStr::new("/tmp/.mount_x");
         // an AppImage is the file, not the mount inside it
         assert_eq!(
-            tray_source(
-                Os::Linux,
-                exe,
-                Some(OsStr::new("/home/a/printpapi.AppImage"))
-            )
-            .as_deref(),
+            tray_source(Os::Linux, exe, Some(image), Some(mount)).as_deref(),
             Some(Path::new("/home/a/printpapi.AppImage"))
         );
         assert_eq!(
-            tray_source(Os::Linux, exe, Some(OsStr::new(""))).as_deref(),
+            tray_source(Os::Linux, exe, Some(OsStr::new("")), Some(mount)).as_deref(),
             Some(exe)
         );
-        assert_eq!(tray_source(Os::Linux, exe, None).as_deref(), Some(exe));
+        assert_eq!(
+            tray_source(Os::Linux, exe, None, None).as_deref(),
+            Some(exe)
+        );
+        // the variables are inherited: a .deb-installed setup that a terminal running as an
+        // AppImage started sees them, but its exe is not inside that mount, so the foreign
+        // AppImage is not offered as the tray icon
+        let deb = Path::new("/usr/bin/printpapi-setup");
+        assert_eq!(
+            tray_source(Os::Linux, deb, Some(image), Some(mount)).as_deref(),
+            Some(deb)
+        );
+        // without $APPDIR nothing shows that the exe is the AppImage's
+        assert_eq!(
+            tray_source(Os::Linux, exe, Some(image), None).as_deref(),
+            Some(exe)
+        );
+        // a mount that only shares a name prefix is another folder
+        assert_eq!(
+            tray_source(
+                Os::Linux,
+                Path::new("/tmp/.mount_xy/usr/bin/printpapi-setup"),
+                Some(image),
+                Some(mount)
+            )
+            .as_deref(),
+            Some(Path::new("/tmp/.mount_xy/usr/bin/printpapi-setup"))
+        );
         let mac =
             Path::new("/Users/a/Downloads/printpapi Agent.app/Contents/MacOS/printpapi-setup");
         assert_eq!(
-            tray_source(Os::Macos, mac, None).as_deref(),
+            tray_source(Os::Macos, mac, None, None).as_deref(),
             Some(Path::new("/Users/a/Downloads/printpapi Agent.app"))
         );
         // a development run, outside a bundle
@@ -532,6 +574,7 @@ mod tests {
             tray_source(
                 Os::Macos,
                 Path::new("/src/target/debug/printpapi-setup"),
+                None,
                 None
             ),
             None

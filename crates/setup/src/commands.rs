@@ -643,6 +643,7 @@ fn stage_own_tray_with(
     os: Os,
     exe: &Path,
     appimage: Option<&OsStr>,
+    appdir: Option<&OsStr>,
     l: &Layout,
     dir: &Path,
     run: &Runner,
@@ -654,7 +655,15 @@ fn stage_own_tray_with(
             std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf())
         }
     };
-    let source = settings::tray_source(os, exe, appimage).map(|p| resolve(&p));
+    // `exe` comes resolved from the system, `$APPDIR` may not be: compare like with like
+    let appdir = appdir.map(|d| resolve(Path::new(d)));
+    let source = settings::tray_source(
+        os,
+        &resolve(exe),
+        appimage,
+        appdir.as_deref().map(Path::as_os_str),
+    )
+    .map(|p| resolve(&p));
     settings::stage_tray(os, source.as_deref(), &resolve(&l.tray), dir, run)
         .map_err(|e| SetupError::io("cannot prepare the tray icon", e))
 }
@@ -665,6 +674,7 @@ fn stage_own_tray(dir: &Path) -> Result<bool, SetupError> {
         Os::host(),
         &exe,
         std::env::var_os("APPIMAGE").as_deref(),
+        std::env::var_os("APPDIR").as_deref(),
         &layout(),
         dir,
         &runner(),
@@ -1664,13 +1674,16 @@ printers = Z = socket://nohost
         let l = install::layout(Os::Windows, Path::new("C:\\Program Files"));
         let installed_exe = Path::new("C:\\Program Files\\printpapi\\printpapi-tray.exe");
         let staged =
-            stage_own_tray_with(Os::Windows, installed_exe, None, &l, tmp.path(), &run).unwrap();
+            stage_own_tray_with(Os::Windows, installed_exe, None, None, &l, tmp.path(), &run)
+                .unwrap();
         assert!(!staged);
         assert!(names_in(tmp.path()).is_empty());
         // a copy somewhere else is offered, and the install replaces the installed one with it
         let elsewhere = tmp.path().join("printpapi-setup.exe");
         std::fs::write(&elsewhere, b"exe").unwrap();
-        assert!(stage_own_tray_with(Os::Windows, &elsewhere, None, &l, tmp.path(), &run).unwrap());
+        assert!(
+            stage_own_tray_with(Os::Windows, &elsewhere, None, None, &l, tmp.path(), &run).unwrap()
+        );
         assert_eq!(std::fs::read(tmp.path().join("tray")).unwrap(), b"exe");
     }
 

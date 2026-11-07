@@ -256,6 +256,33 @@ pub fn lock_path() -> Option<PathBuf> {
     }
 }
 
+/// What identifies the installed tray program: size, time of the last change and, on Unix, the
+/// inode (an update renames a new file over it, so the inode differs even when the rest does not).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileStamp {
+    len: u64,
+    modified: Option<SystemTime>,
+    #[cfg(unix)]
+    inode: u64,
+}
+
+/// The stamp of `path`, `None` when there is nothing there.
+pub fn file_stamp(path: &Path) -> Option<FileStamp> {
+    let meta = std::fs::metadata(path).ok()?;
+    Some(FileStamp {
+        len: meta.len(),
+        modified: meta.modified().ok(),
+        #[cfg(unix)]
+        inode: std::os::unix::fs::MetadataExt::ino(&meta),
+    })
+}
+
+/// Was the program, which was there at the start, replaced or removed? An icon that never saw it
+/// there has nothing to compare (a development run from elsewhere) and does not end.
+pub fn replaced(at_start: Option<&FileStamp>, now: Option<&FileStamp>) -> bool {
+    at_start.is_some() && at_start != now
+}
+
 /// Where the agent leaves its status file: `status.json` in the agent's own status folder.
 pub fn status_path() -> PathBuf {
     status::status_dir(Os::host()).join("status.json")
@@ -332,20 +359,36 @@ pub fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
             _ => {}
         })
         .build(app)?;
-    std::thread::spawn(move || watch(&tray, &line, &dashboard, &address));
+    let handle = app.handle().clone();
+    std::thread::spawn(move || watch(&handle, &tray, &line, &dashboard, &address));
     Ok(())
 }
 
 /// Read the status file every [`POLL`] and change icon, tooltip and menu when something differs.
+/// The icon also ends itself when the installed program file is replaced or removed. An update or
+/// a removal cannot find the process of an AppImage by its command line (the running program is
+/// inside a mount, not at the installed path), and a stale icon would hold the lock of
+/// [`single_instance`] so that the new one ends at once. On Windows the running exe cannot be
+/// replaced, and the install ends it by image name.
 fn watch(
+    app: &tauri::AppHandle,
     tray: &TrayIcon,
     line: &MenuItem<tauri::Wry>,
     dashboard: &MenuItem<tauri::Wry>,
     address: &Mutex<Option<String>>,
 ) {
     let path = status_path();
+    let program =
+        (!cfg!(windows)).then(|| install::layout(Os::host(), &install::program_files()).tray);
+    let at_start = program.as_deref().and_then(file_stamp);
     let mut shown: Option<(TrayState, String, bool)> = None;
     loop {
+        if let Some(program) = &program
+            && replaced(at_start.as_ref(), file_stamp(program).as_ref())
+        {
+            app.exit(0);
+            return;
+        }
         let text = load_status(&path, SystemTime::now());
         let (state, text_line) = read_state(text.as_deref(), now_secs());
         let text_line = text_line.unwrap_or_default();
@@ -569,6 +612,28 @@ mod tests {
         assert!(single_instance(&lock).is_none(), "a second icon stays away");
         drop(first);
         assert!(single_instance(&lock).is_some(), "the lock is free again");
+    }
+
+    #[test]
+    fn the_icon_ends_when_its_program_is_replaced_or_removed() {
+        let dir = tempfile::tempdir().unwrap();
+        let program = dir.path().join("printpapi-tray");
+        // not installed where this icon looks: nothing to watch, it never ends for that
+        assert_eq!(file_stamp(&program), None);
+        assert!(!replaced(None, None));
+        std::fs::write(&program, b"old program").unwrap();
+        let start = file_stamp(&program);
+        assert!(start.is_some());
+        assert!(!replaced(start.as_ref(), file_stamp(&program).as_ref()));
+        // an update puts a new file in place, as `place_file` of the install does
+        let new = dir.path().join(".printpapi-tray.new");
+        std::fs::write(&new, b"a newer program, other length").unwrap();
+        std::fs::rename(&new, &program).unwrap();
+        assert!(replaced(start.as_ref(), file_stamp(&program).as_ref()));
+        // a removal
+        let start = file_stamp(&program);
+        std::fs::remove_file(&program).unwrap();
+        assert!(replaced(start.as_ref(), file_stamp(&program).as_ref()));
     }
 
     #[test]
