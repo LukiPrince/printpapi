@@ -104,11 +104,25 @@ pub fn needs_insecure_confirm(url: &str) -> bool {
     }
 }
 
+/// The failure in words a person can act on. The raw text of the TLS stack or of the JSON parser
+/// (`invalid peer certificate: UnknownIssuer`, `expected value at line 1 column 1`) says nothing
+/// to them. Anything else (`server returned 502`, `connection failed: ...`) is readable as it is.
+fn explain(e: &HttpError) -> String {
+    match e {
+        HttpError::Os(m) if m.contains("certificate") => {
+            "the server's certificate is not trusted (self-signed, expired or for another name)."
+                .to_string()
+        }
+        HttpError::Value(_) => "this address does not answer like a printpapi server.".to_string(),
+        _ => e.to_string(),
+    }
+}
+
 fn unreachable_or_key(e: &HttpError) -> ConnectError {
     if http_status(e) == Some(401) {
         ConnectError::BadKey
     } else {
-        ConnectError::Unreachable(e.to_string())
+        ConnectError::Unreachable(explain(e))
     }
 }
 
@@ -134,7 +148,7 @@ pub fn check_connection(
     name: &str,
 ) -> Result<bool, ConnectError> {
     http.get(&format!("{base}/health"), key)
-        .map_err(|e| ConnectError::Unreachable(e.to_string()))?;
+        .map_err(|e| ConnectError::Unreachable(explain(&e)))?;
     Ok(computers(http, base, key)?
         .iter()
         .any(|c| c["name"].as_str() == Some(name)))
@@ -172,20 +186,47 @@ pub fn test_print(entry: &Printer, sumatra: &str, run: Runner) -> SendResult {
     test_print_with(entry, &Fns::native(raw, pdf))
 }
 
+/// Where the computer's name may be read, in order: `COMPUTERNAME` (Windows), `HOSTNAME` (only set
+/// in the environment when somebody exported it, a desktop launch does not), the kernel's hostname
+/// file and `/etc/hostname` (Linux), `/bin/hostname` (macOS, which has neither file).
+const NAME_SOURCES: [&str; 5] = [
+    "COMPUTERNAME",
+    "HOSTNAME",
+    "/proc/sys/kernel/hostname",
+    "/etc/hostname",
+    "/bin/hostname",
+];
+
+/// First non-empty line of the first source of [`NAME_SOURCES`] that gives one, else `agent`.
 fn device_name_from(get: impl Fn(&str) -> Option<String>) -> String {
-    ["COMPUTERNAME", "HOSTNAME"]
+    NAME_SOURCES
         .iter()
         .find_map(|k| {
             get(k)
-                .map(|v| v.trim().to_string())
+                .and_then(|v| v.lines().next().map(|l| l.trim().to_string()))
                 .filter(|v| !v.is_empty())
         })
         .unwrap_or_else(|| "agent".to_string())
 }
 
+/// One source of [`NAME_SOURCES`] on this machine: `None` when it is not there.
+fn read_name_source(key: &str) -> Option<String> {
+    if key == "/bin/hostname" {
+        let out = std::process::Command::new(key).output().ok()?;
+        return out
+            .status
+            .success()
+            .then(|| String::from_utf8_lossy(&out.stdout).into_owned());
+    }
+    if key.starts_with('/') {
+        return std::fs::read_to_string(key).ok();
+    }
+    std::env::var(key).ok()
+}
+
 /// The suggested device name: the computer's name, else `agent`.
 pub fn default_device_name() -> String {
-    device_name_from(|k| std::env::var(k).ok())
+    device_name_from(read_name_source)
 }
 
 #[cfg(test)]
@@ -354,12 +395,35 @@ mod tests {
 
     #[test]
     fn a_tls_failure_reads_as_unreachable_in_words() {
-        let tls = HttpError::Os("connection failed: invalid peer certificate".into());
-        let http = FakeHttp::new(Err(tls), Ok(None));
+        // the text ureq/rustls gives for a self-signed certificate, measured against a loopback
+        // server with one
+        let tls =
+            HttpError::Os("connection failed: io: invalid peer certificate: UnknownIssuer".into());
+        let http = FakeHttp::new(Err(tls.clone()), Ok(None));
         let e = check_connection(&http, "https://x", "k", "pc").unwrap_err();
         assert!(matches!(e, ConnectError::Unreachable(_)));
-        assert!(e.to_string().starts_with("Could not reach the server:"));
-        assert!(e.to_string().contains("invalid peer certificate"));
+        let text = e.to_string();
+        assert!(text.starts_with("Could not reach the server:"), "{text}");
+        assert!(text.contains("certificate is not trusted"), "{text}");
+        assert!(!text.contains("UnknownIssuer"), "{text}");
+        // the same on the second request
+        let http = FakeHttp::new(Ok(Some(json!({"ok": true}))), Err(tls));
+        let e = check_connection(&http, "https://x", "k", "pc").unwrap_err();
+        assert!(e.to_string().contains("certificate is not trusted"), "{e}");
+    }
+
+    #[test]
+    fn an_address_that_is_not_a_printpapi_server_reads_in_words() {
+        // a web page with 200 on /health: serde says `expected value at line 1 column 1`
+        let html = HttpError::Value("expected value at line 1 column 1".into());
+        let http = FakeHttp::new(Err(html), Ok(None));
+        let e = check_connection(&http, "https://x", "k", "pc").unwrap_err();
+        let text = e.to_string();
+        assert!(
+            text.contains("does not answer like a printpapi server"),
+            "{text}"
+        );
+        assert!(!text.contains("column"), "{text}");
     }
 
     #[test]
@@ -496,5 +560,50 @@ mod tests {
         assert_eq!(device_name_from(env(&[("COMPUTERNAME", "  ")])), "agent");
         assert_eq!(device_name_from(env(&[])), "agent");
         assert!(!default_device_name().is_empty());
+    }
+
+    #[test]
+    fn the_device_name_reads_the_real_hostname_when_the_environment_has_none() {
+        // a desktop launch has no HOSTNAME in its environment: Linux has the kernel's file, macOS
+        // the hostname command; nothing of this depends on the test machine's environment
+        let src = |pairs: Vec<(&'static str, &'static str)>| {
+            move |k: &str| {
+                pairs
+                    .iter()
+                    .find(|(n, _)| *n == k)
+                    .map(|(_, v)| v.to_string())
+            }
+        };
+        let proc = (
+            "/proc/sys/kernel/hostname",
+            "shop-linux
+",
+        );
+        let etc = (
+            "/etc/hostname",
+            "etc-name
+",
+        );
+        let cmd = (
+            "/bin/hostname",
+            "Shops-Mac.local
+",
+        );
+        assert_eq!(device_name_from(src(vec![proc, etc, cmd])), "shop-linux");
+        assert_eq!(device_name_from(src(vec![etc, cmd])), "etc-name");
+        assert_eq!(device_name_from(src(vec![cmd])), "Shops-Mac.local");
+        assert_eq!(
+            device_name_from(src(vec![(
+                "/etc/hostname",
+                " 
+"
+            )])),
+            "agent"
+        );
+        // the environment still wins, so a deliberate HOSTNAME is honoured
+        assert_eq!(
+            device_name_from(src(vec![("HOSTNAME", "env-name"), proc])),
+            "env-name"
+        );
     }
 }
