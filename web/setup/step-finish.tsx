@@ -7,7 +7,7 @@ import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/com
 import { Button } from "@/components/ui/button";
 import { setup, toSetupError, type Platform, type PrinterChoice } from "./api";
 import { connectMayHelp, errorText, logLocation, patchFor, returnsToConnect } from "./model";
-import { Actions, Notice } from "./bits";
+import { Actions, Notice, Path } from "./bits";
 import type { Connection } from "./step-connect";
 
 type Phase =
@@ -156,7 +156,7 @@ export function StepFinish({
         {phase.at === "offline" && (
           <Notice tone="error">
             The agent did not report in within 60 seconds. Look for the reason in the log:{" "}
-            <span className="break-all font-mono text-xs">{logLocation(platform)}</span>
+            <Path path={logLocation(platform)} />
           </Notice>
         )}
         {phase.at === "failed" && <Notice tone="error">{phase.message}</Notice>}

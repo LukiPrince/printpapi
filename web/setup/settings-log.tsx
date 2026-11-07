@@ -7,7 +7,7 @@ import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/com
 import { Button } from "@/components/ui/button";
 import { setup, toSetupError, type Platform } from "./api";
 import { errorText, logLocation } from "./model";
-import { Actions, Notice } from "./bits";
+import { Actions, Notice, Path } from "./bits";
 
 /** How many of the last lines the window shows. */
 const LINES = 200;
@@ -42,7 +42,7 @@ export function LogSection({ platform }: { platform: Platform }) {
         <CardTitle>Log</CardTitle>
         <CardDescription>
           {`The last ${LINES} lines of the agent's log file:`}
-          <span className="mt-0.5 block font-mono text-xs [overflow-wrap:anywhere]">{logLocation(platform)}</span>
+          <Path path={logLocation(platform)} className="mt-0.5 block" />
         </CardDescription>
       </CardHeader>
       <CardContent className="space-y-3">

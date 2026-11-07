@@ -5,7 +5,7 @@ import { useState } from "react";
 import { setup, toSetupError, type ConfigPatch, type Platform } from "./api";
 import { errorText, logLocation } from "./model";
 import { Button } from "@/components/ui/button";
-import { Notice } from "./bits";
+import { Notice, Path } from "./bits";
 
 export type Run =
   | { at: "idle" }
@@ -102,7 +102,7 @@ export function RunNotice({
         <Notice tone="error">
           <p>
             The agent did not report in within 60 seconds. Look for the reason in the log:{" "}
-            <span className="break-all font-mono text-xs">{logLocation(platform)}</span>
+            <Path path={logLocation(platform)} />
           </p>
           <Button type="button" variant="outline" size="sm" className="mt-2" onClick={onKeepWaiting}>
             Keep waiting

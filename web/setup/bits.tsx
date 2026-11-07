@@ -5,7 +5,7 @@ import { Check, CircleAlert, CircleCheck, Info, PowerOff, TriangleAlert, type Lu
 import { Barcode, Logo } from "@/components/brand";
 import { cn } from "@/lib/utils";
 import type { AgentStatus } from "./api";
-import { statusWord } from "./model";
+import { pathParts, statusWord } from "./model";
 
 // The breakpoint is 700px, not Tailwind's md (768px): the setup window is a fixed 760px wide and
 // must show the rail.
@@ -15,11 +15,14 @@ export type NavItem = { id: string; label: string; icon: LucideIcon };
 export function Shell({
   steps,
   current,
+  dimmed = false,
   nav,
   children,
 }: {
   steps?: string[];
   current?: number;
+  /** The steps are shown for orientation only: a window that has no flow to follow. */
+  dimmed?: boolean;
   /** Sections to choose from, for the settings of an installed agent. */
   nav?: { label: string; items: NavItem[]; current: string; onSelect: (id: string) => void };
   children: React.ReactNode;
@@ -33,7 +36,10 @@ export function Shell({
         </div>
         <Barcode className="mx-1 h-3.5 text-white/30" />
         {steps && (
-          <ol className="mt-2 flex gap-4 min-[700px]:flex-col min-[700px]:gap-3">
+          <ol
+            aria-hidden={dimmed || undefined}
+            className={cn("mt-2 flex gap-4 min-[700px]:flex-col min-[700px]:gap-3", dimmed && "opacity-40")}
+          >
             {steps.map((label, n) => {
               const done = n < (current ?? 0);
               const on = n === current;
@@ -141,6 +147,20 @@ export function AgentStateLine({ state }: { state: AgentStatus["state"] }) {
     <span className={cn("inline-flex items-center gap-1.5 font-medium", cls)}>
       <Icon className="size-4" />
       {statusWord(state)}
+    </span>
+  );
+}
+
+/** A file path that wraps only after a separator, so a file name is never cut in the middle. */
+export function Path({ path, className }: { path: string; className?: string }) {
+  return (
+    <span className={cn("font-mono text-xs", className)}>
+      {pathParts(path).map((part, n) => (
+        <span key={n} className="whitespace-nowrap">
+          {part}
+          <wbr />
+        </span>
+      ))}
     </span>
   );
 }

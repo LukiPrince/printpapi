@@ -102,6 +102,24 @@ export function statusWord(state: AgentStatus["state"]): string {
   }
 }
 
+/**
+ * The "Last job" line of the overview. A missing job reads "none yet" only when the agent runs; an
+ * agent that is not running has reported nothing, so the value is "—" like the other fields.
+ */
+export function lastJobText(
+  state: AgentStatus["state"],
+  job: AgentStatus["lastJob"],
+  ago: (ts: number) => string,
+): string {
+  if (job) return `#${job.id} ${job.ok ? "printed" : "failed"}, ${ago(job.at)}`;
+  return state === "not_running" ? "—" : "none yet";
+}
+
+/** A path in pieces that may be broken between, each ending in its separator, so a file name stays whole. */
+export function pathParts(path: string): string[] {
+  return path.match(/[^\\/]+[\\/]?|[\\/]/g) ?? [];
+}
+
 /** An address the way the agent reads it: no space, no slash at the end, the host in lower case. */
 function normalizedServer(url: string): string {
   return url.trim().replace(/\/+$/, "").toLowerCase();

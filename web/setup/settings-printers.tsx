@@ -17,7 +17,7 @@ export function PrintersSection({ status, onChange }: { status: AgentStatus | nu
         <CardTitle>Printers</CardTitle>
         <CardDescription>
           Add or remove printers, change their kind, print a test. You will be asked for administrator
-          rights once. A newer setup file updates the agent when you apply a change.
+          rights once.
         </CardDescription>
       </CardHeader>
       <CardContent className="space-y-3">

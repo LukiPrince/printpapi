@@ -5,6 +5,7 @@ import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/com
 import { Skeleton } from "@/components/ui/skeleton";
 import { fmtAgo } from "@/lib/format";
 import type { AgentStatus } from "./api";
+import { lastJobText } from "./model";
 import { AgentStateLine, Notice } from "./bits";
 
 /** The first section: whether the agent runs, and what it last did. Reads the status file only. */
@@ -12,7 +13,6 @@ export function Overview({ status, error }: { status: AgentStatus | null; error:
   if (!status) {
     return error ? <Notice tone="error">{error}</Notice> : <Skeleton className="h-48 w-full" />;
   }
-  const { lastJob } = status;
   return (
     <Card>
       <CardHeader>
@@ -39,7 +39,7 @@ export function Overview({ status, error }: { status: AgentStatus | null; error:
           <dt className="text-muted-foreground">Last contact</dt>
           <dd>{fmtAgo(status.lastContact)}</dd>
           <dt className="text-muted-foreground">Last job</dt>
-          <dd>{lastJob ? `#${lastJob.id} ${lastJob.ok ? "printed" : "failed"}, ${fmtAgo(lastJob.at)}` : "none yet"}</dd>
+          <dd>{lastJobText(status.state, status.lastJob, fmtAgo)}</dd>
           <dt className="text-muted-foreground">Agent version</dt>
           <dd className="font-mono">{status.version || "—"}</dd>
         </dl>

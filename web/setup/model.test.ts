@@ -1,7 +1,7 @@
 // printpapi — self-hosted PrintNode alternative. Elastic License 2.0 (see LICENSE).
 import test from "node:test";
 import assert from "node:assert/strict";
-import { DEFAULT_RAW_PORT, addNetworkPrinter, canLeavePrinters, canSwitchOn, canTest, connectMayHelp, errorText, fromFound, logLocation, needsNewName, needsSumatra, patchFor, returnsToConnect, statusWord, timeoutProblem } from "./model.ts";
+import { DEFAULT_RAW_PORT, addNetworkPrinter, canLeavePrinters, canSwitchOn, canTest, connectMayHelp, errorText, fromFound, lastJobText, logLocation, needsNewName, needsSumatra, patchFor, pathParts, returnsToConnect, statusWord, timeoutProblem } from "./model.ts";
 import type { FoundPrinter, PrinterChoice } from "./api.ts";
 
 const choice = (over: Partial<PrinterChoice> = {}): PrinterChoice => ({
@@ -197,4 +197,27 @@ test("the timeout must be a number the agent accepts", () => {
   for (const bad of ["", "abc", "6x", "Infinity", "-1"]) {
     assert.notEqual(timeoutProblem(bad), null, bad);
   }
+});
+
+test("the last job says none yet only while the agent runs", () => {
+  const ago = (ts: number) => `at ${ts}`;
+  const job = { id: 7, ok: true, at: 100 };
+  assert.equal(lastJobText("online", job, ago), "#7 printed, at 100");
+  assert.equal(lastJobText("offline", { ...job, ok: false }, ago), "#7 failed, at 100");
+  assert.equal(lastJobText("online", null, ago), "none yet");
+  assert.equal(lastJobText("offline", null, ago), "none yet");
+  // an agent that is not running has told nothing: the value is missing, not "none"
+  assert.equal(lastJobText("not_running", null, ago), "—");
+  assert.equal(lastJobText("not_running", job, ago), "#7 printed, at 100");
+});
+
+test("a path breaks only after a separator", () => {
+  assert.deepEqual(pathParts("C:\\ProgramData\\printpapi-agent\\print_agent-error.log"), [
+    "C:\\",
+    "ProgramData\\",
+    "printpapi-agent\\",
+    "print_agent-error.log",
+  ]);
+  assert.deepEqual(pathParts("/var/lib/x.log"), ["/", "var/", "lib/", "x.log"]);
+  assert.deepEqual(pathParts("plain"), ["plain"]);
 });

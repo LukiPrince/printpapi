@@ -97,7 +97,7 @@ export function SumatraSection({ platform, onApplied }: { platform: Platform; on
         </CardDescription>
       </CardHeader>
       <CardContent className="space-y-3">
-        {present && (
+        {present && run.at !== "done" && (
           <p className="flex items-center gap-2 text-sm">
             <CircleCheck className="size-4 text-state-done" /> SumatraPDF is installed.
           </p>
@@ -108,7 +108,12 @@ export function SumatraSection({ platform, onApplied }: { platform: Platform; on
             checked before it is installed. You will be asked for administrator rights.
           </p>
         )}
-        <RunNotice run={run} platform={platform} onKeepWaiting={() => keepWaiting()} />
+        <RunNotice
+          run={run}
+          platform={platform}
+          onKeepWaiting={() => keepWaiting()}
+          doneText="SumatraPDF is installed. PDF jobs can print now."
+        />
         {present === false && (
           <Actions>
             <Button type="button" variant="brand" disabled={busy} onClick={() => void install()}>
