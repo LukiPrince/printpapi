@@ -3,6 +3,7 @@
 //! the crash log. It never holds the key or a header value, so every local user may read it. The
 //! agent opens no port and takes no command; the icon only reads this file.
 
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use serde_json::{Value, json};
@@ -73,6 +74,104 @@ pub fn status_dir_in(os: Os, program_data: &Path) -> PathBuf {
 /// The status folder on this machine.
 pub fn status_dir(os: Os) -> PathBuf {
     status_dir_in(os, &program_data())
+}
+
+/// Who owns a folder, as far as [`distrust`] cares.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DirOwner {
+    /// Unix: the user id.
+    Uid(u32),
+    /// Windows: the owner as an `S-1-5-...` text.
+    Sid(String),
+    /// The owner could not be read.
+    Unknown,
+}
+
+/// What the agent looks at before it writes into its status folder.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DirFacts {
+    pub is_dir: bool,
+    /// A symbolic link or, on Windows, any reparse point (a junction is one).
+    pub is_link: bool,
+    pub owner: DirOwner,
+}
+
+/// Why the agent must not write its status file and its log into a folder, `None` when it may:
+/// the folder exists, is no link and belongs to whoever the install makes it belong to (`uids`:
+/// root and, on Linux, the service user; on Windows SYSTEM and Administrators). The agent runs as
+/// SYSTEM or root, and where `%ProgramData%` lets every user create a folder, a user could have
+/// made this one first, as a junction, and have the agent's writes land where it points. Pure.
+pub fn distrust(facts: Option<&DirFacts>, uids: &[u32]) -> Option<&'static str> {
+    let Some(f) = facts else {
+        return Some("is missing");
+    };
+    if f.is_link {
+        return Some("is a link");
+    }
+    if !f.is_dir {
+        return Some("is not a folder");
+    }
+    let trusted = match &f.owner {
+        DirOwner::Uid(u) => uids.contains(u),
+        DirOwner::Sid(sid) => crate::apply::trusted_windows_owner(sid),
+        DirOwner::Unknown => false,
+    };
+    (!trusted).then_some("is owned by somebody else")
+}
+
+/// The facts about `dir`, without following a link; `None` when it cannot be looked at.
+pub fn inspect_dir(dir: &Path) -> Option<DirFacts> {
+    let meta = std::fs::symlink_metadata(dir).ok()?;
+    Some(DirFacts {
+        is_dir: meta.is_dir(),
+        is_link: crate::apply::is_link(&meta),
+        owner: owner_of(dir, &meta),
+    })
+}
+
+#[cfg(unix)]
+fn owner_of(_: &Path, meta: &std::fs::Metadata) -> DirOwner {
+    use std::os::unix::fs::MetadataExt;
+    DirOwner::Uid(meta.uid())
+}
+
+#[cfg(windows)]
+fn owner_of(dir: &Path, _: &std::fs::Metadata) -> DirOwner {
+    crate::apply::dir_owner_sid(dir).map_or(DirOwner::Unknown, DirOwner::Sid)
+}
+
+/// The user ids that may own the status folder of `os`: root, and on Linux the service user. Empty
+/// on Windows, where owners are SIDs.
+#[cfg(unix)]
+pub fn trusted_uids(os: Os) -> Vec<u32> {
+    let mut uids = vec![0];
+    if os == Os::Linux
+        && let Ok(name) = std::ffi::CString::new(crate::install::SERVICE_USER)
+    {
+        // SAFETY: `name` is a valid C string; the returned record is read at once, before any
+        // other call could reuse it
+        let entry = unsafe { libc::getpwnam(name.as_ptr()) };
+        if !entry.is_null() {
+            uids.push(unsafe { (*entry).pw_uid });
+        }
+    }
+    uids
+}
+
+#[cfg(not(unix))]
+pub fn trusted_uids(_: Os) -> Vec<u32> {
+    Vec::new()
+}
+
+/// May the agent write its status file and its log into `dir`? `Err` says why not.
+// ponytail: the folder can still be swapped between this look and the first write. The folder is
+// in a place only administrators (and the service user) can change once the install has set its
+// rights, so the gap is for somebody who already is one.
+pub fn usable_status_dir(dir: &Path, os: Os) -> Result<(), &'static str> {
+    match distrust(inspect_dir(dir).as_ref(), &trusted_uids(os)) {
+        None => Ok(()),
+        Some(why) => Err(why),
+    }
 }
 
 /// Seconds since the Unix epoch, the time stamps of the status file.
@@ -207,11 +306,23 @@ impl StatusWriter {
 }
 
 /// `status.json` in `dir` via a temporary file in the same folder and a rename, so the tray never
-/// reads half a file. Readable by everybody (Unix: 0644 whatever the umask).
+/// reads half a file. Readable by everybody (Unix: 0644 whatever the umask). The temporary file is
+/// deleted first and created with `create_new`, which refuses to open anything that is there: a
+/// file or link that somebody placed at that name is never written through (the agent can run as
+/// SYSTEM).
 fn write_atomic(dir: &Path, text: &str) -> std::io::Result<()> {
     let tmp = dir.join(TMP_NAME);
     let result = (|| {
-        std::fs::write(&tmp, text)?;
+        match std::fs::remove_file(&tmp) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e),
+            _ => {}
+        }
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp)?;
+        file.write_all(text.as_bytes())?;
+        drop(file);
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -451,6 +562,20 @@ mod tests {
         gone.update(&Status::from_config(&config()), 1.0); // must not panic
     }
 
+    #[test]
+    fn a_file_planted_as_the_temporary_file_is_never_written_through() {
+        let dir = tempfile::tempdir().unwrap();
+        let victim = dir.path().join("victim");
+        std::fs::write(&victim, "precious").unwrap();
+        // a hard link is the same file under two names: writing into it would overwrite the victim
+        std::fs::hard_link(&victim, dir.path().join("status.json.tmp")).unwrap();
+        let mut w = StatusWriter::new(dir.path().to_path_buf());
+        w.update(&Status::from_config(&config()), 1.0);
+        assert_eq!(std::fs::read_to_string(&victim).unwrap(), "precious");
+        assert_eq!(read(dir.path())["name"], "PACKTISCH-1");
+        assert!(!dir.path().join("status.json.tmp").exists());
+    }
+
     #[cfg(unix)]
     #[test]
     fn status_file_is_world_readable() {
@@ -469,6 +594,85 @@ mod tests {
             .permissions()
             .mode();
         assert_eq!(mode & 0o777, 0o644);
+    }
+
+    fn facts(is_dir: bool, is_link: bool, owner: DirOwner) -> Option<DirFacts> {
+        Some(DirFacts {
+            is_dir,
+            is_link,
+            owner,
+        })
+    }
+
+    #[test]
+    fn the_status_folder_is_trusted_only_when_the_system_owns_a_real_folder() {
+        let uids = [0, 996];
+        let sid = |s: &str| DirOwner::Sid(s.to_string());
+        // root, or the service user; SYSTEM or Administrators
+        for owner in [
+            DirOwner::Uid(0),
+            DirOwner::Uid(996),
+            sid("S-1-5-18"),
+            sid("S-1-5-32-544"),
+        ] {
+            let f = facts(true, false, owner.clone());
+            assert_eq!(distrust(f.as_ref(), &uids), None, "{owner:?}");
+        }
+        // any other owner: a user made the folder first
+        for owner in [
+            DirOwner::Uid(1000),
+            sid("S-1-5-21-1-2-3-1001"),
+            sid("S-1-5-32-545"),
+            DirOwner::Unknown,
+        ] {
+            let f = facts(true, false, owner.clone());
+            assert_eq!(
+                distrust(f.as_ref(), &uids),
+                Some("is owned by somebody else"),
+                "{owner:?}"
+            );
+        }
+        // a link or a reparse point is never followed, whoever owns it
+        assert_eq!(
+            distrust(facts(true, true, DirOwner::Uid(0)).as_ref(), &uids),
+            Some("is a link")
+        );
+        assert_eq!(
+            distrust(facts(false, false, DirOwner::Uid(0)).as_ref(), &uids),
+            Some("is not a folder")
+        );
+        // the agent never makes the folder: missing is not usable
+        assert_eq!(distrust(None, &uids), Some("is missing"));
+    }
+
+    #[test]
+    fn inspect_reads_what_the_decision_needs() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = inspect_dir(dir.path()).unwrap();
+        assert!(f.is_dir && !f.is_link);
+        #[cfg(unix)]
+        assert_eq!(f.owner, DirOwner::Uid(unsafe { libc::geteuid() }));
+        #[cfg(windows)]
+        assert!(
+            matches!(&f.owner, DirOwner::Sid(s) if s.starts_with("S-1-5-")),
+            "{f:?}"
+        );
+        assert!(inspect_dir(&dir.path().join("gone")).is_none());
+        // a link (a junction on Windows) is reported as one, not followed
+        let link = dir.path().join("link");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(dir.path(), &link).unwrap();
+        #[cfg(windows)]
+        {
+            let out = std::process::Command::new("cmd")
+                .args(["/C", "mklink", "/J"])
+                .arg(&link)
+                .arg(dir.path())
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "{out:?}");
+        }
+        assert!(inspect_dir(&link).unwrap().is_link);
     }
 
     #[test]

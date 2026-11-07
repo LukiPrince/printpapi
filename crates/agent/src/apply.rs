@@ -137,7 +137,7 @@ pub fn verify_sha256(path: &Path, expected_hex: &str) -> Result<(), String> {
 }
 
 /// A symlink, or on Windows any reparse point (a junction is not a symlink to Rust).
-fn is_link(meta: &std::fs::Metadata) -> bool {
+pub(crate) fn is_link(meta: &std::fs::Metadata) -> bool {
     #[cfg(windows)]
     {
         use std::os::windows::fs::MetadataExt;
@@ -605,16 +605,7 @@ fn start_agent(env: &Env) -> Result<(), ApplyError> {
 fn status_dir_owners(os: Os) -> Vec<u32> {
     // SAFETY: geteuid has no arguments and cannot fail
     let mut owners = vec![unsafe { libc::geteuid() }];
-    if os == Os::Linux
-        && let Ok(name) = std::ffi::CString::new(install::SERVICE_USER)
-    {
-        // SAFETY: `name` is a valid C string; the returned record is read at once, before any
-        // other call could reuse it
-        let entry = unsafe { libc::getpwnam(name.as_ptr()) };
-        if !entry.is_null() {
-            owners.push(unsafe { (*entry).pw_uid });
-        }
-    }
+    owners.extend(crate::status::trusted_uids(os));
     owners
 }
 
@@ -628,8 +619,7 @@ fn status_dir_owners(_: Os) -> Vec<u32> {
 /// made first is theirs (they hold WRITE_DAC as owner, and icacls `/grant:r` leaves explicit
 /// entries for other SIDs alone), so it has to go, not be fixed up. Pure, so it is tested on every
 /// system.
-#[cfg_attr(not(windows), allow(dead_code))]
-fn trusted_windows_owner(sid: &str) -> bool {
+pub(crate) fn trusted_windows_owner(sid: &str) -> bool {
     let star = format!("*{sid}");
     star == install::SID_ADMINISTRATORS || star == install::SID_SYSTEM
 }
@@ -640,7 +630,7 @@ fn trusted_windows_owner(sid: &str) -> bool {
 /// https://learn.microsoft.com/en-us/windows/win32/api/sddl/nf-sddl-convertsidtostringsidw
 /// (the text is released with `LocalFree` too).
 #[cfg(windows)]
-fn dir_owner_sid(dir: &Path) -> std::io::Result<String> {
+pub(crate) fn dir_owner_sid(dir: &Path) -> std::io::Result<String> {
     use std::os::windows::ffi::OsStrExt;
     use std::ptr::null_mut;
     use windows_sys::Win32::Foundation::{ERROR_SUCCESS, LocalFree};
@@ -752,6 +742,28 @@ fn foreign_status_dir(dir: &Path) -> ApplyError {
     ))
 }
 
+/// Windows: delete everything in the freshly made status folder but a real log file. Between the
+/// creation of the folder and the icacls calls every user may create files in it
+/// (`%ProgramData%` lets them), and the rights set afterwards are not inherited by what is in it
+/// already (`icacls` without `/T` changes the folder only). A planted `status.json.tmp`, or a link
+/// under any of the agent's file names, would be taken over by the agent, which runs as SYSTEM. The
+/// agent is stopped while this runs, and it writes its status again within seconds of its start.
+/// Only a log that is a plain file (no link) stays, so the history of earlier runs survives a
+/// change of the printers.
+fn purge_status_dir(dir: &Path) -> std::io::Result<()> {
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        // `DirEntry::metadata` does not follow links
+        let meta = entry.metadata()?;
+        let log = entry.file_name() == std::ffi::OsStr::new(crate::log::LOG_NAME);
+        if log && meta.is_file() && !is_link(&meta) {
+            continue;
+        }
+        remove_tree(&entry.path())?;
+    }
+    Ok(())
+}
+
 /// Make the status folder (readable for everybody, writable for the agent only).
 fn prepare_status_dir(env: &Env) -> Result<(), ApplyError> {
     let dir = &env.layout.status_dir;
@@ -760,6 +772,11 @@ fn prepare_status_dir(env: &Env) -> Result<(), ApplyError> {
     set_mode(dir, 0o755).map_err(|e| system("cannot set the status folder's rights", e))?;
     for c in install::status_dir_cmds(env.os, &env.layout, &env.sys) {
         (env.run)(&c).map_err(|e| system("cannot set the status folder's rights", e))?;
+    }
+    // ponytail: Windows only. Elsewhere the folder is made under `/var/lib` or `/Library/Application
+    // Support`, which no user can write to, so nobody can slip a file in before the rights are set.
+    if env.os == Os::Windows {
+        purge_status_dir(dir).map_err(|e| system("cannot clean the status folder", e))?;
     }
     Ok(())
 }
@@ -1122,6 +1139,9 @@ mod tests {
         failing: Rc<RefCell<Vec<String>>>,
         /// what the check "is the agent still running?" answers
         running: Rc<std::cell::Cell<bool>>,
+        /// files that appear at the moment a command containing the text runs (what a user can
+        /// do between two commands of the install)
+        plant: Rc<RefCell<Vec<(String, PathBuf)>>>,
         run: Runner,
         http_for: HttpFor,
         sleep: Box<dyn Fn(u64)>,
@@ -1177,8 +1197,14 @@ mod tests {
             let settings: Rc<RefCell<Vec<HttpSettings>>> = Rc::default();
             let failing: Rc<RefCell<Vec<String>>> = Rc::default();
             let running: Rc<std::cell::Cell<bool>> = Rc::default();
+            let plant: Rc<RefCell<Vec<(String, PathBuf)>>> = Rc::default();
             let run: Runner = {
-                let (events, failing, running) = (events.clone(), failing.clone(), running.clone());
+                let (events, failing, running, plant) = (
+                    events.clone(),
+                    failing.clone(),
+                    running.clone(),
+                    plant.clone(),
+                );
                 let layout = layout.clone();
                 Rc::new(move |c| {
                     let line = c.argv.join(" ");
@@ -1201,6 +1227,11 @@ mod tests {
                         ));
                     }
                     events.borrow_mut().push(note);
+                    for (when, path) in plant.borrow().iter() {
+                        if line.contains(when.as_str()) {
+                            let _ = std::fs::write(path, b"planted by a user");
+                        }
+                    }
                     // success of the check means "still running"; the agent is stopped by default
                     if install::running_check(os).as_ref() == Some(c) {
                         return if running.get() {
@@ -1249,6 +1280,7 @@ mod tests {
                 settings,
                 failing,
                 running,
+                plant,
                 run,
                 http_for,
                 sleep: Box::new(|_| {}),
@@ -2678,6 +2710,60 @@ mod tests {
         ));
         assert!(owner.is_some() && grant.is_some(), "{ev}");
         assert!(owner < grant, "{ev}");
+    }
+
+    #[test]
+    fn a_file_a_user_slips_into_the_new_windows_status_folder_is_deleted_after_the_rights_are_set()
+    {
+        let fx = Fixture::new(Os::Windows);
+        let dir = &fx.layout.status_dir;
+        // %ProgramData% lets every user create files in a folder that was just made, until the
+        // rights are set: once before the first icacls call, once between the two
+        let (early, late) = (dir.join("status.json.tmp"), dir.join("status.json"));
+        fx.plant
+            .borrow_mut()
+            .push(("/setowner".into(), early.clone()));
+        fx.plant
+            .borrow_mut()
+            .push(("/inheritance:r".into(), late.clone()));
+        fx.plant
+            .borrow_mut()
+            .push(("/inheritance:r".into(), dir.join("evil.dll")));
+        apply(&fx.staging, &fx.env()).unwrap();
+        for planted in [&early, &late, &dir.join("evil.dll")] {
+            assert!(!planted.exists(), "{planted:?} survived");
+        }
+        assert!(dir.is_dir());
+    }
+
+    #[test]
+    fn the_status_folder_purge_keeps_only_a_real_log_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("status");
+        std::fs::create_dir(&dir).unwrap();
+        let elsewhere = tmp.path().join("elsewhere");
+        std::fs::create_dir(&elsewhere).unwrap();
+        std::fs::write(elsewhere.join("precious"), b"x").unwrap();
+        std::fs::write(dir.join("print_agent-error.log"), b"earlier run").unwrap();
+        std::fs::write(dir.join("status.json"), b"{}").unwrap();
+        std::fs::write(dir.join("status.json.tmp"), b"{").unwrap();
+        std::fs::write(dir.join("evil.exe"), b"x").unwrap();
+        std::fs::create_dir(dir.join("sub")).unwrap();
+        std::fs::write(dir.join("sub").join("inner"), b"x").unwrap();
+        link_dir(&dir.join("junction"), &elsewhere);
+        purge_status_dir(&dir).unwrap();
+        let mut left: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        left.sort();
+        assert_eq!(left, ["print_agent-error.log"]);
+        assert_eq!(
+            std::fs::read(dir.join("print_agent-error.log")).unwrap(),
+            b"earlier run"
+        );
+        // a link is removed, never followed
+        assert!(elsewhere.join("precious").is_file());
     }
 
     #[test]

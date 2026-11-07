@@ -205,10 +205,28 @@ fn setup_data_dir(base_dir: &Path, os: install::Os) -> Option<PathBuf> {
         .then(|| status::status_dir(os))
 }
 
-/// The folder only if it exists. Setup creates it with its permissions; an agent must not create
-/// one that setup did not, and a log line sent to a missing folder would be lost.
-fn existing_dir(dir: &Option<PathBuf>) -> Option<&PathBuf> {
-    dir.as_ref().filter(|d| d.is_dir())
+/// The folder only if the agent may use it: it exists, is no link and belongs to SYSTEM or the
+/// administrators (root, the service user). Setup creates it with its permissions; an agent must
+/// not create one that setup did not, a log line sent to a missing folder would be lost, and a
+/// folder that a user made first (a junction, say) would send what the agent writes as SYSTEM
+/// wherever that user wants. Otherwise nothing is written there and `refused` hears why: the log
+/// then stays where it was before the setup existed.
+fn vetted_dir(
+    dir: Option<PathBuf>,
+    usable: &dyn Fn(&Path) -> Result<(), &'static str>,
+    refused: &dyn Fn(&str),
+) -> Option<PathBuf> {
+    let dir = dir?;
+    match usable(&dir) {
+        Ok(()) => Some(dir),
+        Err(why) => {
+            refused(&format!(
+                "status folder {} {why}; no status file and no log are written there",
+                dir.display()
+            ));
+            None
+        }
+    }
 }
 
 /// Longest stretch the register back-off sleeps without letting the status writer refresh its
@@ -228,8 +246,13 @@ fn sleep_ticking(secs: u64, sleep: &dyn Fn(u64), tick: &dyn Fn()) {
 
 /// The agent: load `<base_dir>/agent.ini`, register, poll forever. Only returns on failure.
 pub fn run(base_dir: &Path) -> Result<(), Fatal> {
-    let data_dir = setup_data_dir(base_dir, install::Os::host());
-    if let Some(dir) = existing_dir(&data_dir) {
+    let os = install::Os::host();
+    let data_dir = vetted_dir(
+        setup_data_dir(base_dir, os),
+        &|dir| status::usable_status_dir(dir, os),
+        &log::log_error,
+    );
+    if let Some(dir) = &data_dir {
         log::set_log_dir(dir.clone());
     }
     let cfg = Config::load(base_dir).map_err(Fatal::Exit)?;
@@ -519,13 +542,44 @@ printers=p
     }
 
     #[test]
-    fn the_log_only_moves_into_a_folder_that_exists() {
+    fn the_status_folder_is_only_used_when_it_may_be() {
+        let told = RefCell::new(Vec::new());
+        let refused = |m: &str| told.borrow_mut().push(m.to_string());
+        let dir = PathBuf::from("/var/lib/printpapi-agent");
+        assert_eq!(
+            vetted_dir(Some(dir.clone()), &|_| Ok(()), &refused),
+            Some(dir.clone())
+        );
+        assert!(told.borrow().is_empty());
+        // missing, a link or somebody else's: not used, and the reason is logged
+        assert_eq!(
+            vetted_dir(Some(dir.clone()), &|_| Err("is a link"), &refused),
+            None
+        );
+        assert_eq!(told.borrow().len(), 1);
+        assert!(told.borrow()[0].contains("is a link"), "{told:?}");
+        assert!(told.borrow()[0].contains("printpapi-agent"), "{told:?}");
+        // no setup-installed agent at all: nothing to look at, nothing to say
+        assert_eq!(
+            vetted_dir(None, &|_| panic!("nothing to look at"), &refused),
+            None
+        );
+        assert_eq!(told.borrow().len(), 1);
+    }
+
+    #[test]
+    fn a_folder_that_is_not_there_is_not_made_up() {
         let dir = tempfile::tempdir().unwrap();
-        let there = Some(dir.path().to_path_buf());
-        assert_eq!(existing_dir(&there), there.as_ref());
-        // a missing folder (setup has not made it, or it was deleted) keeps the old log place
-        assert_eq!(existing_dir(&Some(dir.path().join("gone"))), None);
-        assert_eq!(existing_dir(&None), None);
+        let told = RefCell::new(Vec::new());
+        let gone = dir.path().join("gone");
+        let got = vetted_dir(
+            Some(gone.clone()),
+            &|d| status::usable_status_dir(d, install::Os::host()),
+            &|m| told.borrow_mut().push(m.to_string()),
+        );
+        assert_eq!(got, None);
+        assert!(!gone.exists());
+        assert!(told.borrow()[0].contains("is missing"), "{told:?}");
     }
 
     #[test]
