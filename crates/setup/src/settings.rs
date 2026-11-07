@@ -156,10 +156,18 @@ pub fn status_from_file(path: &Path, now: SystemTime) -> AgentStatus {
 
 /// Has the agent made contact with its server after `baseline` (seconds since the epoch of this
 /// machine)? The wait after a change of settings: the window has no key, so it cannot ask the
-/// server, and the agent writes `last_contact` itself when it registers and polls.
+/// server, and the agent writes `last_contact` itself when it registers and polls. The process
+/// must also have started after `baseline` (`started_at`): a restart takes its baseline before the
+/// command that ends the old process, which can still write a contact in the meantime. A file
+/// without `started_at` (an agent from before it) is judged by the contact alone.
 pub fn online_since(text: Option<&str>, now: f64, baseline: f64) -> bool {
     let status = parse_status(text, now);
-    status.state == AgentState::Online && status.last_contact.is_some_and(|at| at > baseline)
+    let started_at = text
+        .and_then(|t| serde_json::from_str::<serde_json::Value>(t).ok())
+        .and_then(|v| v["started_at"].as_f64());
+    status.state == AgentState::Online
+        && status.last_contact.is_some_and(|at| at > baseline)
+        && started_at.is_none_or(|at| at > baseline)
 }
 
 /// `online_since` for the status file at `path`.
@@ -475,6 +483,23 @@ mod tests {
         ));
         assert!(!online_since(None, NOW, 0.0));
         assert!(!online_since(Some("{"), NOW, 0.0));
+    }
+
+    #[test]
+    fn the_wait_needs_a_process_that_started_after_the_change() {
+        // a restart takes its baseline before the command that also ends the old process: that one
+        // can still write a contact in between, and only the new process started after it
+        let with_start = |started_at: f64| {
+            let mut v: serde_json::Value =
+                serde_json::from_str(&file("online", NOW - 1.0)).unwrap();
+            v["started_at"] = json!(started_at);
+            v.to_string()
+        };
+        let baseline = NOW - 5.0;
+        assert!(!online_since(Some(&with_start(NOW - 600.0)), NOW, baseline));
+        assert!(online_since(Some(&with_start(NOW - 4.0)), NOW, baseline));
+        // a file without the field (an agent from before it) is judged by its contact alone
+        assert!(online_since(Some(&file("online", NOW - 1.0)), NOW, baseline));
     }
 
     #[test]
