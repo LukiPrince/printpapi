@@ -7,6 +7,10 @@ use printpapi_agent::{Fatal, err_line, install_panic_hook, log, run};
 
 fn main() -> ExitCode {
     install_panic_hook();
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if let Some(code) = printpapi_agent::apply::cli(&args) {
+        return code;
+    }
     let base_dir = std::env::current_exe()
         .ok()
         .and_then(|p| p.parent().map(|d| d.to_path_buf()))

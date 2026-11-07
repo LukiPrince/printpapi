@@ -28,6 +28,12 @@ pub enum HttpError {
     Value(String),
 }
 
+/// The status code of a `server returned NNN` error, `None` for any other failure.
+pub fn http_status(e: &HttpError) -> Option<u16> {
+    let HttpError::Os(m) = e else { return None };
+    m.strip_prefix("server returned ")?.parse().ok()
+}
+
 impl fmt::Display for HttpError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -334,6 +340,36 @@ mod tests {
     }
 
     const OK_JSON: &str = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 12\r\nConnection: close\r\n\r\n{\"ok\": true}";
+
+    #[test]
+    fn http_status_reads_only_status_errors() {
+        assert_eq!(
+            http_status(&HttpError::Os("server returned 409".into())),
+            Some(409)
+        );
+        assert_eq!(
+            http_status(&HttpError::Os("server returned 503".into())),
+            Some(503)
+        );
+        assert_eq!(
+            http_status(&HttpError::Os(
+                "connection failed: server returned 409".into()
+            )),
+            None
+        );
+        assert_eq!(
+            http_status(&HttpError::Os("connection failed: timed out".into())),
+            None
+        );
+        assert_eq!(
+            http_status(&HttpError::Os("server returned abc".into())),
+            None
+        );
+        assert_eq!(
+            http_status(&HttpError::Value("server returned 409".into())),
+            None
+        );
+    }
 
     #[test]
     fn test_req_sends_extra_headers_and_timeout() {

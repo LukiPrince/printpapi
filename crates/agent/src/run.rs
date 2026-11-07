@@ -68,7 +68,7 @@ pub fn build_printer_map(printers: &[Printer], reg: &Value) -> Result<PrinterMap
     Ok(PrinterMap(map))
 }
 
-fn register(
+pub fn register(
     http: &dyn Http,
     base: &str,
     key: &str,

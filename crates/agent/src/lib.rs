@@ -2,6 +2,7 @@
 //! The printpapi agent: runs on the machine with the printers, registers them with the server,
 //! then long-polls for jobs, prints them and reports the result. Outbound connections only.
 
+pub mod apply;
 pub mod backend_cups;
 pub mod backend_windows;
 pub mod client;

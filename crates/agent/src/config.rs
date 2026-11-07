@@ -53,7 +53,7 @@ const CP1252_HIGH: [char; 32] = [
 /// first (BOM dropped), cp1252 when that fails.
 // ponytail: a UTF-8 file with non-ASCII was mojibake under Python on Windows; it reads correctly
 // now, so such a printer name changes. Only cp1252, not other ANSI code pages.
-fn decode_ini(bytes: &[u8]) -> String {
+pub fn decode_ini(bytes: &[u8]) -> String {
     match std::str::from_utf8(bytes) {
         Ok(t) => t.strip_prefix('\u{feff}').unwrap_or(t).to_string(),
         Err(_) => bytes
