@@ -24,6 +24,7 @@ export function StepConnect({
   initial,
   replacing = null,
   notice,
+  onCancel,
   onNext,
 }: {
   initial: Connection | null;
@@ -31,6 +32,8 @@ export function StepConnect({
   replacing?: Replacing | null;
   /** Shown when the install sent the window back here. */
   notice?: string | null;
+  /** Leaves the flow without a change; given when an installed agent is being changed. */
+  onCancel?: () => void;
   onNext: (c: Connection) => void;
 }) {
   const [serverUrl, setServerUrl] = useState(initial?.serverUrl ?? "");
@@ -172,6 +175,11 @@ export function StepConnect({
           {error && <Notice tone="error">{error}</Notice>}
 
           <Actions>
+            {onCancel && (
+              <Button type="button" variant="ghost" onClick={onCancel}>
+                Cancel
+              </Button>
+            )}
             <Button type="submit" variant="brand" disabled={!filled || busy || askInsecure}>
               {busy ? <Loader2 className="animate-spin" /> : <Plug />}
               {nameTaken ? "Continue" : "Connect"}

@@ -6,6 +6,7 @@ import { Eye, Loader2, Plus, Rocket, X } from "lucide-react";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
+import { Textarea } from "@/components/ui/textarea";
 import { FieldLabel } from "@/components/bits";
 import { setup, toSetupError, type AgentStatus, type Platform } from "./api";
 import { errorText, patchFor, timeoutProblem } from "./model";
@@ -132,32 +133,38 @@ function AdvancedForm({
           ) : (
             <ul className="space-y-1.5">
               {headers.map(([name, value]) => (
-                <li key={name} className="flex items-center gap-2 rounded-lg border px-3 py-1.5 text-sm">
-                  <span className="shrink-0 font-mono">{name}</span>
+                <li key={name} className="space-y-1.5 rounded-lg border px-3 py-2 text-sm">
+                  <div className="flex items-center gap-2">
+                    <span className="min-w-0 flex-1 font-mono break-all">{name}</span>
+                    <Button
+                      type="button"
+                      variant="ghost"
+                      size="icon-sm"
+                      aria-label={`Remove header ${name}`}
+                      onClick={() => setHeaders((list) => list.filter(([n]) => n !== name))}
+                    >
+                      <X />
+                    </Button>
+                  </div>
                   {value === null ? (
-                    <span className="min-w-0 flex-1 truncate font-mono text-muted-foreground" aria-label="value hidden">
+                    <p className="font-mono text-muted-foreground" aria-label="value hidden">
                       ••••••••
-                    </span>
+                    </p>
                   ) : (
-                    <Input
+                    <Textarea
                       aria-label={`Value of ${name}`}
-                      className="h-8 min-w-0 flex-1 font-mono"
+                      rows={1}
+                      className="min-h-8 resize-none py-1.5 font-mono break-all"
                       autoComplete="off"
                       value={value}
-                      onChange={(e) =>
-                        setHeaders((list) => list.map(([n, v]) => (n === name ? [n, e.target.value] : [n, v])))
-                      }
+                      // a header value is one line: it wraps in the field, but Enter adds nothing
+                      onKeyDown={(e) => e.key === "Enter" && e.preventDefault()}
+                      onChange={(e) => {
+                        const next = e.target.value.replace(/[\r\n]/g, "");
+                        setHeaders((list) => list.map(([n, v]) => (n === name ? [n, next] : [n, v])));
+                      }}
                     />
                   )}
-                  <Button
-                    type="button"
-                    variant="ghost"
-                    size="icon-sm"
-                    aria-label={`Remove header ${name}`}
-                    onClick={() => setHeaders((list) => list.filter(([n]) => n !== name))}
-                  >
-                    <X />
-                  </Button>
                 </li>
               ))}
             </ul>

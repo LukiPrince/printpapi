@@ -23,8 +23,8 @@ import {
 import { Actions, Notice } from "./bits";
 
 const KINDS = {
-  raw: { label: "Raw (ZPL, ESC/POS)", help: "Zebra, receipt printers. Not DYMO or Brother QL." },
-  pdf: { label: "PDF through its driver", help: "Laser, inkjet, and the label printers DYMO and Brother QL." },
+  raw: { label: "Raw (ZPL, ESC/POS)", help: "For Zebra and receipt printers. Not for DYMO or Brother QL." },
+  pdf: { label: "PDF through its driver", help: "For laser and inkjet printers, and for the label printers DYMO and Brother QL." },
 } as const;
 
 type Row = { name: string; found: FoundPrinter | null; choice: PrinterChoice | null };
@@ -38,6 +38,7 @@ export function StepPrinters({
   onChange,
   onSumatra,
   onBack,
+  onCancel,
   onNext,
 }: {
   platform: Platform;
@@ -47,6 +48,8 @@ export function StepPrinters({
   onChange: (list: PrinterChoice[]) => void;
   onSumatra: () => void;
   onBack?: () => void;
+  /** Leaves the flow without a change, when there is no step to go back to. */
+  onCancel?: () => void;
   onNext: () => void;
 }) {
   const [adding, setAdding] = useState(false);
@@ -113,7 +116,7 @@ export function StepPrinters({
       <CardContent className="space-y-3">
         {found === null ? (
           <p className="text-sm text-muted-foreground">Looking for printers…</p>
-        ) : rows.length === 0 ? (
+        ) : rows.length === 0 && !adding ? (
           <EmptyState
             icon={Printer}
             title="No printers found on this machine"
@@ -166,7 +169,7 @@ export function StepPrinters({
               <Button type="button" variant="ghost" size="sm" onClick={() => setAdding(false)}>
                 Cancel
               </Button>
-              <Button type="submit" size="sm">
+              <Button type="submit" variant="brand" size="sm">
                 Add
               </Button>
             </div>
@@ -201,6 +204,11 @@ export function StepPrinters({
               Back
             </Button>
           )}
+          {onCancel && (
+            <Button type="button" variant="ghost" onClick={onCancel}>
+              Cancel
+            </Button>
+          )}
           <Button type="button" variant="brand" disabled={!canLeavePrinters(selected)} onClick={onNext}>
             Continue
           </Button>
@@ -227,8 +235,8 @@ function PrinterRow({
   const network = choice?.target?.startsWith("socket://") ?? false;
 
   return (
-    <li className={`rounded-lg border px-3 py-2 ${unusable ? "opacity-60" : ""}`}>
-      <div className="flex flex-wrap items-center gap-x-3 gap-y-2">
+    <li className="rounded-lg border px-3 py-2">
+      <div className={`flex flex-wrap items-center gap-x-3 gap-y-2 ${unusable ? "opacity-60" : ""}`}>
         <Switch
           size="sm"
           checked={on}

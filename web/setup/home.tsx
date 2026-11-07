@@ -9,7 +9,7 @@ import { Skeleton } from "@/components/ui/skeleton";
 import { setup, toSetupError, type InstallState, type Platform } from "./api";
 import { errorText } from "./model";
 import { Actions, Notice, Shell } from "./bits";
-import { Wizard } from "./wizard";
+import { NEW_STEPS, Wizard } from "./wizard";
 import { Settings } from "./settings";
 
 type Boot =
@@ -48,7 +48,7 @@ export function Home() {
   }
   if (boot.at === "broken") {
     return (
-      <Shell>
+      <Shell steps={NEW_STEPS} dimmed>
         <Notice tone="error">{boot.message}</Notice>
       </Shell>
     );
@@ -91,7 +91,7 @@ export function Home() {
 
   if (boot.install === "foreign") {
     return (
-      <Shell>
+      <Shell steps={NEW_STEPS} dimmed>
         <Notice tone="warn">
           This computer already runs an agent that was set up by hand, so this setup does not change or
           remove it. Remove it by hand, the way it was set up: see &quot;Run as a service&quot; in
@@ -105,7 +105,7 @@ export function Home() {
   }
   if (boot.install === "unsupported") {
     return (
-      <Shell>
+      <Shell steps={NEW_STEPS} dimmed>
         <Notice tone="warn">
           This Linux does not use systemd. Set up the agent by hand, see docs/agent.md.
         </Notice>

@@ -89,6 +89,7 @@ export function Settings({ platform, onRemoved }: { platform: Platform; onRemove
           setFlow(null);
           void refresh();
         }}
+        onCancel={() => setFlow(null)}
       />
     );
   }

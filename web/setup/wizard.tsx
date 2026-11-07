@@ -9,7 +9,7 @@ import { StepPrinters } from "./step-printers";
 import { StepTest } from "./step-test";
 import { StepFinish } from "./step-finish";
 
-const NEW_STEPS = ["Connect", "Printers", "Test", "Finish"];
+export const NEW_STEPS = ["Connect", "Printers", "Test", "Finish"];
 const CHANGE_STEPS = ["Printers", "Test", "Finish"];
 
 /**
@@ -21,6 +21,7 @@ export function Wizard({
   existing,
   replacing = null,
   onDone,
+  onCancel,
 }: {
   platform: Platform;
   /** Present when the printers of an installed agent are being changed. */
@@ -28,6 +29,8 @@ export function Wizard({
   /** Present when an installed agent gets another server or key: the four steps, from what is known. */
   replacing?: Existing | null;
   onDone: () => void;
+  /** Leaves a change of an installed agent at its first step, with nothing changed. */
+  onCancel?: () => void;
 }) {
   const steps = existing ? CHANGE_STEPS : NEW_STEPS;
   const [i, setI] = useState(0);
@@ -84,6 +87,7 @@ export function Wizard({
           initial={connection}
           replacing={replacing}
           notice={connectNotice}
+          onCancel={replacing ? onCancel : undefined}
           onNext={(c) => {
             setConnection(c);
             setConnectNotice(null);
@@ -100,6 +104,7 @@ export function Wizard({
           onChange={setSelected}
           onSumatra={() => setSumatra(true)}
           onBack={existing ? undefined : back}
+          onCancel={existing ? onCancel : undefined}
           onNext={next}
         />
       )}
