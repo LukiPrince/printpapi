@@ -73,6 +73,7 @@ impl AgentStatus {
 /// the wrong type fails the whole parse: the window then says "not running" and shows nothing.
 #[derive(Deserialize)]
 struct StatusFile {
+    state: String,
     version: String,
     name: String,
     server: String,
@@ -98,9 +99,9 @@ struct PrinterFile {
     target: String,
 }
 
-/// The state with the same rules as the tray icon (`tray::read_state`: a missing file, a broken
-/// one, or an `online` one without a recent contact is "not running"), and the details of the
-/// file where it can be read.
+/// The state with the same rules as the tray icon (`tray::read_state`: a missing file or a broken
+/// one is "not running", an `online` one without a recent contact is offline), and the details of
+/// the file where it can be read.
 pub fn parse_status(text: Option<&str>, now: f64) -> AgentStatus {
     let state = match tray::read_state(text, now).0 {
         TrayState::Online => AgentState::Online,
@@ -110,6 +111,16 @@ pub fn parse_status(text: Option<&str>, now: f64) -> AgentStatus {
     let Some(file) = text.and_then(|t| serde_json::from_str::<StatusFile>(t).ok()) else {
         return AgentStatus::not_running();
     };
+    // an agent that says "online" but has not been in touch for a while (see `tray::read_state`)
+    let silence = (file.state == "online" && state == AgentState::Offline)
+        .then_some(file.last_contact)
+        .flatten()
+        .map(|at| {
+            format!(
+                "No contact with the server for {}.",
+                tray::quiet_for(now - at)
+            )
+        });
     AgentStatus {
         state,
         name: file.name,
@@ -128,7 +139,7 @@ pub fn parse_status(text: Option<&str>, now: f64) -> AgentStatus {
             .collect(),
         timeout: file.timeout,
         header_names: file.header_names,
-        error: file.error,
+        error: file.error.or(silence),
     }
 }
 
@@ -404,16 +415,31 @@ mod tests {
     }
 
     #[test]
-    fn offline_keeps_its_error_and_online_without_a_recent_contact_is_not_running() {
+    fn offline_keeps_its_error_and_a_silent_online_agent_is_offline_with_the_silence() {
         let mut v: Value = serde_json::from_str(&file("offline", NOW - 5.0)).unwrap();
         v["error"] = json!("connection refused");
         let s = parse_status(Some(&v.to_string()), NOW);
         assert_eq!(s.state, AgentState::Offline);
         assert_eq!(s.error.as_deref(), Some("connection refused"));
-        // the file is fresh, but the agent has not talked to the server for ten minutes
+        // the file is young (the agent writes it from a thread of its own), but the agent has not
+        // talked to the server for ten minutes: it runs, and it says what it knows
         let s = parse_status(Some(&file("online", NOW - 600.0)), NOW);
-        assert_eq!(s.state, AgentState::NotRunning);
+        assert_eq!(s.state, AgentState::Offline);
         assert_eq!(s.name, "PACKTISCH-1");
+        assert_eq!(
+            s.error.as_deref(),
+            Some("No contact with the server for 10 min.")
+        );
+        // a better reason in the file wins
+        let mut v: Value = serde_json::from_str(&file("online", NOW - 600.0)).unwrap();
+        v["error"] = json!("poll failed");
+        assert_eq!(
+            parse_status(Some(&v.to_string()), NOW).error.as_deref(),
+            Some("poll failed")
+        );
+        // and a contact in the last two minutes is online without a word
+        let s = parse_status(Some(&file("online", NOW - 100.0)), NOW);
+        assert_eq!((s.state, s.error), (AgentState::Online, None));
     }
 
     #[test]

@@ -181,10 +181,21 @@ pub fn unix_now() -> f64 {
         .map_or(0.0, |d| d.as_secs_f64())
 }
 
+static STARTED_AT: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
+
+/// When this process started, as far as the status file is concerned: the first time anybody asks
+/// (the agent asks right at its start). A restarted agent is a new process with a later value, which
+/// is how a caller tells "restarted" from "the old process wrote again".
+pub fn process_started_at() -> f64 {
+    *STARTED_AT.get_or_init(unix_now)
+}
+
 /// What the agent says about itself. No field can hold the key or a header value.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Status {
     pub version: String,
+    /// Seconds since the epoch at which this process started.
+    pub started_at: f64,
     pub name: String,
     pub server: String,
     /// `"online"` or `"offline"`. "Not running" is the tray's reading of a missing or old file.
@@ -228,6 +239,7 @@ impl Status {
         let server = cfg.get("server_url").ok().flatten().unwrap_or_default();
         Status {
             version: env!("CARGO_PKG_VERSION").to_string(),
+            started_at: process_started_at(),
             name: mask_key(name, &key),
             server: mask_key(without_credentials(server.trim_end_matches('/')), &key),
             state: "offline",
@@ -258,6 +270,7 @@ fn without_credentials(url: &str) -> String {
 pub fn render(s: &Status) -> String {
     json!({
         "version": s.version,
+        "started_at": s.started_at,
         "name": s.name,
         "server": s.server,
         "state": s.state,
@@ -299,9 +312,23 @@ impl StatusWriter {
         {
             return;
         }
+        self.write_now(s, now, key);
+    }
+
+    /// Write `s` whatever was written last. `key` is its `render` without `last_contact`.
+    fn write_now(&mut self, s: &Status, now: f64, key: String) {
         if write_atomic(&self.dir, &render(s)).is_ok() {
             self.last = Some((key, now));
         }
+    }
+
+    /// Write `s` now, changed or not.
+    pub fn refresh(&mut self, s: &Status, now: f64) {
+        let key = render(&Status {
+            last_contact: None,
+            ..s.clone()
+        });
+        self.write_now(s, now, key);
     }
 }
 
@@ -368,6 +395,15 @@ impl Reporter {
         self.flush(now);
     }
 
+    /// The agent is alive: write the last state again whatever the writer last did, so the file
+    /// stays young while the main thread is in a long job or a hanging call. Called from the thread
+    /// of [`spawn_heartbeat`]. Nothing about the state changes, `last_contact` included.
+    pub fn heartbeat(&mut self, now: f64) {
+        if let Some(w) = &mut self.writer {
+            w.refresh(&self.status, now);
+        }
+    }
+
     /// Time has passed with nothing to report (the register back-off): lets the writer refresh
     /// the file, so the tray does not read a waiting agent as a dead one.
     pub fn tick(&mut self, now: f64) {
@@ -399,6 +435,37 @@ impl Reporter {
         }
         self.flush(now);
     }
+}
+
+/// How often the heartbeat thread rewrites the status file. The tray calls a file older than 120 s
+/// "not running", and the agent's main thread can be busy for longer than that: printing a big
+/// job, or waiting on a connection that hangs.
+pub const HEARTBEAT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Rewrite the status file every `every` from a thread of its own, with the state the reporter
+/// holds at that moment. The reporter is locked only for the write, and the thread holds it by a
+/// weak reference: it ends when the reporter is dropped.
+pub fn spawn_heartbeat(
+    reporter: &std::sync::Arc<std::sync::Mutex<Reporter>>,
+    every: std::time::Duration,
+    now: fn() -> f64,
+) -> std::io::Result<std::thread::JoinHandle<()>> {
+    let weak = std::sync::Arc::downgrade(reporter);
+    std::thread::Builder::new()
+        .name("status-heartbeat".into())
+        .spawn(move || {
+            loop {
+                std::thread::sleep(every);
+                let Some(reporter) = weak.upgrade() else {
+                    return;
+                };
+                // a panic elsewhere must not stop the heartbeat
+                reporter
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .heartbeat(now());
+            }
+        })
 }
 
 #[cfg(test)]
@@ -741,6 +808,70 @@ mod tests {
         r.polled(&Ok(None), 3.0);
         r.tick(4.0);
         assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn the_status_says_when_the_process_started() {
+        let a = Status::from_config(&config());
+        let b = Status::from_config(&config());
+        // one value for the whole process, near now; a restarted agent gets a later one
+        assert_eq!(a.started_at, b.started_at);
+        assert!(a.started_at > 1.7e9 && a.started_at <= unix_now());
+        let v: Value = serde_json::from_str(&render(&a)).unwrap();
+        assert_eq!(v["started_at"], a.started_at);
+    }
+
+    #[test]
+    fn a_heartbeat_rewrites_the_last_state_though_nothing_changed() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut r = reporter(dir.path());
+        r.polled(&Ok(None), 100.0);
+        std::fs::remove_file(dir.path().join("status.json")).unwrap();
+        // 5 s later: a tick would not write (unchanged, under the refresh time), a heartbeat does
+        r.tick(105.0);
+        assert!(!dir.path().join("status.json").exists());
+        r.heartbeat(105.0);
+        let v = read(dir.path());
+        assert_eq!(v["state"], "online");
+        // the last state, not a made-up contact
+        assert_eq!(v["last_contact"], 100.0);
+        // and it counts as the last write
+        std::fs::remove_file(dir.path().join("status.json")).unwrap();
+        r.tick(110.0);
+        assert!(!dir.path().join("status.json").exists());
+    }
+
+    #[test]
+    fn a_reporter_without_a_writer_has_no_heartbeat() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut r = Reporter::new(Status::from_config(&config()), None, KEY.to_string());
+        r.heartbeat(1.0);
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn the_heartbeat_thread_refreshes_the_file_while_the_main_thread_is_busy() {
+        use std::sync::{Arc, Mutex};
+        use std::time::{Duration, Instant};
+        let dir = tempfile::tempdir().unwrap();
+        let shared = Arc::new(Mutex::new(reporter(dir.path())));
+        shared.lock().unwrap().polled(&Ok(None), unix_now());
+        let status = dir.path().join("status.json");
+        let beat = spawn_heartbeat(&shared, Duration::from_millis(10), unix_now).unwrap();
+        // a long job or a hanging call: the main thread does nothing with the reporter, and
+        // the file is written again anyway, again and again
+        for round in 0..3 {
+            std::fs::remove_file(&status).unwrap();
+            let end = Instant::now() + Duration::from_secs(5);
+            while !status.exists() && Instant::now() < end {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            assert!(status.exists(), "no refresh in round {round}");
+        }
+        assert_eq!(read(dir.path())["state"], "online");
+        // the thread ends with the reporter instead of living on
+        drop(shared);
+        beat.join().unwrap();
     }
 
     #[test]

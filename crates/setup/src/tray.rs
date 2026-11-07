@@ -29,7 +29,8 @@ use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
 use tauri::tray::{TrayIcon, TrayIconBuilder};
 
 /// A status file that was not written for this long means the agent is not running: the agent
-/// rewrites it at least once a minute.
+/// rewrites it every 30 s from a thread of its own, whatever its main thread is doing. An `online`
+/// agent that has not made contact with the server for this long is shown as offline.
 const STALE_SECS: f64 = 120.0;
 /// The status file is a few hundred bytes; more than this is not read.
 const MAX_STATUS_BYTES: u64 = 64 * 1024;
@@ -68,9 +69,21 @@ fn not_running() -> (TrayState, Option<String>) {
     )
 }
 
+/// How long the agent has been silent, for a line of text: minutes up to two hours, then hours.
+pub fn quiet_for(secs: f64) -> String {
+    if secs < 7200.0 {
+        format!("{} min", (secs / 60.0).floor() as u64)
+    } else {
+        format!("{} h", (secs / 3600.0).floor() as u64)
+    }
+}
+
 /// The state and the line for the first menu item and the tooltip. A file that is missing, cut
-/// off, of the wrong types or without a recent contact (an `online` agent made contact within the
-/// last [`STALE_SECS`]) is "not running".
+/// off or of the wrong types is "not running" (`load_status` also says so for one that is old). An
+/// `online` agent whose last contact is older than [`STALE_SECS`] is offline: the file is young
+/// (the agent writes it from a thread of its own), so it runs, but its main thread is in a long job
+/// or a call that hangs, and the server has not heard from it. One that never made contact is not
+/// `online` at all.
 // ponytail: the second value is always `Some` (the plan's signature); it is a line for every state.
 pub fn read_state(text: Option<&str>, now: f64) -> (TrayState, Option<String>) {
     let Some(view) = text.and_then(|t| serde_json::from_str::<StatusView>(t).ok()) else {
@@ -78,8 +91,15 @@ pub fn read_state(text: Option<&str>, now: f64) -> (TrayState, Option<String>) {
     };
     match view.state.as_str() {
         "online" => {
-            if !view.last_contact.is_some_and(|at| now - at <= STALE_SECS) {
+            let Some(at) = view.last_contact else {
                 return not_running();
+            };
+            if now - at > STALE_SECS {
+                let line = format!(
+                    "Offline: no contact with the server for {}",
+                    quiet_for(now - at)
+                );
+                return (TrayState::Offline, Some(fit(&line)));
             }
             let line = match host_of(&view.server) {
                 Some(host) => format!("Connected to {host}"),
@@ -451,14 +471,37 @@ mod tests {
     }
 
     #[test]
-    fn old_file_is_not_running() {
+    fn a_silent_agent_with_a_young_file_is_offline_not_dead() {
+        // The agent rewrites the file from a thread of its own while its main thread is in a long
+        // job or a call that hangs, so a young file with an old contact is an agent that runs and
+        // has not talked to the server for a while. (The age of the file itself is `load_status`.)
         let just_fresh = status("online", "1794048680.0", "null", "https://p.example.com");
         assert_eq!(read_state(Some(&just_fresh), NOW).0, TrayState::Online);
-        let old = status("online", "1794048679.0", "null", "https://p.example.com");
-        assert_eq!(read_state(Some(&old), NOW).0, TrayState::NotRunning);
-        // an online agent that never made contact is not online
+        let quiet = status("online", "1794048679.0", "null", "https://p.example.com");
+        assert_eq!(
+            read_state(Some(&quiet), NOW),
+            (
+                TrayState::Offline,
+                Some("Offline: no contact with the server for 2 min".to_string())
+            )
+        );
+        let long = status("online", "1794037999.0", "null", "https://p.example.com");
+        assert_eq!(
+            read_state(Some(&long), NOW).1.as_deref(),
+            Some("Offline: no contact with the server for 3 h")
+        );
+        // an online agent that never made contact is not online, and says nothing true either
         let never = status("online", "null", "null", "https://p.example.com");
         assert_eq!(read_state(Some(&never), NOW).0, TrayState::NotRunning);
+    }
+
+    #[test]
+    fn a_silence_is_told_in_minutes_then_hours() {
+        assert_eq!(quiet_for(121.0), "2 min");
+        assert_eq!(quiet_for(600.0), "10 min");
+        assert_eq!(quiet_for(7199.0), "119 min");
+        assert_eq!(quiet_for(7200.0), "2 h");
+        assert_eq!(quiet_for(10801.0), "3 h");
     }
 
     #[test]

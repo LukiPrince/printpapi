@@ -30,11 +30,14 @@ Connection (another server or key), Advanced (`timeout` and the `[headers]` valu
 SumatraPDF (Windows), Restart and Remove. Looking needs no administrator rights; each change asks
 for them once.
 
-- The icon only reads `status.json`, which the agent rewrites at least once a minute: Windows
+- The icon only reads `status.json`, which the agent rewrites every 30 seconds from a thread of
+  its own, so it stays young while a long job prints or a connection hangs: Windows
   `%ProgramData%\printpapi-agent\`, macOS `/Library/Application Support/printpapi-agent/`, Linux
   `/var/lib/printpapi-agent/`. The file holds the server, device name, state, last contact and job, the
-  printers and the header names, never the key and never a header value. A file that is missing or
-  older than two minutes shows "not running". The agent still opens no port and takes no commands.
+  printers, the header names and the time the agent process started, never the key and never a
+  header value. A file that is missing or older than two minutes shows "not running"; an agent that
+  has not been in touch with the server for two minutes shows "offline" with the time it has been
+  silent. The agent still opens no port and takes no commands.
   The crash log of an agent the setup installed lives in the same folder.
 - A new key on the same server needs a new device name, because the server ties a name to its
   key. The printers then get new ids and the old device stays in the dashboard; the window warns

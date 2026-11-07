@@ -18,11 +18,11 @@ pub mod run;
 pub mod setup;
 pub mod status;
 
-use std::cell::RefCell;
 use std::io::Write;
 use std::path::Path;
 use std::path::PathBuf;
 use std::rc::Rc;
+use std::sync::{Arc, Mutex};
 
 use serde_json::Value;
 
@@ -257,11 +257,25 @@ pub fn run(base_dir: &Path) -> Result<(), Fatal> {
     }
     let cfg = Config::load(base_dir).map_err(Fatal::Exit)?;
     let settings = cfg.http_settings().map_err(Fatal::Exit)?;
-    let reporter = RefCell::new(Reporter::new(
+    status::process_started_at();
+    let has_status_file = data_dir.is_some();
+    let reporter = Arc::new(Mutex::new(Reporter::new(
         Status::from_config(&cfg),
         data_dir.map(StatusWriter::new),
         cfg.get("api_key").ok().flatten().unwrap_or_default(),
-    ));
+    )));
+    let report = |f: &dyn Fn(&mut Reporter)| {
+        f(&mut reporter
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner))
+    };
+    // The main thread can be busy for minutes (a big job, a call that hangs) and the tray calls a
+    // file that is not rewritten for 120 s "not running": a thread of its own keeps it young.
+    if has_status_file
+        && let Err(e) = status::spawn_heartbeat(&reporter, status::HEARTBEAT, unix_now)
+    {
+        log::log_error(&format!("no status heartbeat: {e}"));
+    }
     let http = Client::new(&settings);
     let sumatra = sumatra_program(base_dir);
     let runner = real_runner();
@@ -270,7 +284,7 @@ pub fn run(base_dir: &Path) -> Result<(), Fatal> {
     let (raw, pdf) = select_backend(platform, &sumatra, runner);
     let fns = Fns::native(raw, pdf);
     let sleep = |secs: u64| std::thread::sleep(std::time::Duration::from_secs(secs));
-    let wait = |secs: u64| sleep_ticking(secs, &sleep, &|| reporter.borrow_mut().tick(unix_now()));
+    let wait = |secs: u64| sleep_ticking(secs, &sleep, &|| report(&|r| r.tick(unix_now())));
     let hooks = Hooks {
         caps: &*caps,
         register: &|base, key, name, printers| {
@@ -283,12 +297,12 @@ pub fn run(base_dir: &Path) -> Result<(), Fatal> {
                 &wait,
                 &|msg| {
                     log::log_error(msg);
-                    reporter.borrow_mut().register_failed(msg, unix_now());
+                    report(&|r| r.register_failed(msg, unix_now()));
                 },
                 300,
             )
         },
-        registered: &|| reporter.borrow_mut().registered(unix_now()),
+        registered: &|| report(&|r| r.registered(unix_now())),
         poll: &|base, key, map| {
             poll_forever(
                 base,
@@ -298,7 +312,7 @@ pub fn run(base_dir: &Path) -> Result<(), Fatal> {
                 &fns,
                 &sleep,
                 &log::log_error,
-                &mut |outcome| reporter.borrow_mut().polled(outcome, unix_now()),
+                &mut |outcome| report(&|r| r.polled(outcome, unix_now())),
             )
         },
     };
