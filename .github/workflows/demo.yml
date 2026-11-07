@@ -1,19 +1,23 @@
 name: demo
 # Deploys the static demo (web/out-demo) to the Cloudflare Worker "printpapi-demo" (static assets).
+# A pull request runs the same steps without the deploy, so a broken step shows before the merge
+# and not only on main (pull request #4).
 on:
   push:
     branches: [main]
-    paths: ["web/**"]
+    paths: ["web/**", ".github/workflows/demo.yml"]
+  pull_request:
+    paths: ["web/**", ".github/workflows/demo.yml"]
   workflow_dispatch:
 permissions:
   contents: read
-# deploys stay ordered: a newer run waits for the running one instead of cancelling it
+# deploys stay ordered: a newer run waits for the running one instead of cancelling it. A pull
+# request has a group of its own, so it never takes the place of a waiting deploy.
 concurrency:
-  group: demo-deploy
+  group: demo-${{ github.event_name == 'pull_request' && github.ref || 'deploy' }}
   cancel-in-progress: false
 jobs:
-  deploy:
-    if: github.ref == 'refs/heads/main'
+  build:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -37,7 +41,9 @@ jobs:
         working-directory: web
       - run: npm run check:bundles
         working-directory: web
-      - uses: cloudflare/wrangler-action@953926a2e2182532811c01a25e53647d93bf07c0 # v4.1.3
+      # only main deploys: on a pull request github.ref is refs/pull/<n>/merge
+      - if: github.ref == 'refs/heads/main'
+        uses: cloudflare/wrangler-action@953926a2e2182532811c01a25e53647d93bf07c0 # v4.1.3
         with:
           apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
