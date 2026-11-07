@@ -21,26 +21,12 @@ import { errorText } from "./model";
 import { Actions, Notice } from "./bits";
 import { RunNotice, useApplyPatch } from "./settings-apply";
 
-/** Stops the agent and starts it again. One administrator prompt; the Overview shows when it is back. */
-export function RestartSection({ onRestarted }: { onRestarted: () => void }) {
-  const [busy, setBusy] = useState(false);
-  const [done, setDone] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-
-  async function restart() {
-    setBusy(true);
-    setDone(false);
-    setError(null);
-    try {
-      await setup.restartAgent();
-      setDone(true);
-      onRestarted();
-    } catch (e) {
-      setError(errorText(toSetupError(e)));
-    } finally {
-      setBusy(false);
-    }
-  }
+/**
+ * Stops the agent and starts it again. One administrator prompt, then the wait for the agent's next
+ * contact after the start, which the elevated run reports (not a time read afterwards).
+ */
+export function RestartSection({ platform, onRestarted }: { platform: Platform; onRestarted: () => void }) {
+  const { run, busy, restart, keepWaiting } = useApplyPatch(onRestarted);
 
   return (
     <Card>
@@ -52,8 +38,12 @@ export function RestartSection({ onRestarted }: { onRestarted: () => void }) {
         </CardDescription>
       </CardHeader>
       <CardContent className="space-y-3">
-        {done && <Notice tone="ok">Restarted. The Overview shows when the agent is connected again.</Notice>}
-        {error && <Notice tone="error">{error}</Notice>}
+        <RunNotice
+          run={run}
+          platform={platform}
+          onKeepWaiting={() => keepWaiting()}
+          doneText="Restarted. The agent is connected again."
+        />
         <Actions>
           <Button type="button" variant="brand" disabled={busy} onClick={() => void restart()}>
             {busy ? <Loader2 className="animate-spin" /> : <RotateCw />}

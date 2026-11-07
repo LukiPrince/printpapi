@@ -106,7 +106,7 @@ export function Settings({ platform, onRemoved }: { platform: Platform; onRemove
       {section === "advanced" && <AdvancedSection status={status} platform={platform} onApplied={() => void refresh()} />}
       {section === "log" && <LogSection platform={platform} />}
       {section === "sumatra" && <SumatraSection platform={platform} onApplied={() => void refresh()} />}
-      {section === "restart" && <RestartSection onRestarted={() => void refresh()} />}
+      {section === "restart" && <RestartSection platform={platform} onRestarted={() => void refresh()} />}
       {section === "remove" && <RemoveSection onRemoved={onRemoved} />}
     </Shell>
   );

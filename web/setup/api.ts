@@ -80,8 +80,11 @@ export const setup = {
    * computer when it was done; waitOnline then waits for the agent's next contact after it.
    */
   applyPatch: (patch: ConfigPatch) => call<number>("apply_patch", { patch }),
-  /** Stops the agent and starts it again: one administrator prompt. */
-  restartAgent: () => call<void>("restart_agent"),
+  /**
+   * Stops the agent and starts it again: one administrator prompt. Returns the time on this computer
+   * right before the agent was started, like applyPatch.
+   */
+  restartAgent: () => call<number>("restart_agent"),
   /** The values of the installed [headers] (they are secrets): one administrator prompt. */
   headerValues: () => call<[string, string][]>("header_values"),
   /**

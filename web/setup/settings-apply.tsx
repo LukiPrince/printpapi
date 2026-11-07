@@ -47,16 +47,39 @@ export function useApplyPatch(onDone: () => void) {
     }
   }
 
+  /** Restarts the agent, then waits for its next contact like a change does. */
+  async function restart() {
+    setRun({ at: "applying" });
+    try {
+      const since = await setup.restartAgent();
+      setBaseline(since);
+      await wait(since);
+    } catch (e) {
+      setRun({ at: "failed", message: errorText(toSetupError(e)) });
+    }
+  }
+
   return {
     run,
     busy: run.at === "applying" || run.at === "waiting",
     apply,
+    restart,
     keepWaiting: () => (baseline === null ? undefined : void wait(baseline)),
   };
 }
 
 /** What a run says, in words. Nothing while idle. */
-export function RunNotice({ run, platform, onKeepWaiting }: { run: Run; platform: Platform; onKeepWaiting: () => void }) {
+export function RunNotice({
+  run,
+  platform,
+  onKeepWaiting,
+  doneText = "Applied. The agent is running with the new settings.",
+}: {
+  run: Run;
+  platform: Platform;
+  onKeepWaiting: () => void;
+  doneText?: string;
+}) {
   switch (run.at) {
     case "idle":
       return null;
@@ -73,7 +96,7 @@ export function RunNotice({ run, platform, onKeepWaiting }: { run: Run; platform
         </p>
       );
     case "done":
-      return <Notice tone="ok">Applied. The agent is running with the new settings.</Notice>;
+      return <Notice tone="ok">{doneText}</Notice>;
     case "slow":
       return (
         <Notice tone="error">

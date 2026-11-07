@@ -575,6 +575,17 @@ pub fn test_print(state: Shared, printer: PrinterChoice) -> Result<(), SetupErro
     .map_err(|m| SetupError::new("print", m))
 }
 
+/// The time on this computer that the elevated command took right before it started the agent
+/// (`baseline_local` of its `result.json`), which the wait after a change compares the status
+/// file's `last_contact` with. It is the agent's own word, written after the old agent was
+/// stopped: a time read here once the elevated run is back could be later than the new agent's
+/// first contact, and the wait would then miss it.
+fn local_baseline(result: &Value) -> Result<f64, SetupError> {
+    result["baseline_local"]
+        .as_f64()
+        .ok_or_else(|| SetupError::new("system", "The agent did not report a start time."))
+}
+
 /// What a finished install hands back: the start time of the agent's record on the server and,
 /// for a new connection, the connection the later steps use.
 struct Applied {
@@ -821,7 +832,7 @@ fn apply_patch_in(
     agent: &Path,
     dir: &Path,
     req: &PatchRequest,
-) -> Result<(), SetupError> {
+) -> Result<f64, SetupError> {
     let text = patch_json(req)?;
     // the agent takes a staged agent.ini over a patch
     match std::fs::remove_file(dir.join("agent.ini")) {
@@ -834,32 +845,35 @@ fn apply_patch_in(
         .map_err(|e| SetupError::io("cannot write the change", e))?;
     let ran = run_elevated(elevate, agent, dir, "install");
     let _ = std::fs::remove_file(dir.join("patch.json"));
-    ran.map(|_| ())
+    local_baseline(&ran?)
 }
 
-/// Apply a change. Returns the time on this computer when the install was done, which
-/// `wait_online` then compares the agent's next contact with (the window has no key, so there is
-/// no server-side start time to give).
+/// Apply a change. Returns the time on this computer right before the agent was started again,
+/// which `wait_online` then compares the agent's next contact with (the window has no key, so there
+/// is no server-side start time to give).
 #[tauri::command(async)]
 pub fn apply_patch(state: Shared, patch: PatchRequest) -> Result<f64, SetupError> {
     let (agent, dir) = staged(&state)?;
     let tray_staged = stage_own_tray(&dir)?;
-    apply_patch_in(&elevate::run, &agent, &dir, &patch)?;
+    let baseline = apply_patch_in(&elevate::run, &agent, &dir, &patch)?;
     // the wait that follows reads the status file, not a connection left over from the wizard
     lock(&state).conn = None;
     if tray_staged {
         start_installed_tray();
     }
-    Ok(settings::unix_secs(SystemTime::now()))
+    Ok(baseline)
 }
 
-fn restart_in(elevate: Elevator, agent: &Path, dir: &Path) -> Result<(), SetupError> {
-    run_elevated(elevate, agent, dir, "restart").map(|_| ())
+fn restart_in(elevate: Elevator, agent: &Path, dir: &Path) -> Result<f64, SetupError> {
+    local_baseline(&run_elevated(elevate, agent, dir, "restart")?)
 }
 
+/// Restart the agent. Returns the time on this computer right before it was started, like
+/// `apply_patch`, for the wait that follows.
 #[tauri::command(async)]
-pub fn restart_agent(state: Shared) -> Result<(), SetupError> {
+pub fn restart_agent(state: Shared) -> Result<f64, SetupError> {
     let (agent, dir) = staged(&state)?;
+    lock(&state).conn = None;
     restart_in(&elevate::run, &agent, &dir)
 }
 
@@ -1580,12 +1594,34 @@ printers = Z = socket://nohost
             assert!(!dir.join("agent.ini").exists());
             let patch = std::fs::read_to_string(dir.join("patch.json")).unwrap();
             assert!(patch.contains("SECRET"), "{patch}");
-            write_result(&dir, json!({"ok": true, "baseline_last_seen": 1.0}));
+            write_result(
+                &dir,
+                json!({"ok": true, "baseline_last_seen": 1.0, "baseline_local": 1794048800.5}),
+            );
             Ok(())
         };
         let req = patch_request(None, None, Some(vec![("X-Token", Some("SECRET"))]));
-        apply_patch_in(&elevate, Path::new("agent"), dir, &req).unwrap();
+        // what the agent says it took right before it started, not a time read here afterwards
+        let baseline = apply_patch_in(&elevate, Path::new("agent"), dir, &req).unwrap();
+        assert_eq!(baseline, 1794048800.5);
         assert_eq!(names_in(dir), ["result.json"]);
+    }
+
+    #[test]
+    fn a_change_or_restart_without_a_baseline_from_the_agent_is_an_error_not_a_guess() {
+        // an older agent, or a result that is not what was asked: the window must not wait on a
+        // time it made up after the agent was already running
+        let tmp = tempfile::tempdir().unwrap();
+        let elevate = |_: &Path, args: &[&OsStr]| {
+            write_result(&staging_dir_of(args), json!({"ok": true}));
+            Ok(())
+        };
+        let req = patch_request(None, Some(45.0), None);
+        let e = apply_patch_in(&elevate, Path::new("agent"), tmp.path(), &req).unwrap_err();
+        assert_eq!(e.code, "system");
+        assert!(e.message.contains("start time"), "{}", e.message);
+        let e = restart_in(&elevate, Path::new("agent"), tmp.path()).unwrap_err();
+        assert!(e.message.contains("start time"), "{}", e.message);
     }
 
     #[test]
@@ -1630,10 +1666,16 @@ printers = Z = socket://nohost
         let tmp = tempfile::tempdir().unwrap();
         let elevate = |_: &Path, args: &[&OsStr]| {
             assert_eq!((args.len(), args[0]), (2, OsStr::new("restart")));
-            write_result(&staging_dir_of(args), json!({"ok": true}));
+            write_result(
+                &staging_dir_of(args),
+                json!({"ok": true, "baseline_local": 1794048801.0}),
+            );
             Ok(())
         };
-        restart_in(&elevate, Path::new("agent"), tmp.path()).unwrap();
+        assert_eq!(
+            restart_in(&elevate, Path::new("agent"), tmp.path()).unwrap(),
+            1794048801.0
+        );
         let elevate = |_: &Path, _: &[&OsStr]| Err(Elevate::Cancelled);
         let e = restart_in(&elevate, Path::new("agent"), tmp.path()).unwrap_err();
         assert_eq!(e.code, "cancelled");
