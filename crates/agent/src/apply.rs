@@ -3667,6 +3667,47 @@ mod tests {
     }
 
     #[test]
+    fn a_patch_with_a_new_connection_keeps_the_installed_headers_and_timeout() {
+        let fx = Fixture::new(Os::Linux);
+        std::fs::write(
+            fx.staging.join("agent.ini"),
+            format!(
+                "{INI}timeout = 45
+
+[headers]
+X-Via = proxy
+"
+            ),
+        )
+        .unwrap();
+        apply(&fx.staging, &fx.env()).unwrap();
+        fx.after_an_elevated_install();
+        // one prompt: the window names the connection, and the installed file supplies the rest
+        fx.stage_patch(
+            r#"{"server_url": "https://other.example.com", "api_key": "NEW-KEY", "name": "pc2", "printers": "Zebra GK420d"}"#,
+        );
+        apply(&fx.staging, &fx.env()).unwrap();
+        let ini = std::fs::read_to_string(&fx.layout.ini).unwrap();
+        assert!(
+            ini.contains("server_url = https://other.example.com"),
+            "{ini}"
+        );
+        assert!(
+            ini.contains("api_key = NEW-KEY") && !ini.contains("SECRET-KEY"),
+            "{ini}"
+        );
+        assert!(ini.contains("name = pc2"), "{ini}");
+        assert!(
+            ini.contains("timeout = 45") && ini.contains("X-Via = proxy"),
+            "{ini}"
+        );
+        let settings = fx.settings.borrow();
+        let last = settings.last().unwrap();
+        assert_eq!(last.timeout, 45.0);
+        assert_eq!(last.headers.get("x-via").map(String::as_str), Some("proxy"));
+    }
+
+    #[test]
     fn a_bad_patch_touches_nothing() {
         let bad_ones = [
             r#"{"headers": [["authorization", "x"]]}"#,

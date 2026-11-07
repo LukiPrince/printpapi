@@ -543,8 +543,12 @@ pub fn update_ini(existing: Option<&str>, update: &IniUpdate) -> String {
 /// A change to an installed agent.ini: only what is named is touched. The window stages it as
 /// `patch.json` and the admin command merges it into the installed file, so a change asks for
 /// administrator rights once and never needs the file's secrets in the window.
-#[derive(Debug, Clone, PartialEq, Default)]
+#[derive(Clone, PartialEq, Default)]
 pub struct Patch {
+    /// A new connection, `(server_url, api_key, name)`: all three or none. The window that changes
+    /// the connection never read the installed file, so `timeout` and `[headers]` stay by this
+    /// merge instead of by a second administrator prompt.
+    pub connection: Option<(String, String, String)>,
     /// The `printers` value, already in the `name [|pdf] [= target]` grammar.
     pub printers: Option<String>,
     pub timeout: Option<f64>,
@@ -552,15 +556,39 @@ pub struct Patch {
     pub headers: Vec<(String, Option<String>)>,
 }
 
+// Not derived: the connection holds the key.
+impl std::fmt::Debug for Patch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Patch")
+            .field("connection", &self.connection.as_ref().map(|c| &c.0))
+            .field("printers", &self.printers)
+            .field("timeout", &self.timeout)
+            .field("headers", &self.headers)
+            .finish()
+    }
+}
+
 /// `{"printers": "...", "timeout": 60, "headers": [["Name", "value"], ["Other", null]]}`, every
-/// field optional. Anything else is refused: the file is staged where a user can write.
+/// field optional, plus `server_url`, `api_key` and `name` together for a new connection. Anything
+/// else is refused: the file is staged where a user can write.
 pub fn parse_patch(json: &str) -> Result<Patch, String> {
     let bad = |what: &str| format!("invalid patch: {what}");
     let v: Value = serde_json::from_str(json).map_err(|_| bad("not JSON"))?;
     let obj = v.as_object().ok_or_else(|| bad("not an object"))?;
     let mut patch = Patch::default();
+    let mut connection: [Option<String>; 3] = [None, None, None];
     for (key, value) in obj {
         match key.as_str() {
+            "server_url" | "api_key" | "name" => {
+                let at = ["server_url", "api_key", "name"]
+                    .iter()
+                    .position(|k| *k == key)
+                    .unwrap_or_default();
+                let s = value
+                    .as_str()
+                    .ok_or_else(|| bad("the connection is not text"))?;
+                connection[at] = Some(s.to_string());
+            }
             "printers" => {
                 let s = value.as_str().ok_or_else(|| bad("printers is not text"))?;
                 patch.printers = Some(s.to_string());
@@ -594,6 +622,11 @@ pub fn parse_patch(json: &str) -> Result<Patch, String> {
             other => return Err(bad(&format!("unknown field {other:?}"))),
         }
     }
+    patch.connection = match connection {
+        [None, None, None] => None,
+        [Some(url), Some(key), Some(name)] => Some((url, key, name)),
+        _ => return Err(bad("server_url, api_key and name come together")),
+    };
     Ok(patch)
 }
 
@@ -639,11 +672,21 @@ pub fn apply_patch(installed: &str, patch: &Patch) -> Result<String, String> {
     {
         return Err("printers has a control character".into());
     }
+    if let Some((url, key, name)) = &patch.connection {
+        // a line break is turned into a blank by `update_ini`, but the value is wrong all the same
+        if [url, key, name]
+            .iter()
+            .any(|v| v.chars().any(char::is_control))
+        {
+            return Err("the connection has a control character".into());
+        }
+    }
     let timeout = patch.timeout.map(|t| t.to_string());
+    let conn = patch.connection.as_ref();
     let update = IniUpdate {
-        server_url: None,
-        api_key: None,
-        name: None,
+        server_url: conn.map(|c| c.0.as_str()),
+        api_key: conn.map(|c| c.1.as_str()),
+        name: conn.map(|c| c.2.as_str()),
         printers: patch.printers.as_deref(),
         timeout: timeout.as_deref(),
         headers: Some(&patch.headers),
@@ -1124,6 +1167,58 @@ mod tests {
             s.headers.get("cf-access-client-secret").map(String::as_str),
             Some("s3")
         );
+    }
+
+    #[test]
+    fn a_patch_can_move_the_connection_and_keeps_headers_and_timeout() {
+        // a new server or key from a window that never read the installed file: the patch names
+        // the connection, and what it does not name stays, wherever it stands in the file
+        let installed = "[headers]
+CF-Access = abc
+
+[agent]
+server_url = https://x
+api_key = OLD
+name = pc
+printers = a
+timeout = 45
+";
+        let p = patch(
+            r#"{"server_url":"https://y","api_key":"NEW%KEY","name":"pc2","printers":"b|pdf"}"#,
+        );
+        let text = apply_patch(installed, &p).unwrap();
+        let cfg = Config::from_text(&text).unwrap();
+        assert_eq!(cfg.require("server_url").unwrap(), "https://y");
+        assert_eq!(cfg.require("api_key").unwrap(), "NEW%KEY");
+        assert_eq!(cfg.require("name").unwrap(), "pc2");
+        assert_eq!(cfg.require("printers").unwrap(), "b|pdf");
+        let s = cfg.http_settings().unwrap();
+        assert_eq!(s.timeout, 45.0);
+        assert_eq!(s.headers.get("cf-access").map(String::as_str), Some("abc"));
+        assert!(!text.contains("OLD"));
+    }
+
+    #[test]
+    fn a_patch_names_the_whole_connection_or_none_of_it() {
+        for json in [
+            r#"{"server_url":"https://y"}"#,
+            r#"{"server_url":"https://y","api_key":"k"}"#,
+            r#"{"api_key":"k","name":"n"}"#,
+            r#"{"server_url":1,"api_key":"k","name":"n"}"#,
+        ] {
+            assert!(parse_patch(json).is_err(), "{json}");
+        }
+        assert!(parse_patch(r#"{"server_url":"https://y","api_key":"k","name":"n"}"#).is_ok());
+        // a control character could start a second line of the file
+        let p = patch(r#"{"server_url":"https://y","api_key":"k\nprinters = evil","name":"n"}"#);
+        let e = apply_patch(INSTALLED, &p).unwrap_err();
+        assert!(!e.contains("evil"), "{e}");
+    }
+
+    #[test]
+    fn a_patch_does_not_show_its_key_when_printed() {
+        let p = patch(r#"{"server_url":"https://y","api_key":"SECRET-KEY","name":"n"}"#);
+        assert!(!format!("{p:?}").contains("SECRET-KEY"));
     }
 
     #[test]
