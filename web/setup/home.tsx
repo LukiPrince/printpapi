@@ -180,7 +180,7 @@ function Installed({ onChange, onRemoved }: { onChange: (e: Existing) => void; o
         </CardTitle>
         <CardDescription>
           It runs in the background and starts with this computer. You will be asked for administrator
-          rights.
+          rights. A newer setup file updates the agent when you use Change printers.
         </CardDescription>
       </CardHeader>
       <CardContent className="space-y-3">
