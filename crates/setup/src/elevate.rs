@@ -134,7 +134,7 @@ fn run_windows(agent: &Path, args: &[&OsStr]) -> Result<(), Elevate> {
         GetExitCodeProcess, INFINITE, WaitForSingleObject,
     };
     use windows_sys::Win32::UI::Shell::{
-        SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW, ShellExecuteExW,
+        SEE_MASK_NOASYNC, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW, ShellExecuteExW,
     };
     use windows_sys::Win32::UI::WindowsAndMessaging::SW_HIDE;
 
@@ -161,7 +161,8 @@ fn run_windows(agent: &Path, args: &[&OsStr]) -> Result<(), Elevate> {
         );
         let mut info: SHELLEXECUTEINFOW = std::mem::zeroed();
         info.cbSize = std::mem::size_of::<SHELLEXECUTEINFOW>() as u32;
-        info.fMask = SEE_MASK_NOCLOSEPROCESS;
+        // NOASYNC: the calling thread has no message loop (Microsoft, SHELLEXECUTEINFOW Remarks).
+        info.fMask = SEE_MASK_NOCLOSEPROCESS | SEE_MASK_NOASYNC;
         info.lpVerb = verb.as_ptr();
         info.lpFile = file.as_ptr();
         info.lpParameters = parameters.as_ptr();

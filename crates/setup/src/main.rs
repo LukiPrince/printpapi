@@ -57,6 +57,9 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    // ponytail: WebView2 leaves its profile (`%LOCALAPPDATA%\com.printpapi.setup\EBWebView`, about 9 MB, no
+    // key in it) behind. It is runtime data, not staging, and msedgewebview2.exe still holds the
+    // folder while the process ends, so it is not removed. Ceiling: a setup run again and again.
     // The process ends right after the exit event without dropping managed state, so the working
     // folder (it holds the unpacked agent) is removed here.
     app.run(|handle, event| {

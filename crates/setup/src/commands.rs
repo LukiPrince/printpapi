@@ -973,6 +973,11 @@ mod tests {
             "[agent]\nserver_url = https://x\nprinters = A\n",
             "[agent]\napi_key = k\nprinters = A\n",
             "[agent]\nserver_url = https://x\napi_key = k\nprinters = a;;\n= \n",
+            "[agent]
+server_url = https://x
+api_key = k
+printers = Z = socket://nohost
+",
             "not an ini [",
         ] {
             let e = parse_installed(text.into()).err().expect(text);
@@ -1186,6 +1191,31 @@ mod tests {
         assert!(!tmp.path().join("agent.ini").exists());
     }
 
+    #[test]
+    fn a_new_connection_does_not_build_on_an_installed_file_still_in_memory() {
+        let tmp = tempfile::tempdir().unwrap();
+        let elevate = |_: &Path, args: &[&OsStr]| {
+            let dir = staging_dir_of(args);
+            let ini = std::fs::read_to_string(dir.join("agent.ini")).unwrap();
+            assert!(!ini.contains("CF-Access"), "{ini}");
+            assert!(!ini.contains(KEY), "{ini}");
+            write_result(&dir, json!({"ok": true, "baseline_last_seen": 2.0}));
+            Ok(())
+        };
+        let req = request(
+            Some(("https://y", "NEW", "pc2")),
+            vec![choice("A", false, None)],
+        );
+        apply_in(
+            &elevate,
+            Path::new("agent"),
+            tmp.path(),
+            &req,
+            Some(INSTALLED),
+        )
+        .unwrap();
+    }
+
     // ---- the SumatraPDF download
 
     const ZIP: &[u8] = b"zipbytes";
@@ -1201,6 +1231,10 @@ mod tests {
     /// A `tar` that "unpacks" an exe with the given content into the folder after `-C`.
     fn fake_tar(exe: &'static [u8]) -> Runner {
         Rc::new(move |cmd: &Cmd| {
+            assert_eq!(
+                cmd.argv[0],
+                Path::new("sys").join("tar.exe").to_string_lossy()
+            );
             assert_eq!(cmd.argv[1], "-xf");
             assert!(Path::new(&cmd.argv[2]).is_file(), "the ZIP is on disk");
             std::fs::write(Path::new(&cmd.argv[4]).join(SUMATRA_EXE_IN_ZIP), exe).unwrap();

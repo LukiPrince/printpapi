@@ -25,5 +25,7 @@ tauri-build = { version = "2.7.4", features = [] }
 windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_System_Com", "Win32_System_Threading", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging"] }
 
 [features]
-# Tauri CLI turns this on for `tauri build`: load the embedded pages instead of a dev server.
+# For a hand-run `cargo build --release --features custom-protocol`: load the embedded pages
+# instead of a dev server. `tauri build` does not use it, the CLI enables `tauri/custom-protocol`
+# itself (tauri-cli `interface/rust.rs`, `build_options`).
 custom-protocol = ["tauri/custom-protocol"]
