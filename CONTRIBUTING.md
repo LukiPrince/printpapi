@@ -32,7 +32,9 @@ Thanks for helping! The bar for merging is low ceremony, high discipline:
 2. Add a failing test, make it pass, keep the suite green.
 3. Touched `web/`? Run `cd web && npm run build:app` and commit the regenerated `crates/server/web`
    with it — CI fails the PR otherwise, and self-hosters would keep serving the old dashboard.
-4. Open a PR with a short description of the *why*.
+4. Touched `README.md` or `docs/`? `python tools/docs/check_docs.py` must pass. Once per clone,
+   `git config core.hooksPath tools/githooks` runs it before every push.
+5. Open a PR with a short description of the *why*.
 
 ## Licensing of contributions
 

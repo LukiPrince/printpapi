@@ -5,6 +5,3 @@
 # the fonts ride on git's binary heuristic and every JS chunk is a normalization candidate, so a
 # rebuild could "change" files it never touched.
 crates/server/web/** -text
-
-# The git hooks run under sh: a CRLF script breaks it (this machine has core.autocrlf).
-tools/githooks/* text eol=lf

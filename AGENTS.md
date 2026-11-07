@@ -13,10 +13,12 @@ export embedded into the server binary.
 - **Security at trust boundaries stays:** auth on every endpoint, constant-time token compare,
   `http(s)`-only fetches, no shell with user input, temp files cleaned up.
 - **Docs follow the code.** Before a push, compare `README.md` and `docs/` with the change.
-  `tools/githooks/pre-push` runs `check_docs` on every pushed commit and, in Claude Code
-  (`CLAUDECODE=1`), holds the push until `python tools/docs/push_hook.py --mark`. CI's `docs` job
-  runs the same check: relative links and anchors that resolve to files in git, setup file names,
-  source-available wording (never "open source").
+  `tools/githooks/pre-push` runs `check_docs` on the commit at the tip of each pushed ref (not
+  the commits in between: pull requests are squash-merged) and, in Claude Code (`CLAUDECODE=1`),
+  holds the push until `python tools/docs/push_hook.py --mark`. The hook runs only once
+  `git config core.hooksPath tools/githooks` is set in that clone. CI's `docs` job runs the same
+  check on its checked-out commit: relative links and anchors that resolve to files in git, setup
+  file names, source-available wording (never "open source").
 - **Licensing.** New Rust files start with
   `// printpapi — self-hosted PrintNode alternative. Elastic License 2.0 (see LICENSE).`
   `integrations/woocommerce/` is GPL-2.0-or-later. Never re-license a file without reading

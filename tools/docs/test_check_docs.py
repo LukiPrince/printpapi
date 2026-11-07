@@ -313,6 +313,20 @@ def test_open_source_in_a_fence_is_checked_per_line():
     assert len(out) == 1 and out[0].startswith("README.md:3: ")
 
 
+def test_a_bullet_list_is_not_one_block_for_the_wording_rule():
+    text = ("- printpapi is not a toy.\n"
+            "- printpapi is open source software.\n"
+            "- never mind the third.\n")
+    out = repo({"README.md": text})
+    assert len(out) == 1 and out[0].startswith("README.md:2: ")
+
+
+def test_a_list_item_keeps_its_wrapped_lines_and_its_own_not():
+    text = "1. We are open\n   source, truly.\n2) It is not open\n   source.\n* Never open source.\n"
+    out = repo({"README.md": text})
+    assert len(out) == 1 and out[0].startswith("README.md:1: ")
+
+
 # --- helpers -------------------------------------------------------------------------------
 
 def test_crlf_line_endings():
@@ -356,3 +370,42 @@ def test_check_rev_uses_head_content_and_tracked_files(tmp_path):
     (tmp_path / "README.md").write_text("[bad](nope.md)\n")
     (tmp_path / "docs" / "new.md").write_text("[bad](nope.md)\n")
     assert check_docs.check_rev(tmp_path, "HEAD") == (findings, 2)
+
+
+def commit_repo(tmp_path, files: dict[str, str]):
+    git(tmp_path, "init", "-q")
+    for name, text in files.items():
+        (tmp_path / name).parent.mkdir(parents=True, exist_ok=True)
+        (tmp_path / name).write_text(text, encoding="utf-8", newline="\n")
+    git(tmp_path, "add", "-A")
+    git(tmp_path, "commit", "-q", "-m", "init")
+
+
+def test_check_rev_names_the_checked_revision(tmp_path):
+    commit_repo(tmp_path, {"README.md": "[x](nope.md)\n"})
+    sha = git(tmp_path, "rev-parse", "HEAD")
+    findings, _ = check_docs.check_rev(tmp_path, sha, label=sha[:9])
+    assert len(findings) == 1 and f"not in git at {sha[:9]}" in findings[0] and "at HEAD" not in findings[0]
+
+
+def test_invalid_setup_json_is_a_finding_not_an_exception(tmp_path):
+    commit_repo(tmp_path, {"README.md": "printpapi-setup-a.exe\n", "web/lib/setup-downloads.json": "{nope"})
+    findings, count = check_docs.check_rev(tmp_path, "HEAD")
+    assert count == 1
+    assert len(findings) == 1
+    assert findings[0].startswith("web/lib/setup-downloads.json: not valid JSON: Expecting ")
+
+
+def test_setup_json_of_the_wrong_shape_is_a_finding(tmp_path):
+    commit_repo(tmp_path, {"README.md": "# T\n", "web/lib/setup-downloads.json": '["x", 3]'})
+    findings, _ = check_docs.check_rev(tmp_path, "HEAD")
+    assert len(findings) == 1 and findings[0].startswith("web/lib/setup-downloads.json: not valid JSON: ")
+
+
+def test_unreadable_setup_json_is_a_finding(tmp_path):
+    commit_repo(tmp_path, {"README.md": "# T\n"})
+    # a submodule entry is in ls-tree but cannot be read with git show
+    git(tmp_path, "update-index", "--add", "--cacheinfo", f"160000,{'a' * 40},web/lib/setup-downloads.json")
+    git(tmp_path, "commit", "-q", "-m", "gitlink")
+    findings, _ = check_docs.check_rev(tmp_path, "HEAD")
+    assert len(findings) == 1 and findings[0].startswith("web/lib/setup-downloads.json: ")

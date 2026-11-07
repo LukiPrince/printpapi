@@ -14,7 +14,8 @@ there for CI or for a reader of the repo, so it is a finding locally exactly as 
      that file, computed like GitHub does (see `slug`);
   c. a literal setup file name (printpapi-setup-...) is one of the assets in
      web/lib/setup-downloads.json (at the same revision);
-  d. "open source" only in a paragraph with a "not" or "never": the project is "source available".
+  d. "open source" only in a paragraph (or list item) with a "not" or "never": the project is
+     "source available".
 
 Fenced code blocks and inline code spans (which may span the lines of a paragraph) are ignored for
 links and headings; file names (c) and wording (d) are checked everywhere. `check` is pure: it
@@ -53,6 +54,7 @@ SCHEME = re.compile(r"^(?:[A-Za-z][A-Za-z0-9+.-]*:|//)")
 SETUP_NAME = re.compile(r"printpapi-setup-[A-Za-z0-9_.-]*[A-Za-z0-9_]")
 OPEN_SOURCE = re.compile(r"open[\s-]+source", re.I)  # \s: the docs are hard-wrapped
 NOT_WORD = re.compile(r"\b(?:not|never)\b", re.I)
+LIST_ITEM = re.compile(r"^\s*(?:[-*+]|\d+[.)])\s")
 
 
 def lines_of(text: str):
@@ -106,6 +108,21 @@ def blocks_of(text: str):
         yield block, False
 
 
+def item_blocks(text: str):
+    """`blocks_of`, with every prose block also cut where a list item starts."""
+    for block, in_fence in blocks_of(text):
+        if in_fence:
+            yield block, in_fence
+            continue
+        part: list[tuple[int, str]] = []
+        for no, line in block:
+            if part and LIST_ITEM.match(line):
+                yield part, False
+                part = []
+            part.append((no, line))
+        yield part, False
+
+
 def prose_lines(text: str) -> dict[int, str]:
     """Line number -> the line with inline code blanked, for the lines outside fences.
 
@@ -123,10 +140,11 @@ def prose_lines(text: str) -> dict[int, str]:
 def wording_findings(text: str) -> list[tuple[int, str]]:
     """(line number, message) for every "open source" in a block without a "not" or "never".
 
-    The docs are hard-wrapped, so the rule works per paragraph, not per line.
+    The docs are hard-wrapped, so the rule works per paragraph, not per line. A list item is a
+    block of its own (a "not" in one bullet must not excuse the next one).
     """
     out = []
-    for block, _ in blocks_of(text):
+    for block, _ in item_blocks(text):
         joined = "\n".join(line for _, line in block)
         # ponytail: a paragraph with "not" or "never" anywhere passes, even if it says something
         # else ("not only open source"). A word list per paragraph, not a parse.
@@ -214,10 +232,12 @@ def tracked_set(paths) -> set[str]:
 
 
 def check(md_files: list[str], read: Callable[[str], str], tracked: set[str],
-          setup_assets: set[str]) -> list[str]:
+          setup_assets: set[str] | None, rev: str = "HEAD") -> list[str]:
     """Findings ("path:line: message") for the Markdown files (repo-relative, '/'-separated).
 
-    `read(path)` returns a tracked file's text; `tracked` holds the tracked files and directories.
+    `read(path)` returns a tracked file's text; `tracked` holds the tracked files and directories;
+    `rev` names the checked revision in the messages. `setup_assets` None skips rule c (the list
+    itself is unreadable, which is a finding of its own).
     """
     findings: list[str] = []
     anchor_cache: dict[str, set[str]] = {}
@@ -234,7 +254,7 @@ def check(md_files: list[str], read: Callable[[str], str], tracked: set[str],
         for no, line, in_fence in lines_of(text):
             where = f"{md}:{no}: "
             for name in SETUP_NAME.findall(line):
-                if name not in setup_assets:
+                if setup_assets is not None and name not in setup_assets:
                     findings.append(f"{where}setup file name {name} is not in {SETUP_JSON}")
             if in_fence:
                 continue
@@ -253,7 +273,7 @@ def check(md_files: list[str], read: Callable[[str], str], tracked: set[str],
                 rel = rel.replace("\\", "/")
                 if rel not in tracked:
                     findings.append(
-                        f"{where}broken link {target}: {rel} is not in git at HEAD (missing or gitignored)")
+                        f"{where}broken link {target}: {rel} is not in git at {rev} (missing or gitignored)")
                     continue
                 if fragment and rel.lower().endswith(".md") and fragment not in anchors(rel):
                     findings.append(f"{where}broken anchor {target}: no heading #{fragment} in {rel}")
@@ -271,8 +291,11 @@ def git_out(root: Path, *args: str) -> bytes:
     return subprocess.run(["git", *args], cwd=root, check=True, capture_output=True).stdout
 
 
-def check_rev(root: Path, rev: str = "HEAD") -> tuple[list[str], int]:
-    """(findings, number of Markdown files) for what git has at `rev` in the repo at `root`."""
+def check_rev(root: Path, rev: str = "HEAD", label: str | None = None) -> tuple[list[str], int]:
+    """(findings, number of Markdown files) for what git has at `rev` in the repo at `root`.
+
+    `label` (default `rev`) is how the messages name the revision.
+    """
     listing = git_out(root, "ls-tree", "-r", "-z", "--name-only", rev).decode("utf-8")
     files = [f for f in listing.split("\0") if f]
     tracked = tracked_set(files)
@@ -284,7 +307,17 @@ def check_rev(root: Path, rev: str = "HEAD") -> tuple[list[str], int]:
         return cache[path]
 
     md = [f for f in files if f.lower().endswith(".md")]
-    return check(md, read, tracked, setup_assets_at(read, tracked)), len(md)
+    extra: list[str] = []
+    assets: set[str] | None
+    try:
+        assets = setup_assets_at(read, tracked)
+    except (ValueError, TypeError, AttributeError) as e:  # bad JSON, or not a list of objects
+        extra.append(f"{SETUP_JSON}: not valid JSON: {e}")
+        assets = None
+    except subprocess.CalledProcessError as e:  # in the tree but not readable (a submodule entry)
+        extra.append(f"{SETUP_JSON}: not readable at {label or rev}: {e}")
+        assets = None
+    return extra + check(md, read, tracked, assets, label or rev), len(md)
 
 
 def main() -> int:

@@ -31,9 +31,10 @@ jobs:
       - run: pip install pytest
       - run: python -m pytest -q agent/tests
 
-  # The docs follow the code. The same check as tools/githooks/pre-push, on what git has at HEAD:
-  # relative links and anchors that resolve to files in git, setup file names, source-available
-  # wording (never "open source").
+  # The docs follow the code. The same check as tools/githooks/pre-push (which only runs where
+  # core.hooksPath is set), on what git has at the checked-out commit, not the ones in between
+  # (pull requests are squash-merged): relative links and anchors that resolve to files in git,
+  # setup file names, source-available wording (never "open source").
   docs:
     runs-on: ubuntu-latest
     steps:
