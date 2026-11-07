@@ -6,7 +6,8 @@
         "hooks": [
           {
             "type": "command",
-            "command": "\"$(command -v python || command -v python3)\" \"$CLAUDE_PROJECT_DIR/tools/docs/push_hook.py\"",
+            "command": "f=\"$CLAUDE_PROJECT_DIR/tools/docs/push_hook.py\"; [ -f \"$f\" ] || exit 0; \"$(command -v python || command -v python3)\" \"$f\"",
+            "onFailure": "continue",
             "timeout": 30
           }
         ]
