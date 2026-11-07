@@ -512,18 +512,22 @@ pub fn update_ini(existing: Option<&str>, update: &IniUpdate) -> String {
         ends[s] = Some(out.len());
         i = last + 1;
     }
-    // Missing keys go into their section, the later one first so the indexes stay valid. A section
-    // that is absent is added at the end, but only when it has something to hold.
+    // Missing keys go into their section, the one further down the file first so that the
+    // places of the others stay valid (`[headers]` may come before `[agent]`). A section that is
+    // absent is added at the end, but only when it has something to hold.
     let mut appended: Vec<(usize, Vec<String>)> = Vec::new();
+    let mut inserts: Vec<(usize, Vec<String>)> = Vec::new();
     for s in (0..2).rev() {
         let missing = additions(s, &done[s]);
         match ends[s] {
-            Some(at) => {
-                out.splice(at..at, missing);
-            }
+            Some(at) => inserts.push((at, missing)),
             None if !missing.is_empty() => appended.push((s, missing)),
             None => {}
         }
+    }
+    inserts.sort_by_key(|(at, _)| std::cmp::Reverse(*at));
+    for (at, missing) in inserts {
+        out.splice(at..at, missing);
     }
     for (s, missing) in appended.into_iter().rev() {
         if out.last().is_some_and(|l| !l.trim().is_empty()) {
@@ -1276,6 +1280,64 @@ mod tests {
                 ("c".to_string(), None)
             ]
         );
+    }
+
+    #[test]
+    fn missing_keys_go_into_their_own_section_whichever_comes_first() {
+        // [headers] before [agent]: the insert into the earlier section must not move the place
+        // where the later one's keys are added
+        let before = "[headers]
+A = b
+B = c
+
+[agent]
+server_url = https://x
+";
+        let h = [
+            ("D".to_string(), Some("d".to_string())),
+            ("E".to_string(), Some("e".to_string())),
+            ("F".to_string(), Some("f".to_string())),
+        ];
+        let text = update_ini(
+            Some(before),
+            &IniUpdate {
+                server_url: None,
+                api_key: Some("k"),
+                name: None,
+                printers: Some("p"),
+                timeout: Some("45"),
+                headers: Some(&h),
+            },
+        );
+        let cfg = Config::from_text(&text).unwrap();
+        let s = cfg.http_settings().unwrap();
+        // timeout was read from [agent] (a timeout in [headers] would be a header called timeout)
+        assert_eq!(s.timeout, 45.0, "{text}");
+        assert_eq!(s.headers.len(), 5, "{text}");
+        assert!(!s.headers.contains_key("timeout"), "{text}");
+        assert_eq!(cfg.get("api_key").unwrap().as_deref(), Some("k"), "{text}");
+        assert_eq!(cfg.get("printers").unwrap().as_deref(), Some("p"), "{text}");
+        // and the same either way round
+        let after = "[agent]
+server_url = https://x
+
+[headers]
+A = b
+B = c
+";
+        let text = update_ini(
+            Some(after),
+            &IniUpdate {
+                server_url: None,
+                api_key: Some("k"),
+                name: None,
+                printers: Some("p"),
+                timeout: Some("45"),
+                headers: Some(&h),
+            },
+        );
+        let s = Config::from_text(&text).unwrap().http_settings().unwrap();
+        assert_eq!((s.timeout, s.headers.len()), (45.0, 5), "{text}");
     }
 
     #[test]
