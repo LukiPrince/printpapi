@@ -452,10 +452,32 @@ fn apply_with(staging: &Path, env: &Env, sumatra_sha: &str) -> Result<f64, Apply
             (env.run)(&c).map_err(|e| system("creating the service user failed", e))?;
         }
     }
-    // there is nothing to stop on a first install
+    // there is nothing to stop on a first install; on a reinstall ("change printers") the old agent
+    // is the one to bring back if a later step fails
+    let was_installed = l.marker.is_file();
     for c in install::stop_cmds(env.os, l, &env.sys) {
         let _ = (env.run)(&c);
     }
+    replace_install(env, &staged, &*http, computer_id, first_seen).inspect_err(|_| {
+        if was_installed {
+            // best effort: the original error is the one the window shows
+            for c in install::start_cmds(env.os, l, &env.sys) {
+                let _ = (env.run)(&c);
+            }
+        }
+    })
+}
+
+/// Everything after the old agent is stopped: files, key, marker, autostart, start. Returns the
+/// baseline `last_seen_at`.
+fn replace_install(
+    env: &Env,
+    staged: &Staged,
+    http: &dyn Http,
+    computer_id: i64,
+    first_seen: f64,
+) -> Result<f64, ApplyError> {
+    let l = &env.layout;
 
     std::fs::create_dir_all(&l.dir).map_err(|e| system("cannot create the install folder", e))?;
     // the service user has to get into the folder whatever the umask of the caller is
@@ -481,7 +503,7 @@ fn apply_with(staging: &Path, env: &Env, sumatra_sha: &str) -> Result<f64, Apply
         .map_err(|e| system("cannot write the autostart file", e))?;
     // The old agent is stopped by now. Its long-poll bumped last_seen_at until then, so the value
     // the window compares against is read here, not before. A failing read keeps the first one.
-    let baseline = last_seen(&*http, &staged, computer_id).unwrap_or(first_seen);
+    let baseline = last_seen(http, staged, computer_id).unwrap_or(first_seen);
     for (i, c) in install::start_cmds(env.os, l, &env.sys).iter().enumerate() {
         // the first macOS command removes the quarantine attribute, which a local file may lack
         let optional = env.os == Os::Macos && i == 0;
@@ -1317,6 +1339,45 @@ mod tests {
         let fx = Fixture::new(Os::Linux);
         fx.failing.borrow_mut().push("systemctl stop".into());
         apply(&fx.staging, &fx.env()).unwrap();
+    }
+
+    #[test]
+    fn a_failure_after_the_stop_starts_the_old_agent_again() {
+        for os in [Os::Linux, Os::Macos] {
+            let fx = Fixture::new(os);
+            apply(&fx.staging, &fx.env()).unwrap();
+            fx.events.borrow_mut().clear();
+            fx.failing.borrow_mut().push("chmod".into());
+            fx.failing.borrow_mut().push("daemon-reload".into());
+            let e = apply(&fx.staging, &fx.env()).unwrap_err();
+            // the original error comes back, not one of the restart
+            assert_eq!(e.code(), "system", "{os:?}");
+            assert!(e.to_string().contains("chmod"), "{os:?}: {e}");
+            let ev = fx.events();
+            let stop = ev
+                .iter()
+                .position(|e| e.contains("stop") || e.contains("bootout"));
+            let start = ev
+                .iter()
+                .position(|e| e.contains("enable --now") || e.contains("bootstrap"));
+            assert!(stop < start && start.is_some(), "{os:?}: {ev:?}");
+        }
+    }
+
+    #[test]
+    fn a_failure_on_a_first_install_starts_nothing() {
+        for os in [Os::Linux, Os::Macos] {
+            let fx = Fixture::new(os);
+            fx.failing.borrow_mut().push("chmod".into());
+            let e = apply(&fx.staging, &fx.env()).unwrap_err();
+            assert!(e.to_string().contains("chmod"), "{os:?}: {e}");
+            let ev = fx.events();
+            assert!(
+                ev.iter()
+                    .all(|e| !e.contains("enable") && !e.contains("bootstrap")),
+                "{os:?}: {ev:?}"
+            );
+        }
     }
 
     #[test]
