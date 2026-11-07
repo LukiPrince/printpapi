@@ -90,6 +90,33 @@ fn osascript_result(code: Option<i32>, stderr: &str) -> Result<(), Elevate> {
     }
 }
 
+/// Win32 `ERROR_CANCELLED`: the UAC prompt was dismissed
+/// (https://learn.microsoft.com/en-us/windows/win32/debug/system-error-codes--1000-1299-).
+const ERROR_CANCELLED: u32 = 1223;
+
+/// `ShellExecuteExW` returned FALSE: a dismissed prompt is a refusal, anything else a failure.
+// Pure, so it is tested on every host; only the Windows branch of `run` calls it.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn prompt_error(error: u32) -> Elevate {
+    if error == ERROR_CANCELLED {
+        Elevate::Cancelled
+    } else {
+        Elevate::Failed(format!(
+            "the administrator prompt failed (Windows error {error})"
+        ))
+    }
+}
+
+/// The outcome of `GetExitCodeProcess`: `got` is whether the call worked, `code` what it wrote.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn exit_result(got: bool, code: u32) -> Result<(), Elevate> {
+    match (got, code) {
+        (true, 0) => Ok(()),
+        (true, c) => Err(Elevate::Failed(format!("the agent exited with code {c}"))),
+        (false, _) => Err(Elevate::Failed("cannot read the agent's exit code".into())),
+    }
+}
+
 /// Run `agent args...` with administrator rights and wait for it. `Ok` only when it exited 0; what
 /// went wrong inside is in `result.json` in the staging folder.
 pub fn run(agent: &Path, args: &[&OsStr]) -> Result<(), Elevate> {
@@ -126,7 +153,7 @@ fn run_windows(_: &Path, _: &[&OsStr]) -> Result<(), Elevate> {
 #[cfg(windows)]
 fn run_windows(agent: &Path, args: &[&OsStr]) -> Result<(), Elevate> {
     use std::os::windows::ffi::OsStrExt;
-    use windows_sys::Win32::Foundation::{CloseHandle, ERROR_CANCELLED, GetLastError};
+    use windows_sys::Win32::Foundation::{CloseHandle, GetLastError};
     use windows_sys::Win32::System::Com::{
         COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE, CoInitializeEx, CoUninitialize,
     };
@@ -170,13 +197,7 @@ fn run_windows(agent: &Path, args: &[&OsStr]) -> Result<(), Elevate> {
         let started = ShellExecuteExW(&mut info) != 0;
         let error = GetLastError();
         let result = if !started {
-            if error == ERROR_CANCELLED {
-                Err(Elevate::Cancelled)
-            } else {
-                Err(Elevate::Failed(format!(
-                    "the administrator prompt failed (Windows error {error})"
-                )))
-            }
+            Err(prompt_error(error))
         } else if info.hProcess.is_null() {
             Err(Elevate::Failed("no process to wait for".into()))
         } else {
@@ -184,11 +205,7 @@ fn run_windows(agent: &Path, args: &[&OsStr]) -> Result<(), Elevate> {
             let mut code = 1u32;
             let got = GetExitCodeProcess(info.hProcess, &mut code) != 0;
             CloseHandle(info.hProcess);
-            match (got, code) {
-                (true, 0) => Ok(()),
-                (true, c) => Err(Elevate::Failed(format!("the agent exited with code {c}"))),
-                (false, _) => Err(Elevate::Failed("cannot read the agent's exit code".into())),
-            }
+            exit_result(got, code)
         };
         if com >= 0 {
             CoUninitialize();
@@ -342,6 +359,19 @@ mod tests {
                 "{path}"
             );
         }
+    }
+
+    #[test]
+    fn a_dismissed_uac_prompt_is_a_refusal() {
+        assert_eq!(prompt_error(1223), Elevate::Cancelled);
+        assert!(matches!(prompt_error(5), Elevate::Failed(m) if m.contains("error 5")));
+    }
+
+    #[test]
+    fn the_exit_code_of_the_elevated_agent_decides() {
+        assert_eq!(exit_result(true, 0), Ok(()));
+        assert!(matches!(exit_result(true, 3), Err(Elevate::Failed(m)) if m.contains("code 3")));
+        assert!(matches!(exit_result(false, 0), Err(Elevate::Failed(_))));
     }
 
     #[test]

@@ -4,7 +4,7 @@
   "identifier": "com.printpapi.setup",
   "build": { "frontendDist": "../../web/out-setup" },
   "app": {
-    "windows": [{ "title": "printpapi Agent Setup", "width": 760, "height": 560, "resizable": false, "center": true }],
+    "windows": [{ "title": "printpapi Agent Setup", "width": 760, "height": 560, "resizable": false, "maximizable": false, "center": true }],
     "security": { "csp": "default-src 'self'; connect-src ipc: http://ipc.localhost; img-src 'self' data:; style-src 'self' 'unsafe-inline'; font-src 'self'" }
   },
   "bundle": {

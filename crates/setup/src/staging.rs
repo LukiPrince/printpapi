@@ -22,6 +22,10 @@ impl Staging {
         // A random name in the temp folder. `tempfile` takes the umask for the folder (0755 on
         // Linux), so the owner-only mode is asked for; on Windows the folder inherits the ACL of
         // the user's own temp folder.
+        // ponytail: on Windows `mode` is ignored, so `agent.ini` (it holds the key) is only as
+        // private as the temp folder. That is the person's own %TEMP% by default; if TEMP points to
+        // a shared folder (say C:\Temp), other local users could read the file while the setup
+        // runs. A folder with its own DACL would lift this.
         let mut builder = tempfile::Builder::new();
         builder.prefix("printpapi-setup-");
         #[cfg(unix)]

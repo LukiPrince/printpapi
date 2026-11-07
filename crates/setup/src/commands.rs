@@ -163,11 +163,13 @@ fn os_name(os: Os) -> &'static str {
     }
 }
 
-fn installed_name(os: Os, found: Installed) -> &'static str {
-    if !install::supported(os) {
+/// The word of the contract for what is on this machine. Where the setup cannot install at all
+/// (`supported` is false: Linux without systemd) nothing is looked for.
+fn install_state(supported: bool, detect: impl FnOnce() -> Installed) -> &'static str {
+    if !supported {
         return "unsupported";
     }
-    match found {
+    match detect() {
         Installed::None => "none",
         Installed::Managed => "managed",
         Installed::Foreign => "foreign",
@@ -314,12 +316,9 @@ pub fn get_platform() -> &'static str {
 #[tauri::command(async)]
 pub fn detect_install() -> &'static str {
     let os = Os::host();
-    let found = if install::supported(os) {
+    install_state(install::supported(os), || {
         install::detect(os, &layout(), &install::system_dir(), &runner())
-    } else {
-        Installed::None
-    };
-    installed_name(os, found)
+    })
 }
 
 #[tauri::command(async)]
@@ -441,11 +440,12 @@ fn sumatra_in(dir: &Path) -> PathBuf {
 #[tauri::command(async)]
 pub fn sumatra_present(state: Shared) -> Result<bool, SetupError> {
     let mut guard = lock(&state);
-    Ok(layout().sumatra.is_file() || sumatra_in(guard.staging()?.dir()).is_file())
+    Ok(sumatra_path(&layout().sumatra, guard.staging()?.dir()).is_file())
 }
 
-/// SumatraPDF where the test print finds it: next to the installed agent, else the downloaded copy.
-fn sumatra_for_test(installed: &Path, staging: &Path) -> PathBuf {
+/// SumatraPDF where the test print and the "is it there" check find it: next to the installed
+/// agent, else the downloaded copy.
+fn sumatra_path(installed: &Path, staging: &Path) -> PathBuf {
     if installed.is_file() {
         installed.to_path_buf()
     } else {
@@ -456,7 +456,7 @@ fn sumatra_for_test(installed: &Path, staging: &Path) -> PathBuf {
 const BROWSER_UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36";
 /// The name of the exe inside the pinned ZIP.
 const SUMATRA_EXE_IN_ZIP: &str = "SumatraPDF-3.6.1-64.exe";
-/// The ZIP is about 8 MB.
+/// The pinned ZIP is 10 MB (10,031,830 bytes); the limit leaves room for a later pin.
 const MAX_SUMATRA_ZIP: u64 = 64 * 1024 * 1024;
 
 fn download(url: &str) -> Result<Vec<u8>, String> {
@@ -515,6 +515,10 @@ fn fetch_sumatra(
             .map_err(|_| bad("the download is not the expected file"))?;
         let _ = std::fs::remove_dir_all(&extracted);
         std::fs::create_dir(&extracted).map_err(|e| SetupError::io("cannot unpack", e))?;
+        // ponytail: `tar.exe` reads its arguments in the ANSI code page, so a staging path with
+        // characters outside it (user name "Łukasz Ж" on code page 1252) fails to open; the person
+        // then sees "cannot unpack" and can still install without SumatraPDF. A relative path with
+        // the staging folder as working directory would lift this (`Cmd` has no cwd yet).
         let tar = system_dir.join("tar.exe");
         let argv = [
             tar.to_string_lossy().into_owned(),
@@ -560,7 +564,7 @@ pub fn download_sumatra(state: Shared) -> Result<(), SetupError> {
 #[tauri::command(async)]
 pub fn test_print(state: Shared, printer: PrinterChoice) -> Result<(), SetupError> {
     let dir = lock(&state).staging()?.dir().to_path_buf();
-    let sumatra = sumatra_for_test(&layout().sumatra, &dir);
+    let sumatra = sumatra_path(&layout().sumatra, &dir);
     setup::test_print(
         &choice_to_printer(&printer),
         &sumatra.to_string_lossy(),
@@ -807,19 +811,90 @@ mod tests {
         let installed = tmp.path().join("SumatraPDF.exe");
         let staging = tmp.path().join("staging");
         assert_eq!(
-            sumatra_for_test(&installed, &staging),
+            sumatra_path(&installed, &staging),
             staging.join("SumatraPDF.exe")
         );
         std::fs::write(&installed, b"x").unwrap();
-        assert_eq!(sumatra_for_test(&installed, &staging), installed);
+        assert_eq!(sumatra_path(&installed, &staging), installed);
     }
 
     #[test]
     fn detection_maps_to_the_words_of_the_contract() {
-        assert_eq!(installed_name(Os::Windows, Installed::None), "none");
-        assert_eq!(installed_name(Os::Macos, Installed::Managed), "managed");
-        assert_eq!(installed_name(Os::Windows, Installed::Foreign), "foreign");
+        assert_eq!(install_state(true, || Installed::None), "none");
+        assert_eq!(install_state(true, || Installed::Managed), "managed");
+        assert_eq!(install_state(true, || Installed::Foreign), "foreign");
         assert_eq!(os_name(Os::Linux), "linux");
+    }
+
+    #[test]
+    fn where_the_setup_cannot_install_nothing_is_looked_for() {
+        let asked = Cell::new(false);
+        let word = install_state(false, || {
+            asked.set(true);
+            Installed::Managed
+        });
+        assert_eq!(word, "unsupported");
+        assert!(!asked.get(), "the machine must not be probed");
+    }
+
+    #[test]
+    fn closing_the_window_deletes_the_working_folder_and_forgets_the_rest() {
+        let mut state = AppState::default();
+        let dir = state.staging().unwrap().dir().to_path_buf();
+        std::fs::write(dir.join("agent.ini"), "key").unwrap();
+        state.ini_text = Some("key".into());
+        state.clear();
+        assert!(!dir.exists());
+        assert!(state.staging.is_none() && state.conn.is_none() && state.ini_text.is_none());
+    }
+
+    /// A one-shot HTTP server on loopback: answers the first request with `status_line` and `body`
+    /// and hands back the request head it received.
+    fn serve_once(
+        status_line: &'static str,
+        body: &'static [u8],
+    ) -> (String, std::thread::JoinHandle<String>) {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/file.zip", listener.local_addr().unwrap());
+        let handle = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            let mut head = Vec::new();
+            let mut byte = [0u8; 1];
+            while !head.ends_with(b"\r\n\r\n") {
+                if socket.read(&mut byte).unwrap() == 0 {
+                    break;
+                }
+                head.push(byte[0]);
+            }
+            write!(
+                socket,
+                "HTTP/1.1 {status_line}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            )
+            .unwrap();
+            socket.write_all(body).unwrap();
+            String::from_utf8_lossy(&head).into_owned()
+        });
+        (url, handle)
+    }
+
+    #[test]
+    fn the_download_sends_a_browser_user_agent() {
+        let (url, server) = serve_once("200 OK", b"zip bytes");
+        assert_eq!(download(&url).unwrap(), b"zip bytes");
+        let head = server.join().unwrap().to_ascii_lowercase();
+        assert!(
+            head.contains(&format!("user-agent: {}", BROWSER_UA.to_ascii_lowercase())),
+            "{head}"
+        );
+    }
+
+    #[test]
+    fn a_refused_download_is_an_error_not_a_file() {
+        let (url, server) = serve_once("403 Forbidden", b"denied");
+        assert!(download(&url).is_err());
+        server.join().unwrap();
     }
 
     // ---- the waiting for the agent
