@@ -115,6 +115,8 @@ pub struct Env<'a> {
     pub delete_at_reboot: &'a dyn Fn(&Path) -> std::io::Result<()>,
     /// The owner of a file as an `S-1-5-...` text, `None` when it cannot be read (Windows only).
     pub owner_sid: &'a dyn Fn(&Path) -> Option<String>,
+    /// Whether a process serves a FUSE mount (Linux only; the process of an AppImage's mount).
+    pub serves_mount: &'a dyn Fn(u32) -> bool,
 }
 
 fn bad(msg: impl Into<String>) -> ApplyError {
@@ -709,6 +711,16 @@ fn stop_trays(env: &Env) {
         && let Ok(out) = (env.run)(&list)
     {
         for pid in install::tray_pids(&out, env.keep_pid) {
+            // An AppImage's FUSE process is a copy of its runtime and keeps the command line, so the
+            // listing finds it. The window that asked may run from that very mount (opened from the
+            // icon, or from the menu entry with an AppImage of its own), and ending the process
+            // pulls the mount out from under it. The icon ends itself when its program file is
+            // replaced or removed (`tray::watch`), and the mount goes when the last program using
+            // it has ended (the runtime's keep-alive pipe).
+            // https://github.com/AppImage/type2-runtime/blob/main/src/runtime/runtime.c
+            if env.keep_pid.is_some() && (env.serves_mount)(pid) {
+                continue;
+            }
             let _ = (env.run)(&install::tray_kill_cmd(env.os, &env.sys, pid));
         }
     }
@@ -917,7 +929,8 @@ fn prepare_status_dir(env: &Env) -> Result<(), ApplyError> {
     // ponytail: Windows only. Elsewhere the folder is made under `/var/lib` or `/Library/Application
     // Support`, which no user can write to, so nobody can slip a file in before the rights are set.
     if env.os == Os::Windows {
-        purge_status_dir(dir, env.owner_sid).map_err(|e| system("cannot clean the status folder", e))?;
+        purge_status_dir(dir, env.owner_sid)
+            .map_err(|e| system("cannot clean the status folder", e))?;
     }
     Ok(())
 }
@@ -1285,9 +1298,26 @@ pub fn cli(args: &[String]) -> Option<ExitCode> {
             keep_pid: None,
             delete_at_reboot: &delete_at_reboot,
             owner_sid: &owner_sid,
+            serves_mount: &serves_mount,
         })
         .map_err(|e| system("cannot find the running program", e));
     run_args(args, env.as_ref().map_err(Clone::clone)).map(ExitCode::from)
+}
+
+/// Does the process hold `/dev/fuse` open, which is what a FUSE server does? Its `fd` folder lists
+/// where each descriptor points (proc(5)); one that cannot be read (the process is gone) is no.
+#[cfg(target_os = "linux")]
+fn serves_mount(pid: u32) -> bool {
+    let Ok(fds) = std::fs::read_dir(format!("/proc/{pid}/fd")) else {
+        return false;
+    };
+    fds.flatten()
+        .any(|fd| std::fs::read_link(fd.path()).is_ok_and(|to| to == Path::new("/dev/fuse")))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn serves_mount(_: u32) -> bool {
+    false
 }
 
 /// A process id: digits only, nothing a command line could carry along.
@@ -1426,6 +1456,9 @@ mod tests {
         keep_pid: Rc<std::cell::Cell<Option<u32>>>,
         /// what `pgrep` lists
         pids: Rc<RefCell<String>>,
+        /// the listed processes that serve a mount (the FUSE process of an AppImage)
+        mount_servers: Rc<RefCell<Vec<u32>>>,
+        serves: Box<dyn Fn(u32) -> bool>,
         /// what was handed to the delete-at-reboot call, in order
         at_reboot: Rc<RefCell<Vec<PathBuf>>>,
         reboot: RebootFn,
@@ -1491,6 +1524,7 @@ mod tests {
             let note_now: Rc<std::cell::Cell<bool>> = Rc::default();
             let pids: Rc<RefCell<String>> = Rc::default();
             let at_reboot: Rc<RefCell<Vec<PathBuf>>> = Rc::default();
+            let mount_servers: Rc<RefCell<Vec<u32>>> = Rc::default();
             let run: Runner = {
                 let (events, failing, running, plant, task_states, pids) = (
                     events.clone(),
@@ -1595,6 +1629,11 @@ mod tests {
                 note_now: note_now.clone(),
                 keep_pid: Rc::default(),
                 pids,
+                serves: {
+                    let m = mount_servers.clone();
+                    Box::new(move |pid| m.borrow().contains(&pid))
+                },
+                mount_servers,
                 at_reboot: at_reboot.clone(),
                 reboot: Box::new(move |p| {
                     at_reboot.borrow_mut().push(p.to_path_buf());
@@ -1634,6 +1673,7 @@ mod tests {
                 keep_pid: self.keep_pid.get(),
                 delete_at_reboot: &*self.reboot,
                 owner_sid: &|_| Some("S-1-5-21-1-2-3-1001".into()),
+                serves_mount: &*self.serves,
             }
         }
 
@@ -2975,6 +3015,37 @@ mod tests {
                 "{os:?}: {ev:?}"
             );
         }
+    }
+
+    #[test]
+    fn linux_spares_the_process_that_serves_the_mount_of_the_window_that_asked() {
+        // An AppImage's FUSE process keeps the command line of the runtime, so the listing finds
+        // it, and ending it pulls the mount out from under the window that runs from it.
+        let fx = Fixture::new(Os::Linux);
+        fx.keep_pid.set(Some(4242));
+        *fx.pids.borrow_mut() = "4242
+4300
+4301
+"
+        .into();
+        fx.mount_servers.borrow_mut().push(4301);
+        fx.stage_tray(b"the tray");
+        apply(&fx.staging, &fx.env()).unwrap();
+        let ev = fx.events();
+        let kill = |pid: &str| ev.iter().any(|e| e.ends_with(&format!("kill {pid}")));
+        assert!(kill("4300"), "{ev:?}");
+        assert!(!kill("4242") && !kill("4301"), "{ev:?}");
+        // no window to spare: every process of the listing is ended, as before
+        let fx = Fixture::new(Os::Linux);
+        *fx.pids.borrow_mut() = "4300
+4301
+"
+        .into();
+        fx.mount_servers.borrow_mut().push(4301);
+        fx.stage_tray(b"the tray");
+        apply(&fx.staging, &fx.env()).unwrap();
+        let ev = fx.events();
+        assert!(ev.iter().any(|e| e.ends_with("kill 4301")), "{ev:?}");
     }
 
     #[test]
