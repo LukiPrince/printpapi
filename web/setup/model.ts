@@ -62,6 +62,23 @@ export function returnsToConnect(code: string): boolean {
   return code === "key_in_use" || code === "name_taken";
 }
 
+/**
+ * Whether the finish step offers "Change server or key". Only a failure that another address, key
+ * or name fixes does: an unreachable server, a key that is taken, a name that belongs to another key.
+ */
+export function connectMayHelp(code: string): boolean {
+  return code === "unreachable" || returnsToConnect(code);
+}
+
+/**
+ * A printer connected for one user only is invisible to the agent (a service), so it cannot be
+ * switched on. One that is already on can still be switched off.
+ */
+export function canSwitchOn(found: FoundPrinter | null, on: boolean): boolean {
+  if (on) return true;
+  return found === null || (found.usable && !found.per_user);
+}
+
 /** Where the installed agent writes its log; mirrors `service_log_path` in crates/agent/src/install.rs. */
 export function logLocation(platform: Platform): string {
   switch (platform) {

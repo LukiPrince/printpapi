@@ -1,7 +1,7 @@
 // printpapi — self-hosted PrintNode alternative. Elastic License 2.0 (see LICENSE).
 import test from "node:test";
 import assert from "node:assert/strict";
-import { DEFAULT_RAW_PORT, addNetworkPrinter, canLeavePrinters, canTest, errorText, fromFound, logLocation, needsSumatra, returnsToConnect } from "./model.ts";
+import { DEFAULT_RAW_PORT, addNetworkPrinter, canLeavePrinters, canSwitchOn, canTest, connectMayHelp, errorText, fromFound, logLocation, needsSumatra, returnsToConnect } from "./model.ts";
 import type { FoundPrinter, PrinterChoice } from "./api.ts";
 
 const choice = (over: Partial<PrinterChoice> = {}): PrinterChoice => ({
@@ -110,4 +110,23 @@ test("a refused key or name sends the window back to the first step, every other
   for (const code of ["proxy", "unreachable", "system", "bad_staging", "error"]) {
     assert.equal(returnsToConnect(code), false, code);
   }
+});
+
+test("only a failure that another address, key or name fixes offers to go back to step 1", () => {
+  for (const code of ["key_in_use", "name_taken", "unreachable"]) {
+    assert.equal(connectMayHelp(code), true, code);
+  }
+  // the user said no, a proxy refused, the machine failed: nothing in step 1 changes that
+  for (const code of ["cancelled", "proxy", "system", "bad_staging", "error"]) {
+    assert.equal(connectMayHelp(code), false, code);
+  }
+});
+
+test("a printer that is connected for one user only cannot be switched on, but can be switched off", () => {
+  const found = (per_user: boolean): FoundPrinter => ({ name: "Buero", per_user, usable: true });
+  assert.equal(canSwitchOn(found(true), false), false);
+  assert.equal(canSwitchOn(found(true), true), true);
+  assert.equal(canSwitchOn(found(false), false), true);
+  assert.equal(canSwitchOn(null, false), true);
+  assert.equal(canSwitchOn({ ...found(false), usable: false }, false), false);
 });

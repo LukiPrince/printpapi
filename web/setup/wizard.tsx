@@ -32,6 +32,8 @@ export function Wizard({
   const [selected, setSelected] = useState<PrinterChoice[]>(existing?.printers ?? []);
   const [found, setFound] = useState<FoundPrinter[] | null>(null);
   const [sumatra, setSumatra] = useState(false);
+  // the agent reported in: every step is done, none is current
+  const [finished, setFinished] = useState(false);
   // why step 1 is shown again: the install found the key taken, revoked or the name another key's
   const [connectNotice, setConnectNotice] = useState<string | null>(null);
 
@@ -70,7 +72,7 @@ export function Wizard({
   const next = () => setI((n) => Math.min(steps.length - 1, n + 1));
 
   return (
-    <Shell steps={steps} current={i}>
+    <Shell steps={steps} current={finished ? steps.length : i}>
       {step === "Connect" && (
         <StepConnect
           initial={connection}
@@ -112,6 +114,7 @@ export function Wizard({
                   setI(0);
                 }
           }
+          onOnline={() => setFinished(true)}
           onDone={onDone}
         />
       )}

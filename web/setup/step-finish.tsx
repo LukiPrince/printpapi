@@ -6,7 +6,7 @@ import { CircleCheck, Loader2, Rocket } from "lucide-react";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { setup, toSetupError, type Platform, type PrinterChoice } from "./api";
-import { errorText, logLocation, returnsToConnect } from "./model";
+import { connectMayHelp, errorText, logLocation, returnsToConnect } from "./model";
 import { Actions, Notice } from "./bits";
 import type { Connection } from "./step-connect";
 
@@ -16,7 +16,15 @@ type Phase =
   | { at: "waiting"; baseline: number }
   | { at: "offline"; baseline: number }
   | { at: "online" }
-  | { at: "failed"; message: string };
+  | { at: "failed"; message: string; code: string };
+
+/** What the main button says: the action before and after a run, what is going on during one. */
+function buttonLabel(at: Phase["at"], changing: boolean): string {
+  if (at === "installing") return changing ? "Applying…" : "Installing…";
+  if (at === "waiting") return "Waiting for the agent…";
+  if (at === "failed") return "Try again";
+  return changing ? "Apply changes" : "Install and start";
+}
 
 /**
  * Step 4. Asks for admin rights, installs, then only reports success once the server has seen the
@@ -30,6 +38,7 @@ export function StepFinish({
   selected,
   onBack,
   onBackToConnect,
+  onOnline,
   onDone,
 }: {
   platform: Platform;
@@ -39,6 +48,8 @@ export function StepFinish({
   onBack: () => void;
   /** Back to step 1, with the reason when a refused key or name sent it there. */
   onBackToConnect?: (message?: string) => void;
+  /** The agent reported in: the whole run is finished, whatever the person does next. */
+  onOnline: () => void;
   onDone: () => void;
 }) {
   const [phase, setPhase] = useState<Phase>({ at: "idle" });
@@ -47,9 +58,12 @@ export function StepFinish({
   async function wait(baseline: number) {
     setPhase({ at: "waiting", baseline });
     try {
-      setPhase((await setup.waitOnline(baseline)) ? { at: "online" } : { at: "offline", baseline });
+      const online = await setup.waitOnline(baseline);
+      setPhase(online ? { at: "online" } : { at: "offline", baseline });
+      if (online) onOnline();
     } catch (e) {
-      setPhase({ at: "failed", message: errorText(toSetupError(e)) });
+      const err = toSetupError(e);
+      setPhase({ at: "failed", message: errorText(err), code: err.code });
     }
   }
 
@@ -69,7 +83,7 @@ export function StepFinish({
         onBackToConnect(errorText(err));
         return;
       }
-      setPhase({ at: "failed", message: errorText(err) });
+      setPhase({ at: "failed", message: errorText(err), code: err.code });
       return;
     }
     await wait(baseline);
@@ -120,23 +134,18 @@ export function StepFinish({
           <dt className="text-muted-foreground">Device</dt>
           <dd className="truncate">{deviceName}</dd>
           <dt className="text-muted-foreground">Printers</dt>
-          <dd className="truncate">{selected.map((p) => p.name).join(", ")}</dd>
+          <dd className="break-words">{selected.map((p) => p.name).join(", ")}</dd>
         </dl>
 
         {phase.at === "installing" && (
-          <Notice tone="info">
-            <span className="flex items-center gap-2">
-              <Loader2 className="size-3.5 animate-spin" /> Installing. Confirm the administrator prompt.
-            </span>
-          </Notice>
+          <p role="status" className="text-sm text-muted-foreground">
+            Confirm the administrator prompt.
+          </p>
         )}
         {phase.at === "waiting" && (
-          <Notice tone="info">
-            <span className="flex items-center gap-2">
-              <Loader2 className="size-3.5 animate-spin" /> Waiting for the agent to report in, up to 60
-              seconds.
-            </span>
-          </Notice>
+          <p role="status" className="text-sm text-muted-foreground">
+            The agent has to report in to the server. This takes up to 60 seconds.
+          </p>
         )}
         {phase.at === "offline" && (
           <Notice tone="error">
@@ -152,7 +161,7 @@ export function StepFinish({
               Back
             </Button>
           )}
-          {phase.at === "failed" && onBackToConnect && (
+          {phase.at === "failed" && onBackToConnect && connectMayHelp(phase.code) && (
             <Button type="button" variant="outline" onClick={() => onBackToConnect()}>
               Change server or key
             </Button>
@@ -164,7 +173,7 @@ export function StepFinish({
           ) : (
             <Button type="button" variant="brand" disabled={busy} onClick={() => void run()}>
               {busy ? <Loader2 className="animate-spin" /> : <Rocket />}
-              {phase.at === "failed" ? "Try again" : changing ? "Apply changes" : "Install and start"}
+              {buttonLabel(phase.at, changing)}
             </Button>
           )}
         </Actions>
