@@ -16,8 +16,8 @@ jobs:
       matrix:
         include:
           - { os: windows-latest, target: x86_64-pc-windows-msvc, name: windows-x86_64, exe: .exe }
-          - { os: ubuntu-latest, target: x86_64-unknown-linux-gnu, name: linux-x86_64, exe: "" }
-          - { os: ubuntu-24.04-arm, target: aarch64-unknown-linux-gnu, name: linux-aarch64, exe: "" }
+          - { os: ubuntu-22.04, target: x86_64-unknown-linux-gnu, name: linux-x86_64, exe: "" }
+          - { os: ubuntu-22.04-arm, target: aarch64-unknown-linux-gnu, name: linux-aarch64, exe: "" }
           - { os: macos-latest, target: aarch64-apple-darwin, name: macos-aarch64, exe: "" }
           - { os: macos-latest, target: x86_64-apple-darwin, name: macos-x86_64, exe: "" }
     runs-on: ${{ matrix.os }}
@@ -56,6 +56,10 @@ jobs:
   # one file in its folder, renamed to the scheme of web/lib/setup-downloads.json.
   # Linux libraries: https://v2.tauri.app/start/prerequisites/ ; AppImage extras (patchelf,
   # xdg-utils) as in https://v2.tauri.app/distribute/pipelines/github/.
+  # Linux builds run on the oldest system the downloads should start on, pinned (not
+  # ubuntu-latest, which moves): the bundled libraries ask for the glibc of the build system, and
+  # an AppImage built on 24.04 does not start on Ubuntu 22.04 or Debian 12 (GLIBC_2.38 not found).
+  # https://v2.tauri.app/distribute/appimage/ names Ubuntu 22.04 and Debian 12 as baselines.
   setup:
     strategy:
       fail-fast: false
