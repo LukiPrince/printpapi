@@ -163,17 +163,25 @@ pub fn start(cfg: &Config, hooks: &Hooks) -> Result<(), Fatal> {
     Ok(())
 }
 
+/// The SumatraPDF to start. Next to the exe when it is there. Without it, a setup-installed agent
+/// (marker file, runs as SYSTEM) still gets the absolute path: a bare name would be searched on
+/// the machine PATH and a local user could plant a SumatraPDF.exe there. The job then fails with
+/// the spawn error naming the missing file. Only a hand-installed agent falls back to the PATH.
+fn sumatra_program(base_dir: &Path) -> String {
+    let bundled = base_dir.join("SumatraPDF.exe");
+    if bundled.exists() || base_dir.join(install::MARKER_NAME).exists() {
+        bundled.to_string_lossy().into_owned()
+    } else {
+        "SumatraPDF.exe".to_string()
+    }
+}
+
 /// The agent: load `<base_dir>/agent.ini`, register, poll forever. Only returns on failure.
 pub fn run(base_dir: &Path) -> Result<(), Fatal> {
     let cfg = Config::load(base_dir).map_err(Fatal::Exit)?;
     let settings = cfg.http_settings().map_err(Fatal::Exit)?;
     let http = Client::new(&settings);
-    let bundled = base_dir.join("SumatraPDF.exe");
-    let sumatra = if bundled.exists() {
-        bundled.to_string_lossy().into_owned()
-    } else {
-        "SumatraPDF.exe".to_string()
-    };
+    let sumatra = sumatra_program(base_dir);
     let runner = real_runner();
     let platform = Platform::host();
     let caps = select_caps_collector(platform, Rc::clone(&runner));
@@ -326,6 +334,25 @@ mod tests {
         assert!(
             matches!(start(&bad, &hooks), Err(Fatal::Crash(m)) if m.contains("expected socket://host:port"))
         );
+    }
+
+    #[test]
+    fn a_setup_installed_agent_never_looks_up_sumatra_on_the_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let abs = dir
+            .path()
+            .join("SumatraPDF.exe")
+            .to_string_lossy()
+            .into_owned();
+        // hand-installed, no SumatraPDF next to the exe: PATH lookup as before
+        assert_eq!(sumatra_program(dir.path()), "SumatraPDF.exe");
+        // setup-installed (runs as SYSTEM) without the file: absolute path, so the job fails
+        std::fs::write(dir.path().join(install::MARKER_NAME), "").unwrap();
+        assert_eq!(sumatra_program(dir.path()), abs);
+        assert!(Path::new(&sumatra_program(dir.path())).is_absolute());
+        // with the file, either way
+        std::fs::write(dir.path().join("SumatraPDF.exe"), "x").unwrap();
+        assert_eq!(sumatra_program(dir.path()), abs);
     }
 
     #[test]
