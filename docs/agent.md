@@ -44,8 +44,8 @@ for them once.
   before it does that.
 - On Linux the icon needs the library `libayatana-appindicator3` (`libayatana-appindicator3.so.1`;
   `libappindicator3` works too). On Debian and Ubuntu it is the package `libayatana-appindicator3-1`
-  ([packages.debian.org](https://packages.debian.org/sid/libs/libayatana-appindicator3-1)); the
-  AppImage does not bring it along. Without it the icon cannot be shown: it writes one line saying
+  ([packages.debian.org](https://packages.debian.org/sid/libs/libayatana-appindicator3-1)).
+  Without it the icon cannot be shown: it writes one line saying
   so to `printpapi-tray.log` (in `$XDG_RUNTIME_DIR/printpapi/`, else `~/.cache/printpapi/`) and ends
   quietly at every logon instead of crashing. The agent is not affected, and the application menu's
   **printpapi Agent** entry still opens the settings window.
