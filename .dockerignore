@@ -14,3 +14,5 @@ target/
 web/node_modules/
 web/.next/
 web/out/
+web/out-setup/
+crates/setup/target/

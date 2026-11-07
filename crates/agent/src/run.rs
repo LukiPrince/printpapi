@@ -68,7 +68,7 @@ pub fn build_printer_map(printers: &[Printer], reg: &Value) -> Result<PrinterMap
     Ok(PrinterMap(map))
 }
 
-fn register(
+pub fn register(
     http: &dyn Http,
     base: &str,
     key: &str,
@@ -227,7 +227,17 @@ fn execute(
     print_job(mode, printer, &payload, copies, options, fns, Some(job_id))
 }
 
-/// Poll once; print and report if there was a job. `Ok(false)` = no job.
+/// A job this poll handled, for the status file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct JobDone {
+    pub id: i64,
+    pub ok: bool,
+}
+
+/// What one poll came to: `Ok(None)` = no job, `Ok(Some(_))` = a job was handled.
+pub type PollOutcome = Result<Option<JobDone>, String>;
+
+/// Poll once; print and report if there was a job.
 pub fn run_once(
     base: &str,
     key: &str,
@@ -235,16 +245,16 @@ pub fn run_once(
     http: &dyn Http,
     fns: &Fns,
     report_sleep: Sleep,
-) -> Result<bool, String> {
+) -> PollOutcome {
     let Some(job) = http
         .get(&format!("{base}/agent/jobs"), key)
         .map_err(|e| e.to_string())?
     else {
-        return Ok(false);
+        return Ok(None);
     };
     // a literal `null` body means the same as 204
     if job.is_null() {
-        return Ok(false);
+        return Ok(None);
     }
     let job_id = job_id_text(job.get("job_id").unwrap_or(&Value::Null))?;
     if job.get("printer_id").is_none() {
@@ -257,16 +267,28 @@ pub fn run_once(
     };
     report_with_retry(http, base, key, &job_id, ok, error, 5, report_sleep)
         .map_err(|e| e.to_string())?;
-    Ok(true)
+    // ponytail: the server's ids are integers; a plain-word id (which `job_id_text` still lets
+    // through) shows as 0 in the status file
+    Ok(Some(JobDone {
+        id: job_id.parse().unwrap_or(0),
+        ok,
+    }))
 }
 
 /// The loop behind [`poll_forever`]: `next` returns the outcome of one poll, or `None` to stop.
 /// Logs only on a failing/recovered transition, not every error - at the 2 s retry interval a
 /// down server or a revoked token would otherwise write about 43k lines/day and bury the one
 /// thing an operator needs from the crash log. Still prints every error to the console.
-pub fn poll_while(next: &mut dyn FnMut() -> Option<Result<bool, String>>, sleep: Sleep, log: Log) {
+/// `observe` sees every outcome first (the status file).
+pub fn poll_while(
+    next: &mut dyn FnMut() -> Option<PollOutcome>,
+    observe: &mut dyn FnMut(&PollOutcome),
+    sleep: Sleep,
+    log: Log,
+) {
     let mut failing = false;
     while let Some(outcome) = next() {
+        observe(&outcome);
         match outcome {
             Err(e) => {
                 if !failing {
@@ -287,6 +309,7 @@ pub fn poll_while(next: &mut dyn FnMut() -> Option<Result<bool, String>>, sleep:
 }
 
 /// The main loop: poll, print, repeat. Never returns.
+#[allow(clippy::too_many_arguments)] // the loop's whole environment; a struct would only move the list
 pub fn poll_forever(
     base: &str,
     key: &str,
@@ -295,9 +318,11 @@ pub fn poll_forever(
     fns: &Fns,
     sleep: Sleep,
     log: Log,
+    observe: &mut dyn FnMut(&PollOutcome),
 ) {
     poll_while(
         &mut || Some(run_once(base, key, printers, http, fns, sleep)),
+        observe,
         sleep,
         log,
     );
@@ -394,7 +419,7 @@ mod tests {
             &no_sleep,
         )
         .unwrap();
-        assert!(handled);
+        assert_eq!(handled, Some(JobDone { id: 7, ok: true }));
         assert_eq!(
             *printed.borrow(),
             vec![("Zebra".to_string(), b"ZPLDATA".to_vec())]
@@ -423,7 +448,7 @@ mod tests {
             &no_sleep,
         )
         .unwrap();
-        assert!(handled);
+        assert_eq!(handled, Some(JobDone { id: 9, ok: false }));
         let (url, body) = http.last_post();
         assert!(url.ends_with("/agent/jobs/9/result"));
         assert_eq!(body["ok"], json!(false));
@@ -441,14 +466,14 @@ mod tests {
             &Fns::refusing(),
             &no_sleep,
         );
-        assert_eq!(r, Ok(false));
+        assert_eq!(r, Ok(None));
     }
 
     #[test]
     fn test_run_once_no_job_returns_false() {
         let http = FakeHttp::new(None, b"");
         assert!(
-            !run_once(
+            run_once(
                 "http://x",
                 "k",
                 &PrinterMap::default(),
@@ -457,6 +482,7 @@ mod tests {
                 &no_sleep
             )
             .unwrap()
+            .is_none()
         );
         assert!(http.posts.borrow().is_empty());
     }
@@ -488,6 +514,7 @@ mod tests {
                 &no_sleep
             )
             .unwrap()
+            .is_some()
         );
         assert_eq!(
             *printed.borrow(),
@@ -663,7 +690,7 @@ mod tests {
             &fns,
             &no_sleep,
         );
-        assert_eq!(ret, Ok(true));
+        assert_eq!(ret, Ok(Some(JobDone { id: 1, ok: true })));
         assert_eq!(*printed.borrow(), vec![b"DATA".to_vec()]); // printed, and no error escaped
     }
 
@@ -686,6 +713,7 @@ mod tests {
                 &no_sleep
             )
             .unwrap()
+            .is_some()
         );
         assert_eq!(
             std::fs::read(dir.path().join("out").join("job-11.pdf")).unwrap(),
@@ -712,6 +740,7 @@ mod tests {
                 &no_sleep
             )
             .unwrap()
+            .is_some()
         );
         assert_eq!(
             http.last_post().1,
@@ -739,7 +768,11 @@ mod tests {
         ];
         for (job, want) in cases {
             let http = FakeHttp::new(Some(job), b"x");
-            assert!(run_once("http://x", "k", &p, &http, &Fns::refusing(), &no_sleep).unwrap());
+            assert!(
+                run_once("http://x", "k", &p, &http, &Fns::refusing(), &no_sleep)
+                    .unwrap()
+                    .is_some_and(|d| !d.ok)
+            );
             let (_, body) = http.last_post();
             assert_eq!(body["ok"], json!(false));
             assert!(body["error"].as_str().unwrap().contains(want), "{body}");
@@ -922,8 +955,8 @@ mod tests {
             calls += 1;
             match calls {
                 1 | 2 => Some(Err("down".to_string())),
-                3 => Some(Ok(false)), // recovered
-                _ => None,            // end the otherwise-infinite loop
+                3 => Some(Ok(None)), // recovered
+                _ => None,           // end the otherwise-infinite loop
             }
         };
         let (logged, slept) = (
@@ -931,9 +964,18 @@ mod tests {
             std::rc::Rc::new(RefCell::new(Vec::<u64>::new())),
         );
         let l = logged.clone();
-        poll_while(&mut next, &*collect(&slept), &move |m| {
-            l.borrow_mut().push(m.to_string())
-        });
+        let mut observed = Vec::new();
+        poll_while(
+            &mut next,
+            &mut |o| observed.push(o.clone()),
+            &*collect(&slept),
+            &move |m| l.borrow_mut().push(m.to_string()),
+        );
+        // the status file sees every outcome, not only the transitions
+        assert_eq!(
+            observed,
+            vec![Err("down".to_string()), Err("down".to_string()), Ok(None)]
+        );
         assert_eq!(*logged.borrow(), vec!["poll error: down", "poll recovered"]);
         assert_eq!(*slept.borrow(), vec![2, 2]); // only the two failing calls sleep
     }

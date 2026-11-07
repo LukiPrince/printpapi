@@ -2,9 +2,11 @@
 [workspace]
 resolver = "3"
 members = ["crates/server", "crates/agent"]
+# Tauri and its system libraries: built by its own CI job, with its own Cargo.lock.
+exclude = ["crates/setup"]
 
 [workspace.package]
-version = "3.2.0"
+version = "3.3.0"
 edition = "2024"
 license-file = "LICENSE"
 publish = false

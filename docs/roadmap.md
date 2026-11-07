@@ -119,6 +119,10 @@ order of pull:
 15. **Re-test `orientation` on the next SumatraPDF.** Its master branch also writes `portrait` and
     `landscape` into the driver's settings, where 3.6.1 only uses them for its own rotation. On a
     driver whose paper is already wide that may flip the sheet and shrink the label.
+16. **Guided agent setup on Linux without a screen.** A graphical setup cannot open a window on a
+    Raspberry Pi or a headless server, so those machines keep writing `agent.ini` by hand. A text
+    wizard in the terminal (`printpapi-agent setup`) could cover them. Whether anyone needs it is
+    unknown, so it waits for demand.
 
 Explicitly parked: MCP/LLM printing (no measurable audience yet), email-to-print (not even
 PrintNode has it), Magento-specific work (generic webhook intake covers it), browser-side silent

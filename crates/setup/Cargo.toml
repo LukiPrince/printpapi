@@ -1,0 +1,30 @@
+# Elastic License 2.0 (see LICENSE)
+# Not a workspace member (see `exclude` in the root Cargo.toml): Tauri and its system libraries stay
+# out of `cargo test --workspace`, the Docker build and the server and agent dependency trees.
+[package]
+name = "printpapi-setup"
+description = "printpapi agent setup: a window that installs the agent on this machine"
+# The same number as [workspace.package].version of the root Cargo.toml; a test keeps them equal.
+version = "3.3.0"
+edition = "2024"
+license-file = "../../LICENSE"
+publish = false
+
+[dependencies]
+printpapi-agent = { path = "../agent" }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.154"
+tauri = { version = "2.12.5", features = ["tray-icon", "image-png"] }
+tempfile = "3.27.0"
+ureq = { version = "3.5.0", default-features = false, features = ["rustls", "platform-verifier", "win-system-proxy"] }
+
+[build-dependencies]
+tauri-build = { version = "2.7.4", features = [] }
+
+[target."cfg(windows)".dependencies]
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_System_Com", "Win32_System_Threading", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging"] }
+
+# Not covered by the root [profile.release] (this crate is excluded from the workspace). The exe
+# was about 30 MB without it.
+[profile.release]
+strip = "symbols"

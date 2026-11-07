@@ -4,6 +4,66 @@ The agent runs on the machine with the printers. It registers its printers with 
 then long-polls for jobs, prints them, and reports the result. It makes **outbound connections
 only** — nothing listens on the printer's machine, so NAT/firewalls are no problem.
 
+## Setup app
+
+The easiest way on Windows, macOS and Linux with a desktop: download `printpapi-setup-<platform>`
+from the [latest release](https://github.com/LukiPrince/printpapi/releases/latest), open it and go
+through four steps (connect to the server with an agent key, pick the printers, test print, done).
+It writes `agent.ini`, installs the agent to `%ProgramFiles%\printpapi-agent\` (Windows) or
+`/opt/printpapi-agent/` (macOS, Linux) and starts it with the machine: a scheduled task
+`printpapi-agent` on Windows, a launchd daemon `com.printpapi.agent` on macOS, a systemd unit
+`printpapi-agent.service` (running as the system user `printpapi-agent`) on Linux. The folder and
+the user are not the ones of a printpapi server on the same machine (`/opt/printpapi`, user
+`printpapi`, see the [migration guide](migration.md)), so the two do not touch each other. Open the
+setup again to change the printers or remove the agent; the removal deletes only what the setup
+installed, and the folder only when nothing else is in it.
+
+### Tray icon and settings
+
+The setup also installs a small icon (next to the clock on Windows, in the menu bar on macOS, in
+the status area on Linux) that starts with every user's login. Its colour, symbol and word show
+the agent: connected, offline, or not running. Its menu has the status line, **Settings...**,
+**Open dashboard** and **Quit**; Quit ends only the icon, the agent keeps printing.
+
+**Settings...** opens a window with Overview, Printers (add, remove, change the kind, test print),
+Connection (another server or key), Advanced (`timeout` and the `[headers]` values), Log,
+SumatraPDF (Windows), Restart and Remove. Looking needs no administrator rights; each change asks
+for them once.
+
+- The icon only reads `status.json`, which the agent rewrites every 30 seconds from a thread of
+  its own, so it stays young while a long job prints or a connection hangs: Windows
+  `%ProgramData%\printpapi-agent\`, macOS `/Library/Application Support/printpapi-agent/`, Linux
+  `/var/lib/printpapi-agent/`. The file holds the server, device name, state, last contact and job, the
+  printers, the header names and the time the agent process started, never the key and never a
+  header value. A file that is missing or older than two minutes shows "not running"; an agent that
+  has not been in touch with the server for two minutes shows "offline" with the time it has been
+  silent. The agent still opens no port and takes no commands.
+  The crash log of an agent the setup installed lives in the same folder.
+- A new key on the same server needs a new device name, because the server ties a name to its
+  key. The printers then get new ids and the old device stays in the dashboard; the window warns
+  before it does that.
+- On Linux the icon needs the library `libayatana-appindicator3` (`libayatana-appindicator3.so.1`;
+  `libappindicator3` works too). On Debian and Ubuntu it is the package `libayatana-appindicator3-1`
+  ([packages.debian.org](https://packages.debian.org/sid/libs/libayatana-appindicator3-1)).
+  Without it the icon cannot be shown: it writes one line saying
+  so to `printpapi-tray.log` (in `$XDG_RUNTIME_DIR/printpapi/`, else `~/.cache/printpapi/`) and ends
+  quietly at every logon instead of crashing. The agent is not affected, and the application menu's
+  **printpapi Agent** entry still opens the settings window.
+- GNOME shows no tray icons without the
+  [AppIndicator extension](https://extensions.gnome.org/extension/615/appindicator-support/).
+  The application menu has a **printpapi Agent** entry that opens the settings window directly.
+- Removing the agent removes the icon, its autostart entry and the status folder too (the files
+  the agent wrote there; anything else in that folder stays).
+
+- The setup is not code-signed yet, so the system warns first. Windows: *More info*, then *Run
+  anyway*. macOS: System Settings, Privacy & Security, *Open Anyway*. macOS and the aarch64 Linux
+  builds are marked Beta on the downloads page until someone has run them by hand.
+- Smart App Control and WDAC block the unsigned exe with no way around it. Use the Python agent
+  ([Locked-down Windows](#locked-down-windows)).
+- Linux without a desktop or without systemd: use the manual steps below.
+- An agent you set up by hand is not taken over: the setup stops and says so, so a job is never
+  printed twice.
+
 ## Install
 
 The agent is a single Rust binary, `printpapi-agent`. No Python, no runtime.
@@ -68,7 +128,9 @@ On start the agent registers until it succeeds (backoff 1 s … 5 min), so a mac
 before its network is up simply waits instead of exiting. Each failed register try, the first poll
 error after a working stretch (and the matching "poll recovered"), a rejected `agent.ini` and every
 crash are appended to `%LOCALAPPDATA%\print_agent-error.log` (Windows) or the temp dir - that file
-is the first thing to read over remote desktop.
+is the first thing to read over remote desktop. (An agent the setup installed writes it next to
+its `status.json` instead, see [Tray icon and settings](#tray-icon-and-settings), and the settings
+window shows it under Log.)
 
 `api_key` is a key issued for the agent — on the dashboard's **Keys** page or with
 `POST /apikeys` — and the agent lands in that key's org. A made-up key is refused (`401`) since

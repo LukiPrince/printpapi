@@ -1,0 +1,17 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "printpapi Agent Setup",
+  "identifier": "com.printpapi.setup",
+  "build": { "frontendDist": "../../web/out-setup" },
+  "app": {
+    "windows": [{ "create": false, "title": "printpapi Agent Setup", "width": 760, "height": 560, "resizable": false, "maximizable": false, "center": true }],
+    "security": { "csp": "default-src 'self'; connect-src ipc: http://ipc.localhost; img-src 'self' data:; style-src 'self' 'unsafe-inline'; font-src 'self'" }
+  },
+  "bundle": {
+    "active": true,
+    "targets": ["deb", "appimage", "app", "dmg"],
+    "icon": ["icons/32x32.png", "icons/128x128.png", "icons/128x128@2x.png", "icons/icon.icns", "icons/icon.ico"],
+    "macOS": { "signingIdentity": "-" },
+    "linux": { "deb": { "depends": ["pkexec | policykit-1", "libayatana-appindicator3-1"] } }
+  }
+}

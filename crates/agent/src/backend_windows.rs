@@ -115,21 +115,29 @@ pub fn pdf_to_printer(
     run(&Cmd::new(argv, 60)).map(|_| ())
 }
 
+/// Every printer the spooler lists, as `(name, per_user)`. `per_user` is a connection made for
+/// one user (it has a server name); the agent runs as SYSTEM and does not see those.
+#[cfg(not(windows))]
+pub fn enum_printers() -> Result<Vec<(String, bool)>, String> {
+    Ok(Vec::new())
+}
+
 #[cfg(not(windows))]
 pub fn raw_to_printer(_printer: &str, _data: &[u8]) -> SendResult {
     Err("RAW printing through the Windows spooler is only available on Windows".into())
 }
 
 #[cfg(windows)]
-pub use win32::{Win32, raw_to_printer};
+pub use win32::{Win32, enum_printers, raw_to_printer};
 
 #[cfg(windows)]
 mod win32 {
     use std::ptr::{null, null_mut};
 
     use windows_sys::Win32::Graphics::Printing::{
-        ClosePrinter, DOC_INFO_1W, EndDocPrinter, EndPagePrinter, GetPrinterW, OpenPrinterW,
-        PRINTER_HANDLE, PRINTER_INFO_2W, StartDocPrinterW, StartPagePrinter, WritePrinter,
+        ClosePrinter, DOC_INFO_1W, EndDocPrinter, EndPagePrinter, EnumPrintersW, GetPrinterW,
+        OpenPrinterW, PRINTER_ENUM_CONNECTIONS, PRINTER_ENUM_LOCAL, PRINTER_HANDLE,
+        PRINTER_INFO_2W, PRINTER_INFO_4W, StartDocPrinterW, StartPagePrinter, WritePrinter,
     };
     use windows_sys::Win32::Storage::Xps::DeviceCapabilitiesW;
 
@@ -215,6 +223,59 @@ mod win32 {
             return Err(last_error("EndPagePrinter"));
         }
         Ok(())
+    }
+
+    /// Local printers and the connections of the calling user, as `(name, per_user)`.
+    /// `EnumPrintersW` level 4 reads the registry only, so a dead print server cannot stall it
+    /// (https://learn.microsoft.com/en-us/windows/win32/printdocs/enumprinters).
+    pub fn enum_printers() -> Result<Vec<(String, bool)>, String> {
+        let flags = PRINTER_ENUM_LOCAL | PRINTER_ENUM_CONNECTIONS;
+        let mut needed = 0u32;
+        // The list can grow between the size query and the fill: ask again a few times.
+        for _ in 0..4 {
+            let mut buf = vec![0u64; (needed as usize).div_ceil(8)];
+            let mut returned = 0u32;
+            // SAFETY: `buf` spans `needed` bytes (rounded up to u64); the out-pointers are valid.
+            // A null buffer with size 0 is the documented size query.
+            let ok = unsafe {
+                EnumPrintersW(
+                    flags,
+                    null(),
+                    4,
+                    if needed == 0 {
+                        null_mut()
+                    } else {
+                        buf.as_mut_ptr().cast()
+                    },
+                    needed,
+                    &mut needed,
+                    &mut returned,
+                )
+            };
+            if ok != 0 {
+                if returned == 0 {
+                    return Ok(Vec::new());
+                }
+                // SAFETY: a successful level-4 call filled the start of `buf` with `returned`
+                // PRINTER_INFO_4W (8-byte aligned, as `buf` is u64 words); their string pointers
+                // point into the same buffer.
+                let infos = unsafe {
+                    std::slice::from_raw_parts(
+                        buf.as_ptr().cast::<PRINTER_INFO_4W>(),
+                        returned as usize,
+                    )
+                };
+                return Ok(infos
+                    .iter()
+                    .map(|i| (read_wstr(i.pPrinterName, &buf), !i.pServerName.is_null()))
+                    .filter(|(name, _)| !name.is_empty())
+                    .collect());
+            }
+            if needed == 0 {
+                return Err(last_error("EnumPrinters"));
+            }
+        }
+        Err(last_error("EnumPrinters"))
     }
 
     /// The real winspool-backed [`WinPrint`].

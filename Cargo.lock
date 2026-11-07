@@ -987,11 +987,13 @@ dependencies = [
 
 [[package]]
 name = "printpapi-agent"
-version = "3.2.0"
+version = "3.3.0"
 dependencies = [
  "chrono",
+ "libc",
  "percent-encoding",
  "serde_json",
+ "sha2",
  "tempfile",
  "ureq",
  "wait-timeout",
@@ -1000,7 +1002,7 @@ dependencies = [
 
 [[package]]
 name = "printpapi-server"
-version = "3.2.0"
+version = "3.3.0"
 dependencies = [
  "base64",
  "bytes",
@@ -1014,6 +1016,7 @@ dependencies = [
  "image",
  "include_dir",
  "lettre",
+ "printpapi-agent",
  "rusqlite",
  "rust_decimal",
  "scrypt",
