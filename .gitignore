@@ -29,6 +29,8 @@ agent.ini
 
 # Rust
 target/
+# Tauri's generated capability schemas (crates/setup)
+crates/setup/gen/
 
 # Maintainer-only working docs (plans, specs, handoff, release routine): kept locally, not published
 docs/superpowers/

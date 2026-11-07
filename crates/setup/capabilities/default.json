@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "The setup window calls the commands of this program and nothing else: no plugins, no shell, no file access.",
+  "windows": ["main"],
+  "permissions": []
+}

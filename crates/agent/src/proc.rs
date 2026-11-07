@@ -54,6 +54,13 @@ pub fn real_runner() -> Runner {
 }
 
 pub fn run_command(cmd: &Cmd) -> Result<Vec<u8>, String> {
+    run_command_with(cmd, &|_| {})
+}
+
+/// [`run_command`] with a last look at the [`Command`] before it starts: the setup window uses it
+/// to keep a console window from flashing up for every `schtasks` and `tasklist` (Windows
+/// `CREATE_NO_WINDOW`).
+pub fn run_command_with(cmd: &Cmd, configure: &dyn Fn(&mut Command)) -> Result<Vec<u8>, String> {
     let Some((program, args)) = cmd.argv.split_first() else {
         return Err("empty command".into());
     };
@@ -74,6 +81,7 @@ pub fn run_command(cmd: &Cmd) -> Result<Vec<u8>, String> {
         } else {
             Stdio::inherit()
         });
+    configure(&mut c);
     let mut child = c
         .spawn()
         .map_err(|e| format!("{e}: {}", repr_str(program)))?;
@@ -154,6 +162,22 @@ mod tests {
             String::from_utf8_lossy(&run_command(&c).unwrap()).trim(),
             "hi"
         );
+    }
+
+    #[test]
+    fn configure_sees_the_command_before_it_starts() {
+        let script = if cfg!(windows) {
+            "echo %PP_PROC_TEST%"
+        } else {
+            "echo $PP_PROC_TEST"
+        };
+        let mut c = Cmd::new(shell(script), 10);
+        c.capture = true;
+        let out = run_command_with(&c, &|command| {
+            command.env("PP_PROC_TEST", "configured");
+        })
+        .unwrap();
+        assert_eq!(String::from_utf8_lossy(&out).trim(), "configured");
     }
 
     #[test]

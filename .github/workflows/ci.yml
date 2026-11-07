@@ -72,6 +72,48 @@ jobs:
           if [ "$RUNNER_OS" = "Windows" ]; then ext='.exe'; fi
           python tools/smoke/setup_smoke.py             --server "target/release/printpapi$ext"             --agent "target/release/printpapi-agent$ext"
 
+  # The setup window (Tauri) is not a workspace member, so `rust` above never builds it. It embeds
+  # the agent binary and the `web/out-setup` pages, so both are built first. Tauri builds against
+  # MSVC on Windows; the Linux libraries are the ones from
+  # https://v2.tauri.app/start/prerequisites/.
+  setup:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            . -> target
+            crates/setup -> target
+      - name: Linux libraries for the window
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev libxdo-dev
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - run: npm ci
+        working-directory: web
+      - run: npm run build:setup
+        working-directory: web
+      - run: cargo build --release --locked -p printpapi-agent
+      - run: cargo fmt --check
+        working-directory: crates/setup
+      - run: cargo clippy --locked -- -D warnings
+        working-directory: crates/setup
+      - run: cargo test --locked
+        working-directory: crates/setup
+
   # The dashboard bundle in crates/server/web is committed (so a plain `cargo build` checkout has
   # a UI without Node). This job proves the source in web/ still builds, and that nobody changed
   # the source without regenerating the bundle that actually ships.
