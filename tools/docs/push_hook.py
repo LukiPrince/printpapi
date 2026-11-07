@@ -32,8 +32,10 @@ entirely (an old tag or a mirror push must not fail today's rules). For every ot
 
 `--mark [rev]` appends the commit sha of rev (HEAD by default) to the marker, without duplicates.
 
-Exit 1 aborts the push, 0 allows it. An unexpected error inside the hook: message on stderr,
-exit 0 (fail open: a broken hook must never lock pushes). That includes check_docs.py failing to
+Exit 3 aborts the push (the wrapper turns it into git's non-zero), 0 allows it. The wrapper
+lets every other exit code through, so a crash of this file (python exits 1 on a SyntaxError)
+never blocks. An unexpected error inside the hook: message on stderr, exit 0 (fail open: a
+broken hook must never lock pushes). That includes check_docs.py failing to
 import (it is imported from the working tree): the mechanical check is skipped, the marker is
 still required under CLAUDECODE.
 
@@ -51,6 +53,7 @@ MARKER_NAME = "docs-checked"
 ZEROS = "0"
 OID = re.compile(r"[0-9a-f]{40,64}")
 SHORT = 10  # characters of a sha in messages
+ABORT = 3  # the only exit code tools/githooks/pre-push turns into an aborted push
 
 Update = tuple[str, str, str]  # (remote ref, commit, remote object name)
 
@@ -167,7 +170,7 @@ def pre_push(stdin_text: str, remote: str = "origin") -> int:
                     remote, git_ok(top, "rev-parse", "--verify", "-q", f"refs/remotes/{remote}/main"))
     if reason:
         print(reason, file=sys.stderr)
-        return 1
+        return ABORT
     return 0
 
 

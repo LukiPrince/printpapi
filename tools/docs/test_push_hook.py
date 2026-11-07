@@ -311,6 +311,15 @@ def test_a_syntax_error_in_check_docs_does_not_block_a_push(clone):
     assert "skipped" in out.stderr and clone.remote_ref("refs/heads/main")
 
 
+def test_a_crash_of_push_hook_itself_does_not_block_a_push(clone):
+    # python exits 1 on a SyntaxError; only the hook's own abort code (3) may stop the push
+    clone.commit(BAD_README)
+    (clone.dir / "tools" / "docs" / "push_hook.py").write_text("def broken(:\n", newline="\n")
+    out = clone.push(claude=True)
+    assert out.returncode == 0, out.stderr
+    assert clone.remote_ref("refs/heads/main")
+
+
 def test_the_marker_is_still_required_when_check_docs_is_broken(clone):
     sha = clone.commit()
     break_check_docs(clone)
