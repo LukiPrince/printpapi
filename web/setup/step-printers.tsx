@@ -15,8 +15,8 @@ import { DEFAULT_RAW_PORT, addNetworkPrinter, canLeavePrinters, errorText, fromF
 import { Actions, Notice } from "./bits";
 
 const KINDS = {
-  raw: { label: "Raw (ZPL, ESC/POS)", help: "Zebra, receipt printers" },
-  pdf: { label: "PDF through its driver", help: "Laser, inkjet, DYMO, Brother QL" },
+  raw: { label: "Raw (ZPL, ESC/POS)", help: "Zebra, receipt printers. Not DYMO or Brother QL." },
+  pdf: { label: "PDF through its driver", help: "Laser, inkjet, and the label printers DYMO and Brother QL" },
 } as const;
 
 type Row = { name: string; found: FoundPrinter | null; choice: PrinterChoice | null };
@@ -240,7 +240,10 @@ function PrinterRow({
             <SelectContent>
               {(Object.keys(KINDS) as (keyof typeof KINDS)[]).map((k) => (
                 <SelectItem key={k} value={k}>
-                  {KINDS[k].label}
+                  <span className="flex flex-col items-start">
+                    <span>{KINDS[k].label}</span>
+                    <span className="text-xs text-muted-foreground">{KINDS[k].help}</span>
+                  </span>
                 </SelectItem>
               ))}
             </SelectContent>
