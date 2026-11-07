@@ -16,9 +16,12 @@ pub mod proc;
 pub mod pyrepr;
 pub mod run;
 pub mod setup;
+pub mod status;
 
+use std::cell::RefCell;
 use std::io::Write;
 use std::path::Path;
+use std::path::PathBuf;
 use std::rc::Rc;
 
 use serde_json::Value;
@@ -28,6 +31,7 @@ use config::{Capabilities, Config, Printer, parse_printers};
 use print::{Fns, add_capabilities};
 use proc::{Runner, real_runner};
 use run::{PrinterMap, build_printer_map, poll_forever, register_with_retry};
+use status::{Reporter, Status, StatusWriter, unix_now};
 
 pub use print::{PdfFn, RawFn};
 type RegisterFn<'a> = dyn Fn(&str, &str, &str, &[Printer]) -> Value + 'a;
@@ -140,7 +144,7 @@ pub struct Hooks<'a> {
 /// `msg` without the key. A key under 8 characters is no real key (the server hands out 32 hex
 /// digits) and masking it would cut up the text.
 // ponytail: only the key as one piece is found; a message that quotes part of it is not.
-fn mask_key(msg: String, key: &str) -> String {
+pub(crate) fn mask_key(msg: String, key: &str) -> String {
     if key.len() < 8 {
         msg
     } else {
@@ -189,10 +193,28 @@ fn sumatra_program(base_dir: &Path) -> String {
     }
 }
 
+/// The folder for the status file and the crash log, only for an agent that setup installed (the
+/// marker file next to the exe). A hand-set-up agent behaves as before.
+fn setup_data_dir(base_dir: &Path, os: install::Os) -> Option<PathBuf> {
+    base_dir
+        .join(install::MARKER_NAME)
+        .exists()
+        .then(|| status::status_dir(os))
+}
+
 /// The agent: load `<base_dir>/agent.ini`, register, poll forever. Only returns on failure.
 pub fn run(base_dir: &Path) -> Result<(), Fatal> {
+    let data_dir = setup_data_dir(base_dir, install::Os::host());
+    if let Some(dir) = &data_dir {
+        log::set_log_dir(dir.clone());
+    }
     let cfg = Config::load(base_dir).map_err(Fatal::Exit)?;
     let settings = cfg.http_settings().map_err(Fatal::Exit)?;
+    let reporter = RefCell::new(Reporter::new(
+        Status::from_config(&cfg),
+        data_dir.map(StatusWriter::new),
+        cfg.get("api_key").ok().flatten().unwrap_or_default(),
+    ));
     let http = Client::new(&settings);
     let sumatra = sumatra_program(base_dir);
     let runner = real_runner();
@@ -204,18 +226,34 @@ pub fn run(base_dir: &Path) -> Result<(), Fatal> {
     let hooks = Hooks {
         caps: &*caps,
         register: &|base, key, name, printers| {
-            register_with_retry(
+            let reg = register_with_retry(
                 &http,
                 base,
                 key,
                 name,
                 printers,
                 &sleep,
-                &log::log_error,
+                &|msg| {
+                    log::log_error(msg);
+                    reporter.borrow_mut().register_failed(msg, unix_now());
+                },
                 300,
+            );
+            reporter.borrow_mut().registered(unix_now());
+            reg
+        },
+        poll: &|base, key, map| {
+            poll_forever(
+                base,
+                key,
+                map,
+                &http,
+                &fns,
+                &sleep,
+                &log::log_error,
+                &mut |outcome| reporter.borrow_mut().polled(outcome, unix_now()),
             )
         },
-        poll: &|base, key, map| poll_forever(base, key, map, &http, &fns, &sleep, &log::log_error),
     };
     start(&cfg, &hooks)
 }
@@ -366,6 +404,18 @@ mod tests {
         // with the file, either way
         std::fs::write(dir.path().join("SumatraPDF.exe"), "x").unwrap();
         assert_eq!(sumatra_program(dir.path()), abs);
+    }
+
+    #[test]
+    fn no_status_without_the_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        // a hand-set-up agent behaves as before: no status file, no log redirection
+        assert_eq!(setup_data_dir(dir.path(), install::Os::host()), None);
+        std::fs::write(dir.path().join(install::MARKER_NAME), "").unwrap();
+        assert_eq!(
+            setup_data_dir(dir.path(), install::Os::host()),
+            Some(status::status_dir(install::Os::host()))
+        );
     }
 
     #[test]

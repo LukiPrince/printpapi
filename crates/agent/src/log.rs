@@ -5,6 +5,7 @@
 use std::ffi::OsString;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 /// Python wrote the log in text mode, so on Windows every line ended in CRLF (old Notepad needs it).
 const EOL: &str = if cfg!(windows) { "\r\n" } else { "\n" };
@@ -34,9 +35,29 @@ pub fn append_log(dir: &Path, msg: &str) {
     }
 }
 
+/// Where `log_error` writes: the folder set by [`set_log_dir`], else [`log_dir`].
+fn target_dir(set: Option<&PathBuf>, local_app_data: Option<OsString>) -> PathBuf {
+    match set {
+        Some(d) => d.clone(),
+        None => log_dir(local_app_data),
+    }
+}
+
+static LOG_DIR: OnceLock<PathBuf> = OnceLock::new();
+
+/// Send `log_error` to `dir` from now on (once per process; a later call changes nothing). A
+/// setup-installed agent runs as SYSTEM or root, and this puts the log next to the status file
+/// where the tray icon can show it, instead of in the profile of SYSTEM.
+pub fn set_log_dir(dir: PathBuf) {
+    let _ = LOG_DIR.set(dir);
+}
+
 /// Append one line to the crash log.
 pub fn log_error(msg: &str) {
-    append_log(&log_dir(std::env::var_os("LOCALAPPDATA")), msg);
+    append_log(
+        &target_dir(LOG_DIR.get(), std::env::var_os("LOCALAPPDATA")),
+        msg,
+    );
 }
 
 #[cfg(test)]
@@ -73,6 +94,21 @@ mod tests {
         assert_eq!(log_dir(None), std::env::temp_dir());
         assert_eq!(log_dir(Some(OsString::new())), std::env::temp_dir());
         assert_eq!(log_dir(Some("C:/x".into())), PathBuf::from("C:/x"));
+    }
+
+    #[test]
+    fn log_goes_to_the_set_dir() {
+        let set = PathBuf::from("/var/lib/printpapi");
+        // a directory set by a setup-installed agent wins over %LOCALAPPDATA% (SYSTEM's profile)
+        assert_eq!(target_dir(Some(&set), Some("C:/x".into())), set);
+        assert_eq!(target_dir(None, Some("C:/x".into())), PathBuf::from("C:/x"));
+        // and the real thing end to end; the setting is once per process, so it is the only
+        // test that sets it
+        let dir = tempfile::tempdir().unwrap();
+        set_log_dir(dir.path().to_path_buf());
+        log_error("into the set dir");
+        let text = std::fs::read_to_string(dir.path().join("print_agent-error.log")).unwrap();
+        assert!(text.contains("into the set dir"));
     }
 
     #[test]

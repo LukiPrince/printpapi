@@ -134,7 +134,7 @@ pub fn program_files() -> PathBuf {
 }
 
 #[cfg(windows)]
-fn wide_to_path(wide: &[u16]) -> PathBuf {
+pub(crate) fn wide_to_path(wide: &[u16]) -> PathBuf {
     use std::os::windows::ffi::OsStringExt;
     PathBuf::from(std::ffi::OsString::from_wide(wide))
 }
