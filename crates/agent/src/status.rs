@@ -818,7 +818,8 @@ mod tests {
         assert_eq!(a.started_at, b.started_at);
         assert!(a.started_at > 1.7e9 && a.started_at <= unix_now());
         let v: Value = serde_json::from_str(&render(&a)).unwrap();
-        assert_eq!(v["started_at"], a.started_at);
+        // serde_json reads a float back without the last digit, so not `assert_eq!`
+        assert!((v["started_at"].as_f64().unwrap() - a.started_at).abs() < 1e-3);
     }
 
     #[test]
