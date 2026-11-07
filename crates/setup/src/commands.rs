@@ -278,6 +278,59 @@ pub fn build_ini(
     Ok(update_ini(existing, &update))
 }
 
+/// The arguments of an admin subcommand, with `--keep-pid <this window>` added to the two that end
+/// tray icons. The icon and this window are one program, so ending "the icons" ends this window
+/// too, before it can show the result (and on Windows locks the exe that is to be removed).
+fn keep_pid_args(args: &[&OsStr], pid: u32) -> Vec<std::ffi::OsString> {
+    let mut words: Vec<std::ffi::OsString> = args.iter().map(|a| (*a).to_os_string()).collect();
+    if args
+        .first()
+        .is_some_and(|c| *c == OsStr::new("install") || *c == OsStr::new("uninstall"))
+    {
+        words.push("--keep-pid".into());
+        words.push(pid.to_string().into());
+    }
+    words
+}
+
+/// `elevate` with `keep_pid_args`.
+fn elevate_keeping_window(
+    elevate: Elevator,
+    pid: u32,
+    agent: &Path,
+    args: &[&OsStr],
+) -> Result<(), Elevate> {
+    let words = keep_pid_args(args, pid);
+    let words: Vec<&OsStr> = words.iter().map(|w| w.as_os_str()).collect();
+    elevate(agent, &words)
+}
+
+/// Whether the icon of the installed program is to be started for this user once a run is over.
+/// `ended` is whether that run was to end the icons (it replaces or removes their program). A
+/// success starts the new one. A failure after they were ended must not leave the user without
+/// icon until the next logon, when there is a program to start; a refused prompt (`cancelled`)
+/// changed nothing.
+fn icon_wanted_again(failure: Option<&str>, ended: bool, installed: bool) -> bool {
+    match failure {
+        None => ended,
+        Some("cancelled") => false,
+        Some(_) => ended && installed,
+    }
+}
+
+/// `start` the icon if `icon_wanted_again`, given how `outcome` came out.
+fn restart_icon<T>(
+    outcome: &Result<T, SetupError>,
+    ended: bool,
+    installed: bool,
+    start: &dyn Fn(),
+) {
+    let failure = outcome.as_ref().err().map(|e| e.code.as_str());
+    if icon_wanted_again(failure, ended, installed) {
+        start();
+    }
+}
+
 fn read_result(dir: &Path) -> Option<Value> {
     let bytes = std::fs::read(dir.join("result.json")).ok()?;
     serde_json::from_slice(&bytes).ok()
@@ -732,6 +785,11 @@ fn installed_text_for(
     Ok(known)
 }
 
+/// `elevate::run` for the commands that end icons: they are told to spare this window.
+fn window_elevator() -> impl Fn(&Path, &[&OsStr]) -> Result<(), Elevate> {
+    |agent, args| elevate_keeping_window(&elevate::run, std::process::id(), agent, args)
+}
+
 #[tauri::command(async)]
 pub fn apply(state: Shared, request: ApplyRequest) -> Result<f64, SetupError> {
     let (agent, dir) = staged(&state)?;
@@ -742,12 +800,17 @@ pub fn apply(state: Shared, request: ApplyRequest) -> Result<f64, SetupError> {
         layout().marker.is_file(),
         &|| read_existing_in(&elevate::run, &agent, &dir).map(|c| c.text),
     )?;
-    let applied = apply_in(&elevate::run, &agent, &dir, &request, existing.as_deref())?;
+    let elevate = window_elevator();
+    let applied = apply_in(&elevate, &agent, &dir, &request, existing.as_deref());
+    restart_icon(
+        &applied,
+        tray_staged,
+        layout().tray.exists(),
+        &start_installed_tray,
+    );
+    let applied = applied?;
     if let Some(conn) = applied.conn {
         lock(&state).conn = Some(conn);
-    }
-    if tray_staged {
-        start_installed_tray();
     }
     Ok(applied.baseline)
 }
@@ -791,10 +854,20 @@ pub fn wait_online(state: Shared, baseline: f64) -> Result<bool, SetupError> {
 #[tauri::command(async)]
 pub fn uninstall(state: Shared) -> Result<(), SetupError> {
     let (agent, dir) = staged(&state)?;
-    run_elevated(&elevate::run, &agent, &dir, "uninstall")?;
-    let mut guard = lock(&state);
-    guard.conn = None;
-    guard.ini_text = None;
+    let removed = run_elevated(&window_elevator(), &agent, &dir, "uninstall");
+    // The removal ended the icons, this window excepted. When it failed, an icon that is still
+    // installed comes back; when it worked, the window shows the result and cleans up after itself:
+    // the working folder holds the unpacked agent, and nothing else needs it any more.
+    if removed.is_err() {
+        restart_icon(
+            &removed,
+            true,
+            layout().tray.exists(),
+            &start_installed_tray,
+        );
+    }
+    removed?;
+    lock(&state).clear();
     Ok(())
 }
 
@@ -882,12 +955,16 @@ fn apply_patch_in(
 pub fn apply_patch(state: Shared, patch: PatchRequest) -> Result<f64, SetupError> {
     let (agent, dir) = staged(&state)?;
     let tray_staged = stage_own_tray(&dir)?;
-    let baseline = apply_patch_in(&elevate::run, &agent, &dir, &patch)?;
+    let baseline = apply_patch_in(&window_elevator(), &agent, &dir, &patch);
+    restart_icon(
+        &baseline,
+        tray_staged,
+        layout().tray.exists(),
+        &start_installed_tray,
+    );
+    let baseline = baseline?;
     // the wait that follows reads the status file, not a connection left over from the wizard
     lock(&state).conn = None;
-    if tray_staged {
-        start_installed_tray();
-    }
     Ok(baseline)
 }
 
@@ -1749,6 +1826,83 @@ printers = Z = socket://nohost
         assert!(apply_patch_in(&elevate, Path::new("agent"), tmp.path(), &req).is_err());
         assert!(!asked.get());
         assert!(names_in(tmp.path()).is_empty());
+    }
+
+    #[test]
+    fn install_and_uninstall_are_told_which_process_is_this_window() {
+        let pid = 4242;
+        let dir = OsStr::new("/tmp/staging");
+        let words = |args: &[&OsStr]| -> Vec<String> {
+            keep_pid_args(args, pid)
+                .iter()
+                .map(|a| a.to_string_lossy().into_owned())
+                .collect()
+        };
+        for command in ["install", "uninstall"] {
+            assert_eq!(
+                words(&[OsStr::new(command), dir]),
+                [command, "/tmp/staging", "--keep-pid", "4242"]
+            );
+        }
+        // the others end no icon
+        for command in ["read-config", "restart"] {
+            assert_eq!(
+                words(&[OsStr::new(command), dir]),
+                [command, "/tmp/staging"]
+            );
+        }
+        // and the call that reaches the elevation carries it
+        let seen = std::cell::RefCell::new(Vec::new());
+        let elevate = |_: &Path, args: &[&OsStr]| {
+            seen.borrow_mut()
+                .extend(args.iter().map(|a| a.to_string_lossy().into_owned()));
+            Ok(())
+        };
+        elevate_keeping_window(
+            &elevate,
+            pid,
+            Path::new("agent"),
+            &[OsStr::new("uninstall"), dir],
+        )
+        .unwrap();
+        assert_eq!(
+            *seen.borrow(),
+            ["uninstall", "/tmp/staging", "--keep-pid", "4242"]
+        );
+    }
+
+    #[test]
+    fn the_icon_comes_back_after_a_run_that_ended_it_fails() {
+        // (failure code, icons were ended, an icon program is installed) -> start the icon
+        let cases = [
+            (None, true, true, true),
+            (None, true, false, true),
+            (None, false, true, false),
+            (Some("system"), true, true, true),
+            (Some("unreachable"), true, true, true),
+            // a failure before it came to the icons, or without anything installed to start
+            (Some("system"), false, true, false),
+            (Some("system"), true, false, false),
+            // a refused prompt changed nothing, the icons are still there
+            (Some("cancelled"), true, true, false),
+        ];
+        for (failure, ended, installed, want) in cases {
+            assert_eq!(
+                icon_wanted_again(failure, ended, installed),
+                want,
+                "{failure:?} ended={ended} installed={installed}"
+            );
+        }
+        let started = Cell::new(0);
+        let err = SetupError::new("system", "boom");
+        restart_icon(&Err::<(), _>(err.clone()), true, true, &|| {
+            started.set(started.get() + 1)
+        });
+        restart_icon(&Ok(()), true, true, &|| started.set(started.get() + 1));
+        restart_icon(&Err::<(), _>(err), false, true, &|| {
+            started.set(started.get() + 1)
+        });
+        assert_eq!(started.get(), 2);
     }
 
     #[test]

@@ -151,8 +151,8 @@ export function RemoveSection({ onRemoved }: { onRemoved: () => void }) {
       </CardHeader>
       <CardContent className="space-y-3">
         <Notice tone="info">
-          The tray icon is removed with it. If you opened this window from the tray icon, it closes, too:
-          its program is part of what is removed.
+          The tray icon is removed with it. If you opened this window from the tray icon, it stays open to
+          show the result; close it afterwards.
         </Notice>
         {error && <Notice tone="error">{error}</Notice>}
         <Actions>
@@ -168,8 +168,8 @@ export function RemoveSection({ onRemoved }: { onRemoved: () => void }) {
                 <AlertDialogTitle>Remove the agent?</AlertDialogTitle>
                 <AlertDialogDescription>
                   It stops, no longer starts with this computer, and its folder and the tray icon are
-                  deleted. This window closes if it belongs to the installed program. The device stays
-                  listed on your server until you revoke its key.
+                  deleted. This window stays open to show the result. The device stays listed on your
+                  server until you revoke its key.
                 </AlertDialogDescription>
               </AlertDialogHeader>
               <AlertDialogFooter>

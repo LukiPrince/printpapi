@@ -255,9 +255,9 @@ fn is_installed(os: Os, source: &Path, installed: &Path) -> bool {
 }
 
 /// Put the tray program into the staging folder as `tray`, for the elevated install to copy.
-/// Nothing is staged when the window runs from the installed place: the install ends every
-/// program at that place (`install::tray_stop_cmds`), this window included, before it replaces
-/// it. Returns whether something was staged.
+/// Nothing is staged when the window runs from the installed place: the install spares this window
+/// (`install::tray_stop_cmds`, `--keep-pid`), and on Windows its exe, which the window holds
+/// locked, cannot be replaced. Returns whether something was staged.
 pub fn stage_tray(
     os: Os,
     source: Option<&Path>,
