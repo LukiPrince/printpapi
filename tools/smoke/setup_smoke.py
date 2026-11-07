@@ -153,12 +153,14 @@ def plant_foreign_file():
 def remove_foreign_file(foreign):
     if WIN:
         foreign.unlink(missing_ok=True)
+        try:
+            INSTALL_DIR.rmdir()
+        except OSError:
+            pass
     else:
         subprocess.run(["sudo", "rm", "-f", str(foreign)], check=True)
-    try:
-        INSTALL_DIR.rmdir()
-    except OSError:
-        pass
+        # the folder lies in root's /opt, so the runner user may not remove it itself
+        subprocess.run(["sudo", "rmdir", str(INSTALL_DIR)], check=False)
 
 
 def agent_cmd(agent, sub, staging):
