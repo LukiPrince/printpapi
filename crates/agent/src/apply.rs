@@ -113,6 +113,8 @@ pub struct Env<'a> {
     pub keep_pid: Option<u32>,
     /// Have a file or an empty folder deleted when the computer restarts.
     pub delete_at_reboot: &'a dyn Fn(&Path) -> std::io::Result<()>,
+    /// The owner of a file as an `S-1-5-...` text, `None` when it cannot be read (Windows only).
+    pub owner_sid: &'a dyn Fn(&Path) -> Option<String>,
 }
 
 fn bad(msg: impl Into<String>) -> ApplyError {
@@ -754,7 +756,7 @@ pub(crate) fn trusted_windows_owner(sid: &str) -> bool {
     star == install::SID_ADMINISTRATORS || star == install::SID_SYSTEM
 }
 
-/// The owner of `dir` as an `S-1-5-...` text.
+/// The owner of a folder or file as an `S-1-5-...` text.
 /// https://learn.microsoft.com/en-us/windows/win32/api/aclapi/nf-aclapi-getnamedsecurityinfow
 /// (the owner SID points into the returned security descriptor, which `LocalFree` releases) and
 /// https://learn.microsoft.com/en-us/windows/win32/api/sddl/nf-sddl-convertsidtostringsidw
@@ -878,15 +880,24 @@ fn foreign_status_dir(dir: &Path) -> ApplyError {
 /// already (`icacls` without `/T` changes the folder only). A planted `status.json.tmp`, or a link
 /// under any of the agent's file names, would be taken over by the agent, which runs as SYSTEM. The
 /// agent is stopped while this runs, and it writes its status again within seconds of its start.
-/// Only a log that is a plain file (no link) stays, so the history of earlier runs survives a
-/// change of the printers.
-fn purge_status_dir(dir: &Path) -> std::io::Result<()> {
+/// Only a log that is a plain file (no link) and that Administrators or SYSTEM own stays, so the
+/// history of earlier runs survives a change of the printers. A log a user made in the gap keeps
+/// that user as its owner, who may rewrite it or point it somewhere later, and the agent appends
+/// to it as SYSTEM.
+fn purge_status_dir(
+    dir: &Path,
+    owner_sid: &dyn Fn(&Path) -> Option<String>,
+) -> std::io::Result<()> {
     for entry in std::fs::read_dir(dir)? {
         let entry = entry?;
         // `DirEntry::metadata` does not follow links
         let meta = entry.metadata()?;
         let log = entry.file_name() == std::ffi::OsStr::new(crate::log::LOG_NAME);
-        if log && meta.is_file() && !is_link(&meta) {
+        if log
+            && meta.is_file()
+            && !is_link(&meta)
+            && owner_sid(&entry.path()).is_some_and(|sid| trusted_windows_owner(&sid))
+        {
             continue;
         }
         remove_tree(&entry.path())?;
@@ -906,7 +917,7 @@ fn prepare_status_dir(env: &Env) -> Result<(), ApplyError> {
     // ponytail: Windows only. Elsewhere the folder is made under `/var/lib` or `/Library/Application
     // Support`, which no user can write to, so nobody can slip a file in before the rights are set.
     if env.os == Os::Windows {
-        purge_status_dir(dir).map_err(|e| system("cannot clean the status folder", e))?;
+        purge_status_dir(dir, env.owner_sid).map_err(|e| system("cannot clean the status folder", e))?;
     }
     Ok(())
 }
@@ -1251,6 +1262,16 @@ pub fn cli(args: &[String]) -> Option<ExitCode> {
     let http_for = |s: &HttpSettings| -> Box<dyn Http> { Box::new(Client::new(s)) };
     let sleep = |secs: u64| std::thread::sleep(std::time::Duration::from_secs(secs));
     let now = crate::status::unix_now;
+    let owner_sid = |p: &Path| -> Option<String> {
+        #[cfg(windows)]
+        return dir_owner_sid(p).ok();
+        // only the Windows purge of the status folder asks
+        #[cfg(not(windows))]
+        {
+            let _ = p;
+            None
+        }
+    };
     let env = std::env::current_exe()
         .map(|self_exe| Env {
             os,
@@ -1263,6 +1284,7 @@ pub fn cli(args: &[String]) -> Option<ExitCode> {
             now: &now,
             keep_pid: None,
             delete_at_reboot: &delete_at_reboot,
+            owner_sid: &owner_sid,
         })
         .map_err(|e| system("cannot find the running program", e));
     run_args(args, env.as_ref().map_err(Clone::clone)).map(ExitCode::from)
@@ -1611,6 +1633,7 @@ mod tests {
                 now: &*self.now,
                 keep_pid: self.keep_pid.get(),
                 delete_at_reboot: &*self.reboot,
+                owner_sid: &|_| Some("S-1-5-21-1-2-3-1001".into()),
             }
         }
 
@@ -3345,8 +3368,14 @@ mod tests {
         fx.plant
             .borrow_mut()
             .push(("/inheritance:r".into(), dir.join("evil.dll")));
+        // a log made by a user keeps its owner, who may rewrite it later (and the agent appends to
+        // it as SYSTEM), so it goes like the rest
+        let log = dir.join("print_agent-error.log");
+        fx.plant
+            .borrow_mut()
+            .push(("/setowner".into(), log.clone()));
         apply(&fx.staging, &fx.env()).unwrap();
-        for planted in [&early, &late, &dir.join("evil.dll")] {
+        for planted in [&early, &late, &dir.join("evil.dll"), &log] {
             assert!(!planted.exists(), "{planted:?} survived");
         }
         assert!(dir.is_dir());
@@ -3367,7 +3396,7 @@ mod tests {
         std::fs::create_dir(dir.join("sub")).unwrap();
         std::fs::write(dir.join("sub").join("inner"), b"x").unwrap();
         link_dir(&dir.join("junction"), &elsewhere);
-        purge_status_dir(&dir).unwrap();
+        purge_status_dir(&dir, &|_| Some("S-1-5-18".into())).unwrap();
         let mut left: Vec<String> = std::fs::read_dir(&dir)
             .unwrap()
             .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
@@ -3380,6 +3409,26 @@ mod tests {
         );
         // a link is removed, never followed
         assert!(elsewhere.join("precious").is_file());
+    }
+
+    #[test]
+    fn the_status_folder_purge_drops_a_log_nobody_trusted_owns() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("status");
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::write(dir.join("print_agent-error.log"), b"x").unwrap();
+        for owner in [
+            None,
+            Some("S-1-5-21-1-2-3-1001".to_string()),
+            Some("S-1-5-32-545".to_string()),
+        ] {
+            std::fs::write(dir.join("print_agent-error.log"), b"x").unwrap();
+            purge_status_dir(&dir, &|_| owner.clone()).unwrap();
+            assert!(!dir.join("print_agent-error.log").exists(), "{owner:?}");
+        }
+        std::fs::write(dir.join("print_agent-error.log"), b"x").unwrap();
+        purge_status_dir(&dir, &|_| Some("S-1-5-32-544".into())).unwrap();
+        assert!(dir.join("print_agent-error.log").exists());
     }
 
     #[test]
