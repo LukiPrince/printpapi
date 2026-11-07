@@ -257,8 +257,9 @@ pub fn poll_until(
     }
 }
 
-/// The `agent.ini` the install writes. A new install has no earlier text; changing printers sets
-/// only `printers` and leaves everything else of the installed file as it is.
+/// The `agent.ini` the install writes. A new install has no earlier text; with an earlier text,
+/// changing printers sets only `printers`, and a new connection sets only `server_url`, `api_key`
+/// and `name` besides, so `[headers]`, `timeout` and comments of the installed file stay.
 pub fn build_ini(
     existing: Option<&str>,
     conn: Option<(&str, &str, &str)>,
@@ -615,7 +616,7 @@ fn apply_in(
         ));
     }
     let text = build_ini(
-        if new_conn.is_some() { None } else { existing },
+        existing,
         new_conn
             .as_ref()
             .map(|(u, k, n)| (u.as_str(), k.as_str(), n.as_str())),
@@ -639,7 +640,11 @@ fn apply_in(
             server_url,
             api_key,
             name,
-            settings: HttpSettings::default(),
+            // what the agent will use, headers included: the wait asks the new server with them
+            settings: Config::from_text(&text)
+                .ok()
+                .and_then(|c| c.http_settings().ok())
+                .unwrap_or_default(),
         }),
     })
 }
@@ -710,11 +715,33 @@ fn start_installed_tray() {
     let _ = command.spawn();
 }
 
+/// The installed `agent.ini` text an install builds on. A new connection over an installed agent
+/// (the settings window, which only knows the status file) must keep `[headers]` and `timeout` of
+/// the installed file, so it is read once, by an elevated `read-config`, unless this window has it
+/// already. A first install has nothing to keep, and a change of printers does not need the
+/// connection.
+fn installed_text_for(
+    known: Option<String>,
+    new_connection: bool,
+    installed_by_setup: bool,
+    read: &dyn Fn() -> Result<String, SetupError>,
+) -> Result<Option<String>, SetupError> {
+    if known.is_none() && new_connection && installed_by_setup {
+        return read().map(Some);
+    }
+    Ok(known)
+}
+
 #[tauri::command(async)]
 pub fn apply(state: Shared, request: ApplyRequest) -> Result<f64, SetupError> {
     let (agent, dir) = staged(&state)?;
     let tray_staged = stage_own_tray(&dir)?;
-    let existing = lock(&state).ini_text.clone();
+    let existing = installed_text_for(
+        lock(&state).ini_text.clone(),
+        request.server_url.is_some(),
+        layout().marker.is_file(),
+        &|| read_existing_in(&elevate::run, &agent, &dir).map(|c| c.text),
+    )?;
     let applied = apply_in(&elevate::run, &agent, &dir, &request, existing.as_deref())?;
     if let Some(conn) = applied.conn {
         lock(&state).conn = Some(conn);
@@ -1476,13 +1503,21 @@ printers = Z = socket://nohost
     }
 
     #[test]
-    fn a_new_connection_does_not_build_on_an_installed_file_still_in_memory() {
+    fn a_new_connection_keeps_the_headers_and_the_timeout_of_the_installed_file() {
         let tmp = tempfile::tempdir().unwrap();
+        let installed = INSTALLED.replace("name = pc\n", "name = pc\ntimeout = 45\n");
         let elevate = |_: &Path, args: &[&OsStr]| {
             let dir = staging_dir_of(args);
             let ini = std::fs::read_to_string(dir.join("agent.ini")).unwrap();
-            assert!(!ini.contains("CF-Access"), "{ini}");
-            assert!(!ini.contains(KEY), "{ini}");
+            // the new server, key and name replace the old ones, nothing of the old key is left
+            assert!(ini.contains("server_url = https://y\n"), "{ini}");
+            assert!(ini.contains("api_key = NEW\n"), "{ini}");
+            assert!(ini.contains("name = pc2\n"), "{ini}");
+            assert!(!ini.contains(KEY) && !ini.contains("https://x"), "{ini}");
+            // what the connection did not change stays: the headers an auth proxy needs, and the
+            // timeout (they can be changed under Advanced)
+            assert!(ini.contains("[headers]\nCF-Access = abc"), "{ini}");
+            assert!(ini.contains("timeout = 45\n"), "{ini}");
             write_result(&dir, json!({"ok": true, "baseline_last_seen": 2.0}));
             Ok(())
         };
@@ -1490,14 +1525,69 @@ printers = Z = socket://nohost
             Some(("https://y", "NEW", "pc2")),
             vec![choice("A", false, None)],
         );
-        apply_in(
+        let applied = apply_in(
             &elevate,
             Path::new("agent"),
             tmp.path(),
             &req,
-            Some(INSTALLED),
+            Some(&installed),
         )
         .unwrap();
+        // the wait that follows asks the new server with the same headers and timeout
+        let settings = applied.conn.unwrap().settings;
+        assert_eq!(settings.timeout, 45.0);
+        assert_eq!(
+            settings.headers.get("cf-access").map(String::as_str),
+            Some("abc")
+        );
+    }
+
+    #[test]
+    fn a_first_install_has_no_installed_file_to_keep() {
+        let tmp = tempfile::tempdir().unwrap();
+        let elevate = |_: &Path, args: &[&OsStr]| {
+            let dir = staging_dir_of(args);
+            let ini = std::fs::read_to_string(dir.join("agent.ini")).unwrap();
+            assert!(
+                !ini.contains("[headers]") && !ini.contains("timeout"),
+                "{ini}"
+            );
+            write_result(&dir, json!({"ok": true, "baseline_last_seen": 2.0}));
+            Ok(())
+        };
+        let req = request(
+            Some(("https://y", "NEW", "pc2")),
+            vec![choice("A", false, None)],
+        );
+        let applied = apply_in(&elevate, Path::new("agent"), tmp.path(), &req, None).unwrap();
+        assert_eq!(applied.conn.unwrap().settings, HttpSettings::default());
+    }
+
+    #[test]
+    fn the_installed_file_is_read_for_a_new_connection_only_when_there_is_one_to_keep() {
+        let reads = Cell::new(0);
+        let read = || {
+            reads.set(reads.get() + 1);
+            Ok(INSTALLED.to_string())
+        };
+        // the settings window knows no text: a new connection over an installed agent reads it
+        let got = installed_text_for(None, true, true, &read).unwrap();
+        assert_eq!(got.as_deref(), Some(INSTALLED));
+        assert_eq!(reads.get(), 1);
+        // already read in this window, a change of printers, or a first install: no prompt
+        for (known, new_conn, managed) in [
+            (Some("kept".to_string()), true, true),
+            (None, false, true),
+            (None, true, false),
+        ] {
+            let got = installed_text_for(known.clone(), new_conn, managed, &read).unwrap();
+            assert_eq!(got, known);
+        }
+        assert_eq!(reads.get(), 1);
+        // a refused prompt stops the install: it would lose the headers silently otherwise
+        let refused = || Err(SetupError::new("cancelled", "no"));
+        let e = installed_text_for(None, true, true, &refused).unwrap_err();
+        assert_eq!(e.code, "cancelled");
     }
 
     // ---- changes of the settings

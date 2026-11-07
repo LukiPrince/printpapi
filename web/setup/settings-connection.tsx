@@ -30,7 +30,7 @@ export function ConnectionSection({ status, onChange }: { status: AgentStatus | 
         </dl>
         <p className="text-sm text-muted-foreground">
           The printers carry over and are shown in the next steps. The timeout and the headers under
-          Advanced start from their defaults on a new connection.
+          Advanced carry over, too; change them there if the new server needs other values.
         </p>
         <Actions>
           <Button type="button" variant="brand" onClick={onChange}>
