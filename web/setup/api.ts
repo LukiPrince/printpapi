@@ -4,6 +4,7 @@
 // https://v2.tauri.app/develop/calling-rust/). This is the only file that imports @tauri-apps/api,
 // and nothing outside web/setup/ may import this file.
 import { invoke } from "@tauri-apps/api/core";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 
 export type Platform = "windows" | "macos" | "linux";
 export type InstallState = "none" | "managed" | "foreign" | "unsupported";
@@ -53,4 +54,9 @@ export const setup = {
   /** Waits up to 60 s for the agent to check in after the baseline. */
   waitOnline: (baseline: number) => call<boolean>("wait_online", { baseline }),
   uninstall: () => call<void>("uninstall"),
+  /**
+   * Closes the window, and with it the program. Needs `core:window:allow-close` in
+   * crates/setup/capabilities/default.json (https://v2.tauri.app/learn/window-customization/).
+   */
+  close: () => getCurrentWindow().close(),
 };

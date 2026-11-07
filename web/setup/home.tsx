@@ -2,7 +2,7 @@
 "use client";
 
 import { useCallback, useEffect, useState } from "react";
-import { CircleCheck, Loader2, Pencil, Trash2 } from "lucide-react";
+import { CircleCheck, Loader2, Pencil, Trash2, X } from "lucide-react";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Skeleton } from "@/components/ui/skeleton";
@@ -77,6 +77,11 @@ export function Home() {
               Removed. Revoke this device&apos;s key on the Keys page of your dashboard.
             </CardDescription>
           </CardHeader>
+          <CardContent>
+            <Actions>
+              <CloseButton variant="brand" />
+            </Actions>
+          </CardContent>
         </Card>
       </Shell>
     );
@@ -113,9 +118,13 @@ export function Home() {
     return (
       <Shell>
         <Notice tone="warn">
-          This machine already runs an agent that was set up by hand. Remove it first, or keep editing
-          its agent.ini.
+          This computer already runs an agent that was set up by hand, so this setup does not change or
+          remove it. Remove it by hand, the way it was set up: see &quot;Run as a service&quot; in
+          docs/agent.md.
         </Notice>
+        <Actions>
+          <CloseButton />
+        </Actions>
       </Shell>
     );
   }
@@ -125,6 +134,9 @@ export function Home() {
         <Notice tone="warn">
           This Linux does not use systemd. Set up the agent by hand, see docs/agent.md.
         </Notice>
+        <Actions>
+          <CloseButton />
+        </Actions>
       </Shell>
     );
   }
@@ -139,6 +151,16 @@ export function Home() {
         onRemoved={() => setView("removed")}
       />
     </Shell>
+  );
+}
+
+/** Closes the window. An error here has nowhere to go, so it is dropped: the window is still open. */
+function CloseButton({ variant = "outline" }: { variant?: "outline" | "brand" }) {
+  return (
+    <Button type="button" variant={variant} onClick={() => void setup.close().catch(() => {})}>
+      <X />
+      Close
+    </Button>
   );
 }
 
@@ -203,7 +225,9 @@ function Installed({ onChange, onRemoved }: { onChange: (e: Existing) => void; o
               </AlertDialogHeader>
               <AlertDialogFooter>
                 <AlertDialogCancel>Keep it</AlertDialogCancel>
-                <AlertDialogAction onClick={() => void remove()}>Remove</AlertDialogAction>
+                <AlertDialogAction variant="destructive" onClick={() => void remove()}>
+                  Remove
+                </AlertDialogAction>
               </AlertDialogFooter>
             </AlertDialogContent>
           </AlertDialog>
