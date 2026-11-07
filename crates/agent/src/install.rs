@@ -490,6 +490,150 @@ pub fn start_cmds(os: Os, l: &Layout, sys: &Path) -> Vec<Cmd> {
     }
 }
 
+/// How `restart` brings the agent back, per system.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RestartPlan {
+    /// Run first; a failure is ignored (there may be nothing to stop).
+    pub stop: Vec<Cmd>,
+    /// Windows: asks whether the task still runs, see [`parse_task_state`]. Asked until it does not,
+    /// at most [`RESTART_WAIT_SECS`] seconds. A failing look means there is nothing to wait for.
+    pub wait: Option<Cmd>,
+    /// Run last; a failure is an error.
+    pub start: Vec<Cmd>,
+}
+
+/// How long `restart` waits for the Windows task to end before it starts it again.
+pub const RESTART_WAIT_SECS: u64 = 15;
+
+/// What `restart` runs.
+/// - Linux: `systemctl restart` "stops and starts" a unit and starts one that is not running
+///   (systemctl(1), https://www.freedesktop.org/software/systemd/man/latest/systemctl.html).
+/// - macOS: `launchctl kickstart -k` ends a running instance of the service and starts it again
+///   (launchctl(1), `kickstart [-kp] service-target`; `bootout` followed at once by `bootstrap`
+///   fails while the old job is still being torn down).
+/// - Windows: `schtasks /end`, then wait until the task is no longer running, then `/run`. The task
+///   has `MultipleInstancesPolicy` `IgnoreNew`, so a `/run` while the old process is still there is
+///   dropped without a word.
+pub fn restart_plan(os: Os, _l: &Layout, sys: &Path) -> RestartPlan {
+    match os {
+        Os::Windows => {
+            let schtasks = tool(os, sys, "schtasks.exe");
+            let mut query = cmd(vec![
+                schtasks.clone(),
+                "/query".into(),
+                "/tn".into(),
+                TASK_NAME.into(),
+                "/fo".into(),
+                "csv".into(),
+                "/nh".into(),
+            ]);
+            query.capture = true;
+            RestartPlan {
+                stop: vec![cmd(vec![
+                    schtasks.clone(),
+                    "/end".into(),
+                    "/tn".into(),
+                    TASK_NAME.into(),
+                ])],
+                wait: Some(query),
+                start: vec![cmd(vec![
+                    schtasks,
+                    "/run".into(),
+                    "/tn".into(),
+                    TASK_NAME.into(),
+                ])],
+            }
+        }
+        Os::Linux => RestartPlan {
+            stop: Vec::new(),
+            wait: None,
+            start: vec![cmd(argv(&["systemctl", "restart", "printpapi-agent"]))],
+        },
+        Os::Macos => RestartPlan {
+            stop: Vec::new(),
+            wait: None,
+            start: vec![cmd(vec![
+                tool(os, sys, "bin/launchctl"),
+                "kickstart".into(),
+                "-k".into(),
+                format!("system/{LAUNCHD_LABEL}"),
+            ])],
+        },
+    }
+}
+
+/// What the task of the agent is doing, from the `Status` column of `schtasks /query`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TaskState {
+    Running,
+    /// Ready or disabled: no process.
+    Stopped,
+    /// Not in the answer, or in a word that is not known.
+    Unknown,
+}
+
+/// The state of the task `printpapi-agent` in the CSV of `schtasks /query /fo csv /nh`:
+/// `"\printpapi-agent","<next run>","<status>"`. The status words are localised (Windows prints
+/// "Running" and "Ready", "Wird ausgeführt" and "Bereit" on a German one; Microsoft does not list
+/// them, https://learn.microsoft.com/en-us/windows-server/administration/windows-commands/schtasks-query)
+/// and written in the console's OEM code page, so the words are compared by their ASCII letters
+/// only ("ü" is no UTF-8 there). Anything else is [`TaskState::Unknown`], which the caller must
+/// not take for "stopped".
+// ponytail: English and German only. On another language the wait runs its full
+// `RESTART_WAIT_SECS`, which is safe because it ends with the task being run anyway; the cost is
+// 15 seconds. A new language is one more word in `classify_status`.
+pub fn parse_task_state(out: &[u8]) -> TaskState {
+    let text = String::from_utf8_lossy(out);
+    for line in text.lines() {
+        let fields = csv_fields(line);
+        let (Some(name), Some(status)) = (fields.first(), fields.last()) else {
+            continue;
+        };
+        if fields.len() >= 2
+            && name
+                .trim_start_matches('\\')
+                .eq_ignore_ascii_case(TASK_NAME)
+        {
+            return classify_status(status);
+        }
+    }
+    TaskState::Unknown
+}
+
+fn classify_status(status: &str) -> TaskState {
+    let letters: String = status
+        .chars()
+        .filter(|c| c.is_ascii_alphabetic() || *c == ' ')
+        .collect::<String>()
+        .to_ascii_lowercase();
+    match letters.trim() {
+        "running" | "wird ausgefhrt" => TaskState::Running,
+        "ready" | "bereit" | "disabled" | "deaktiviert" => TaskState::Stopped,
+        _ => TaskState::Unknown,
+    }
+}
+
+/// The fields of one CSV line: separated by commas, quoted with `"`, a quote inside doubled.
+fn csv_fields(line: &str) -> Vec<String> {
+    let mut fields = Vec::new();
+    let mut field = String::new();
+    let mut quoted = false;
+    let mut chars = line.trim_end_matches(['\r', '\n']).chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '"' if quoted && chars.peek() == Some(&'"') => {
+                field.push('"');
+                chars.next();
+            }
+            '"' => quoted = !quoted,
+            ',' if !quoted => fields.push(std::mem::take(&mut field)),
+            c => field.push(c),
+        }
+    }
+    fields.push(field);
+    fields
+}
+
 /// Take the autostart out, after `stop_cmds`. The caller deletes the autostart file and the
 /// installation folder afterwards. macOS needs nothing here: `bootout` in `stop_cmds` already
 /// unloaded the daemon.
@@ -871,6 +1015,133 @@ mod tests {
 
     fn p(l: &Path) -> String {
         l.to_string_lossy().into_owned()
+    }
+
+    #[test]
+    fn restart_is_one_command_where_the_service_manager_has_one() {
+        let sys = Path::new("/");
+        // systemctl(1): `restart` stops and starts, and starts a unit that is not running
+        let linux = restart_plan(Os::Linux, &linux(), sys);
+        assert!(linux.stop.is_empty() && linux.wait.is_none());
+        assert_eq!(
+            argvs(&linux.start),
+            [vec!["systemctl", "restart", "printpapi-agent"]]
+        );
+        // launchctl(1): `kickstart -k` kills a running instance and starts the service again
+        let mac = restart_plan(Os::Macos, &mac(), sys);
+        assert!(mac.stop.is_empty() && mac.wait.is_none());
+        assert_eq!(
+            argvs(&mac.start),
+            [vec![
+                "/bin/launchctl",
+                "kickstart",
+                "-k",
+                "system/com.printpapi.agent"
+            ]]
+        );
+    }
+
+    #[test]
+    fn restart_on_windows_ends_the_task_waits_for_it_and_runs_it() {
+        let sys = Path::new(WIN_SYS);
+        let plan = restart_plan(Os::Windows, &win_layout("C:\\Program Files"), sys);
+        assert_eq!(
+            argvs(&plan.stop),
+            [vec![
+                "C:\\Windows\\System32\\schtasks.exe",
+                "/end",
+                "/tn",
+                "printpapi-agent"
+            ]]
+        );
+        let wait = plan.wait.unwrap();
+        assert_eq!(
+            wait.argv,
+            [
+                "C:\\Windows\\System32\\schtasks.exe",
+                "/query",
+                "/tn",
+                "printpapi-agent",
+                "/fo",
+                "csv",
+                "/nh"
+            ]
+        );
+        // its answer is read
+        assert!(wait.capture);
+        assert_eq!(
+            argvs(&plan.start),
+            [vec![
+                "C:\\Windows\\System32\\schtasks.exe",
+                "/run",
+                "/tn",
+                "printpapi-agent"
+            ]]
+        );
+    }
+
+    fn state(csv: &str) -> TaskState {
+        parse_task_state(csv.as_bytes())
+    }
+
+    #[test]
+    fn the_task_state_is_read_from_the_csv_of_schtasks() {
+        // English and German Windows (the words are localised; measured on German Windows 11)
+        assert_eq!(
+            state("\"\\printpapi-agent\",\"N/A\",\"Running\"\r\n"),
+            TaskState::Running
+        );
+        assert_eq!(
+            state("\"\\printpapi-agent\",\"N/A\",\"Ready\"\r\n"),
+            TaskState::Stopped
+        );
+        assert_eq!(
+            state("\"\\printpapi-agent\",\"Nicht zutreffend\",\"Bereit\""),
+            TaskState::Stopped
+        );
+        assert_eq!(
+            state("\"\\printpapi-agent\",\"Nicht zutreffend\",\"Wird ausgeführt\""),
+            TaskState::Running
+        );
+        assert_eq!(
+            state("\"\\printpapi-agent\",\"N/A\",\"Disabled\""),
+            TaskState::Stopped
+        );
+        assert_eq!(
+            state("\"\\printpapi-agent\",\"N/A\",\"Deaktiviert\""),
+            TaskState::Stopped
+        );
+        // a header line (without /nh) and other tasks are skipped, the name is not case sensitive
+        assert_eq!(
+            state(
+                "\"TaskName\",\"Next Run Time\",\"Status\"\n\"\\Other\",\"N/A\",\"Ready\"\n\"\\PrintPapi-Agent\",\"N/A\",\"Running\""
+            ),
+            TaskState::Running
+        );
+    }
+
+    #[test]
+    fn the_task_state_survives_the_code_page_of_the_console() {
+        // schtasks writes the console's OEM code page: on German Windows "ü" is the single byte
+        // 0x81 (code page 850/437), which is no UTF-8
+        let mut out = b"\"\\printpapi-agent\",\"Nicht zutreffend\",\"Wird ausgef".to_vec();
+        out.push(0x81);
+        out.extend_from_slice(b"hrt\"");
+        assert_eq!(parse_task_state(&out), TaskState::Running);
+    }
+
+    #[test]
+    fn a_state_that_is_not_known_is_not_taken_for_stopped() {
+        // another language, an empty answer, a task that is not in the output: the caller must
+        // not run the task while the old process may still be there ("IgnoreNew")
+        assert_eq!(
+            state("\"\\printpapi-agent\",\"N/A\",\"En cours d'exécution\""),
+            TaskState::Unknown
+        );
+        assert_eq!(state(""), TaskState::Unknown);
+        assert_eq!(state("\"\\other\",\"N/A\",\"Ready\""), TaskState::Unknown);
+        assert_eq!(state("\"\\printpapi-agent\""), TaskState::Unknown);
+        assert_eq!(state("not csv at all"), TaskState::Unknown);
     }
 
     #[test]

@@ -104,6 +104,8 @@ pub struct Env<'a> {
     /// The running binary, which is what gets installed.
     pub self_exe: PathBuf,
     pub sleep: &'a dyn Fn(u64),
+    /// Seconds since the epoch on this computer.
+    pub now: &'a dyn Fn() -> f64,
 }
 
 fn bad(msg: impl Into<String>) -> ApplyError {
@@ -468,13 +470,24 @@ fn check_install_dir(_: &Layout) -> Result<(), ApplyError> {
     Ok(())
 }
 
-/// Install. Returns `last_seen_at` of this device as read right after registering, which the
-/// window compares against to know the agent really started.
-pub fn apply(staging: &Path, env: &Env) -> Result<f64, ApplyError> {
+/// What a window compares the agent's next sign of life with, to know that a new process started
+/// and not the old one wrote again.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Baselines {
+    /// `last_seen_at` of this device on the server, read after the old agent was stopped. For a
+    /// window that holds the key and asks the server.
+    pub last_seen: f64,
+    /// The time on this computer right before the agent was started, for a window that has no key
+    /// and reads the status file's `last_contact` (the agent's clock is this computer's).
+    pub local: f64,
+}
+
+/// Install. Returns the [`Baselines`] the window compares against to know the agent really started.
+pub fn apply(staging: &Path, env: &Env) -> Result<Baselines, ApplyError> {
     apply_with(staging, env, SUMATRA_EXE_SHA256)
 }
 
-fn apply_with(staging: &Path, env: &Env, sumatra_sha: &str) -> Result<f64, ApplyError> {
+fn apply_with(staging: &Path, env: &Env, sumatra_sha: &str) -> Result<Baselines, ApplyError> {
     let staged = read_staged(staging, env, sumatra_sha)?;
     let l = &env.layout;
     // before the server or the machine is touched
@@ -538,14 +551,14 @@ fn apply_with(staging: &Path, env: &Env, sumatra_sha: &str) -> Result<f64, Apply
 }
 
 /// Everything after the old agent is stopped: files, key, marker, autostart, start. Returns the
-/// baseline `last_seen_at`.
+/// baselines.
 fn replace_install(
     env: &Env,
     staged: &Staged,
     http: &dyn Http,
     computer_id: i64,
     first_seen: f64,
-) -> Result<f64, ApplyError> {
+) -> Result<Baselines, ApplyError> {
     let l = &env.layout;
 
     std::fs::create_dir_all(&l.dir).map_err(|e| system("cannot create the install folder", e))?;
@@ -577,9 +590,12 @@ fn replace_install(
     }
     // The old agent is stopped by now. Its long-poll bumped last_seen_at until then, so the value
     // the window compares against is read here, not before. A failing read keeps the first one.
-    let baseline = last_seen(http, staged, computer_id).unwrap_or(first_seen);
+    let last_seen = last_seen(http, staged, computer_id).unwrap_or(first_seen);
+    // the clock of this computer: after the old agent's last write to the status file, before the
+    // new agent's first one
+    let local = (env.now)();
     start_agent(env)?;
-    Ok(baseline)
+    Ok(Baselines { last_seen, local })
 }
 
 /// Register the autostart and start the agent.
@@ -864,9 +880,10 @@ fn install_tray(env: &Env, tray: &TrayStaged) -> Result<(), ApplyError> {
     Ok(())
 }
 
-/// Restart: stop the agent and start it again, so a changed `agent.ini` takes effect. Only for an
-/// installation this setup made.
-pub fn restart(env: &Env) -> Result<(), ApplyError> {
+/// Restart: stop the agent and start it again (see [`install::restart_plan`]), so a changed
+/// `agent.ini` takes effect. Only for an installation this setup made. Returns the time on this
+/// computer right before the start: the new process's status file says `started_at` after it.
+pub fn restart(env: &Env) -> Result<f64, ApplyError> {
     let l = &env.layout;
     check_install_dir(l)?;
     if !l.marker.is_file() {
@@ -874,10 +891,31 @@ pub fn restart(env: &Env) -> Result<(), ApplyError> {
             "This agent was not installed by the setup, so the setup leaves it alone.".into(),
         ));
     }
-    for c in install::stop_cmds(env.os, l, &env.sys) {
-        let _ = (env.run)(&c);
+    let plan = install::restart_plan(env.os, l, &env.sys);
+    for c in &plan.stop {
+        let _ = (env.run)(c);
     }
-    start_agent(env)
+    if let Some(look) = &plan.wait {
+        wait_until_stopped(env, look);
+    }
+    let local = (env.now)();
+    for c in &plan.start {
+        (env.run)(c).map_err(|e| system("cannot start the agent", e))?;
+    }
+    Ok(local)
+}
+
+/// Look at the task until it is no longer running, for at most [`install::RESTART_WAIT_SECS`]
+/// seconds. A task that cannot be asked about (the look fails) is not waited for; one whose state
+/// is not recognised is waited for the whole time, never taken for stopped.
+fn wait_until_stopped(env: &Env, look: &crate::proc::Cmd) {
+    for _ in 0..install::RESTART_WAIT_SECS {
+        match (env.run)(look) {
+            Ok(out) if install::parse_task_state(&out) != install::TaskState::Stopped => {}
+            _ => return,
+        }
+        (env.sleep)(1);
+    }
 }
 
 /// `last_seen_at` of this device on the server.
@@ -1028,6 +1066,7 @@ pub fn cli(args: &[String]) -> Option<ExitCode> {
     let os = Os::host();
     let http_for = |s: &HttpSettings| -> Box<dyn Http> { Box::new(Client::new(s)) };
     let sleep = |secs: u64| std::thread::sleep(std::time::Duration::from_secs(secs));
+    let now = crate::status::unix_now;
     let env = std::env::current_exe()
         .map(|self_exe| Env {
             os,
@@ -1037,6 +1076,7 @@ pub fn cli(args: &[String]) -> Option<ExitCode> {
             http_for: &http_for,
             self_exe,
             sleep: &sleep,
+            now: &now,
         })
         .map_err(|e| system("cannot find the running program", e));
     run_args(args, env.as_ref().map_err(Clone::clone)).map(ExitCode::from)
@@ -1057,9 +1097,11 @@ fn run_args(args: &[String], env: Result<&Env, ApplyError>) -> Option<u8> {
     };
     let staging = Path::new(dir);
     let outcome = env.and_then(|env| match command {
-        "install" => apply(staging, env).map(|b| json!({"ok": true, "baseline_last_seen": b})),
+        "install" => apply(staging, env).map(
+            |b| json!({"ok": true, "baseline_last_seen": b.last_seen, "baseline_local": b.local}),
+        ),
         "uninstall" => remove(env).map(|()| json!({"ok": true})),
-        "restart" => restart(env).map(|()| json!({"ok": true})),
+        "restart" => restart(env).map(|b| json!({"ok": true, "baseline_local": b})),
         _ => export_config(staging, env).map(|()| json!({"ok": true})),
     });
     let (result, code) = match outcome {
@@ -1142,6 +1184,13 @@ mod tests {
         /// files that appear at the moment a command containing the text runs (what a user can
         /// do between two commands of the install)
         plant: Rc<RefCell<Vec<(String, PathBuf)>>>,
+        /// what `schtasks /query` answers, one text per call (then "Ready")
+        task_states: Rc<RefCell<std::collections::VecDeque<String>>>,
+        /// the seconds `sleep` was asked for
+        slept: Rc<RefCell<Vec<u64>>>,
+        /// whether a look at the clock shows up in the events (as "baseline_local")
+        note_now: Rc<std::cell::Cell<bool>>,
+        now: Box<dyn Fn() -> f64>,
         run: Runner,
         http_for: HttpFor,
         sleep: Box<dyn Fn(u64)>,
@@ -1198,12 +1247,16 @@ mod tests {
             let failing: Rc<RefCell<Vec<String>>> = Rc::default();
             let running: Rc<std::cell::Cell<bool>> = Rc::default();
             let plant: Rc<RefCell<Vec<(String, PathBuf)>>> = Rc::default();
+            let task_states: Rc<RefCell<std::collections::VecDeque<String>>> = Rc::default();
+            let slept: Rc<RefCell<Vec<u64>>> = Rc::default();
+            let note_now: Rc<std::cell::Cell<bool>> = Rc::default();
             let run: Runner = {
-                let (events, failing, running, plant) = (
+                let (events, failing, running, plant, task_states) = (
                     events.clone(),
                     failing.clone(),
                     running.clone(),
                     plant.clone(),
+                    task_states.clone(),
                 );
                 let layout = layout.clone();
                 Rc::new(move |c| {
@@ -1231,6 +1284,17 @@ mod tests {
                         if line.contains(when.as_str()) {
                             let _ = std::fs::write(path, b"planted by a user");
                         }
+                    }
+                    if line.contains("/query") {
+                        let answer = task_states
+                            .borrow_mut()
+                            .pop_front()
+                            .unwrap_or_else(|| r#""\printpapi-agent","N/A","Ready""#.into());
+                        return if failing.borrow().iter().any(|f| line.contains(f.as_str())) {
+                            Err(format!("failed: {line}"))
+                        } else {
+                            Ok(answer.into_bytes())
+                        };
                     }
                     // success of the check means "still running"; the agent is stopped by default
                     if install::running_check(os).as_ref() == Some(c) {
@@ -1272,7 +1336,7 @@ mod tests {
                 staging,
                 layout,
                 os,
-                events,
+                events: events.clone(),
                 register,
                 computers,
                 later,
@@ -1281,9 +1345,23 @@ mod tests {
                 failing,
                 running,
                 plant,
+                task_states,
+                slept: slept.clone(),
+                note_now: note_now.clone(),
+                now: {
+                    let (events, note_now, tick) =
+                        (events.clone(), note_now, std::cell::Cell::new(1000.0));
+                    Box::new(move || {
+                        if note_now.get() {
+                            events.borrow_mut().push("baseline_local".into());
+                        }
+                        tick.set(tick.get() + 1.0);
+                        tick.get()
+                    })
+                },
                 run,
                 http_for,
-                sleep: Box::new(|_| {}),
+                sleep: Box::new(move |s| slept.borrow_mut().push(s)),
             }
         }
 
@@ -1300,6 +1378,7 @@ mod tests {
                 http_for: &*self.http_for,
                 self_exe: self.tmp.path().join("self.exe"),
                 sleep: &*self.sleep,
+                now: &*self.now,
             }
         }
 
@@ -1427,11 +1506,23 @@ mod tests {
     #[test]
     fn baseline_is_read_before_the_agent_starts() {
         let fx = Fixture::new(Os::Linux);
-        assert_eq!(apply(&fx.staging, &fx.env()), Ok(123.5));
+        fx.note_now.set(true);
+        let baselines = apply(&fx.staging, &fx.env()).unwrap();
+        assert_eq!(baselines.last_seen, 123.5);
         let ev = fx.events();
         let get = ev.iter().rposition(|e| e == "GET /computers").unwrap();
         let start = ev.iter().position(|e| e.contains("enable")).unwrap();
         assert!(get < start, "{ev:?}");
+        // the time on this computer is taken after the old agent is stopped and before the new one
+        // starts: the old one's last contact in the status file must be older than it
+        let stop = ev
+            .iter()
+            .position(|e| e.contains("systemctl stop"))
+            .unwrap();
+        let now = ev.iter().position(|e| e == "baseline_local").unwrap();
+        assert!(stop < now && now < start, "{ev:?}");
+        assert_eq!(ev.iter().filter(|e| *e == "baseline_local").count(), 1);
+        assert_eq!(baselines.local, 1001.0);
     }
 
     #[test]
@@ -1442,7 +1533,7 @@ mod tests {
         *fx.later.borrow_mut() = Some(Ok(Some(json!({"computers": [
             {"id": 7, "name": "shop-pc", "last_seen_at": 130.25}
         ]}))));
-        assert_eq!(apply(&fx.staging, &fx.env()), Ok(130.25));
+        assert_eq!(apply(&fx.staging, &fx.env()).unwrap().last_seen, 130.25);
         let ev = fx.events();
         let stop = ev
             .iter()
@@ -1456,7 +1547,7 @@ mod tests {
     fn a_failing_second_read_keeps_the_first_value() {
         let fx = Fixture::new(Os::Linux);
         *fx.later.borrow_mut() = Some(Err(HttpError::Os("connection failed".into())));
-        assert_eq!(apply(&fx.staging, &fx.env()), Ok(123.5));
+        assert_eq!(apply(&fx.staging, &fx.env()).unwrap().last_seen, 123.5);
     }
 
     #[test]
@@ -2365,7 +2456,7 @@ mod tests {
         assert_eq!(run_args(&args, Ok(&fx.env())), Some(0));
         assert_eq!(
             result(&fx),
-            json!({"ok": true, "baseline_last_seen": 123.5})
+            json!({"ok": true, "baseline_last_seen": 123.5, "baseline_local": 1001.0})
         );
         // read-config puts the installed ini in the folder, uninstall removes the install
         std::fs::write(fx.staging.join("agent.ini"), b"old").unwrap();
@@ -2998,24 +3089,41 @@ mod tests {
     }
 
     #[test]
-    fn restart_runs_stop_then_start() {
-        for os in [Os::Linux, Os::Macos, Os::Windows] {
+    fn restart_restarts_with_what_each_system_offers() {
+        for (os, restart_cmd) in [
+            (Os::Linux, "run systemctl restart printpapi-agent"),
+            (
+                Os::Macos,
+                "run /bin/launchctl kickstart -k system/com.printpapi.agent",
+            ),
+            (Os::Windows, "/run /tn printpapi-agent"),
+        ] {
             let fx = Fixture::new(os);
             apply(&fx.staging, &fx.env()).unwrap();
             fx.events.borrow_mut().clear();
-            restart(&fx.env()).unwrap();
+            fx.note_now.set(true);
+            let baseline = restart(&fx.env()).unwrap();
             let ev = fx.events();
-            let stop = ev
-                .iter()
-                .position(|e| e.contains("stop") || e.contains("bootout") || e.contains("/end"))
-                .unwrap();
-            let start = ev
-                .iter()
-                .position(|e| {
-                    e.contains("enable --now") || e.contains("bootstrap") || e.contains("/run")
-                })
-                .unwrap();
-            assert!(stop < start, "{os:?}: {ev:?}");
+            let at = |what: &str| ev.iter().position(|e| e.contains(what));
+            // no bootout and bootstrap one after the other (launchd), no stop and start (systemd)
+            assert!(
+                at("bootout").is_none() && at("bootstrap").is_none(),
+                "{os:?}: {ev:?}"
+            );
+            assert!(
+                at("systemctl stop").is_none() && at("enable --now").is_none(),
+                "{os:?}: {ev:?}"
+            );
+            let restart_at = at(restart_cmd).unwrap_or_else(|| panic!("{os:?}: {ev:?}"));
+            if os == Os::Windows {
+                let (end, query) = (at("/end").unwrap(), at("/query").unwrap());
+                assert!(end < query && query < restart_at, "{os:?}: {ev:?}");
+            }
+            // the time on this computer is taken after the old process is gone, before the new one
+            let now = at("baseline_local").unwrap();
+            assert!(now < restart_at, "{os:?}: {ev:?}");
+            // the install above took the first reading of the clock
+            assert_eq!(baseline, 1002.0, "{os:?}");
             // it only restarts: no server, no files
             assert!(
                 ev.iter()
@@ -3025,16 +3133,80 @@ mod tests {
         }
     }
 
+    fn running_row(word: &str) -> String {
+        format!(r#""\printpapi-agent","N/A","{word}""#)
+    }
+
     #[test]
-    fn restart_ignores_a_failing_stop_but_not_a_failing_start() {
-        let fx = Fixture::new(Os::Linux);
+    fn restart_on_windows_waits_until_the_task_is_not_running_any_more() {
+        let fx = Fixture::new(Os::Windows);
         apply(&fx.staging, &fx.env()).unwrap();
-        fx.failing.borrow_mut().push("systemctl stop".into());
+        fx.slept.borrow_mut().clear();
+        fx.events.borrow_mut().clear();
+        // still running for three looks, then gone (localised words, as schtasks prints them)
+        for word in ["Running", "Wird ausgeführt", "Running", "Ready"] {
+            fx.task_states.borrow_mut().push_back(running_row(word));
+        }
         restart(&fx.env()).unwrap();
-        fx.failing.borrow_mut().push("enable --now".into());
+        assert_eq!(*fx.slept.borrow(), [1, 1, 1]);
+        let ev = fx.events();
+        assert_eq!(
+            ev.iter().filter(|e| e.contains("/query")).count(),
+            4,
+            "{ev:?}"
+        );
+        assert!(ev.last().unwrap().contains("/run"), "{ev:?}");
+    }
+
+    #[test]
+    fn restart_on_windows_waits_fifteen_seconds_at_most_and_then_runs_the_task() {
+        // a task that stays "running" and one whose state is not recognised (another language)
+        for word in ["Running", "En cours d'exécution"] {
+            let fx = Fixture::new(Os::Windows);
+            apply(&fx.staging, &fx.env()).unwrap();
+            fx.slept.borrow_mut().clear();
+            fx.events.borrow_mut().clear();
+            for _ in 0..40 {
+                fx.task_states.borrow_mut().push_back(running_row(word));
+            }
+            restart(&fx.env()).unwrap();
+            assert_eq!(fx.slept.borrow().iter().sum::<u64>(), 15, "{word}");
+            assert!(fx.events().last().unwrap().contains("/run"), "{word}");
+        }
+    }
+
+    #[test]
+    fn restart_on_windows_does_not_wait_for_a_task_it_cannot_ask_about() {
+        let fx = Fixture::new(Os::Windows);
+        apply(&fx.staging, &fx.env()).unwrap();
+        fx.slept.borrow_mut().clear();
+        // `schtasks /query` fails when the task does not exist: nothing to wait for
+        fx.failing.borrow_mut().push("/query".into());
+        restart(&fx.env()).unwrap();
+        assert!(fx.slept.borrow().is_empty());
+        assert!(fx.events().last().unwrap().contains("/run"));
+    }
+
+    #[test]
+    fn restart_ignores_a_failing_end_but_not_a_failing_start() {
+        let fx = Fixture::new(Os::Windows);
+        apply(&fx.staging, &fx.env()).unwrap();
+        fx.failing.borrow_mut().push("/end".into());
+        restart(&fx.env()).unwrap();
+        fx.failing.borrow_mut().push("/run".into());
         let e = restart(&fx.env()).unwrap_err();
         assert_eq!(e.code(), "system");
         assert!(e.to_string().contains("cannot start the agent"), "{e}");
+        for (os, cmd) in [(Os::Linux, "restart"), (Os::Macos, "kickstart")] {
+            let fx = Fixture::new(os);
+            apply(&fx.staging, &fx.env()).unwrap();
+            fx.failing.borrow_mut().push(cmd.into());
+            let e = restart(&fx.env()).unwrap_err();
+            assert!(
+                e.to_string().contains("cannot start the agent"),
+                "{os:?}: {e}"
+            );
+        }
     }
 
     #[cfg(unix)]
@@ -3066,7 +3238,10 @@ mod tests {
         assert_eq!(result()["code"], json!("system"));
         apply(&fx.staging, &fx.env()).unwrap();
         assert_eq!(run_args(&args, Ok(&fx.env())), Some(0));
-        assert_eq!(result(), json!({"ok": true}));
+        // the time on this computer right before the agent was started: what a window that has no
+        // key compares the status file's last contact with
+        assert_eq!(result()["ok"], json!(true));
+        assert!(result()["baseline_local"].as_f64().unwrap() > 1000.0);
         // one argument only, like the others
         assert_eq!(run_args(&["restart".to_string()], Ok(&fx.env())), Some(2));
     }

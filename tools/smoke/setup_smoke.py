@@ -271,16 +271,20 @@ def main():
         if out.read_bytes() != zpl:
             raise Fail(f"{out.name} has the wrong content")
 
-        # restart: the old process is stopped when the command returns, so a contact newer than
-        # the one read right after it can only come from the new process
-        def last_seen():
-            for c in call(base, token, "GET", "/computers")["computers"]:
-                if c["name"] == name:
-                    return c.get("last_seen_at") or 0
-            return 0
-        run_agent(agent, "restart", staging)
-        before = last_seen()
-        wait_for("the agent to come online after the restart", lambda: last_seen() > before)
+        # restart: a new process says so itself. Its status file holds the start time of the
+        # process, which the old process cannot have written (a newer last_seen_at on the server
+        # could still come from the old one, which long-polls until it is stopped)
+        def started_at():
+            return json.loads(STATUS_FILE.read_text(encoding="utf-8")).get("started_at") or 0
+        before = started_at()
+        if not before:
+            raise Fail("the status file has no started_at")
+        result = run_agent(agent, "restart", staging)
+        if not result.get("baseline_local"):
+            raise Fail(f"restart reported no baseline_local: {result}")
+        wait_for("the restarted agent to write a new started_at", lambda: started_at() > before)
+        if started_at() < result["baseline_local"] - 1:
+            raise Fail("the new started_at is older than the restart")
 
         foreign = plant_foreign_file()
         run_agent(agent, "uninstall", staging)
