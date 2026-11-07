@@ -6,7 +6,7 @@ only** — nothing listens on the printer's machine, so NAT/firewalls are no pro
 
 ## Setup app
 
-The easiest way on Windows, macOS and Linux with a desktop: download `printpapi-setup-<platform>-<arch>`
+The easiest way on Windows, macOS and Linux with a desktop: download `printpapi-setup-<platform>`
 (`.exe` on Windows, `.dmg` on macOS, `.deb` or `.AppImage` on Linux) from the
 [latest release](https://github.com/LukiPrince/printpapi/releases/latest), open it and go through
 four steps (connect to the server with an agent key, pick the printers, test print, done).
@@ -61,6 +61,8 @@ for them once.
   Beta on the downloads page until someone has run it by hand.
 - Smart App Control and WDAC block the unsigned exe with no way around it. Use the Python agent
   ([Locked-down Windows](#locked-down-windows)).
+- An AppImage starts only once it is executable: run `chmod +x` on the file, or tick *Allow
+  executing as program* in its properties.
 - Linux without a desktop or without systemd: use the manual steps below.
 - An agent you set up by hand is not taken over: the setup stops and says so, so a job is never
   printed twice.

@@ -86,10 +86,10 @@ Or `docker compose up -d`, which keeps the DB in a volume (see [`docker-compose.
 Prefer to build it yourself? `docker build -t printpapi .`
 
 **Agent**, on the machine with the printers. The easiest way is the setup app: download the
-`printpapi-setup-<platform>-<arch>` file for your system from the
+`printpapi-setup-<platform>` file for your system from the
 [latest release](https://github.com/LukiPrince/printpapi/releases/latest) (`.exe` on Windows, `.dmg`
-on macOS, `.deb` or `.AppImage` on Linux), open it and follow the four steps
-([docs](docs/agent.md#setup-app)). It also installs a tray icon with a settings window
+on macOS, `.deb` or `.AppImage` on Linux; an AppImage needs `chmod +x` first), open it and follow
+the four steps ([docs](docs/agent.md#setup-app)). It also installs a tray icon with a settings window
 ([docs](docs/agent.md#tray-icon-and-settings)). Every setup download is Beta until someone has run
 it by hand. It is not code-signed yet, so the system warns first, and Smart App Control / WDAC block
 it: use the Python agent there ([docs](docs/agent.md#locked-down-windows)). Or by hand:
