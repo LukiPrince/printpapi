@@ -110,10 +110,10 @@ On each machine:
    computer with new printer ids.
 4. On Windows, keep `SumatraPDF.exe` next to the executable for PDF jobs. `pywin32` is not needed
    any more.
-5. Point the autostart entry at the new executable instead of the Python interpreter, for example
-   `schtasks /create /tn printpapi-agent /sc onstart /ru SYSTEM /tr "C:\printpapi\printpapi-agent.exe"`
-   on Windows or `ExecStart=/opt/printpapi/printpapi-agent` in the systemd unit. See
-   [Run as a service](agent.md#run-as-a-service).
+5. Point the autostart entry at the new executable instead of the Python interpreter. On Windows,
+   create the task as in [Run as a service](agent.md#run-as-a-service) with `-Force` added to
+   `Register-ScheduledTask`, which replaces the old task (one made with `schtasks /create` also
+   stops after 72 hours). With systemd, set `ExecStart=/opt/printpapi/printpapi-agent` in the unit.
 6. Start it and check the dashboard's **Devices** page: the computer shows as online under its old
    name.
 

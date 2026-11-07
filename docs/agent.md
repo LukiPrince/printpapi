@@ -307,18 +307,34 @@ any local user may submit to CUPS.
 (`sudo launchctl load -w <plist>` on older macOS). A daemon can print: CUPS queues are
 system-wide.
 
-**Windows — Task Scheduler:**
+**Windows — Task Scheduler** (in PowerShell run as administrator):
 
 ```powershell
-schtasks /create /tn printpapi-agent /sc onstart /rl highest /ru SYSTEM `
-  /tr "C:\printpapi\printpapi-agent.exe"
+$action   = New-ScheduledTaskAction -Execute "C:\printpapi\printpapi-agent.exe"
+$trigger  = New-ScheduledTaskTrigger -AtStartup
+$settings = New-ScheduledTaskSettingsSet -ExecutionTimeLimit 0 -AllowStartIfOnBatteries `
+  -DontStopIfGoingOnBatteries -RestartCount 255 -RestartInterval (New-TimeSpan -Minutes 1)
+Register-ScheduledTask -TaskName printpapi-agent -User "NT AUTHORITY\SYSTEM" -RunLevel Highest `
+  -Action $action -Trigger $trigger -Settings $settings
 ```
+
+`-ExecutionTimeLimit 0` is the setting that matters: without it Windows stops the task 72 hours
+after it started ([ExecutionTimeLimit](https://learn.microsoft.com/en-us/windows/win32/taskschd/tasksettings-executiontimelimit)),
+and `schtasks /create` has no switch for it. The two battery switches keep the agent running on
+an unplugged laptop, and the restart settings bring it back a minute after a crash. The setup app
+creates the same task.
+
+If you created the task with `schtasks /create`, as this page said before, it stops after three
+days. Run the block above again with `-Force` added to `Register-ScheduledTask`, which replaces
+the task, then restart the computer or run `Stop-ScheduledTask printpapi-agent` and
+`Start-ScheduledTask printpapi-agent`.
 
 Caveat: printers installed *per user* are invisible to `SYSTEM`. Either install the printer for
 all machine users, or create the task under the operator's account with "run whether user is
-logged on or not". The agent is a console program; under "run whether user is logged on or not"
-no window shows. `nssm install printpapi-agent C:\printpapi\printpapi-agent.exe` works too if you
-want real service semantics (auto-restart, `sc` control).
+logged on or not". In the Task Scheduler window, also untick "Stop the task if it runs longer
+than" on the Settings tab. The agent is a console program; under "run whether user is logged on
+or not" no window shows. `nssm install printpapi-agent C:\printpapi\printpapi-agent.exe` works
+too if you want real service semantics (auto-restart, `sc` control).
 
 ## Locked-down Windows
 
@@ -332,15 +348,21 @@ PSF-signed, and the `.py` file is data, not an executable:
    `printpapi-agent-python.zip`) and `pip install pywin32`. For PDF
    printing put `SumatraPDF.exe` next to the script (or on `PATH`).
 2. Create `agent.ini` next to the script — same format and keys as above.
-3. Run `python print_agent.py`, and for autostart:
+3. Run `python print_agent.py`, and for autostart create the task from
+   [Run as a service](#run-as-a-service) with the interpreter as the program:
 
    ```powershell
-   schtasks /create /tn printpapi-agent /sc onstart /rl highest /ru SYSTEM `
-     /tr '"C:\Program Files\Python312\pythonw.exe" C:\printpapi\print_agent.py'
+   $action   = New-ScheduledTaskAction -Execute "C:\Program Files\Python312\pythonw.exe" `
+     -Argument "C:\printpapi\print_agent.py"
+   $trigger  = New-ScheduledTaskTrigger -AtStartup
+   $settings = New-ScheduledTaskSettingsSet -ExecutionTimeLimit 0 -AllowStartIfOnBatteries `
+     -DontStopIfGoingOnBatteries -RestartCount 255 -RestartInterval (New-TimeSpan -Minutes 1)
+   Register-ScheduledTask -TaskName printpapi-agent -User "NT AUTHORITY\SYSTEM" -RunLevel Highest `
+     -Action $action -Trigger $trigger -Settings $settings
    ```
 
    (`nssm install printpapi-agent <pythonw.exe> <script>` works too; the per-user printer caveat
-   above applies.)
+   and the note on tasks made with `schtasks /create` above apply.)
 
 Switch to the Rust agent once a code-signed build is released.
 

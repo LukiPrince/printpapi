@@ -952,8 +952,8 @@ pub fn detect(os: Os, l: &Layout, sys: &Path, run: &Runner) -> Installed {
 
 /// Windows: something called `printpapi-agent` is registered or running. Four looks, because the
 /// setup asks without administrator rights and each look is blind to something:
-/// - the task file `System32\Tasks\printpapi-agent`: a task made from an elevated shell with
-///   `/ru SYSTEM` (docs/agent.md) is invisible to `schtasks /query` for a normal user, but its
+/// - the task file `System32\Tasks\printpapi-agent`: a `SYSTEM` task made from an elevated shell
+///   (docs/agent.md) is invisible to `schtasks /query` for a normal user, but its
 ///   file name is not. Anything but a clean "not found" counts as there: the file of a task the
 ///   user may not read answers "access denied", not "missing".
 /// - `schtasks /query`, for a task the file check cannot see;
