@@ -2,7 +2,8 @@
 //! The four subcommands that run with administrator rights: `install <dir>`, `uninstall <dir>`,
 //! `read-config <dir>` and `restart <dir>`. They get one argument, the path of a private staging
 //! folder, and treat everything in it as untrusted because the user who started the setup can
-//! write there.
+//! write there. `install` and `uninstall` may add `--keep-pid <number>`, the process id of the
+//! setup window, which stays alive when the tray icons are ended.
 //!
 //! `install` also takes an optional `tray` (the tray icon program, on macOS an `.app` folder) and,
 //! instead of a whole `agent.ini`, an optional `patch.json` that it merges into the installed
@@ -95,6 +96,7 @@ impl fmt::Display for ApplyError {
 }
 
 /// Everything the subcommands touch outside the staging folder, injectable for tests.
+#[derive(Clone)]
 pub struct Env<'a> {
     pub os: Os,
     pub layout: Layout,
@@ -106,6 +108,11 @@ pub struct Env<'a> {
     pub sleep: &'a dyn Fn(u64),
     /// Seconds since the epoch on this computer.
     pub now: &'a dyn Fn() -> f64,
+    /// The process id of the setup window that started this run (`--keep-pid`). Its program is the
+    /// tray icon's, so ending the icons must leave this process alone.
+    pub keep_pid: Option<u32>,
+    /// Have a file or an empty folder deleted when the computer restarts.
+    pub delete_at_reboot: &'a dyn Fn(&Path) -> std::io::Result<()>,
 }
 
 fn bad(msg: impl Into<String>) -> ApplyError {
@@ -536,9 +543,7 @@ fn apply_with(staging: &Path, env: &Env, sumatra_sha: &str) -> Result<Baselines,
     // The icons of all sessions go before their program is replaced: a running exe is locked on
     // Windows. Only when a new one comes; a change of printers leaves the icons alone.
     if staged.tray.is_some() {
-        for c in install::tray_stop_cmds(env.os, l, &env.sys) {
-            let _ = (env.run)(&c);
-        }
+        stop_trays(env);
     }
     replace_install(env, &staged, &*http, computer_id, first_seen).inspect_err(|_| {
         if was_installed {
@@ -596,6 +601,22 @@ fn replace_install(
     let local = (env.now)();
     start_agent(env)?;
     Ok(Baselines { last_seen, local })
+}
+
+/// End the tray icons of all sessions but the window that asked (`env.keep_pid`). Failures are
+/// ignored: there may be none running.
+fn stop_trays(env: &Env) {
+    let l = &env.layout;
+    for c in install::tray_stop_cmds(env.os, l, &env.sys, env.keep_pid) {
+        let _ = (env.run)(&c);
+    }
+    if let Some(list) = install::tray_list_cmd(env.os, l, &env.sys)
+        && let Ok(out) = (env.run)(&list)
+    {
+        for pid in install::tray_pids(&out, env.keep_pid) {
+            let _ = (env.run)(&install::tray_kill_cmd(env.os, &env.sys, pid));
+        }
+    }
 }
 
 /// Register the autostart and start the agent.
@@ -808,6 +829,73 @@ fn remove_tree(path: &Path) -> std::io::Result<()> {
     }
 }
 
+/// Delete the tray program. On Windows the exe of a running process cannot be deleted, and the
+/// setup window that asked for the removal is one (it is the same program as the icon, and the
+/// window stays open to show the result). Such an exe can be renamed, though: it is moved into a
+/// folder next to the install folder (the same drive, which a rename needs) and deleted when the
+/// computer restarts, the file first and then the folder, which goes only when it is empty. The
+/// first deletion is tried for a moment (an icon that was just ended lets go of its exe late),
+/// for a shorter time when a window is known to be there.
+// ponytail: a leftover `printpapi-agent.removed` folder stays until the next restart. A second
+// removal before that finds the parked exe still there and fails with the rename; the install
+// folder is gone by then, so this needs an install and a removal within one session of Windows.
+fn remove_tray(env: &Env, remove: &dyn Fn(&Path) -> std::io::Result<()>) -> Result<(), ApplyError> {
+    let l = &env.layout;
+    let attempts = if env.os == Os::Windows && env.keep_pid.is_some() {
+        2
+    } else {
+        FILE_ATTEMPTS
+    };
+    let gone = retry(attempts, env.sleep, &mut || remove(&l.tray));
+    match gone {
+        Ok(()) => Ok(()),
+        Err(_) if env.os == Os::Windows => {
+            park_tray(env).map_err(|e| system("cannot delete the tray icon", e))
+        }
+        Err(e) => Err(system("cannot delete the tray icon", e)),
+    }
+}
+
+/// See [`remove_tray`].
+fn park_tray(env: &Env) -> std::io::Result<()> {
+    let l = &env.layout;
+    let trash = l
+        .dir
+        .parent()
+        .unwrap_or(&l.dir)
+        .join("printpapi-agent.removed");
+    std::fs::create_dir_all(&trash)?;
+    let parked = trash.join(l.tray.file_name().unwrap_or_default());
+    std::fs::rename(&l.tray, &parked)?;
+    (env.delete_at_reboot)(&parked)?;
+    (env.delete_at_reboot)(&trash)
+}
+
+/// `MoveFileExW(path, NULL, MOVEFILE_DELAY_UNTIL_REBOOT)`: delete `path` when the system restarts,
+/// a folder only if it is empty by then; the entries are carried out in the order they were
+/// registered. Needs administrator rights. The call only puts an entry into the registry
+/// (`PendingFileRenameOperations`), it cannot say whether the deletion will work.
+/// https://learn.microsoft.com/en-us/windows/win32/api/winbase/nf-winbase-movefileexw
+#[cfg(windows)]
+fn delete_at_reboot(path: &Path) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::{MOVEFILE_DELAY_UNTIL_REBOOT, MoveFileExW};
+    let wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+    // SAFETY: `wide` is a NUL-terminated string that outlives the call; a NULL new name is what
+    // asks for the deletion
+    let ok = unsafe { MoveFileExW(wide.as_ptr(), std::ptr::null(), MOVEFILE_DELAY_UNTIL_REBOOT) };
+    if ok == 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(not(windows))]
+fn delete_at_reboot(_: &Path) -> std::io::Result<()> {
+    Err(std::io::Error::from(std::io::ErrorKind::Unsupported))
+}
+
 /// Take the agent out of its status folder: the files the agent itself writes, then the folder if
 /// nothing else is in it. Whatever else is there is not ours and stays, folder included. A link
 /// (or a file) at that place is removed without being followed.
@@ -948,9 +1036,7 @@ pub fn remove(env: &Env) -> Result<(), ApplyError> {
         let _ = (env.run)(&c);
     }
     // the icons go too: on Windows their exe is locked, and "Quit" in a menu is not the removal
-    for c in install::tray_stop_cmds(env.os, l, &env.sys) {
-        let _ = (env.run)(&c);
-    }
+    stop_trays(env);
     // A stop that failed leaves the process alive, and deleting its files would let it print on
     // without anything left to remove it. Nothing is deleted yet, so a second try stays possible.
     // A failing check means "not running".
@@ -987,8 +1073,7 @@ pub fn remove(env: &Env) -> Result<(), ApplyError> {
         }
     }
     // the tray program (outside the install folder on macOS) and the status folder
-    retry(FILE_ATTEMPTS, env.sleep, &mut || remove_tree(&l.tray))
-        .map_err(|e| system("cannot delete the tray icon", e))?;
+    remove_tray(env, &remove_tree)?;
     retry(FILE_ATTEMPTS, env.sleep, &mut || {
         remove_status_dir(&l.status_dir)
     })
@@ -1077,9 +1162,19 @@ pub fn cli(args: &[String]) -> Option<ExitCode> {
             self_exe,
             sleep: &sleep,
             now: &now,
+            keep_pid: None,
+            delete_at_reboot: &delete_at_reboot,
         })
         .map_err(|e| system("cannot find the running program", e));
     run_args(args, env.as_ref().map_err(Clone::clone)).map(ExitCode::from)
+}
+
+/// A process id: digits only, nothing a command line could carry along.
+fn parse_pid(text: &str) -> Option<u32> {
+    if text.is_empty() || !text.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    text.parse().ok()
 }
 
 /// `cli` with the machine handed in, so tests never touch the real one. The exit code is 0 for
@@ -1089,21 +1184,36 @@ fn run_args(args: &[String], env: Result<&Env, ApplyError>) -> Option<u8> {
         Some(c @ ("install" | "uninstall" | "read-config" | "restart")) => c,
         _ => return None,
     };
-    let [_, dir] = args else {
+    let usage = || {
         crate::err_line(
-            "usage: printpapi-agent install|uninstall|read-config|restart <staging folder>",
+            "usage: printpapi-agent install|uninstall|read-config|restart <staging folder> [--keep-pid <number>]",
         );
-        return Some(2);
+        Some(2)
+    };
+    let (dir, keep_pid) = match args {
+        [_, dir] => (dir, None),
+        [_, dir, flag, pid] if flag == "--keep-pid" => match parse_pid(pid) {
+            Some(pid) => (dir, Some(pid)),
+            None => return usage(),
+        },
+        _ => return usage(),
     };
     let staging = Path::new(dir);
-    let outcome = env.and_then(|env| match command {
+    let env = env.map(|env| Env {
+        keep_pid,
+        ..env.clone()
+    });
+    let outcome =
+        env.as_ref().map_err(Clone::clone).and_then(|env| {
+            match command {
         "install" => apply(staging, env).map(
             |b| json!({"ok": true, "baseline_last_seen": b.last_seen, "baseline_local": b.local}),
         ),
         "uninstall" => remove(env).map(|()| json!({"ok": true})),
         "restart" => restart(env).map(|b| json!({"ok": true, "baseline_local": b})),
         _ => export_config(staging, env).map(|()| json!({"ok": true})),
-    });
+    }
+        });
     let (result, code) = match outcome {
         Ok(v) => (v, 0),
         Err(e) => {
@@ -1133,6 +1243,7 @@ mod tests {
 
     type Events = Rc<RefCell<Vec<String>>>;
     type HttpFor = Box<dyn Fn(&HttpSettings) -> Box<dyn Http>>;
+    type RebootFn = Box<dyn Fn(&Path) -> std::io::Result<()>>;
     type Reply = Rc<RefCell<Result<Option<Value>, HttpError>>>;
     type Later = Rc<RefCell<Option<Result<Option<Value>, HttpError>>>>;
 
@@ -1190,6 +1301,13 @@ mod tests {
         slept: Rc<RefCell<Vec<u64>>>,
         /// whether a look at the clock shows up in the events (as "baseline_local")
         note_now: Rc<std::cell::Cell<bool>>,
+        /// the process id of the window that asked, which the icons' end spares
+        keep_pid: Rc<std::cell::Cell<Option<u32>>>,
+        /// what `pgrep` lists
+        pids: Rc<RefCell<String>>,
+        /// what was handed to the delete-at-reboot call, in order
+        at_reboot: Rc<RefCell<Vec<PathBuf>>>,
+        reboot: RebootFn,
         now: Box<dyn Fn() -> f64>,
         run: Runner,
         http_for: HttpFor,
@@ -1250,13 +1368,16 @@ mod tests {
             let task_states: Rc<RefCell<std::collections::VecDeque<String>>> = Rc::default();
             let slept: Rc<RefCell<Vec<u64>>> = Rc::default();
             let note_now: Rc<std::cell::Cell<bool>> = Rc::default();
+            let pids: Rc<RefCell<String>> = Rc::default();
+            let at_reboot: Rc<RefCell<Vec<PathBuf>>> = Rc::default();
             let run: Runner = {
-                let (events, failing, running, plant, task_states) = (
+                let (events, failing, running, plant, task_states, pids) = (
                     events.clone(),
                     failing.clone(),
                     running.clone(),
                     plant.clone(),
                     task_states.clone(),
+                    pids.clone(),
                 );
                 let layout = layout.clone();
                 Rc::new(move |c| {
@@ -1284,6 +1405,9 @@ mod tests {
                         if line.contains(when.as_str()) {
                             let _ = std::fs::write(path, b"planted by a user");
                         }
+                    }
+                    if c.argv[0].ends_with("pgrep") {
+                        return Ok(pids.borrow().clone().into_bytes());
                     }
                     if line.contains("/query") {
                         let answer = task_states
@@ -1348,6 +1472,13 @@ mod tests {
                 task_states,
                 slept: slept.clone(),
                 note_now: note_now.clone(),
+                keep_pid: Rc::default(),
+                pids,
+                at_reboot: at_reboot.clone(),
+                reboot: Box::new(move |p| {
+                    at_reboot.borrow_mut().push(p.to_path_buf());
+                    Ok(())
+                }),
                 now: {
                     let (events, note_now, tick) =
                         (events.clone(), note_now, std::cell::Cell::new(1000.0));
@@ -1379,6 +1510,8 @@ mod tests {
                 self_exe: self.tmp.path().join("self.exe"),
                 sleep: &*self.sleep,
                 now: &*self.now,
+                keep_pid: self.keep_pid.get(),
+                delete_at_reboot: &*self.reboot,
             }
         }
 
@@ -1963,7 +2096,7 @@ mod tests {
             fx.events(),
             vec![
                 "run systemctl stop printpapi-agent".to_string(),
-                format!("run pkill -f {}", fx.layout.tray.display()),
+                format!("run pgrep -f {}", fx.layout.tray.display()),
                 "run systemctl is-active --quiet printpapi-agent".to_string(),
                 "run systemctl disable printpapi-agent".to_string()
             ]
@@ -2607,7 +2740,7 @@ mod tests {
         let fx = Fixture::new(Os::Linux);
         apply(&fx.staging, &fx.env()).unwrap();
         let ev = fx.events().join("\n");
-        assert!(!ev.contains("pkill"), "{ev}");
+        assert!(!ev.contains("pgrep"), "{ev}");
         assert!(!fx.layout.tray.exists());
         assert!(!fx.layout.tray_autostart.as_ref().unwrap().exists());
         // the agent still gets its status folder
@@ -2622,7 +2755,7 @@ mod tests {
             std::fs::write(&fx.layout.tray, b"old tray").unwrap();
             fx.stage_tray(b"new tray");
             let tray = fx.layout.tray.clone();
-            let (run, seen) = fx.run_watching(&["pkill", "taskkill"], move || tray_text(&tray));
+            let (run, seen) = fx.run_watching(&["pgrep", "taskkill"], move || tray_text(&tray));
             let mut env = fx.env();
             env.run = run;
             apply(&fx.staging, &env).unwrap();
@@ -2639,7 +2772,7 @@ mod tests {
             apply(&fx.staging, &fx.env()).unwrap();
             fx.events.borrow_mut().clear();
             let tray = fx.layout.tray.clone();
-            let (run, seen) = fx.run_watching(&["pkill", "taskkill"], move || tray_text(&tray));
+            let (run, seen) = fx.run_watching(&["pgrep", "taskkill"], move || tray_text(&tray));
             let mut env = fx.env();
             env.run = run;
             remove(&env).unwrap();
@@ -2649,6 +2782,161 @@ mod tests {
                 "{os:?}"
             );
         }
+    }
+
+    #[test]
+    fn the_window_that_asked_is_spared_when_the_icons_are_ended() {
+        // Windows: by image name, so the filter is the way out
+        let fx = Fixture::new(Os::Windows);
+        fx.keep_pid.set(Some(4242));
+        fx.stage_tray(b"the tray");
+        apply(&fx.staging, &fx.env()).unwrap();
+        let ev = fx.events().join("\n");
+        assert!(
+            ev.contains("taskkill.exe /f /im printpapi-tray.exe /fi PID ne 4242"),
+            "{ev}"
+        );
+        // elsewhere: listed, and every one but the window is ended
+        for os in [Os::Linux, Os::Macos] {
+            let fx = Fixture::new(os);
+            fx.keep_pid.set(Some(4242));
+            *fx.pids.borrow_mut() = "4242\n4300\n4301\n".into();
+            fx.stage_tray(b"the tray");
+            apply(&fx.staging, &fx.env()).unwrap();
+            let ev = fx.events();
+            let kill = |pid: &str| ev.iter().any(|e| e.ends_with(&format!("kill {pid}")));
+            assert!(kill("4300") && kill("4301"), "{os:?}: {ev:?}");
+            assert!(!kill("4242"), "{os:?}: {ev:?}");
+            // listed before it is ended
+            let at = |what: &str| ev.iter().position(|e| e.contains(what)).unwrap();
+            assert!(at("pgrep") < at("kill 4300"), "{os:?}: {ev:?}");
+            // a removal does the same
+            fx.events.borrow_mut().clear();
+            remove(&fx.env()).unwrap();
+            let ev = fx.events();
+            assert!(
+                ev.iter().any(|e| e.ends_with("kill 4300")),
+                "{os:?}: {ev:?}"
+            );
+            assert!(
+                !ev.iter().any(|e| e.ends_with("kill 4242")),
+                "{os:?}: {ev:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn without_a_window_to_spare_every_icon_is_ended() {
+        let fx = Fixture::new(Os::Linux);
+        *fx.pids.borrow_mut() = "4242\n4300\n".into();
+        fx.stage_tray(b"the tray");
+        apply(&fx.staging, &fx.env()).unwrap();
+        let ev = fx.events();
+        assert!(ev.iter().any(|e| e.ends_with("kill 4242")), "{ev:?}");
+        assert!(ev.iter().any(|e| e.ends_with("kill 4300")), "{ev:?}");
+    }
+
+    #[test]
+    fn a_locked_tray_exe_is_renamed_and_deleted_at_the_next_start() {
+        let fx = Fixture::new(Os::Windows);
+        fx.keep_pid.set(Some(4242));
+        fx.stage_tray(b"the tray");
+        apply(&fx.staging, &fx.env()).unwrap();
+        // the exe of the window that stays open cannot be deleted, only renamed
+        let locked = |p: &Path| -> std::io::Result<()> {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                format!("{p:?}"),
+            ))
+        };
+        let slept = fx.slept.borrow().len();
+        remove_tray(&fx.env(), &locked).unwrap();
+        // one more look after a second at most: the window is not going to let go
+        assert_eq!(fx.slept.borrow().len() - slept, 1);
+        assert!(!fx.layout.tray.exists());
+        let trash = fx
+            .layout
+            .dir
+            .parent()
+            .unwrap()
+            .join("printpapi-agent.removed");
+        let parked = trash.join(fx.layout.tray.file_name().unwrap());
+        assert_eq!(std::fs::read(&parked).unwrap(), b"the tray");
+        // the file first, then its folder, which only goes when it is empty by then
+        assert_eq!(*fx.at_reboot.borrow(), [parked, trash]);
+    }
+
+    #[test]
+    fn a_tray_exe_that_can_be_deleted_is_deleted_and_nothing_waits_for_the_reboot() {
+        let fx = Fixture::new(Os::Windows);
+        fx.stage_tray(b"the tray");
+        apply(&fx.staging, &fx.env()).unwrap();
+        remove(&fx.env()).unwrap();
+        assert!(!fx.layout.tray.exists() && !fx.layout.dir.exists());
+        assert!(fx.at_reboot.borrow().is_empty());
+        assert!(
+            !fx.layout
+                .dir
+                .parent()
+                .unwrap()
+                .join("printpapi-agent.removed")
+                .exists()
+        );
+    }
+
+    #[test]
+    fn a_tray_that_cannot_be_renamed_either_fails_the_removal() {
+        let fx = Fixture::new(Os::Windows);
+        fx.stage_tray(b"the tray");
+        apply(&fx.staging, &fx.env()).unwrap();
+        let locked = |_: &Path| -> std::io::Result<()> {
+            Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied))
+        };
+        // already gone: nothing to rename
+        std::fs::remove_file(&fx.layout.tray).unwrap();
+        let e = remove_tray(&fx.env(), &locked).unwrap_err();
+        assert!(e.to_string().contains("cannot delete the tray icon"), "{e}");
+        // elsewhere there is no rename trick: the error stays
+        let fx = Fixture::new(Os::Linux);
+        fx.stage_tray(b"the tray");
+        apply(&fx.staging, &fx.env()).unwrap();
+        assert!(remove_tray(&fx.env(), &locked).is_err());
+        assert!(fx.layout.tray.is_file());
+        assert!(fx.at_reboot.borrow().is_empty());
+    }
+
+    #[test]
+    fn the_process_to_spare_is_given_as_digits_only() {
+        let fx = Fixture::new(Os::Windows);
+        fx.stage_tray(b"the tray");
+        let dir = fx.staging.display().to_string();
+        let args = |extra: &[&str]| -> Vec<String> {
+            ["install", dir.as_str()]
+                .iter()
+                .chain(extra)
+                .map(|s| s.to_string())
+                .collect()
+        };
+        for bad in [
+            args(&["--keep-pid"]),
+            args(&["--keep-pid", ""]),
+            args(&["--keep-pid", "12a"]),
+            args(&["--keep-pid", "-1"]),
+            args(&["--keep-pid", "+5"]),
+            args(&["--keep-pid", "99999999999"]),
+            args(&["--keep-pid", "1", "2"]),
+            args(&["--keep", "1"]),
+        ] {
+            assert_eq!(run_args(&bad, Ok(&fx.env())), Some(2), "{bad:?}");
+        }
+        // nothing ran for any of them
+        assert!(fx.events().is_empty());
+        assert_eq!(
+            run_args(&args(&["--keep-pid", "4242"]), Ok(&fx.env())),
+            Some(0)
+        );
+        let ev = fx.events().join("\n");
+        assert!(ev.contains("/fi PID ne 4242"), "{ev}");
     }
 
     #[test]
@@ -2714,7 +3002,7 @@ mod tests {
         let ev = fx.events();
         let pos = |needle: &str| ev.iter().position(|e| e.contains(needle)).unwrap();
         let app = fx.layout.tray.display().to_string();
-        assert!(pos("pkill") < pos("ditto"), "{ev:?}");
+        assert!(pos("pgrep") < pos("ditto"), "{ev:?}");
         assert_eq!(
             ev[pos("ditto")],
             format!(

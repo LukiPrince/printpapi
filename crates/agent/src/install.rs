@@ -758,32 +758,71 @@ pub fn tray_unregister_cmds(os: Os, _l: &Layout, sys: &Path) -> Vec<Cmd> {
 
 /// End the tray icons of all sessions, before the program is replaced or removed (a running exe
 /// is locked on Windows). The caller ignores failures: there may be none running.
-/// https://learn.microsoft.com/en-us/windows-server/administration/windows-commands/taskkill
-/// (`/im` names the image, `/f` ends it forcefully); `pkill -f` matches the whole command line.
-// ponytail: this also ends a settings window of the same program, it is the same image and path.
-// Whoever starts an install from that window must not stage a `tray` (then nothing is stopped), and
-// a removal from it ends the window by design, because its exe is locked on Windows anyway.
-pub fn tray_stop_cmds(os: Os, l: &Layout, sys: &Path) -> Vec<Cmd> {
+///
+/// The settings window is the same program as the icon, started from it, and it asked for this
+/// install or removal: `keep_pid`, its process id, is spared, so the window can show the result
+/// (and its own exe, locked on Windows, is dealt with by `apply::remove_tray`).
+/// - Windows: `taskkill /f /im printpapi-tray.exe /fi "PID ne <n>"` (`/im` names the image, `/f`
+///   ends it forcefully, `/fi` filters),
+///   https://learn.microsoft.com/en-us/windows-server/administration/windows-commands/taskkill
+/// - Elsewhere no command ends them in one go: [`tray_list_cmd`] lists the processes, [`tray_pids`]
+///   leaves the window out and [`tray_kill_cmd`] ends each of the rest.
+pub fn tray_stop_cmds(os: Os, _l: &Layout, sys: &Path, keep_pid: Option<u32>) -> Vec<Cmd> {
     match os {
-        Os::Windows => vec![cmd(vec![
-            tool(os, sys, "taskkill.exe"),
-            "/f".into(),
-            "/im".into(),
-            "printpapi-tray.exe".into(),
-        ])],
-        Os::Linux => vec![cmd(vec!["pkill".into(), "-f".into(), s(&l.tray)])],
-        Os::Macos => {
-            // the full path of the app's programs, as on Linux; `pkill -f` takes a regex, so the
-            // dot of ".app" is escaped, and a copy elsewhere (Downloads) or an editor that has the
-            // bundle open is not hit
-            let pattern = format!("{}/Contents/MacOS/", s(&l.tray).replace('.', r"\."));
-            vec![cmd(vec![
-                tool(os, sys, "usr/bin/pkill"),
-                "-f".into(),
-                pattern,
-            ])]
+        Os::Windows => {
+            let mut argv = vec![
+                tool(os, sys, "taskkill.exe"),
+                "/f".into(),
+                "/im".into(),
+                "printpapi-tray.exe".into(),
+            ];
+            if let Some(pid) = keep_pid {
+                argv.extend(["/fi".into(), format!("PID ne {pid}")]);
+            }
+            vec![cmd(argv)]
         }
+        Os::Linux | Os::Macos => Vec::new(),
     }
+}
+
+/// Off Windows: the processes whose command line holds the path of the tray program, one id per
+/// line. `pgrep -f` matches the whole command line (pgrep(1)); the pattern is a regex.
+pub fn tray_list_cmd(os: Os, l: &Layout, sys: &Path) -> Option<Cmd> {
+    let pattern = match os {
+        Os::Windows => return None,
+        Os::Linux => s(&l.tray),
+        // the full path of the app's programs, as on Linux; the dot of ".app" is escaped, and a
+        // copy elsewhere (Downloads) or an editor that has the bundle open is not hit
+        Os::Macos => format!("{}/Contents/MacOS/", s(&l.tray).replace('.', r"\.")),
+    };
+    let program = if os == Os::Macos {
+        tool(os, sys, "usr/bin/pgrep")
+    } else {
+        "pgrep".to_string()
+    };
+    let mut list = cmd(vec![program, "-f".into(), pattern]);
+    list.capture = true;
+    Some(list)
+}
+
+/// The process ids in the output of [`tray_list_cmd`], without `keep_pid`. Anything that is not a
+/// plain number is skipped.
+pub fn tray_pids(output: &[u8], keep_pid: Option<u32>) -> Vec<u32> {
+    String::from_utf8_lossy(output)
+        .lines()
+        .filter_map(|l| l.trim().parse::<u32>().ok())
+        .filter(|pid| Some(*pid) != keep_pid)
+        .collect()
+}
+
+/// End one process off Windows (`kill` sends SIGTERM).
+pub fn tray_kill_cmd(os: Os, sys: &Path, pid: u32) -> Cmd {
+    let program = if os == Os::Macos {
+        tool(os, sys, "bin/kill")
+    } else {
+        "kill".to_string()
+    };
+    cmd(vec![program, pid.to_string()])
 }
 
 /// The rights of `layout.status_dir`, set after the folder exists: readable by every local user,
@@ -1753,31 +1792,73 @@ mod tests {
 
     #[test]
     fn tray_stop_commands() {
+        let win = win_layout("C:\\Program Files");
+        let taskkill = vec![
+            "C:\\Windows\\System32\\taskkill.exe",
+            "/f",
+            "/im",
+            "printpapi-tray.exe",
+        ];
+        assert_eq!(
+            argvs(&tray_stop_cmds(Os::Windows, &win, Path::new(WIN_SYS), None)),
+            std::slice::from_ref(&taskkill)
+        );
+        // the window that asked for the install or removal is the same image, and is spared by its
+        // process id (taskkill: `/fi "PID ne <n>"`)
+        let mut spared = taskkill;
+        spared.extend(["/fi", "PID ne 4242"]);
         assert_eq!(
             argvs(&tray_stop_cmds(
                 Os::Windows,
-                &win_layout("C:\\Program Files"),
-                Path::new(WIN_SYS)
+                &win,
+                Path::new(WIN_SYS),
+                Some(4242)
             )),
-            [vec![
-                "C:\\Windows\\System32\\taskkill.exe",
-                "/f",
-                "/im",
-                "printpapi-tray.exe"
-            ]]
+            [spared]
         );
+        // elsewhere the icons are listed and ended one by one, see `tray_list_cmd`
+        for (os, l) in [(Os::Linux, linux()), (Os::Macos, mac())] {
+            assert!(tray_stop_cmds(os, &l, Path::new("/"), None).is_empty());
+        }
+    }
+
+    #[test]
+    fn tray_icons_are_listed_and_ended_one_by_one_off_windows() {
+        let list = tray_list_cmd(Os::Linux, &linux(), Path::new("/")).unwrap();
         assert_eq!(
-            argvs(&tray_stop_cmds(Os::Linux, &linux(), Path::new("/"))),
-            [vec!["pkill", "-f", "/opt/printpapi-agent/printpapi-tray"]]
+            list.argv,
+            ["pgrep", "-f", "/opt/printpapi-agent/printpapi-tray"]
         );
+        assert!(list.capture);
+        // the full path of the app's programs, as on Linux; the pattern is a regex, so the dot of
+        // ".app" is escaped, and a copy elsewhere (Downloads) or an editor that has the bundle
+        // open is not hit
+        let list = tray_list_cmd(Os::Macos, &mac(), Path::new("/")).unwrap();
         assert_eq!(
-            argvs(&tray_stop_cmds(Os::Macos, &mac(), Path::new("/"))),
-            [vec![
-                "/usr/bin/pkill",
+            list.argv,
+            [
+                "/usr/bin/pgrep",
                 "-f",
                 r"/Applications/printpapi Agent\.app/Contents/MacOS/"
-            ]]
+            ]
         );
+        assert!(tray_list_cmd(Os::Windows, &win_layout("C:\\PF"), Path::new(WIN_SYS)).is_none());
+        assert_eq!(
+            tray_kill_cmd(Os::Linux, Path::new("/"), 4300).argv,
+            ["kill", "4300"]
+        );
+        assert_eq!(
+            tray_kill_cmd(Os::Macos, Path::new("/"), 4300).argv,
+            ["/bin/kill", "4300"]
+        );
+    }
+
+    #[test]
+    fn the_pids_to_end_leave_out_the_one_that_is_spared() {
+        let out = b"4242\n4300\n  77 \r\nnot a pid\n\n-5\n99999999999\n";
+        assert_eq!(tray_pids(out, None), [4242, 4300, 77]);
+        assert_eq!(tray_pids(out, Some(4242)), [4300, 77]);
+        assert_eq!(tray_pids(b"", Some(1)), Vec::<u32>::new());
     }
 
     #[test]
@@ -1887,14 +1968,16 @@ mod tests {
         let sys = Path::new(WIN_SYS);
         let mut all = tray_register_cmds(Os::Windows, &l, sys);
         all.extend(tray_unregister_cmds(Os::Windows, &l, sys));
-        all.extend(tray_stop_cmds(Os::Windows, &l, sys));
+        all.extend(tray_stop_cmds(Os::Windows, &l, sys, Some(7)));
         all.extend(status_dir_cmds(Os::Windows, &l, sys));
         assert_eq!(all.len(), 5);
         for c in all {
             assert!(c.argv[0].starts_with(WIN_SYS), "{:?}", c.argv);
         }
         let m = mac();
-        let mut all = tray_stop_cmds(Os::Macos, &m, Path::new("/"));
+        let mut all = tray_stop_cmds(Os::Macos, &m, Path::new("/"), None);
+        all.extend(tray_list_cmd(Os::Macos, &m, Path::new("/")));
+        all.push(tray_kill_cmd(Os::Macos, Path::new("/"), 7));
         all.extend(status_dir_cmds(Os::Macos, &m, Path::new("/")));
         all.extend(tray_copy_cmds(
             Os::Macos,
