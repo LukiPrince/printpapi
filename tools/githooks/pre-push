@@ -1,0 +1,16 @@
+#!/bin/sh
+# printpapi git hook: checks the docs before every push (see tools/docs/push_hook.py).
+# Turn it on once per clone:  git config core.hooksPath tools/githooks
+# git calls it at the real push with the remote name and URL as arguments and the pushed refs on
+# stdin (https://git-scm.com/docs/githooks#_pre_push); a non-zero exit aborts the push.
+# Without a working Python 3.10+ (on Windows `python` can be a Microsoft Store alias that exits
+# 49) or without the script in this checkout, it lets the push through.
+for py in python python3; do "$py" -c 'import sys; sys.exit(sys.version_info < (3, 10))' >/dev/null 2>&1 && break; py=; done
+[ -n "$py" ] || exit 0
+top=$(git rev-parse --show-toplevel 2>/dev/null) || exit 0
+cd "$top" || exit 0
+[ -f tools/docs/push_hook.py ] || exit 0
+# 3 is the hook's own "abort"; anything else (python exits 1 on a SyntaxError) lets the push through
+"$py" tools/docs/push_hook.py "$@"
+[ $? -ne 3 ] || exit 1
+exit 0
