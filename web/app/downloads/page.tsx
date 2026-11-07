@@ -40,7 +40,10 @@ const SETUP_PLATFORMS: {
     platform: "linux",
     name: "Linux",
     icon: Terminal,
-    notes: ["Linux without a desktop still needs the manual steps below."],
+    notes: [
+      "An AppImage starts only once it is executable: run chmod +x on the file, or tick Allow executing as program in its properties.",
+      "Linux without a desktop still needs the manual steps below.",
+    ],
   },
 ];
 
