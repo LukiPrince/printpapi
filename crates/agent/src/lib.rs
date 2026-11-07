@@ -15,6 +15,7 @@ pub mod print;
 pub mod proc;
 pub mod pyrepr;
 pub mod run;
+pub mod setup;
 
 use std::io::Write;
 use std::path::Path;

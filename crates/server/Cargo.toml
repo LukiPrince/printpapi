@@ -34,4 +34,5 @@ tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "net", "t
 ureq = { version = "3.5.0", default-features = false, features = ["rustls", "platform-verifier"] }
 
 [dev-dependencies]
+printpapi-agent = { path = "../agent" }
 tempfile = "3.27.0"

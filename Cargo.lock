@@ -1015,6 +1015,7 @@ dependencies = [
  "image",
  "include_dir",
  "lettre",
+ "printpapi-agent",
  "rusqlite",
  "rust_decimal",
  "scrypt",
