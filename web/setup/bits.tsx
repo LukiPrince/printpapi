@@ -71,8 +71,11 @@ export function Shell({
                       aria-current={on ? "page" : undefined}
                       onClick={() => nav.onSelect(id)}
                       className={cn(
-                        "flex w-full items-center gap-2 rounded-md border-l-2 border-transparent px-2.5 py-1.5 text-left text-sm transition-colors outline-none hover:bg-sidebar-accent hover:text-sidebar-accent-foreground focus-visible:ring-2 focus-visible:ring-sidebar-ring",
-                        on && "border-sidebar-primary bg-sidebar-accent font-semibold text-sidebar-accent-foreground",
+                        "flex w-full items-center gap-2 rounded-md px-2.5 py-1.5 text-left text-sm transition-colors outline-none focus-visible:ring-2 focus-visible:ring-sidebar-ring",
+                        // the active item as in the dashboard's own sidebar (components/app-shell.tsx): filled amber
+                        on
+                          ? "bg-sidebar-primary font-medium text-sidebar-primary-foreground"
+                          : "hover:bg-sidebar-accent hover:text-sidebar-accent-foreground",
                       )}
                     >
                       <Icon className="size-4 shrink-0" />
