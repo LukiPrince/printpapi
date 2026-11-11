@@ -220,7 +220,7 @@ def test_target_not_in_git_is_a_finding_even_if_the_file_exists_on_disk():
 
 
 def test_maintainer_local_files_are_just_untracked():
-    out = repo({"README.md": "[h](HANDOFF.md) [t](TODO.md) [p](docs/superpowers/plan.md)\n"})
+    out = repo({"README.md": "[h](HANDOFF.md) [t](TODO.md) [p](docs/plans/plan.md)\n"})
     assert len(out) == 3 and all("not in git at HEAD" in line for line in out)
 
 
