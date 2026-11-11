@@ -33,7 +33,8 @@ target/
 crates/setup/gen/
 
 # Maintainer-only working docs (plans, specs, handoff, release routine, open items): kept locally, not published
-docs/superpowers/
+docs/plans/
+docs/specs/
 HANDOFF.md
 TODO.md
 RELEASE_CHECKLIST.md

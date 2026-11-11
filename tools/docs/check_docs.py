@@ -9,7 +9,7 @@ there for CI or for a reader of the repo, so it is a finding locally exactly as 
   a. a relative link (inline, image, reference definition, HTML src/href) points at a file or
      directory that is in git at that revision (relative to the Markdown file; links with a scheme
      are skipped). This also catches links to the gitignored maintainer-local files (HANDOFF.md,
-     TODO.md, docs/superpowers/), see AGENTS.md "Maintainer-local files";
+     TODO.md, docs/plans/, docs/specs/), see AGENTS.md "Maintainer-local files";
   b. a #fragment on a same-file link or a link to another .md file matches a heading anchor of
      that file, computed like GitHub does (see `slug`);
   c. a literal setup file name (printpapi-setup-...) is one of the assets in

@@ -109,6 +109,6 @@ cd web && npm run build:app     # after any web/ change; commit crates/server/we
 
 ## Maintainer-local files
 
-`HANDOFF.md` (origin story, history), `TODO.md` (open items) and `docs/superpowers/` (plans, specs)
+`HANDOFF.md` (origin story, history), `TODO.md` (open items) and `docs/plans/`, `docs/specs/` (plans, specs)
 exist only on the maintainer's disk and are gitignored. Never `git add` them and never link to them from tracked
 files.
