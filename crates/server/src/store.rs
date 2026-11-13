@@ -416,6 +416,8 @@ CREATE INDEX IF NOT EXISTS jobs_state_claimed ON jobs(state, claimed_at);
 CREATE INDEX IF NOT EXISTS jobs_hooks ON jobs(id)
   WHERE callback_url IS NOT NULL AND hook_delivered_at IS NULL;
 CREATE INDEX IF NOT EXISTS agents_org ON agents(org_id);
+-- the retention scan (`purge_jobs`) looks at terminal jobs by age
+CREATE INDEX IF NOT EXISTS jobs_state_finished ON jobs(state, finished_at);
 ";
 
 /// The oldest queued job of one agent that has not passed its deadline (`?1` agent, `?2` now).
@@ -1488,6 +1490,55 @@ pub fn expire_jobs(conn: &Connection, now: Option<f64>) -> Result<usize> {
     )?;
     tx.commit()?;
     Ok(n)
+}
+
+/// What one `purge_jobs` pass did.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct Purged {
+    /// Queued jobs older than the retention that never ran: failed (`error='retention'`) and scrubbed.
+    pub abandoned: usize,
+    /// Terminal jobs whose payload, title and callback were cleared.
+    pub scrubbed: usize,
+    /// Terminal rows from before this month that were deleted.
+    pub deleted: usize,
+}
+
+/// Job retention (PRINTAPI_JOB_RETENTION_DAYS): (1) fail and scrub `queued` jobs older than
+/// `days` (no deadline, so `expire_jobs` never ends them, and an abandoned trial would keep its
+/// payloads for ever), (2) scrub terminal jobs finished more than `days` ago, (3) delete those
+/// that were also created before this UTC month. The current month's rows stay because the quota
+/// counts `jobs` rows (`USAGE_SQL`). `claimed` jobs are never touched.
+/// ponytail: one pass, three statements, no batching: fine for a beta; chunk the DELETE if a pass
+/// ever holds the lock for noticeable time.
+pub fn purge_jobs(conn: &Connection, days: i64, now: Option<f64>) -> Result<Purged> {
+    let now = now.unwrap_or_else(crate::now);
+    let cutoff = now - days as f64 * 86_400.0;
+    let tx = begin(conn)?;
+    let abandoned = tx.execute(
+        "UPDATE jobs SET state='failed', error='retention', finished_at=:now,          payload=x'', title=NULL, callback_url=NULL          WHERE state='queued' AND created_at < :cutoff",
+        named_params! {":now": now, ":cutoff": cutoff},
+    )?;
+    let scrubbed = tx.execute(
+        "UPDATE jobs SET payload=x'', title=NULL, callback_url=NULL          WHERE state IN ('done','failed','cancelled') AND COALESCE(finished_at, created_at) < :cutoff          AND (length(payload) > 0 OR title IS NOT NULL OR callback_url IS NOT NULL)",
+        named_params! {":cutoff": cutoff},
+    )?;
+    let deleted = tx.execute(
+        "DELETE FROM jobs          WHERE state IN ('done','failed','cancelled') AND COALESCE(finished_at, created_at) < :cutoff          AND created_at < :month",
+        named_params! {":cutoff": cutoff, ":month": month_start(now)},
+    )?;
+    tx.commit()?;
+    Ok(Purged {
+        abandoned,
+        scrubbed,
+        deleted,
+    })
+}
+
+/// Freed pages are overwritten with zeros, so a scrubbed or deleted payload does not linger in the
+/// file. Per connection; main switches it on when retention is set.
+pub fn enable_secure_delete(conn: &Connection) -> Result<()> {
+    conn.pragma_update(None, "secure_delete", true)?;
+    Ok(())
 }
 
 /// Cancel a job while it is still 'queued' (before any agent claims it).
@@ -3043,6 +3094,125 @@ mod tests {
             get_job(&conn, fresh, None).unwrap().unwrap().state,
             "claimed"
         ); // untouched
+    }
+
+    const DAY: f64 = 86_400.0;
+
+    /// A job in `state`, created `created_days` ago and (when terminal) finished `finished_days`
+    /// ago, holding a payload, a title and a callback.
+    fn aged(
+        conn: &Connection,
+        pid: i64,
+        state: &str,
+        created_days: f64,
+        finished_days: Option<f64>,
+        now: f64,
+    ) -> i64 {
+        let jid = enq_with(conn, pid, b"label bytes", |j| {
+            j.title = Some("T".into());
+            j.callback_url = Some("https://hook.test/x".into());
+        });
+        conn.execute(
+            "UPDATE jobs SET state=?, created_at=?, finished_at=? WHERE id=?",
+            params![
+                state,
+                now - created_days * DAY,
+                finished_days.map(|d| now - d * DAY),
+                jid
+            ],
+        )
+        .unwrap();
+        jid
+    }
+
+    fn held(conn: &Connection, jid: i64) -> (i64, Option<String>, Option<String>) {
+        conn.query_row(
+            "SELECT length(payload), title, callback_url FROM jobs WHERE id=?",
+            [jid],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn retention_scrubs_old_terminal_jobs_and_only_those() {
+        let conn = db();
+        let pid = id_of(&reg(&conn, "a", "k", &[("Z", false)]), "Z");
+        // mid-month, so "ten days ago" is still this month and nothing is deleted
+        let now = month_start(crate::now()) + 25.0 * DAY;
+        let old = aged(&conn, pid, "done", 11.0, Some(10.5), now);
+        let young = aged(&conn, pid, "done", 5.0, Some(4.0), now);
+        let claimed = aged(&conn, pid, "claimed", 20.0, None, now);
+        let queued = aged(&conn, pid, "queued", 5.0, None, now);
+        let no_finish = aged(&conn, pid, "cancelled", 12.0, None, now); // falls back to created_at
+        let p = purge_jobs(&conn, 7, Some(now)).unwrap();
+        assert_eq!((p.abandoned, p.scrubbed, p.deleted), (0, 2, 0));
+        assert_eq!(held(&conn, old), (0, None, None));
+        assert_eq!(held(&conn, no_finish), (0, None, None));
+        assert_eq!(
+            held(&conn, young),
+            (11, Some("T".into()), Some("https://hook.test/x".into()))
+        );
+        assert_eq!(held(&conn, claimed).0, 11); // never touched, however old
+        assert_eq!(held(&conn, queued).0, 11);
+        // the row and its state survive a scrub
+        assert_eq!(get_job(&conn, old, None).unwrap().unwrap().state, "done");
+        // a second run right after finds nothing to do
+        assert_eq!(purge_jobs(&conn, 7, Some(now)).unwrap(), Purged::default());
+    }
+
+    #[test]
+    fn retention_fails_and_scrubs_an_abandoned_queued_job() {
+        let conn = db();
+        let pid = id_of(&reg(&conn, "a", "k", &[("Z", false)]), "Z");
+        let now = month_start(crate::now()) + 25.0 * DAY;
+        let abandoned = aged(&conn, pid, "queued", 8.0, None, now);
+        let fresh = aged(&conn, pid, "queued", 6.0, None, now);
+        let p = purge_jobs(&conn, 7, Some(now)).unwrap();
+        assert_eq!((p.abandoned, p.scrubbed, p.deleted), (1, 0, 0));
+        let job = get_job(&conn, abandoned, None).unwrap().unwrap();
+        assert!(job.state == "failed" && job.error.as_deref() == Some("retention"));
+        assert_eq!(held(&conn, abandoned), (0, None, None));
+        assert_eq!(
+            get_job(&conn, fresh, None).unwrap().unwrap().state,
+            "queued"
+        );
+        assert_eq!(held(&conn, fresh).0, 11);
+    }
+
+    #[test]
+    fn retention_deletes_only_rows_from_before_this_month_and_keeps_usage() {
+        let conn = db();
+        let pid = id_of(&reg(&conn, "a", "k", &[("Z", false)]), "Z");
+        let now = month_start(crate::now()) + 25.0 * DAY;
+        let last_month = aged(&conn, pid, "done", 40.0, Some(39.0), now);
+        let this_month_old = aged(&conn, pid, "failed", 20.0, Some(19.0), now);
+        let last_month_claimed = aged(&conn, pid, "claimed", 40.0, None, now);
+        let usage = org_usage(&conn, DEFAULT_ORG, Some(month_start(now))).unwrap();
+        let p = purge_jobs(&conn, 7, Some(now)).unwrap();
+        assert_eq!(p.deleted, 1);
+        assert!(get_job(&conn, last_month, None).unwrap().is_none());
+        assert!(get_job(&conn, this_month_old, None).unwrap().is_some()); // quota still counts it
+        assert!(get_job(&conn, last_month_claimed, None).unwrap().is_some());
+        assert_eq!(held(&conn, this_month_old).0, 0); // but its content is gone
+        assert_eq!(
+            org_usage(&conn, DEFAULT_ORG, Some(month_start(now))).unwrap(),
+            usage
+        );
+        assert_eq!(purge_jobs(&conn, 7, Some(now)).unwrap(), Purged::default());
+    }
+
+    #[test]
+    fn retention_scan_has_an_index_and_secure_delete_can_be_switched_on() {
+        let conn = db();
+        let on: i64 = q(
+            &conn,
+            "SELECT count(*) FROM sqlite_master WHERE name='jobs_state_finished'",
+            [],
+        );
+        assert_eq!(on, 1);
+        enable_secure_delete(&conn).unwrap();
+        assert_eq!(q::<i64>(&conn, "PRAGMA secure_delete", []), 1);
     }
 
     #[test]

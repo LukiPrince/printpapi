@@ -49,6 +49,9 @@ pub struct Config {
     /// PRINTAPI_SIGNUP_QUOTA: the monthly `job_quota` of every org `POST /signup` creates.
     /// None: no quota. Root-created orgs are never touched.
     pub signup_quota: Option<i64>,
+    /// PRINTAPI_JOB_RETENTION_DAYS: finished jobs lose their content after this many days and the
+    /// rows go with the month. None: keep for ever.
+    pub job_retention_days: Option<i64>,
 }
 
 impl Config {
@@ -73,6 +76,7 @@ impl Config {
             open_enrollment: false,
             trusted_proxies: crate::proxy::TrustedProxies::default(),
             signup_quota: None,
+            job_retention_days: None,
         }
     }
 }
@@ -164,6 +168,8 @@ pub struct AppState {
     /// Image renders (`label_uri`, `label_base64`) running at once. A decode can take a few
     /// hundred MB, and the fetcher's slots are free again by the time the render starts.
     pub render_slots: RenderSlots,
+    /// When the retention purge last ran (the reaper ticks far more often than once an hour).
+    last_retention: Mutex<Option<f64>>,
 }
 
 /// Concurrent image renders (see `AppState::render_slots`). ponytail: one global cap, not per
@@ -228,6 +234,7 @@ impl AppState {
             dummy_hash,
             poll_slots: Arc::new(tokio::sync::Semaphore::new(POLL_SLOTS)),
             render_slots: RenderSlots::new(RENDER_SLOTS),
+            last_retention: Mutex::new(None),
         }
     }
 }
@@ -2339,6 +2346,33 @@ pub fn deliver_agent_events(
     }
 }
 
+/// How often the retention purge may run.
+const RETENTION_EVERY_S: f64 = 3600.0;
+
+/// The job retention purge (`store::purge_jobs`), at most once an hour and only when
+/// PRINTAPI_JOB_RETENTION_DAYS is set. `None`: not due, not configured, or the purge failed
+/// (logged; the next tick after the hour tries again).
+pub fn retention_pass(state: &AppState, now: f64) -> Option<store::Purged> {
+    let days = state.cfg.job_retention_days?;
+    {
+        let mut last = state
+            .last_retention
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if last.is_some_and(|t| now - t < RETENTION_EVERY_S) {
+            return None;
+        }
+        *last = Some(now);
+    }
+    match state.db.with(|c| store::purge_jobs(c, days, Some(now))) {
+        Ok(p) => Some(p),
+        Err(e) => {
+            eprintln!("retention error: {e}");
+            None
+        }
+    }
+}
+
 /// One reaper pass: expire, requeue stale (waking every long-poll if anything was requeued),
 /// purge expired sessions and resets. Errors are logged to stderr, never propagated.
 pub fn reaper_pass(state: &AppState, timeout_s: f64, max_retries: i64) {
@@ -2353,6 +2387,7 @@ pub fn reaper_pass(state: &AppState, timeout_s: f64, max_retries: i64) {
         }
         state.db.with(|c| store::purge_expired_sessions(c, None))?;
         state.db.with(|c| store::purge_expired_resets(c, None))?;
+        retention_pass(state, crate::now());
         Ok(())
     };
     if let Err(e) = run() {

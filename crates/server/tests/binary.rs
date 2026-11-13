@@ -15,6 +15,7 @@ fn bin() -> Command {
         "PRINTAPI_SIGNUP",
         "PRINTAPI_TRUSTED_PROXIES",
         "PRINTAPI_SIGNUP_QUOTA",
+        "PRINTAPI_JOB_RETENTION_DAYS",
         "LOG_REQUESTS",
     ] {
         c.env_remove(k);
@@ -86,6 +87,19 @@ fn bad_signup_quota_exits_1() {
             .unwrap();
         assert_eq!(out.status.code(), Some(1), "{bad}");
         assert!(String::from_utf8_lossy(&out.stderr).contains("PRINTAPI_SIGNUP_QUOTA"));
+    }
+}
+
+#[test]
+fn bad_job_retention_exits_1() {
+    for bad in ["-1", "ten", "1.5"] {
+        let out = bin()
+            .env("PRINTAPI_TOKEN", "t")
+            .env("PRINTAPI_JOB_RETENTION_DAYS", bad)
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(1), "{bad}");
+        assert!(String::from_utf8_lossy(&out.stderr).contains("PRINTAPI_JOB_RETENTION_DAYS"));
     }
 }
 
@@ -170,4 +184,22 @@ fn serves_health_over_tcp() {
     child.kill().unwrap();
     let _ = child.wait();
     result.unwrap();
+}
+
+#[test]
+fn open_signup_without_retention_warns_on_stderr() {
+    let err = stderr_at_startup(&[("PRINTAPI_SIGNUP", "open")]);
+    assert!(err.contains("PRINTAPI_JOB_RETENTION_DAYS"), "{err:?}");
+    let err = stderr_at_startup(&[
+        ("PRINTAPI_SIGNUP", "open"),
+        ("PRINTAPI_JOB_RETENTION_DAYS", "30"),
+    ]);
+    assert!(!err.contains("PRINTAPI_JOB_RETENTION_DAYS"), "{err:?}");
+    // 0 means "keep for ever", which is the unset case: still warned
+    let err = stderr_at_startup(&[
+        ("PRINTAPI_SIGNUP", "open"),
+        ("PRINTAPI_JOB_RETENTION_DAYS", "0"),
+    ]);
+    assert!(err.contains("PRINTAPI_JOB_RETENTION_DAYS"), "{err:?}");
+    assert!(!stderr_at_startup(&[]).contains("PRINTAPI_JOB_RETENTION_DAYS"));
 }

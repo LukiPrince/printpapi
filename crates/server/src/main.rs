@@ -4,7 +4,8 @@
 //! (default 3460), PRINTAPI_SIGNUP, PUBLIC_URL, PRINTAPI_PLANS (JSON array or a path to a file
 //! holding one), PRINTAPI_BILLING_SECRET, PRINTAPI_TRUSTED_PROXIES (IPs or CIDRs whose
 //! `X-Forwarded-For` is believed), PRINTAPI_SIGNUP_QUOTA (monthly job quota of every self-signup
-//! org), LOG_REQUESTS, SMTP_*.
+//! org), PRINTAPI_JOB_RETENTION_DAYS (days until finished jobs lose payload and title and, a
+//! month later, their row; unset or 0 keeps them), LOG_REQUESTS, SMTP_*.
 use printpapi_server::dispatch::{Destinations, HttpFetcher, OUTBOUND_IN_FLIGHT};
 use printpapi_server::mail::{self, SmtpMailer};
 use printpapi_server::server::{AppState, Config};
@@ -34,12 +35,30 @@ fn parse_quota(raw: &str) -> Result<Option<i64>, String> {
     }
 }
 
+/// Empty or 0: keep for ever. Otherwise a positive number of days.
+fn parse_retention(raw: &str) -> Result<Option<i64>, String> {
+    let t = py_strip(raw);
+    if t.is_empty() {
+        return Ok(None);
+    }
+    match t.parse::<i64>() {
+        Ok(0) => Ok(None),
+        Ok(n) if n > 0 => Ok(Some(n)),
+        _ => Err(format!("must be a positive integer, not {t:?}")),
+    }
+}
+
 /// One stderr line per hosted-beta safeguard that is off while strangers can sign up.
 fn startup_warnings(cfg: &Config) -> Vec<&'static str> {
     let mut out = Vec::new();
     if cfg.signup_open && cfg.signup_quota.is_none() {
         out.push(
             "warning: PRINTAPI_SIGNUP=open without PRINTAPI_SIGNUP_QUOTA: new orgs can print without limit",
+        );
+    }
+    if cfg.signup_open && cfg.job_retention_days.is_none() {
+        out.push(
+            "warning: PRINTAPI_SIGNUP=open without PRINTAPI_JOB_RETENTION_DAYS: job payloads are kept for ever",
         );
     }
     out
@@ -101,6 +120,9 @@ fn config() -> Result<(Config, String, u16), String> {
     .map_err(|e| format!("PRINTAPI_TRUSTED_PROXIES: {e}"))?;
     cfg.signup_quota = parse_quota(&env("PRINTAPI_SIGNUP_QUOTA").unwrap_or_default())
         .map_err(|e| format!("PRINTAPI_SIGNUP_QUOTA: {e}"))?;
+    cfg.job_retention_days =
+        parse_retention(&env("PRINTAPI_JOB_RETENTION_DAYS").unwrap_or_default())
+            .map_err(|e| format!("PRINTAPI_JOB_RETENTION_DAYS: {e}"))?;
     cfg.open_enrollment = env("PRINTAPI_OPEN_ENROLLMENT").is_some_and(|s| py_strip(&s) == "1");
     Ok((cfg, db_path, port))
 }
@@ -134,6 +156,11 @@ fn run() -> Result<(), String> {
         eprintln!("{line}");
     }
     let db = Db::open(&db_path).map_err(|e| format!("cannot open database {db_path:?}: {e}"))?;
+    if cfg.job_retention_days.is_some() {
+        // A scrubbed payload must not survive in the freed pages of the file.
+        db.with(printpapi_server::store::enable_secure_delete)
+            .map_err(|e| format!("cannot enable secure_delete: {e}"))?;
+    }
     let state = Arc::new(AppState::new(
         cfg,
         db,

@@ -28,7 +28,7 @@ Token comparison is constant-time (`hmac.compare_digest`).
 | `GET\|POST /labels`, `GET\|PUT\|DELETE /labels/{id}` | client | [Label templates](labels.md): where the content sits on a label; jobs of type `label_*` render through them |
 | `POST /orders` | client | Render an order as a packing slip and print it → `{job_id}` ([e-commerce](ecommerce.md)) |
 | `POST /integrations/shopify/orders` | HMAC | Shopify order webhook (key in the URL, signature in the header) |
-| `GET /jobs` | client | Recent job history |
+| `GET /jobs` | client | Recent job history. With [retention](server.md#retention) set, old jobs lose payload and title (`title` is `null`), then disappear |
 | `GET /jobs/{id}` | client | One job's state: `queued` \| `claimed` \| `done` \| `failed` \| `cancelled` |
 | `DELETE /jobs/{id}` | client | Cancel a still-`queued` job (`409` once claimed, `404` if unknown) |
 | `GET /printers` | client | Registered printers + online/offline + capabilities |

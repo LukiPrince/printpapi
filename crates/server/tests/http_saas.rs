@@ -532,3 +532,53 @@ fn a_spent_quota_answers_402_on_every_submit_path() {
         1
     );
 }
+
+// --- job retention ----------------------------------------------------------------------------
+
+#[test]
+fn retention_runs_at_most_once_an_hour_and_scrubbed_jobs_still_list() {
+    use printpapi_server::server::retention_pass;
+    let day = 86_400.0;
+    let now = store::month_start(printpapi_server::now()) + 25.0 * day;
+    let app = App::with(|c| c.job_retention_days = Some(7));
+    let pid = agent_z(&app.db).pid("Z");
+    let old = enqueue(&app.db, pid, b"secret", |j| j.title = Some("T".into()));
+    let age = |id: i64| {
+        app.db.with(|c| {
+            c.execute(
+                "UPDATE jobs SET state='done', created_at=?1, finished_at=?1 WHERE id=?2",
+                rusqlite::params![now - 10.0 * day, id],
+            )
+            .unwrap()
+        })
+    };
+    age(old);
+    assert_eq!(retention_pass(&app.state, now).unwrap().scrubbed, 1);
+    // inside the hour nothing runs, even with fresh work waiting
+    let second = enqueue(&app.db, pid, b"secret", |_| {});
+    age(second);
+    assert!(retention_pass(&app.state, now + 3599.0).is_none());
+    assert_eq!(
+        retention_pass(&app.state, now + 3600.0).unwrap().scrubbed,
+        1
+    );
+    // the history and the PrintNode layer cope with a job that lost its title
+    let (code, body) = app.get("/jobs", Some("t"));
+    assert_eq!(code, 200);
+    assert!(body.to_string().contains(&format!("\"id\":{old}")));
+    assert_eq!(
+        app.get(&format!("/jobs/{old}"), Some("t")).1["state"],
+        "done"
+    );
+    let key = "pnkey";
+    add_key(&app.db, "pn", key, DEFAULT_ORG);
+    let (code, body) = app.pn("GET", &format!("/printjobs/{old}"), key, None);
+    assert_eq!(code, 200, "{body}");
+}
+
+#[test]
+fn retention_does_nothing_unless_configured() {
+    use printpapi_server::server::retention_pass;
+    let app = App::new();
+    assert!(retention_pass(&app.state, 1e12).is_none());
+}

@@ -42,6 +42,7 @@ Environment variables:
 | `PRINTAPI_PLANS` | *(unset)* | [Billing](billing.md) catalogue: a JSON array of plans, or a path to a file holding one. Unset ⇒ no plans, no billing routes |
 | `PRINTAPI_BILLING_SECRET` | *(unset)* | Shared secret for the `POST /billing/webhook` signature. Unset ⇒ the webhook answers `503` |
 | `PRINTAPI_SIGNUP_QUOTA` | *(unset: no quota)* | Non-negative integer: the monthly [`job_quota`](api.md#quotas) of every org created through `POST /signup`, so a free signup cannot print without limit. `0` blocks printing. Orgs the root token creates (`POST /orgs`) are untouched, and a [billing](billing.md) plan still overrides it per org. Not an integer stops the server at startup. With `PRINTAPI_SIGNUP=open` and no quota, startup prints a warning |
+| `PRINTAPI_JOB_RETENTION_DAYS` | *(unset or `0`: keep for ever)* | Positive integer N: see [Retention](#retention). Not a positive integer stops the server at startup. With `PRINTAPI_SIGNUP=open` and no retention, startup prints a warning |
 | `PRINTAPI_PRIVATE_URLS` | `deny` with open signup, else `allow` | `deny`: payload URLs (`*_uri`, `*_uri_post`), job `callback_url`s and org `event_url`s may only reach public addresses — no loopback, LAN, link-local/cloud-metadata or other private ranges, checked after DNS on every redirect hop. `allow`: anywhere (a self-hosted box fetching PDFs from an internal service). Set `deny` whenever people you do not trust get keys |
 | `PRINTAPI_TRUSTED_PROXIES` | *(unset: nobody)* | Comma-separated IPs or CIDRs (IPv4 and IPv6, e.g. `127.0.0.1,::1` or `172.16.0.0/12`) of the reverse proxies in front of printpapi. Only a request whose socket peer is listed has its `X-Forwarded-For` read: the rightmost entry that is not itself listed is the client, which the signup throttle (IPv6 per /64) and the `LOG_REQUESTS` line then use. Unset, the socket peer is the client, so behind a proxy every signup shares one throttle slot. An invalid entry stops the server at startup. See [Behind a reverse proxy](#behind-a-reverse-proxy) |
 | `PRINTAPI_OPEN_ENROLLMENT` | *(off)* | `1`: any Bearer value enrolls a new agent into the default org (the v2 rule). Off: a new agent needs an issued key or the root token |
@@ -175,6 +176,22 @@ and a machine key can never manage keys or users — see
 SQLite in WAL mode with an atomic claim. A visibility-timeout reaper requeues jobs whose agent
 went silent and fails them after a bounded number of retries. Reaper errors are logged to
 stderr.
+
+### Retention
+
+A job holds its payload (labels, packing slips, addresses) until you say otherwise. With
+`PRINTAPI_JOB_RETENTION_DAYS=N` the reaper runs, at most once an hour:
+
+- a job still `queued` after N days (its agent never came back) is failed with `error: "retention"`
+  and cleared;
+- a `done`, `failed` or `cancelled` job finished more than N days ago loses its payload, title and
+  callback URL. Its row (state, printer, times) stays;
+- of those, the rows created before the current UTC month are deleted. The current month's rows
+  stay, because the [monthly quota](api.md#quotas) counts them: deleting them would hand quota back.
+
+`claimed` jobs are never touched. With retention set the server opens SQLite with
+`secure_delete=ON`, so freed pages are zeroed instead of keeping the old bytes. **Backups keep what
+they copied** until you rotate them out: set your backup retention to match.
 
 ## Security
 
