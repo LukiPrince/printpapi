@@ -147,6 +147,51 @@ fn signup_is_throttled_per_client_so_one_host_cannot_spray_orgs() {
     assert_eq!(r.status, 200);
 }
 
+#[test]
+fn concurrent_signups_from_one_address_cannot_exceed_the_window_cap() {
+    let app = App::with(|c| {
+        c.signup_open = true;
+        c.max_login_fails = 3;
+    });
+    let orgs = app.db.with(store::list_orgs).unwrap().len();
+    let ok = std::thread::scope(|s| {
+        let hs: Vec<_> = (0..30)
+            .map(|n| {
+                let app = &app;
+                s.spawn(move || {
+                    app.call("POST", "/signup")
+                        .json(&json!({"email": format!("c{n}@shop.test"), "password": PW}))
+                        .send()
+                        .status
+                })
+            })
+            .collect();
+        hs.into_iter()
+            .map(|h| h.join().unwrap())
+            .filter(|c| *c == 200)
+            .count()
+    });
+    assert_eq!(ok, 3);
+    assert_eq!(app.db.with(store::list_orgs).unwrap().len(), orgs + 3);
+}
+
+#[test]
+fn failed_logins_named_like_a_signup_slot_do_not_block_that_address() {
+    let app = App::with(|c| {
+        c.signup_open = true;
+        c.max_login_fails = 2;
+    });
+    for _ in 0..2 {
+        assert_eq!(app.login("signup:127.0.0.1", "wrong").0, 401);
+    }
+    let (code, _) = app.post(
+        "/signup",
+        None,
+        json!({"email": "u1@shop.test", "password": PW}),
+    );
+    assert_eq!(code, 200);
+}
+
 // --- password reset ---------------------------------------------------------------------------
 
 #[test]

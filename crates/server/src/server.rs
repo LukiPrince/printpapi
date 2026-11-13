@@ -808,7 +808,9 @@ impl Ctx<'_> {
         let email = str_field(&body, "email")
             .map(store::normalize_email)
             .unwrap_or_default();
-        if !self.s.limiter.allow(&email, None) {
+        // namespaced: the limiter's map is shared with `signup:` and `reset:` keys
+        let slot = format!("login:{email}");
+        if !self.s.limiter.allow(&slot, None) {
             return Ok(jerr(429, "too many failed logins, try again later"));
         }
         let user = self.db(|c| store::get_user_by_email(c, &email))?;
@@ -820,10 +822,10 @@ impl Ctx<'_> {
         };
         let ok = auth::verify_password(str_field(&body, "password"), stored);
         let Some(user) = user.filter(|_| ok) else {
-            self.s.limiter.fail(&email, None);
+            self.s.limiter.fail(&slot, None);
             return Ok(jerr(401, "invalid credentials"));
         };
-        self.s.limiter.succeed(&email);
+        self.s.limiter.succeed(&slot);
         let tok = auth::new_session_token();
         let expires_at =
             self.db(|c| store::create_session(c, user.id, &tok, self.cfg().session_ttl_s, None))?;
@@ -862,6 +864,12 @@ impl Ctx<'_> {
                 _ => return Ok(jerr(400, "accept_terms required")),
             }
         }
+        // The slot is taken atomically, before the slow hash: parallel requests from one address
+        // must not all pass the peek above and then count afterwards. A successful signup spends
+        // its slot too, which is the cap.
+        if !self.s.limiter.try_take(&slot, None) {
+            return Ok(jerr(429, "too many signups, try again later"));
+        }
         let pw_hash = match auth::hash_password(str_field(&body, "password")) {
             Ok(h) => h,
             Err(e) => return Ok(jerr(400, e)),
@@ -870,8 +878,6 @@ impl Ctx<'_> {
             .map(|n| printnode::py_trim(n).to_string())
             .filter(|n| !n.is_empty())
             .unwrap_or_else(|| email.split_once('@').map_or("", |(_, d)| d).to_string());
-        // a *successful* signup spends a slot too — that is the cap
-        self.s.limiter.fail(&slot, None);
         let quota = self.cfg().signup_quota;
         let new = match self.db(|c| store::signup(c, &name, &email, &pw_hash, quota, terms_version))
         {
