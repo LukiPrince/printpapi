@@ -1331,6 +1331,24 @@ pub fn check_quota(conn: &Connection, org_id: i64, now: f64) -> Result<()> {
     Ok(())
 }
 
+/// The job an org already queued under `key`, as `enqueue_job` returns it for a resubmit — lets a
+/// caller skip fetching a payload it would only throw away.
+pub fn find_job_by_key(conn: &Connection, org_id: i64, key: &str) -> Result<Option<Enqueued>> {
+    Ok(conn
+        .query_row(
+            "SELECT id, agent_id FROM jobs WHERE org_id=? AND idempotency_key=?",
+            params![org_id, key],
+            |r| {
+                Ok(Enqueued {
+                    job_id: r.get(0)?,
+                    agent_id: r.get(1)?,
+                    created: false,
+                })
+            },
+        )
+        .optional()?)
+}
+
 pub fn enqueue_job(conn: &Connection, job: &NewJob<'_>) -> Result<Enqueued> {
     let now = crate::now();
     let unknown = || {

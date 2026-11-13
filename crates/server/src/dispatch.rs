@@ -341,7 +341,7 @@ pub fn is_http(url: &str) -> bool {
 }
 
 // A non-string truthy url gets the scheme error with its repr (Python crashed in urlparse).
-fn checked_http_url(url: Option<&Value>) -> Result<&str, DispatchError> {
+pub fn checked_http_url(url: Option<&Value>) -> Result<&str, DispatchError> {
     match url {
         Some(v) if truthy(v) => match v {
             Value::String(s) if is_http(s) => Ok(s),

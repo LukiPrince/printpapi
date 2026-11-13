@@ -182,6 +182,8 @@ pub struct AppState {
     pub render_slots: RenderSlots,
     /// When the retention purge last ran (the reaper ticks far more often than once an hour).
     last_retention: Mutex<Option<f64>>,
+    /// Payload fetches running now, per org (see `MAX_FETCHES_PER_ORG`).
+    org_fetches: Mutex<std::collections::HashMap<i64, usize>>,
     /// A retention WAL truncate was blocked by a reader; the next pass retries it even if it
     /// changes no rows.
     wal_truncate_pending: std::sync::atomic::AtomicBool,
@@ -226,6 +228,52 @@ impl RenderSlots {
     }
 }
 
+/// Payload downloads one org may have in flight at once. ponytail: this stops one org from
+/// holding every slot of the global `OUTBOUND_IN_FLIGHT` cap; an attacker with many orgs still
+/// shares that global 256, and the cap does not queue, it answers 503.
+pub const MAX_FETCHES_PER_ORG: usize = 4;
+
+/// Holds one of an org's download slots; dropping it (success, error or panic unwind) gives it back.
+struct FetchGuard<'a> {
+    state: &'a AppState,
+    org_id: i64,
+}
+
+impl Drop for FetchGuard<'_> {
+    fn drop(&mut self) {
+        let mut map = self
+            .state
+            .org_fetches
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(n) = map.get_mut(&self.org_id) {
+            *n -= 1;
+            if *n == 0 {
+                map.remove(&self.org_id);
+            }
+        }
+    }
+}
+
+impl AppState {
+    /// A download slot for `org_id`, or `None` when it already has `MAX_FETCHES_PER_ORG` running.
+    fn try_fetch_slot(&self, org_id: i64) -> Option<FetchGuard<'_>> {
+        let mut map = self
+            .org_fetches
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let n = map.entry(org_id).or_insert(0);
+        if *n >= MAX_FETCHES_PER_ORG {
+            return None;
+        }
+        *n += 1;
+        Some(FetchGuard {
+            state: self,
+            org_id,
+        })
+    }
+}
+
 /// Concurrent long-poll DB calls (see `AppState::poll_slots`).
 pub const POLL_SLOTS: usize = 4;
 
@@ -250,6 +298,7 @@ impl AppState {
             poll_slots: Arc::new(tokio::sync::Semaphore::new(POLL_SLOTS)),
             render_slots: RenderSlots::new(RENDER_SLOTS),
             last_retention: Mutex::new(None),
+            org_fetches: Mutex::new(std::collections::HashMap::new()),
             wal_truncate_pending: std::sync::atomic::AtomicBool::new(false),
         }
     }
@@ -600,6 +649,28 @@ impl Principal {
     fn foreign_org(&self, org_id: i64) -> bool {
         self.org_id.is_some_and(|o| o != org_id)
     }
+}
+
+/// What `fetch_gate` decided: the job already exists, or go on (holding a download slot when the
+/// payload is fetched).
+enum Gate2<'a> {
+    Existing(store::Enqueued),
+    Go(Option<FetchGuard<'a>>),
+}
+
+/// What `label_payload` made: an existing job (idempotent resubmit), or the job's mode, validated
+/// options and rendered bytes.
+enum Labeled {
+    Existing(store::Enqueued),
+    Ready(&'static str, Option<Obj>, Vec<u8>),
+}
+
+/// The job types whose payload the server fetches itself (`label_uri` has its own path).
+fn fetches_payload(type_v: &Value) -> bool {
+    matches!(
+        type_v.as_str(),
+        Some("raw_uri" | "pdf_uri" | "raw_uri_post" | "pdf_uri_post")
+    )
 }
 
 /// Why a job submit failed — the callers map these onto their own status codes and shapes.
@@ -991,12 +1062,34 @@ impl Ctx<'_> {
         let idempotency_key = dispatch::parse_idempotency_key(body)?;
         let expire_after = dispatch::parse_expire_after(body)?;
         let data = match &label {
-            None => dispatch::decode_payload(body, &*self.s.fetcher)?,
-            Some(l) => {
-                let (m, o, d) = self.label_payload(body, l, org)?;
-                (mode, options) = (m, o);
-                d
+            None => {
+                // The gate runs only for types that fetch; the rest keep their order of checks.
+                let _slot = if fetches_payload(type_v) {
+                    // a bad url still 400s before the printer is looked at
+                    dispatch::checked_http_url(body.get("url"))?;
+                    let printer_v = body.get("printer_id").unwrap_or(&null);
+                    let printer = self
+                        .db(|c| store::get_printer(c, printer_v, org))
+                        .map_err(SubmitErr::Store)?
+                        .ok_or_else(|| {
+                            SubmitErr::Invalid(format!("unknown printer: {}", py_str(printer_v)))
+                        })?;
+                    match self.gate_printer(&printer, idempotency_key.as_deref(), true)? {
+                        Gate2::Existing(e) => return Ok(e),
+                        Gate2::Go(slot) => slot,
+                    }
+                } else {
+                    None
+                };
+                dispatch::decode_payload(body, &*self.s.fetcher)?
             }
+            Some(l) => match self.label_payload(body, l, org, idempotency_key.as_deref())? {
+                Labeled::Existing(e) => return Ok(e),
+                Labeled::Ready(m, o, d) => {
+                    (mode, options) = (m, o);
+                    d
+                }
+            },
         };
         let job = store::NewJob {
             printer_id: body.get("printer_id").unwrap_or(&null),
@@ -1015,6 +1108,39 @@ impl Ctx<'_> {
         self.enqueue(&job)
     }
 
+    /// The checks before any outbound fetch, cheapest first (the printer is already resolved):
+    /// an existing job under the idempotency key (returned as it is, nothing fetched), the quota,
+    /// and the org's download cap when `fetch`. `enqueue_job` repeats the printer, key and quota
+    /// checks inside its transaction; this only stops the expensive work early.
+    fn gate_printer(
+        &self,
+        printer: &store::PrinterRef,
+        key: Option<&str>,
+        fetch: bool,
+    ) -> Result<Gate2<'_>, SubmitErr> {
+        if let Some(key) = key
+            && let Some(e) = self
+                .db(|c| store::find_job_by_key(c, printer.org_id, key))
+                .map_err(SubmitErr::Store)?
+        {
+            return Ok(Gate2::Existing(e));
+        }
+        match self.db(|c| store::check_quota(c, printer.org_id, crate::now())) {
+            Ok(()) => {}
+            Err(StoreError::QuotaExceeded(m)) => return Err(SubmitErr::Quota(m)),
+            Err(e) => return Err(SubmitErr::Store(e)),
+        }
+        if !fetch {
+            return Ok(Gate2::Go(None));
+        }
+        match self.s.try_fetch_slot(printer.org_id) {
+            Some(slot) => Ok(Gate2::Go(Some(slot))),
+            None => Err(SubmitErr::Busy(
+                "too many downloads in flight for this org, try again later".into(),
+            )),
+        }
+    }
+
     /// A `label_*` job: the printer, then the template, then the payload, each before the next so
     /// that an unknown printer or template never causes a fetch. The printer decides the output:
     /// PDF where it takes PDF, ZPL otherwise (gotcha #1: never a PDF to a label printer). Returns
@@ -1024,7 +1150,8 @@ impl Ctx<'_> {
         body: &Obj,
         job: &dispatch::LabelJob,
         org: Option<i64>,
-    ) -> Result<(&'static str, Option<Obj>, Vec<u8>), SubmitErr> {
+        key: Option<&str>,
+    ) -> Result<Labeled, SubmitErr> {
         let null = Value::Null;
         let printer_v = body.get("printer_id").unwrap_or(&null);
         let printer = self
@@ -1068,20 +1195,17 @@ impl Ctx<'_> {
             ("raw", label::Output::Zpl)
         };
         let options = dispatch::parse_options(body, mode)?;
-        // Fetching and rendering cost a thread and a render slot, so an org past its quota stops
-        // before them, not at enqueue_job. A keyed job may be a resubmit, which spends no quota:
-        // that one still goes through and enqueue_job sorts it out.
-        if body.get("idempotency_key").is_none() {
-            match self.db(|c| store::check_quota(c, printer.org_id, crate::now())) {
-                Ok(()) => {}
-                Err(StoreError::QuotaExceeded(m)) => return Err(SubmitErr::Quota(m)),
-                Err(e) => return Err(SubmitErr::Store(e)),
-            }
-        }
+        // Fetching and rendering cost a thread and a render slot, so an existing key, a spent
+        // quota and a full download cap stop before them, not at enqueue_job.
+        let slot = match self.gate_printer(&printer, key, job.text.is_none())? {
+            Gate2::Existing(e) => return Ok(Labeled::Existing(e)),
+            Gate2::Go(slot) => slot,
+        };
         let rendered = match &job.text {
             Some(text) => label::render_text(&spec, text, out),
             None => {
                 let img = dispatch::decode_payload(body, &*self.s.fetcher)?;
+                drop(slot);
                 let Some(_slot) = self.s.render_slots.try_enter() else {
                     return Err(SubmitErr::Busy(
                         "label rendering is busy, try again later".into(),
@@ -1091,7 +1215,7 @@ impl Ctx<'_> {
             }
         };
         let data = rendered.map_err(|e| SubmitErr::Invalid(format!("label: {e}")))?;
-        Ok((mode, options, data))
+        Ok(Labeled::Ready(mode, options, data))
     }
 
     fn enqueue(&self, job: &store::NewJob<'_>) -> Result<store::Enqueued, SubmitErr> {

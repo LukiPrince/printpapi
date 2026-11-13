@@ -149,6 +149,13 @@ agent 3.2.0; older agents ignore it. Measured with SumatraPDF 3.4.6, 3.5.2 and 3
 URL fetches are `http(s)`-only and sent with a browser User-Agent (WAF/CDN-fronted services
 reject a default library one such as Python's).
 
+For the types that fetch (`raw_uri`, `pdf_uri`, `raw_uri_post`, `pdf_uri_post`, `label_uri`) the
+server checks the printer, an existing `idempotency_key` and the quota **before** it fetches the
+URL, so a wrong printer (`400`) or a spent quota (`402`) never causes an outbound request, and a
+resubmitted key returns the original job without fetching again. Each org may also have at most 4
+downloads in flight at once; a fifth answers `503` (`too many downloads in flight for this org, try
+again later`), so retry later.
+
 The `label_*` types are the odd ones out: the server does not queue the bytes it received but a
 **rendered label**, a PDF for a `|pdf` printer and ZPL for any other. The job's mode follows the
 printer, so `options` are accepted on a PDF printer and refused on a ZPL one. The template is
