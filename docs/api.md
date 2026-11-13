@@ -301,8 +301,9 @@ call — the same body a login answers with. It is **off unless the operator tur
 must not hand an org to whoever finds it. `GET /health` reports `"signup": "open"|"closed"` so the
 dashboard only offers the door when it exists.
 
-Signups are throttled by client address (the same counter a failed login uses), so one host cannot
-spray orgs. IPv6 clients count per /64. Behind a reverse proxy every signup shares the proxy's
+Signups are throttled by client address (the same limit as failed logins, but its own counter: a failed
+login never uses up a signup slot), so one host cannot spray orgs. A password that is too short or too
+long is a `400` before a slot is taken. IPv6 clients count per /64. Behind a reverse proxy every signup shares the proxy's
 address unless `PRINTAPI_TRUSTED_PROXIES` names the proxy, which makes printpapi read the client
 from `X-Forwarded-For` (see [Behind a reverse proxy](server.md#behind-a-reverse-proxy)). `org_name` defaults to the e-mail's domain. A taken address is a `409` and leaves no
 half-made org behind. With `PRINTAPI_SIGNUP_QUOTA` set, the new org starts with that monthly

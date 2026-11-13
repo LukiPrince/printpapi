@@ -198,8 +198,10 @@ A job holds its payload (labels, packing slips, addresses) until you say otherwi
 
 `claimed` jobs are never touched. The server always opens SQLite with `secure_delete=ON`, so freed
 pages are zeroed instead of keeping the old bytes (this also covers deleting an org), and after a
-pass that changed rows it truncates the WAL (`PRAGMA wal_checkpoint(TRUNCATE)`), so cleared payloads
-do not stay in `printpapi.db-wal`. Data freed by an earlier version is not overwritten: to erase it,
+pass that changed rows, and after deleting an org, it truncates the WAL (`PRAGMA wal_checkpoint(TRUNCATE)`),
+so cleared payloads do not stay in `printpapi.db-wal`. A long-running read can block that truncate;
+the server then logs one line and does not wait. The retention pass tries again on its next run; a
+deleted org's frames stay in the WAL until the next truncate or checkpoint. Data freed by an earlier version is not overwritten: to erase it,
 stop the server and run `VACUUM` once (for example `sqlite3 printpapi.db VACUUM`). The server never
 does that by itself. **Backups keep what they copied** until you rotate them out: set your backup
 retention to match.

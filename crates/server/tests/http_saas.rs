@@ -110,6 +110,25 @@ fn signup_rejects_a_taken_address_a_bad_address_and_a_short_password() {
 }
 
 #[test]
+fn a_bad_password_spends_no_signup_slot() {
+    let app = App::with(|c| c.signup_open = true);
+    for i in 0..10 {
+        let (code, _) = app.post(
+            "/signup",
+            None,
+            json!({"email": format!("s{i}@shop.test"), "password": "sixsix"}),
+        );
+        assert_eq!(code, 400, "attempt {i}");
+    }
+    let (code, _) = app.post(
+        "/signup",
+        None,
+        json!({"email": "ok@shop.test", "password": PW}),
+    );
+    assert_eq!(code, 200);
+}
+
+#[test]
 fn signup_is_throttled_per_client_so_one_host_cannot_spray_orgs() {
     let app = App::with(|c| {
         c.signup_open = true;
@@ -626,4 +645,42 @@ fn retention_does_nothing_unless_configured() {
     use printpapi_server::server::retention_pass;
     let app = App::new();
     assert!(retention_pass(&app.state, 1e12).is_none());
+}
+
+#[test]
+fn retention_retries_a_wal_truncate_a_reader_blocked_even_when_nothing_changed() {
+    use printpapi_server::server::retention_pass;
+    let day = 86_400.0;
+    let now = store::month_start(printpapi_server::now()) + 25.0 * day;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("r.db");
+    let path = path.to_str().unwrap();
+    let app = App::on(store::Db::open(path).unwrap(), |c| {
+        c.job_retention_days = Some(7)
+    });
+    let pid = agent_z(&app.db).pid("Z");
+    let marker = b"RETENTION-WAL-MARKER-77;";
+    let id = enqueue(&app.db, pid, &marker.repeat(1000), |_| {});
+    app.db.with(|c| {
+        c.execute(
+            "UPDATE jobs SET state='done', created_at=?1, finished_at=?1 WHERE id=?2",
+            rusqlite::params![now - 10.0 * day, id],
+        )
+        .unwrap()
+    });
+    // a reader pins the WAL while the pass runs
+    let reader = store::connect(path).unwrap();
+    reader
+        .execute_batch("BEGIN; SELECT count(*) FROM jobs;")
+        .unwrap();
+    let t = std::time::Instant::now();
+    assert!(retention_pass(&app.state, now).unwrap().wal_busy);
+    assert!(t.elapsed() < std::time::Duration::from_secs(2));
+    // the next pass changes no rows, but finishes the truncate once the reader is gone
+    reader.execute_batch("COMMIT").unwrap();
+    let p = retention_pass(&app.state, now + 3600.0).unwrap();
+    assert_eq!(p.scrubbed + p.deleted + p.abandoned, 0);
+    assert!(!p.wal_busy);
+    let wal = std::fs::read(dir.path().join("r.db-wal")).unwrap_or_default();
+    assert!(!wal.windows(marker.len()).any(|w| w == marker));
 }

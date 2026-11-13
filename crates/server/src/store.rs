@@ -443,6 +443,8 @@ const USAGE_SQL: &str = "SELECT COUNT(*) FROM jobs WHERE org_id=?1 AND created_a
 /// partial index `jobs_hooks` holds only the handful of undelivered rows and prefers a state scan.
 const HOOKS_SQL: &str = "SELECT id, callback_url, state, error, title, printer_id FROM jobs INDEXED BY jobs_hooks WHERE callback_url IS NOT NULL AND hook_delivered_at IS NULL AND hook_attempts < ?1 AND state IN ('done','failed','cancelled') ORDER BY id";
 
+const BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(5000);
+
 /// Open the DB: WAL journal, 5 s busy timeout (the Python sqlite3 default).
 ///
 /// `synchronous` stays at its default (FULL) on purpose: with WAL, NORMAL could lose the last
@@ -450,7 +452,7 @@ const HOOKS_SQL: &str = "SELECT id, callback_url, state, error, title, printer_i
 /// Foreign keys stay off, as in the Python server (the schema declares none).
 pub fn connect(path: &str) -> Result<Connection> {
     let conn = Connection::open(path)?;
-    conn.busy_timeout(std::time::Duration::from_millis(5000))?;
+    conn.busy_timeout(BUSY_TIMEOUT)?;
     conn.pragma_update(None, "foreign_keys", false)?;
     // The pragma answers with the resulting mode ("memory" for :memory:), so it is a query.
     conn.query_row("PRAGMA journal_mode=WAL", [], |r| r.get::<_, String>(0))?;
@@ -459,7 +461,9 @@ pub fn connect(path: &str) -> Result<Connection> {
     // reprinted label.
     conn.pragma_update(None, "synchronous", "FULL")?;
     // Freed pages are zeroed, so a scrubbed job or a deleted org (`delete_org`) leaves no bytes in
-    // the file. Per connection, hence set here for all of them.
+    // the main file. The WAL may still hold the old frames until `truncate_wal` gets through
+    // (retention and org deletion both try it; a reader can block it, then it is retried or left
+    // to the next checkpoint). Per connection, hence set here for all of them.
     conn.pragma_update(None, "secure_delete", true)?;
     Ok(conn)
 }
@@ -672,6 +676,46 @@ pub fn set_org_plan(
     )?;
     tx.commit()?;
     Ok(n == 1)
+}
+
+/// Shrink the WAL to nothing so bytes cleared by a scrub or a delete do not linger in `-wal`.
+/// True when it completed, false when a reader blocked it (SQLite reports that as a row with
+/// busy=1, not as an error). It runs without the usual 5 s busy wait, which would hold the only
+/// connection while every request queues behind it; the caller retries later. The normal timeout
+/// is restored before returning, also on error.
+pub fn truncate_wal(conn: &Connection) -> Result<bool> {
+    conn.busy_timeout(std::time::Duration::ZERO)?;
+    let r = conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |r| {
+        r.get::<_, i64>(0)
+    });
+    conn.busy_timeout(BUSY_TIMEOUT)?;
+    match r {
+        Ok(busy) => Ok(busy == 0),
+        Err(rusqlite::Error::SqliteFailure(e, _))
+            if e.code == rusqlite::ErrorCode::DatabaseBusy =>
+        {
+            Ok(false)
+        }
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// `truncate_wal` for callers that must not fail because of it: an error or a busy WAL is one
+/// stderr line, and the result says whether it completed.
+pub fn truncate_wal_logged(conn: &Connection, what: &str) -> bool {
+    match truncate_wal(conn) {
+        Ok(true) => true,
+        Ok(false) => {
+            eprintln!(
+                "{what}: wal truncate blocked by a reader, bytes stay in -wal until the next try"
+            );
+            false
+        }
+        Err(e) => {
+            eprintln!("{what}: wal truncate failed: {e}");
+            false
+        }
+    }
 }
 
 /// Remove an org and everything that belongs to it — jobs, printers, agents, keys, accounts and
@@ -1519,6 +1563,8 @@ pub struct Purged {
     pub scrubbed: usize,
     /// Terminal rows from before this month that were deleted.
     pub deleted: usize,
+    /// The WAL truncate after the pass was blocked by a reader; the caller retries it.
+    pub wal_busy: bool,
 }
 
 /// The least age, in days, a terminal row must reach before `purge_jobs` deletes it, whatever
@@ -1556,16 +1602,13 @@ pub fn purge_jobs(conn: &Connection, days: i64, now: Option<f64>) -> Result<Purg
         named_params! {":cutoff": delete_cutoff, ":month": month_start(now)},
     )?;
     tx.commit()?;
-    if abandoned + scrubbed + deleted > 0 {
-        // SQLite reuses the WAL without shrinking it, so cleared payload bytes would stay in it.
-        if let Err(e) = conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(())) {
-            eprintln!("retention: wal checkpoint failed: {e}");
-        }
-    }
+    // SQLite reuses the WAL without shrinking it, so cleared payload bytes would stay in it.
+    let wal_busy = abandoned + scrubbed + deleted > 0 && !truncate_wal_logged(conn, "retention");
     Ok(Purged {
         abandoned,
         scrubbed,
         deleted,
+        wal_busy,
     })
 }
 
@@ -3336,6 +3379,35 @@ mod tests {
             !has(&dir.path().join("p.db-wal")),
             "payload left in the WAL"
         );
+    }
+
+    #[test]
+    fn truncate_wal_reports_a_reader_instead_of_waiting_for_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("w.db");
+        let conn = connect(path.to_str().unwrap()).unwrap();
+        init_db(&conn).unwrap();
+        conn.execute("CREATE TABLE IF NOT EXISTS t (x)", [])
+            .unwrap();
+        let reader = connect(path.to_str().unwrap()).unwrap();
+        reader
+            .execute_batch("BEGIN; SELECT count(*) FROM t;")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (1)", []).unwrap(); // frames the reader pins
+        let t = std::time::Instant::now();
+        assert!(
+            !truncate_wal(&conn).unwrap(),
+            "a reader blocks the truncate"
+        );
+        assert!(
+            t.elapsed() < std::time::Duration::from_millis(2000),
+            "{:?}",
+            t.elapsed()
+        );
+        // the normal timeout is back afterwards
+        assert_eq!(q::<i64>(&conn, "PRAGMA busy_timeout", []), 5000);
+        reader.execute_batch("COMMIT").unwrap();
+        assert!(truncate_wal(&conn).unwrap());
     }
 
     #[test]

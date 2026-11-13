@@ -433,3 +433,21 @@ fn a_job_submitted_from_a_session_records_who_printed_it() {
     );
     assert_eq!(uid, login["user_id"].as_i64());
 }
+
+#[test]
+fn deleting_an_org_leaves_its_bytes_neither_in_the_db_nor_in_the_wal() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("d.db");
+    let app = App::on(store::Db::open(path.to_str().unwrap()).unwrap(), |_| {});
+    let oid = create_org(&app.db, "gone");
+    let reg = register(&app.db, "pc", "gk", &[decl("Z", false)], oid);
+    let marker = b"ORG-DELETE-MARKER-31;";
+    enqueue(&app.db, reg.pid("Z"), &marker.repeat(1000), |j| {
+        j.org_id = Some(oid)
+    });
+    assert_eq!(app.delete(&format!("/orgs/{oid}"), Some("t")).0, 200);
+    for f in ["d.db", "d.db-wal"] {
+        let bytes = std::fs::read(dir.path().join(f)).unwrap_or_default();
+        assert!(!bytes.windows(marker.len()).any(|w| w == marker), "{f}");
+    }
+}

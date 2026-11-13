@@ -37,3 +37,10 @@ test("one URL rule: http(s)://, any case, with a host", () => {
   assert.equal(isHttpUrl("http://x.test"), true);
   assert.equal(parseTerms({ version: "v", terms_url: "https:example.com/terms" }), null);
 });
+
+test("only printable ASCII passes, as on the server (U+FEFF and U+0085 differ between \s and char::is_whitespace)", () => {
+  for (const bad of ["https://x.test/t﻿", "https://x.test/\u0085t", "https://x.test/t ", "https://x.test/täglich", "https://x.test/a b", "https://x.test/\u007F"]) {
+    assert.equal(isHttpUrl(bad), false, JSON.stringify(bad));
+  }
+  assert.equal(isHttpUrl("https://x.test/a%20b?q=1#f"), true);
+});

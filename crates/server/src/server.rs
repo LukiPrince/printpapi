@@ -182,6 +182,9 @@ pub struct AppState {
     pub render_slots: RenderSlots,
     /// When the retention purge last ran (the reaper ticks far more often than once an hour).
     last_retention: Mutex<Option<f64>>,
+    /// A retention WAL truncate was blocked by a reader; the next pass retries it even if it
+    /// changes no rows.
+    wal_truncate_pending: std::sync::atomic::AtomicBool,
 }
 
 /// Concurrent image renders (see `AppState::render_slots`). ponytail: one global cap, not per
@@ -247,6 +250,7 @@ impl AppState {
             poll_slots: Arc::new(tokio::sync::Semaphore::new(POLL_SLOTS)),
             render_slots: RenderSlots::new(RENDER_SLOTS),
             last_retention: Mutex::new(None),
+            wal_truncate_pending: std::sync::atomic::AtomicBool::new(false),
         }
     }
 }
@@ -863,6 +867,10 @@ impl Ctx<'_> {
                 Some(Value::String(_)) => return Ok(jerr(409, "terms changed, reload")),
                 _ => return Ok(jerr(400, "accept_terms required")),
             }
+        }
+        // A bad password must not cost a slot: only the cheap length check runs before it.
+        if let Err(e) = auth::validate_password(str_field(&body, "password")) {
+            return Ok(jerr(400, e));
         }
         // The slot is taken atomically, before the slow hash: parallel requests from one address
         // must not all pass the peek above and then count afterwards. A successful signup spends
@@ -2232,6 +2240,9 @@ impl Ctx<'_> {
                 return Ok(jerr(400, "the default org cannot be removed"));
             }
             return Ok(if self.db(|c| store::delete_org(c, oid))? {
+                // secure_delete zeroed the pages; this clears the WAL frames too. A reader can
+                // block it: logged, never a failed request (the org is gone either way).
+                self.db(|c| store::truncate_wal_logged(c, "delete org"));
                 ok_true()
             } else {
                 not_found()
@@ -2394,8 +2405,21 @@ pub fn retention_pass(state: &AppState, now: f64) -> Option<store::Purged> {
         }
         *last = Some(now);
     }
-    match state.db.with(|c| store::purge_jobs(c, days, Some(now))) {
-        Ok(p) => Some(p),
+    use std::sync::atomic::Ordering::Relaxed;
+    let retry = state.wal_truncate_pending.load(Relaxed);
+    match state.db.with(|c| {
+        let mut p = store::purge_jobs(c, days, Some(now))?;
+        // A pass that changed nothing does not truncate itself, so an earlier blocked truncate
+        // is retried here.
+        if retry && !p.wal_busy && p.abandoned + p.scrubbed + p.deleted == 0 {
+            p.wal_busy = !store::truncate_wal_logged(c, "retention");
+        }
+        Ok::<_, StoreError>(p)
+    }) {
+        Ok(p) => {
+            state.wal_truncate_pending.store(p.wal_busy, Relaxed);
+            Some(p)
+        }
         Err(e) => {
             eprintln!("retention error: {e}");
             None

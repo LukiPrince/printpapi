@@ -29,7 +29,8 @@ Details worth knowing:
 
 - The print is queued through `wp_schedule_single_event`, so **checkout never waits** on a printer.
 - Every automatic print carries `idempotency_key = woo-<order>-<status>`: a retried hook, or a
-  status flapping, prints once. The **Print packing slip** entry in the order's *Actions* box
+  status flapping, prints once. A key dedupes while its job row exists: with server-side
+  [retention](server.md#retention) on, at least `max(N, 7)` days after the job finished. The **Print packing slip** entry in the order's *Actions* box
   sends without a key — a reprint is meant to print again.
 - The API key lives in `wp_options` in plaintext (as WordPress plugin settings do). Issue a key
   for the shop alone, and revoke that one key if the site is ever compromised.

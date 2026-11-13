@@ -47,9 +47,8 @@ fn scrypt_raw(
     Some(dk)
 }
 
-/// `None` (absent or not a JSON string) fails like a too-short password.
-/// Err text: `password must be at least 8 characters` / `password must be at most 1024 characters`.
-pub fn hash_password(password: Option<&str>) -> Result<String, String> {
+/// The length rules of `hash_password`, without the slow hash: the password itself when it passes.
+pub fn validate_password(password: Option<&str>) -> Result<&str, String> {
     let pw = password.unwrap_or("");
     let chars = pw.chars().count();
     if password.is_none() || chars < MIN_PASSWORD_LEN {
@@ -62,6 +61,13 @@ pub fn hash_password(password: Option<&str>) -> Result<String, String> {
             "password must be at most {MAX_PASSWORD_LEN} characters"
         ));
     }
+    Ok(pw)
+}
+
+/// `None` (absent or not a JSON string) fails like a too-short password.
+/// Err text: `password must be at least 8 characters` / `password must be at most 1024 characters`.
+pub fn hash_password(password: Option<&str>) -> Result<String, String> {
+    let pw = validate_password(password)?;
     let salt = random_bytes(16);
     let dk = scrypt_raw(pw, &salt, LOG_N, R, P, DKLEN)
         .ok_or_else(|| "password hashing failed".to_string())?;

@@ -52,13 +52,17 @@ fn parse_retention(raw: &str) -> Result<Option<i64>, String> {
 }
 
 /// The one link rule (`web/lib/terms.ts` `isHttpUrl` is its twin): `http://` or `https://`, any
-/// case, then a non-empty host, no whitespace.
+/// case, then a non-empty host. Printable ASCII only (0x21..=0x7E): Rust's whitespace and JS's
+/// `\s` disagree on U+0085 and U+FEFF, so neither is asked.
 fn is_terms_url(u: &str) -> bool {
-    if u.chars().any(char::is_whitespace) {
+    if !u.bytes().all(|b| (0x21..=0x7E).contains(&b)) {
         return false;
     }
     let lower = u.to_ascii_lowercase();
-    let Some(rest) = lower.strip_prefix("https://").or_else(|| lower.strip_prefix("http://")) else {
+    let Some(rest) = lower
+        .strip_prefix("https://")
+        .or_else(|| lower.strip_prefix("http://"))
+    else {
         return false;
     };
     !rest.split(['/', '?', '#']).next().unwrap_or("").is_empty()
@@ -288,11 +292,34 @@ mod terms_tests {
             "https:///path",
         ] {
             assert!(parse_terms("v1", bad, "", "").is_err(), "terms {bad}");
-            assert!(parse_terms("v1", "https://x.test/t", bad, "").is_err(), "dpa {bad}");
-            assert!(parse_terms("v1", "https://x.test/t", "", bad).is_err(), "privacy {bad}");
+            assert!(
+                parse_terms("v1", "https://x.test/t", bad, "").is_err(),
+                "dpa {bad}"
+            );
+            assert!(
+                parse_terms("v1", "https://x.test/t", "", bad).is_err(),
+                "privacy {bad}"
+            );
         }
-        let t = parse_terms("v1", "HTTPS://EXAMPLE.COM/t", "", "").unwrap().unwrap();
+        let t = parse_terms("v1", "HTTPS://EXAMPLE.COM/t", "", "")
+            .unwrap()
+            .unwrap();
         assert_eq!(t.terms_url, "HTTPS://EXAMPLE.COM/t");
+    }
+
+    #[test]
+    fn urls_are_printable_ascii_only() {
+        // U+FEFF is not whitespace to Rust but is to JS `\s`; U+0085 the other way round.
+        for bad in [
+            "https://x.test/t\u{feff}",
+            "https://x.test/\u{85}t",
+            "https://x.test/täglich",
+            "https://x.test/a b",
+            "https://x.test/\u{7f}",
+        ] {
+            assert!(parse_terms("v1", bad, "", "").is_err(), "{bad:?}");
+        }
+        assert!(parse_terms("v1", "https://x.test/a%20b?q=1#f", "", "").is_ok());
     }
 
     #[test]
@@ -301,7 +328,11 @@ mod terms_tests {
         assert!(parse_terms("", "", "ftp://x/d", "").is_err());
         assert!(parse_terms("", "", "", "/privacy").is_err());
         assert!(parse_terms("", "", "", "").unwrap().is_none());
-        assert!(parse_terms("", "https://x.test/t", "", "").unwrap().is_none());
+        assert!(
+            parse_terms("", "https://x.test/t", "", "")
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]

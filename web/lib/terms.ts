@@ -7,9 +7,9 @@ export type Terms = {
   privacy_url: string | null;
 };
 
-/** The one link rule, twin of `is_terms_url` in crates/server/src/main.rs: `http://` or `https://` (any case),, then a host, no whitespace. */
+/** The one link rule, twin of `is_terms_url` in crates/server/src/main.rs: `http://` or `https://` (any case), then a host, printable ASCII only (0x21-0x7E). */
 export const isHttpUrl = (v: unknown): v is string =>
-  typeof v === "string" && /^https?:\/\/[^/?#]/i.test(v) && !/\s/.test(v);
+  typeof v === "string" && /^[!-~]+$/.test(v) && /^https?:\/\/[^/?#]/i.test(v);
 
 const httpUrl = (v: unknown): string | null => (isHttpUrl(v) ? v : null);
 
