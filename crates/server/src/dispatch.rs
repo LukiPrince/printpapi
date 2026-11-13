@@ -70,8 +70,10 @@ impl Drop for Slot<'_> {
 
 /// Outbound payload fetches in flight at once. Each one waits on a blocking thread, so the cap is
 /// what keeps a client pointing many jobs at a tarpit URL from taking every thread the server has
-/// (main sizes the pool at twice this). ponytail: one global cap, not per org — a single tenant
-/// can still use all of it, it just cannot stall /health, logins or agent claims any more.
+/// (main sizes the pool at twice this). ponytail: this is the global cap; where it matters (open
+/// signup) the per-org cap `MAX_FETCHES_PER_ORG` sits under it so one tenant cannot use all 256.
+/// Without that cap a single tenant can still use all of it, it just cannot stall /health, logins
+/// or agent claims any more.
 pub const OUTBOUND_IN_FLIGHT: usize = 256;
 
 /// Where outbound requests (payload URLs, job callbacks, org event URLs) may connect.

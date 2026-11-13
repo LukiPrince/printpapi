@@ -112,8 +112,14 @@ agent downloads and prints it like any other payload, and nothing on the agent c
 ### Order of checks and errors
 
 The server checks the job fields, then looks up the printer, then the template, then checks that
-the template's `content` matches the job type, and only then fetches the image. A bad printer or
-template therefore never causes a download.
+the template's `content` matches the job type. Before it fetches the image of a `label_uri` job it
+also checks, cheapest first: an existing `idempotency_key` (the original job is returned, nothing is
+fetched or rendered), the org's monthly quota (`402`), the org's download cap (`503`, only where
+`PRINTAPI_FETCHES_PER_ORG` is in force, see [server.md](server.md)) and whether an image render slot
+is free (`503`). A bad printer or template, a spent quota or a resubmitted key therefore never causes
+a download. If another request with the same new `idempotency_key` is still fetching, yours answers
+`409` and nothing is fetched; retry it shortly and it returns the job. `label_base64` and
+`label_text` fetch nothing, so they take no download slot.
 
 | Situation | Answer |
 |---|---|
@@ -123,6 +129,9 @@ template therefore never causes a download.
 | A text job on an image template, or the other way round | `400` `label template <name> does not take text jobs` (or `image jobs`) |
 | The image is not a GIF, PNG or JPEG, is larger than 40 megapixels or 20 000 pixels on one edge, would need too much memory to scale into the template's box, or the text is empty or over 500 characters | `400` `label: <reason>` |
 | The image URL could not be fetched | `502` |
+| The monthly job quota is spent | `402`, before any download |
+| The org already has its maximum of downloads in flight | `503` `too many downloads in flight for this org, try again later`; retry |
+| Another request with the same new `idempotency_key` is still running | `409` `a request with this idempotency_key is still in progress, retry shortly`; retry |
 | Several image renders are already running (the server renders four at a time) | `503` `label rendering is busy, try again later`; retry |
 | `options` on a printer that gets ZPL | `400` `options are only supported on pdf jobs` |
 | A [CloudPRNT](cloudprnt.md) printer | `400` `CloudPRNT printers cannot print label templates — send raw Star commands` |

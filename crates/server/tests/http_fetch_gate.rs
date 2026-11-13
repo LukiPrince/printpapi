@@ -6,6 +6,7 @@ mod common;
 use base64::{Engine, engine::general_purpose::STANDARD as B64};
 use common::*;
 use printpapi_server::dispatch::Fetcher;
+use printpapi_server::server::Config;
 use printpapi_server::store::DEFAULT_ORG;
 use serde_json::{Value, json};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -200,7 +201,7 @@ fn uri_job(pid: i64, url: &str) -> Value {
 
 #[test]
 fn one_org_cannot_hold_more_than_four_downloads_in_flight() {
-    let mut app = App::new();
+    let mut app = App::with(|c| c.fetches_per_org = Some(4));
     let fetcher = GatedFetcher::new();
     app.state.fetcher = fetcher.clone();
     add_key(&app.db, "a", "ka", DEFAULT_ORG);
@@ -287,4 +288,161 @@ fn base64_jobs_keep_their_order_of_checks() {
     );
     assert_eq!(code, 400);
     assert!(err_of(&v).starts_with("unknown printer: "), "{v}");
+}
+
+/// Holds `n` slow downloads of one org, then submits one more fast `raw_uri` job; its status.
+fn status_with_held(tweak: impl FnOnce(&mut Config), n: usize) -> u16 {
+    let mut app = App::with(tweak);
+    let fetcher = GatedFetcher::new();
+    app.state.fetcher = fetcher.clone();
+    add_key(&app.db, "a", "ka", DEFAULT_ORG);
+    let pa = register(&app.db, "pa", "aka", &[decl("P", false)], DEFAULT_ORG).pid("P");
+    std::thread::scope(|s| {
+        let held: Vec<_> = (0..n)
+            .map(|i| {
+                let app = &app;
+                s.spawn(move || {
+                    app.post(
+                        "/jobs",
+                        Some("ka"),
+                        uri_job(pa, &format!("https://x/slow{i}")),
+                    )
+                })
+            })
+            .collect();
+        fetcher.wait_entered(n);
+        let (code, _) = app.post("/jobs", Some("ka"), uri_job(pa, "https://x/fast"));
+        fetcher.release();
+        for h in held {
+            assert_eq!(h.join().unwrap().0, 200);
+        }
+        code
+    })
+}
+
+#[test]
+fn without_open_signup_and_a_setting_there_is_no_per_org_cap() {
+    assert_eq!(status_with_held(|_| {}, 6), 200);
+}
+
+#[test]
+fn with_open_signup_and_no_setting_the_fifth_download_answers_503() {
+    assert_eq!(status_with_held(|c| c.signup_open = true, 4), 503);
+}
+
+#[test]
+fn an_explicit_setting_wins_either_way() {
+    assert_eq!(
+        status_with_held(
+            |c| {
+                c.signup_open = true;
+                c.fetches_per_org = Some(0);
+            },
+            6
+        ),
+        200
+    );
+    assert_eq!(status_with_held(|c| c.fetches_per_org = Some(2), 2), 503);
+}
+
+#[test]
+fn a_label_base64_job_needs_no_download_slot() {
+    let mut app = App::with(|c| c.fetches_per_org = Some(4));
+    let fetcher = GatedFetcher::new();
+    app.state.fetcher = fetcher.clone();
+    add_key(&app.db, "a", "ka", DEFAULT_ORG);
+    let pa = register(&app.db, "pa", "aka", &[decl("P", true)], DEFAULT_ORG).pid("P");
+    let (code, v) = app.post(
+        "/labels",
+        Some("ka"),
+        json!({
+            "name": "img", "content": "image",
+            "label_mm": {"w": 50, "h": 30}, "dpi": 203, "rotate": 0,
+            "crop_percent": {"t": 0, "r": 0, "b": 0, "l": 0},
+            "place_mm": {"x": 0, "y": 0, "w": 50, "h": 30},
+        }),
+    );
+    assert_eq!(code, 200, "{v}");
+    std::thread::scope(|s| {
+        let held: Vec<_> = (0..4)
+            .map(|i| {
+                let app = &app;
+                s.spawn(move || {
+                    app.post(
+                        "/jobs",
+                        Some("ka"),
+                        uri_job(pa, &format!("https://x/slow{i}")),
+                    )
+                })
+            })
+            .collect();
+        fetcher.wait_entered(4);
+        let (code, v) = app.post(
+            "/jobs",
+            Some("ka"),
+            json!({"printer_id": pa, "type": "label_base64", "template": "img", "content": B64.encode(png())}),
+        );
+        assert_eq!(code, 200, "{v}");
+        fetcher.release();
+        for h in held {
+            h.join().unwrap();
+        }
+    });
+}
+
+#[test]
+fn a_second_request_with_the_same_new_key_is_refused_while_the_first_fetches() {
+    let mut app = App::new();
+    let fetcher = GatedFetcher::new();
+    app.state.fetcher = fetcher.clone();
+    add_key(&app.db, "a", "ka", DEFAULT_ORG);
+    let pa = register(&app.db, "pa", "aka", &[decl("P", false)], DEFAULT_ORG).pid("P");
+    let body = json!({"printer_id": pa, "type": "raw_uri_post", "url": "https://x/slow", "json": {}, "idempotency_key": "K"});
+    std::thread::scope(|s| {
+        let first = {
+            let (app, body) = (&app, body.clone());
+            s.spawn(move || app.post("/jobs", Some("ka"), body))
+        };
+        fetcher.wait_entered(1);
+        let (code, v) = app.post("/jobs", Some("ka"), body.clone());
+        assert_eq!(code, 409, "{v}");
+        assert!(err_of(&v).contains("still in progress"), "{v}");
+        assert_eq!(fetcher.entered.load(Ordering::SeqCst), 1);
+        fetcher.release();
+        let (c1, v1) = first.join().unwrap();
+        assert_eq!(c1, 200, "{v1}");
+        let (c2, v2) = app.post("/jobs", Some("ka"), body.clone());
+        assert_eq!(c2, 200, "{v2}");
+        assert_eq!(v1["job_id"], v2["job_id"]);
+        assert_eq!(fetcher.entered.load(Ordering::SeqCst), 1);
+    });
+}
+
+#[test]
+fn a_failed_fetch_frees_its_key_again() {
+    let (app, pid) = app_with_printer();
+    *app.fetch.reply.lock().unwrap() = Some(Err("HTTP Error 500".into()));
+    let body =
+        json!({"printer_id": pid, "type": "raw_uri", "url": "https://x/a", "idempotency_key": "K"});
+    for _ in 0..2 {
+        let (code, v) = app.post("/jobs", Some("k1"), body.clone());
+        assert_eq!(code, 502, "{v}");
+    }
+}
+
+#[test]
+fn label_uri_with_every_render_slot_taken_answers_503_without_fetching() {
+    let (app, pid) = app_with_printer();
+    template(&app, "img", "image");
+    let _held: Vec<_> = (0..printpapi_server::server::RENDER_SLOTS)
+        .map(|_| app.state.render_slots.try_enter().unwrap())
+        .collect();
+    let (code, v) = app.post(
+        "/jobs",
+        Some("k1"),
+        json!({"printer_id": pid, "type": "label_uri", "url": "https://x/a", "template": "img"}),
+    );
+    assert_eq!(code, 503, "{v}");
+    assert!(err_of(&v).contains("rendering is busy"), "{v}");
+    assert_eq!(fetched(&app), 0);
 }
