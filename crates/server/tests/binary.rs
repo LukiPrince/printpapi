@@ -15,6 +15,7 @@ fn bin() -> Command {
         "PRINTAPI_SIGNUP",
         "PRINTAPI_TRUSTED_PROXIES",
         "PRINTAPI_SIGNUP_QUOTA",
+        "PRINTAPI_FETCHES_PER_ORG",
         "PRINTAPI_JOB_RETENTION_DAYS",
         "PRINTAPI_TERMS_VERSION",
         "PRINTAPI_TERMS_URL",
@@ -91,6 +92,19 @@ fn bad_signup_quota_exits_1() {
             .unwrap();
         assert_eq!(out.status.code(), Some(1), "{bad}");
         assert!(String::from_utf8_lossy(&out.stderr).contains("PRINTAPI_SIGNUP_QUOTA"));
+    }
+}
+
+#[test]
+fn bad_fetches_per_org_exits_1() {
+    for bad in ["-1", "ten", "1.5"] {
+        let out = bin()
+            .env("PRINTAPI_TOKEN", "t")
+            .env("PRINTAPI_FETCHES_PER_ORG", bad)
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(1), "{bad}");
+        assert!(String::from_utf8_lossy(&out.stderr).contains("PRINTAPI_FETCHES_PER_ORG"));
     }
 }
 

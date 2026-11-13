@@ -4,7 +4,8 @@
 //! (default 3460), PRINTAPI_SIGNUP, PUBLIC_URL, PRINTAPI_PLANS (JSON array or a path to a file
 //! holding one), PRINTAPI_BILLING_SECRET, PRINTAPI_TRUSTED_PROXIES (IPs or CIDRs whose
 //! `X-Forwarded-For` is believed), PRINTAPI_SIGNUP_QUOTA (monthly job quota of every self-signup
-//! org), PRINTAPI_JOB_RETENTION_DAYS (days until finished jobs lose payload, title and
+//! org), PRINTAPI_FETCHES_PER_ORG (payload downloads one org may run at once, 0 = no cap; unset:
+//! 4 with open signup, else no cap), PRINTAPI_JOB_RETENTION_DAYS (days until finished jobs lose payload, title and
 //! callback, and until queued jobs without a deadline are failed; their row goes after
 //! max(N, 7) days if it is from before this UTC month; unset or 0 keeps everything), PRINTAPI_TERMS_VERSION (set: `POST /signup`
 //! must accept that version of the terms), PRINTAPI_TERMS_URL (required with it), PRINTAPI_DPA_URL,
@@ -36,6 +37,17 @@ fn parse_quota(raw: &str) -> Result<Option<i64>, String> {
         Ok(n) if n >= 0 => Ok(Some(n)),
         _ => Err(format!("must be a non-negative integer, not {t:?}")),
     }
+}
+
+/// Empty: unset (the default follows the signup mode). Otherwise a non-negative integer, 0 = no cap.
+fn parse_fetch_cap(raw: &str) -> Result<Option<usize>, String> {
+    let t = py_strip(raw);
+    if t.is_empty() {
+        return Ok(None);
+    }
+    t.parse::<usize>()
+        .map(Some)
+        .map_err(|_| format!("must be a non-negative integer, not {t:?}"))
 }
 
 /// Empty or 0: keep for ever. Otherwise a positive number of days.
@@ -174,6 +186,8 @@ fn config() -> Result<(Config, String, u16), String> {
             ));
         }
     };
+    cfg.fetches_per_org = parse_fetch_cap(&env("PRINTAPI_FETCHES_PER_ORG").unwrap_or_default())
+        .map_err(|e| format!("PRINTAPI_FETCHES_PER_ORG: {e}"))?;
     cfg.trusted_proxies = printpapi_server::proxy::TrustedProxies::parse(
         &env("PRINTAPI_TRUSTED_PROXIES").unwrap_or_default(),
     )

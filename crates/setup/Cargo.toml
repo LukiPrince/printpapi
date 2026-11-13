@@ -5,7 +5,7 @@
 name = "printpapi-setup"
 description = "printpapi agent setup: a window that installs the agent on this machine"
 # The same number as [workspace.package].version of the root Cargo.toml; a test keeps them equal.
-version = "3.3.0"
+version = "3.4.0"
 edition = "2024"
 license-file = "../../LICENSE"
 publish = false

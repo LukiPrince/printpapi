@@ -80,6 +80,12 @@ Field mapping onto [`POST /jobs`](api.md#submitting-a-job):
 | `options.*` (anything else) | dropped | see below |
 | `source` | — | not stored; every job reports `"printpapi"` back |
 
+A create can also fail with `402` `QuotaExceeded` (monthly job quota spent), `502` `DownstreamError`
+(the `*_uri` content could not be fetched) and `503` `ServiceUnavailable` (the org has too many
+downloads in flight, see `PRINTAPI_FETCHES_PER_ORG` in [server.md](server.md); retry later). This
+layer takes no idempotency key, so it never answers the `409` that [`POST /jobs`](api.md#submitting-a-job)
+gives for a key still in progress.
+
 Two deliberate leniencies, because the point of this layer is that an unmodified client works:
 
 - **Unknown option keys are dropped, not rejected.** A client sends its whole option set with every
