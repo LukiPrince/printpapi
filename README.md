@@ -38,8 +38,10 @@ up and prints it: documents **and** label printers (Zebra/ZPL, Bixolon, thermal)
   ([docs](docs/agent.md#file-output-virtual-print-server))
 - Multi-tenant: orgs isolate API keys, agents, printers and jobs, each with its own
   **e-mail/password logins** for the dashboard ([docs](docs/api.md#accounts-and-login))
-- Run it as a service: optional **self-signup**, password reset by e-mail, a per-org
-  **monthly job quota** ([docs](docs/api.md#quotas)), and **plans + a signed billing webhook** that
+- Run it as a service: optional **self-signup** (with a default quota and terms/DPA consent,
+  [docs](docs/api.md#self-signup)), password reset by e-mail, a per-org
+  **monthly job quota** ([docs](docs/api.md#quotas)), a **retention period** for job data
+  ([docs](docs/server.md#retention)), and **plans + a signed billing webhook** that
   works with any payment provider ([docs](docs/billing.md))
 - Fleet monitoring: `GET /computers` + online/offline webhooks, Prometheus `/metrics`
 - Retry-safe submits (`idempotency_key`) and job deadlines (`expire_after`)
