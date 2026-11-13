@@ -28,7 +28,7 @@ Token comparison is constant-time (`hmac.compare_digest`).
 | `GET\|POST /labels`, `GET\|PUT\|DELETE /labels/{id}` | client | [Label templates](labels.md): where the content sits on a label; jobs of type `label_*` render through them |
 | `POST /orders` | client | Render an order as a packing slip and print it → `{job_id}` ([e-commerce](ecommerce.md)) |
 | `POST /integrations/shopify/orders` | HMAC | Shopify order webhook (key in the URL, signature in the header) |
-| `GET /jobs` | client | Recent job history. With [retention](server.md#retention) set, old jobs lose payload and title (`title` is `null`), then disappear |
+| `GET /jobs` | client | Recent job history. With [retention](server.md#retention) set, old jobs lose payload and title (`title` is `null`), and rows from before the current month disappear after at least 7 days |
 | `GET /jobs/{id}` | client | One job's state: `queued` \| `claimed` \| `done` \| `failed` \| `cancelled` |
 | `DELETE /jobs/{id}` | client | Cancel a still-`queued` job (`409` once claimed, `404` if unknown) |
 | `GET /printers` | client | Registered printers + online/offline + capabilities |
@@ -87,11 +87,16 @@ reaches a terminal state. See [Webhooks](#webhooks). A non-`http(s)` scheme → 
 `idempotency_key` is optional (string, ≤128 chars) — **retry-safe submits**. Resubmitting the same
 key inside the same org returns the *original* `job_id` and prints nothing extra, so a timed-out or
 retried `POST /jobs` (order webhook redelivery, flaky network) can never double-print. Keys are
-scoped per org and never expire; use something stable like the order id.
+scoped per org. A key is honoured as long as its job row exists: with
+[retention](server.md#retention) on, at least `max(N, 7)` days after the job finished (longer than a
+webhook redelivery window), without retention for ever. Use something stable like the order id.
 
 `expire_after` is optional (integer seconds, `1`–`2592000`) — **a deadline for the job**. Past it
 the job is failed (`state: failed`, `error: "expired"`) instead of printed, so a stale shipping
-label doesn't come out hours later when an offline agent reconnects. Without it, jobs wait forever.
+label doesn't come out hours later when an offline agent reconnects. Without it, jobs wait until an
+agent takes them, or, with [retention](server.md#retention) set, N days: then the job is failed with
+`error: "retention"` and its `callback_url` still gets the outcome. A job with `expire_after` waits for
+its own deadline instead.
 
 `options` is optional and **pdf jobs only** (raw ZPL/ESC-POS carries its own layout — `400` on a
 raw job). The agent maps them onto its backend's native flags (SumatraPDF `-print-settings` on

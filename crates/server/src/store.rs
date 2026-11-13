@@ -458,6 +458,9 @@ pub fn connect(path: &str) -> Result<Connection> {
     // known value to return to: a job state that is not on disk after a power cut is a lost or a
     // reprinted label.
     conn.pragma_update(None, "synchronous", "FULL")?;
+    // Freed pages are zeroed, so a scrubbed job or a deleted org (`delete_org`) leaves no bytes in
+    // the file. Per connection, hence set here for all of them.
+    conn.pragma_update(None, "secure_delete", true)?;
     Ok(conn)
 }
 
@@ -1509,7 +1512,8 @@ pub fn expire_jobs(conn: &Connection, now: Option<f64>) -> Result<usize> {
 /// What one `purge_jobs` pass did.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct Purged {
-    /// Queued jobs older than the retention that never ran: failed (`error='retention'`) and scrubbed.
+    /// Queued jobs older than the retention that never ran and had no deadline: failed
+    /// (`error='retention'`) and cleared; the callback stays so the client hears the outcome.
     pub abandoned: usize,
     /// Terminal jobs whose payload, title and callback were cleared.
     pub scrubbed: usize,
@@ -1517,19 +1521,30 @@ pub struct Purged {
     pub deleted: usize,
 }
 
-/// Job retention (PRINTAPI_JOB_RETENTION_DAYS): (1) fail and scrub `queued` jobs older than
-/// `days` (no deadline, so `expire_jobs` never ends them, and an abandoned trial would keep its
-/// payloads for ever), (2) scrub terminal jobs finished more than `days` ago, (3) delete those
-/// that were also created before this UTC month. The current month's rows stay because the quota
-/// counts `jobs` rows (`USAGE_SQL`). `claimed` jobs are never touched.
+/// The least age, in days, a terminal row must reach before `purge_jobs` deletes it, whatever
+/// N is: the row holds the idempotency key, and a webhook redelivery must still find it.
+/// ponytail: 7 days outlasts Shopify's 48 h redelivery window (docs/ecommerce.md) with margin; a
+/// per-integration window would need a setting, so raise this constant if a sender retries longer.
+const MIN_ROW_KEEP_DAYS: i64 = 7;
+
+/// Job retention (PRINTAPI_JOB_RETENTION_DAYS), two clocks: (1) fail and clear `queued` jobs older
+/// than `days` that have no `expires_at` (`expire_jobs` never ends them, and an abandoned trial
+/// would keep its payloads for ever; jobs with a deadline wait for it), keeping the callback so the
+/// outcome webhook fires; (2) scrub terminal jobs finished more than `days` ago (payload, title,
+/// callback); (3) delete those older than `max(days, 7)` that were also created before this UTC
+/// month. The current month's rows stay because the quota counts `jobs` rows (`USAGE_SQL`); the
+/// 7 day floor keeps the idempotency key for webhook redeliveries. `claimed` jobs are never
+/// touched. After a pass that changed rows the WAL is truncated, so cleared bytes do not linger
+/// in `-wal`; a failed checkpoint is logged, never an error.
 /// ponytail: one pass, three statements, no batching: fine for a beta; chunk the DELETE if a pass
 /// ever holds the lock for noticeable time.
 pub fn purge_jobs(conn: &Connection, days: i64, now: Option<f64>) -> Result<Purged> {
     let now = now.unwrap_or_else(crate::now);
     let cutoff = now - days as f64 * 86_400.0;
+    let delete_cutoff = now - days.max(MIN_ROW_KEEP_DAYS) as f64 * 86_400.0;
     let tx = begin(conn)?;
     let abandoned = tx.execute(
-        "UPDATE jobs SET state='failed', error='retention', finished_at=:now,          payload=x'', title=NULL, callback_url=NULL          WHERE state='queued' AND created_at < :cutoff",
+        "UPDATE jobs SET state='failed', error='retention', finished_at=:now, payload=x'', title=NULL          WHERE state='queued' AND expires_at IS NULL AND created_at < :cutoff",
         named_params! {":now": now, ":cutoff": cutoff},
     )?;
     let scrubbed = tx.execute(
@@ -1538,21 +1553,20 @@ pub fn purge_jobs(conn: &Connection, days: i64, now: Option<f64>) -> Result<Purg
     )?;
     let deleted = tx.execute(
         "DELETE FROM jobs          WHERE state IN ('done','failed','cancelled') AND COALESCE(finished_at, created_at) < :cutoff          AND created_at < :month",
-        named_params! {":cutoff": cutoff, ":month": month_start(now)},
+        named_params! {":cutoff": delete_cutoff, ":month": month_start(now)},
     )?;
     tx.commit()?;
+    if abandoned + scrubbed + deleted > 0 {
+        // SQLite reuses the WAL without shrinking it, so cleared payload bytes would stay in it.
+        if let Err(e) = conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(())) {
+            eprintln!("retention: wal checkpoint failed: {e}");
+        }
+    }
     Ok(Purged {
         abandoned,
         scrubbed,
         deleted,
     })
-}
-
-/// Freed pages are overwritten with zeros, so a scrubbed or deleted payload does not linger in the
-/// file. Per connection; main switches it on when retention is set.
-pub fn enable_secure_delete(conn: &Connection) -> Result<()> {
-    conn.pragma_update(None, "secure_delete", true)?;
-    Ok(())
 }
 
 /// Cancel a job while it is still 'queued' (before any agent claims it).
@@ -3186,7 +3200,11 @@ mod tests {
         assert_eq!((p.abandoned, p.scrubbed, p.deleted), (1, 0, 0));
         let job = get_job(&conn, abandoned, None).unwrap().unwrap();
         assert!(job.state == "failed" && job.error.as_deref() == Some("retention"));
-        assert_eq!(held(&conn, abandoned), (0, None, None));
+        // the callback stays so the client hears the outcome; the scrub drops it N days later
+        assert_eq!(
+            held(&conn, abandoned),
+            (0, None, Some("https://hook.test/x".into()))
+        );
         assert_eq!(
             get_job(&conn, fresh, None).unwrap().unwrap().state,
             "queued"
@@ -3217,7 +3235,7 @@ mod tests {
     }
 
     #[test]
-    fn retention_scan_has_an_index_and_secure_delete_can_be_switched_on() {
+    fn retention_scan_has_an_index() {
         let conn = db();
         let on: i64 = q(
             &conn,
@@ -3225,8 +3243,99 @@ mod tests {
             [],
         );
         assert_eq!(on, 1);
-        enable_secure_delete(&conn).unwrap();
-        assert_eq!(q::<i64>(&conn, "PRAGMA secure_delete", []), 1);
+    }
+
+    #[test]
+    fn every_connection_has_secure_delete_on() {
+        assert_eq!(q::<i64>(&db(), "PRAGMA secure_delete", []), 1);
+    }
+
+    #[test]
+    fn an_abandoned_job_keeps_its_callback_until_the_scrub_and_the_hook_still_fires() {
+        let conn = db();
+        let pid = id_of(&reg(&conn, "a", "k", &[("Z", false)]), "Z");
+        let now = month_start(crate::now()) + 10.0 * DAY; // the row is kept: this month
+        let jid = aged(&conn, pid, "queued", 8.0, None, now);
+        purge_jobs(&conn, 7, Some(now)).unwrap();
+        let hooks = pending_webhooks(&conn, 5).unwrap();
+        assert_eq!(hooks.len(), 1);
+        assert_eq!(hooks[0].job_id, jid);
+        assert_eq!(hooks[0].error.as_deref(), Some("retention"));
+        // N days after it was failed, the normal scrub removes the callback
+        purge_jobs(&conn, 7, Some(now + 8.0 * DAY)).unwrap();
+        assert_eq!(held(&conn, jid), (0, None, None));
+    }
+
+    #[test]
+    fn a_queued_job_with_a_deadline_waits_for_it_not_for_retention() {
+        let conn = db();
+        let pid = id_of(&reg(&conn, "a", "k", &[("Z", false)]), "Z");
+        let now = month_start(crate::now()) + 25.0 * DAY;
+        let jid = aged(&conn, pid, "queued", 20.0, None, now);
+        conn.execute(
+            "UPDATE jobs SET expires_at=? WHERE id=?",
+            params![now + 10.0 * DAY, jid],
+        )
+        .unwrap();
+        assert_eq!(purge_jobs(&conn, 7, Some(now)).unwrap(), Purged::default());
+        assert_eq!(state_of(&conn, jid), "queued");
+        assert_eq!(held(&conn, jid).0, 11);
+    }
+
+    #[test]
+    fn an_idempotency_key_outlives_the_scrub_and_a_redelivery_does_not_reprint() {
+        let conn = db();
+        let pid = id_of(&reg(&conn, "a", "k", &[("Z", false)]), "Z");
+        // early in the month: a job two days old is from the previous month
+        let now = month_start(crate::now()) + DAY;
+        let key = |j: &mut NewJob<'_>| j.idempotency_key = Some("order-9".into());
+        let jid = enq_with(&conn, pid, b"label", key);
+        conn.execute(
+            "UPDATE jobs SET state='done', created_at=?1, finished_at=?1 WHERE id=?2",
+            params![now - 2.0 * DAY, jid],
+        )
+        .unwrap();
+        let p = purge_jobs(&conn, 1, Some(now)).unwrap();
+        assert_eq!((p.scrubbed, p.deleted), (1, 0)); // scrubbed at N, kept for the redelivery window
+        let again = try_enq(&conn, &json!(pid), b"label", key).unwrap();
+        assert!(!again.created);
+        assert_eq!(again.job_id, jid);
+        // past the 7 day floor the row goes
+        conn.execute(
+            "UPDATE jobs SET created_at=?1, finished_at=?1 WHERE id=?2",
+            params![now - 8.0 * DAY, jid],
+        )
+        .unwrap();
+        assert_eq!(purge_jobs(&conn, 1, Some(now)).unwrap().deleted, 1);
+    }
+
+    #[test]
+    fn a_purge_leaves_no_payload_bytes_in_the_db_or_the_wal() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("p.db");
+        let conn = connect(path.to_str().unwrap()).unwrap();
+        init_db(&conn).unwrap();
+        let pid = id_of(&reg(&conn, "a", "k", &[("Z", false)]), "Z");
+        let marker = b"UNIQUE-MARKER-9f3a71c2;";
+        let payload = marker.repeat(150_000); // a few MB
+        let jid = enq(&conn, pid, &payload);
+        let now = crate::now();
+        conn.execute(
+            "UPDATE jobs SET state='done', finished_at=? WHERE id=?",
+            params![now - 10.0 * DAY, jid],
+        )
+        .unwrap();
+        assert_eq!(purge_jobs(&conn, 7, Some(now)).unwrap().scrubbed, 1);
+        let has = |p: &std::path::Path| {
+            std::fs::read(p)
+                .map(|b| b.windows(marker.len()).any(|w| w == marker))
+                .unwrap_or(false)
+        };
+        assert!(!has(&path), "payload left in the db file");
+        assert!(
+            !has(&dir.path().join("p.db-wal")),
+            "payload left in the WAL"
+        );
     }
 
     #[test]

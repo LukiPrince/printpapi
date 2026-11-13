@@ -4,8 +4,9 @@
 //! (default 3460), PRINTAPI_SIGNUP, PUBLIC_URL, PRINTAPI_PLANS (JSON array or a path to a file
 //! holding one), PRINTAPI_BILLING_SECRET, PRINTAPI_TRUSTED_PROXIES (IPs or CIDRs whose
 //! `X-Forwarded-For` is believed), PRINTAPI_SIGNUP_QUOTA (monthly job quota of every self-signup
-//! org), PRINTAPI_JOB_RETENTION_DAYS (days until finished jobs lose payload and title and, a
-//! month later, their row; unset or 0 keeps them), PRINTAPI_TERMS_VERSION (set: `POST /signup`
+//! org), PRINTAPI_JOB_RETENTION_DAYS (days until finished jobs lose payload, title and
+//! callback, and until queued jobs without a deadline are failed; their row goes after
+//! max(N, 7) days if it is from before this UTC month; unset or 0 keeps everything), PRINTAPI_TERMS_VERSION (set: `POST /signup`
 //! must accept that version of the terms), PRINTAPI_TERMS_URL (required with it), PRINTAPI_DPA_URL,
 //! PRINTAPI_PRIVACY_URL (optional links, http(s) only), LOG_REQUESTS, SMTP_*.
 use printpapi_server::dispatch::{Destinations, HttpFetcher, OUTBOUND_IN_FLIGHT, is_http};
@@ -202,11 +203,6 @@ fn run() -> Result<(), String> {
         eprintln!("{line}");
     }
     let db = Db::open(&db_path).map_err(|e| format!("cannot open database {db_path:?}: {e}"))?;
-    if cfg.job_retention_days.is_some() {
-        // A scrubbed payload must not survive in the freed pages of the file.
-        db.with(printpapi_server::store::enable_secure_delete)
-            .map_err(|e| format!("cannot enable secure_delete: {e}"))?;
-    }
     let state = Arc::new(AppState::new(
         cfg,
         db,

@@ -185,16 +185,24 @@ stderr.
 A job holds its payload (labels, packing slips, addresses) until you say otherwise. With
 `PRINTAPI_JOB_RETENTION_DAYS=N` the reaper runs, at most once an hour:
 
-- a job still `queued` after N days (its agent never came back) is failed with `error: "retention"`
-  and cleared;
+- a job still `queued` after N days (its agent never came back) and without an `expire_after`
+  deadline is failed with `error: "retention"` and loses payload and title. Its callback URL stays, so
+  the client's outcome webhook still fires (the next step drops it N days later). A job with a
+  deadline waits for it and is failed as `expired`;
 - a `done`, `failed` or `cancelled` job finished more than N days ago loses its payload, title and
   callback URL. Its row (state, printer, times) stays;
-- of those, the rows created before the current UTC month are deleted. The current month's rows
-  stay, because the [monthly quota](api.md#quotas) counts them: deleting them would hand quota back.
+- of those, the rows created before the current UTC month and finished more than `max(N, 7)` days
+  ago are deleted. The current month's rows stay, because the [monthly quota](api.md#quotas) counts
+  them: deleting them would hand quota back. The 7 day floor keeps the row, and with it the
+  idempotency key, long enough for a webhook redelivery (Shopify retries for 48 h).
 
-`claimed` jobs are never touched. With retention set the server opens SQLite with
-`secure_delete=ON`, so freed pages are zeroed instead of keeping the old bytes. **Backups keep what
-they copied** until you rotate them out: set your backup retention to match.
+`claimed` jobs are never touched. The server always opens SQLite with `secure_delete=ON`, so freed
+pages are zeroed instead of keeping the old bytes (this also covers deleting an org), and after a
+pass that changed rows it truncates the WAL (`PRAGMA wal_checkpoint(TRUNCATE)`), so cleared payloads
+do not stay in `printpapi.db-wal`. Data freed by an earlier version is not overwritten: to erase it,
+stop the server and run `VACUUM` once (for example `sqlite3 printpapi.db VACUUM`). The server never
+does that by itself. **Backups keep what they copied** until you rotate them out: set your backup
+retention to match.
 
 ## Security
 
