@@ -314,8 +314,8 @@ absent when consent is not required) and `POST /signup` needs `"accept_terms": "
 missing, `false` or not a string is a `400` (`accept_terms required`), another version is a `409`
 (`terms changed, reload`: the form was loaded before the terms changed). Both are checked before the
 throttle slot is spent. The version and the time are stored with the new org and user. The
-dashboard's form then shows one checkbox ("I act as a business and accept the Terms and the Data
-Processing Agreement") that must be ticked.
+dashboard's form then shows one checkbox ("I act as a business and accept the Terms", plus "and the
+Data Processing Agreement" when `PRINTAPI_DPA_URL` is set) that must be ticked.
 
 ### Password reset
 

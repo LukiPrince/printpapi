@@ -16,6 +16,10 @@ fn bin() -> Command {
         "PRINTAPI_TRUSTED_PROXIES",
         "PRINTAPI_SIGNUP_QUOTA",
         "PRINTAPI_JOB_RETENTION_DAYS",
+        "PRINTAPI_TERMS_VERSION",
+        "PRINTAPI_TERMS_URL",
+        "PRINTAPI_DPA_URL",
+        "PRINTAPI_PRIVACY_URL",
         "LOG_REQUESTS",
     ] {
         c.env_remove(k);
@@ -206,7 +210,12 @@ fn open_signup_without_retention_warns_on_stderr() {
 
 #[test]
 fn bad_terms_settings_exit_1() {
-    let cases: [&[(&str, &str)]; 4] = [
+    let cases: [&[(&str, &str)]; 6] = [
+        &[("PRINTAPI_TERMS_URL", "https:example.com/terms")], // bad link, no version
+        &[
+            ("PRINTAPI_TERMS_VERSION", "v1"),
+            ("PRINTAPI_TERMS_URL", "https://"),
+        ],
         &[("PRINTAPI_TERMS_VERSION", "v1")], // no terms URL
         &[
             ("PRINTAPI_TERMS_VERSION", "v1"),

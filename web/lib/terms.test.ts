@@ -1,7 +1,7 @@
 // printpapi — self-hosted PrintNode alternative. Elastic License 2.0 (see LICENSE).
 import test from "node:test";
 import assert from "node:assert/strict";
-import { parseTerms, termsMessage } from "./terms.ts";
+import { isHttpUrl, parseTerms, termsMessage } from "./terms.ts";
 
 test("a server without terms in /health asks for no consent", () => {
   assert.equal(parseTerms(undefined), null);
@@ -27,4 +27,13 @@ test("only http(s) links are ever rendered", () => {
 test("a 409 reads as a reload hint, other statuses keep the server wording", () => {
   assert.equal(termsMessage(409, "terms changed, reload"), "The terms changed, please reload.");
   assert.equal(termsMessage(400, "email required"), "email required");
+});
+
+test("one URL rule: http(s)://, any case, with a host", () => {
+  for (const bad of ["https:example.com/terms", "http:/terms", "https:", "http:dpa.example", "javascript:x", "https://", "https:///p", "", " https://x.test"]) {
+    assert.equal(isHttpUrl(bad), false, bad);
+  }
+  assert.equal(isHttpUrl("HTTPS://EXAMPLE.COM/t"), true);
+  assert.equal(isHttpUrl("http://x.test"), true);
+  assert.equal(parseTerms({ version: "v", terms_url: "https:example.com/terms" }), null);
 });

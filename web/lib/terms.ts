@@ -7,8 +7,11 @@ export type Terms = {
   privacy_url: string | null;
 };
 
-const httpUrl = (v: unknown): string | null =>
-  typeof v === "string" && /^https?:\/\//i.test(v) ? v : null;
+/** The one link rule, twin of `is_terms_url` in crates/server/src/main.rs: `http://` or `https://` (any case),, then a host, no whitespace. */
+export const isHttpUrl = (v: unknown): v is string =>
+  typeof v === "string" && /^https?:\/\/[^/?#]/i.test(v) && !/\s/.test(v);
+
+const httpUrl = (v: unknown): string | null => (isHttpUrl(v) ? v : null);
 
 /** `/health`'s `terms` key, or null when consent is not required (or the answer is unusable). */
 export function parseTerms(raw: unknown): Terms | null {

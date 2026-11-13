@@ -9,7 +9,7 @@
 //! max(N, 7) days if it is from before this UTC month; unset or 0 keeps everything), PRINTAPI_TERMS_VERSION (set: `POST /signup`
 //! must accept that version of the terms), PRINTAPI_TERMS_URL (required with it), PRINTAPI_DPA_URL,
 //! PRINTAPI_PRIVACY_URL (optional links, http(s) only), LOG_REQUESTS, SMTP_*.
-use printpapi_server::dispatch::{Destinations, HttpFetcher, OUTBOUND_IN_FLIGHT, is_http};
+use printpapi_server::dispatch::{Destinations, HttpFetcher, OUTBOUND_IN_FLIGHT};
 use printpapi_server::mail::{self, SmtpMailer};
 use printpapi_server::server::{AppState, Config, Terms};
 use printpapi_server::store::Db;
@@ -51,8 +51,21 @@ fn parse_retention(raw: &str) -> Result<Option<i64>, String> {
     }
 }
 
-/// The terms a signup must accept. No version: no consent required (the links are then ignored).
-/// A version needs a terms URL, and every URL must be `http(s)`.
+/// The one link rule (`web/lib/terms.ts` `isHttpUrl` is its twin): `http://` or `https://`, any
+/// case, then a non-empty host, no whitespace.
+fn is_terms_url(u: &str) -> bool {
+    if u.chars().any(char::is_whitespace) {
+        return false;
+    }
+    let lower = u.to_ascii_lowercase();
+    let Some(rest) = lower.strip_prefix("https://").or_else(|| lower.strip_prefix("http://")) else {
+        return false;
+    };
+    !rest.split(['/', '?', '#']).next().unwrap_or("").is_empty()
+}
+
+/// The terms a signup must accept. A version needs a terms URL. Every link that is set must be
+/// an absolute `http(s)` URL with a host, version or not.
 fn parse_terms(
     version: &str,
     terms_url: &str,
@@ -60,26 +73,29 @@ fn parse_terms(
     privacy_url: &str,
 ) -> Result<Option<Terms>, String> {
     let version = py_strip(version);
-    if version.is_empty() {
-        return Ok(None);
-    }
     let url = |name: &str, raw: &str| -> Result<Option<String>, String> {
         let t = py_strip(raw);
         if t.is_empty() {
             Ok(None)
-        } else if is_http(t) {
+        } else if is_terms_url(t) {
             Ok(Some(t.to_string()))
         } else {
             Err(format!("{name} must be an http(s) URL, not {t:?}"))
         }
     };
-    let terms_url = url("PRINTAPI_TERMS_URL", terms_url)?
-        .ok_or("PRINTAPI_TERMS_URL is required with PRINTAPI_TERMS_VERSION")?;
+    let terms_url = url("PRINTAPI_TERMS_URL", terms_url)?;
+    let dpa_url = url("PRINTAPI_DPA_URL", dpa_url)?;
+    let privacy_url = url("PRINTAPI_PRIVACY_URL", privacy_url)?;
+    if version.is_empty() {
+        return Ok(None); // no consent required: the links are only checked, not used
+    }
+    let terms_url =
+        terms_url.ok_or("PRINTAPI_TERMS_URL is required with PRINTAPI_TERMS_VERSION")?;
     Ok(Some(Terms {
         version: version.to_string(),
         terms_url,
-        dpa_url: url("PRINTAPI_DPA_URL", dpa_url)?,
-        privacy_url: url("PRINTAPI_PRIVACY_URL", privacy_url)?,
+        dpa_url,
+        privacy_url,
     }))
 }
 
@@ -253,5 +269,43 @@ fn main() {
     if let Err(msg) = run() {
         eprintln!("{msg}");
         std::process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod terms_tests {
+    use super::parse_terms;
+
+    #[test]
+    fn urls_need_scheme_slashes_and_a_host() {
+        for bad in [
+            "https:example.com/terms",
+            "http:/terms",
+            "https:",
+            "http:dpa.example",
+            "javascript:x",
+            "https://",
+            "https:///path",
+        ] {
+            assert!(parse_terms("v1", bad, "", "").is_err(), "terms {bad}");
+            assert!(parse_terms("v1", "https://x.test/t", bad, "").is_err(), "dpa {bad}");
+            assert!(parse_terms("v1", "https://x.test/t", "", bad).is_err(), "privacy {bad}");
+        }
+        let t = parse_terms("v1", "HTTPS://EXAMPLE.COM/t", "", "").unwrap().unwrap();
+        assert_eq!(t.terms_url, "HTTPS://EXAMPLE.COM/t");
+    }
+
+    #[test]
+    fn urls_are_checked_even_without_a_version() {
+        assert!(parse_terms("", "https:example.com", "", "").is_err());
+        assert!(parse_terms("", "", "ftp://x/d", "").is_err());
+        assert!(parse_terms("", "", "", "/privacy").is_err());
+        assert!(parse_terms("", "", "", "").unwrap().is_none());
+        assert!(parse_terms("", "https://x.test/t", "", "").unwrap().is_none());
+    }
+
+    #[test]
+    fn a_version_still_needs_a_terms_url() {
+        assert!(parse_terms("v1", "", "", "").is_err());
     }
 }
