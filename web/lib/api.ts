@@ -2,6 +2,7 @@
 // sent as a bearer header on every call — the static shell itself carries no secrets.
 
 import { getToken } from "./token";
+import { parseTerms, type Terms } from "./terms";
 
 export { TOKEN_KEY, clearToken, getToken, setToken, subscribeToken } from "./token";
 export const UNAUTHORIZED_EVENT = "printpapi:unauthorized";
@@ -86,9 +87,12 @@ export type Plan = {
 };
 
 /** What this server offers before anyone is signed in — read from /health. */
+export type { Terms };
 export type ServerInfo = {
   signup: "open" | "closed";
   password_reset: boolean;
+  /** Present only when signup requires accepting terms. */
+  terms?: Terms | null;
 };
 
 export type Metrics = {
@@ -226,12 +230,18 @@ export async function getServerInfo(): Promise<ServerInfo> {
   return {
     signup: body.signup === "open" ? "open" : "closed",
     password_reset: !!body.password_reset,
+    terms: parseTerms(body.terms),
   };
 }
 
 /** Self-serve: a new org, its first account, and a session token in one call. */
-export const signup = (email: string, password: string, orgName: string) =>
-  open_("/signup", { email, password, org_name: orgName }) as Promise<{
+export const signup = (email: string, password: string, orgName: string, acceptTerms?: string) =>
+  open_("/signup", {
+    email,
+    password,
+    org_name: orgName,
+    ...(acceptTerms ? { accept_terms: acceptTerms } : {}),
+  }) as Promise<{
     token: string;
     org_id: number;
     user_id: number;

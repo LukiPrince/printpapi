@@ -52,6 +52,17 @@ pub struct Config {
     /// PRINTAPI_JOB_RETENTION_DAYS: finished jobs lose their content after this many days and the
     /// rows go with the month. None: keep for ever.
     pub job_retention_days: Option<i64>,
+    /// PRINTAPI_TERMS_VERSION and its links: set, `POST /signup` needs `accept_terms` = version.
+    pub terms: Option<Terms>,
+}
+
+/// The terms a signup must accept (`PRINTAPI_TERMS_*`). The URLs are `http(s)` (checked at startup).
+#[derive(Clone, Debug, PartialEq)]
+pub struct Terms {
+    pub version: String,
+    pub terms_url: String,
+    pub dpa_url: Option<String>,
+    pub privacy_url: Option<String>,
 }
 
 impl Config {
@@ -77,6 +88,7 @@ impl Config {
             trusted_proxies: crate::proxy::TrustedProxies::default(),
             signup_quota: None,
             job_retention_days: None,
+            terms: None,
         }
     }
 }
@@ -842,6 +854,14 @@ impl Ctx<'_> {
         if !email.contains('@') {
             return Ok(jerr(400, "email required"));
         }
+        let terms_version = self.cfg().terms.as_ref().map(|t| t.version.as_str());
+        if let Some(current) = terms_version {
+            match body.get("accept_terms") {
+                Some(Value::String(v)) if v == current => {}
+                Some(Value::String(_)) => return Ok(jerr(409, "terms changed, reload")),
+                _ => return Ok(jerr(400, "accept_terms required")),
+            }
+        }
         let pw_hash = match auth::hash_password(str_field(&body, "password")) {
             Ok(h) => h,
             Err(e) => return Ok(jerr(400, e)),
@@ -853,7 +873,8 @@ impl Ctx<'_> {
         // a *successful* signup spends a slot too — that is the cap
         self.s.limiter.fail(&slot, None);
         let quota = self.cfg().signup_quota;
-        let new = match self.db(|c| store::signup(c, &name, &email, &pw_hash, quota)) {
+        let new = match self.db(|c| store::signup(c, &name, &email, &pw_hash, quota, terms_version))
+        {
             Ok(n) => n,
             Err(StoreError::Conflict) => return Ok(jerr(409, "email already registered")),
             Err(e) => return Err(e),
@@ -1689,11 +1710,14 @@ impl Ctx<'_> {
             // "create an account" and "forgot password" at all. Both are booleans about the
             // server's configuration, not about any account.
             "/health" => {
-                return Ok(Resp::json(
-                    200,
-                    &json!({ "ok": true, "signup": if self.cfg().signup_open { "open" } else { "closed" },
-                             "password_reset": self.cfg().reset_enabled }),
-                ));
+                let mut h = json!({ "ok": true, "signup": if self.cfg().signup_open { "open" } else { "closed" },
+                                    "password_reset": self.cfg().reset_enabled });
+                // Only when consent is required, so a server without it answers as before.
+                if let Some(t) = &self.cfg().terms {
+                    h["terms"] = json!({ "version": t.version, "terms_url": t.terms_url,
+                                         "dpa_url": t.dpa_url, "privacy_url": t.privacy_url });
+                }
+                return Ok(Resp::json(200, &h));
             }
             "/metrics" => {
                 let org = gate!(self.client_org()?);

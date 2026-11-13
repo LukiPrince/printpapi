@@ -5,10 +5,12 @@
 //! holding one), PRINTAPI_BILLING_SECRET, PRINTAPI_TRUSTED_PROXIES (IPs or CIDRs whose
 //! `X-Forwarded-For` is believed), PRINTAPI_SIGNUP_QUOTA (monthly job quota of every self-signup
 //! org), PRINTAPI_JOB_RETENTION_DAYS (days until finished jobs lose payload and title and, a
-//! month later, their row; unset or 0 keeps them), LOG_REQUESTS, SMTP_*.
-use printpapi_server::dispatch::{Destinations, HttpFetcher, OUTBOUND_IN_FLIGHT};
+//! month later, their row; unset or 0 keeps them), PRINTAPI_TERMS_VERSION (set: `POST /signup`
+//! must accept that version of the terms), PRINTAPI_TERMS_URL (required with it), PRINTAPI_DPA_URL,
+//! PRINTAPI_PRIVACY_URL (optional links, http(s) only), LOG_REQUESTS, SMTP_*.
+use printpapi_server::dispatch::{Destinations, HttpFetcher, OUTBOUND_IN_FLIGHT, is_http};
 use printpapi_server::mail::{self, SmtpMailer};
-use printpapi_server::server::{AppState, Config};
+use printpapi_server::server::{AppState, Config, Terms};
 use printpapi_server::store::Db;
 use printpapi_server::{billing, http};
 use std::sync::Arc;
@@ -48,6 +50,38 @@ fn parse_retention(raw: &str) -> Result<Option<i64>, String> {
     }
 }
 
+/// The terms a signup must accept. No version: no consent required (the links are then ignored).
+/// A version needs a terms URL, and every URL must be `http(s)`.
+fn parse_terms(
+    version: &str,
+    terms_url: &str,
+    dpa_url: &str,
+    privacy_url: &str,
+) -> Result<Option<Terms>, String> {
+    let version = py_strip(version);
+    if version.is_empty() {
+        return Ok(None);
+    }
+    let url = |name: &str, raw: &str| -> Result<Option<String>, String> {
+        let t = py_strip(raw);
+        if t.is_empty() {
+            Ok(None)
+        } else if is_http(t) {
+            Ok(Some(t.to_string()))
+        } else {
+            Err(format!("{name} must be an http(s) URL, not {t:?}"))
+        }
+    };
+    let terms_url = url("PRINTAPI_TERMS_URL", terms_url)?
+        .ok_or("PRINTAPI_TERMS_URL is required with PRINTAPI_TERMS_VERSION")?;
+    Ok(Some(Terms {
+        version: version.to_string(),
+        terms_url,
+        dpa_url: url("PRINTAPI_DPA_URL", dpa_url)?,
+        privacy_url: url("PRINTAPI_PRIVACY_URL", privacy_url)?,
+    }))
+}
+
 /// One stderr line per hosted-beta safeguard that is off while strangers can sign up.
 fn startup_warnings(cfg: &Config) -> Vec<&'static str> {
     let mut out = Vec::new();
@@ -59,6 +93,11 @@ fn startup_warnings(cfg: &Config) -> Vec<&'static str> {
     if cfg.signup_open && cfg.job_retention_days.is_none() {
         out.push(
             "warning: PRINTAPI_SIGNUP=open without PRINTAPI_JOB_RETENTION_DAYS: job payloads are kept for ever",
+        );
+    }
+    if cfg.signup_open && cfg.terms.is_none() {
+        out.push(
+            "warning: PRINTAPI_SIGNUP=open without PRINTAPI_TERMS_VERSION: signups do not accept any terms",
         );
     }
     out
@@ -123,6 +162,13 @@ fn config() -> Result<(Config, String, u16), String> {
     cfg.job_retention_days =
         parse_retention(&env("PRINTAPI_JOB_RETENTION_DAYS").unwrap_or_default())
             .map_err(|e| format!("PRINTAPI_JOB_RETENTION_DAYS: {e}"))?;
+
+    cfg.terms = parse_terms(
+        &env("PRINTAPI_TERMS_VERSION").unwrap_or_default(),
+        &env("PRINTAPI_TERMS_URL").unwrap_or_default(),
+        &env("PRINTAPI_DPA_URL").unwrap_or_default(),
+        &env("PRINTAPI_PRIVACY_URL").unwrap_or_default(),
+    )?;
     cfg.open_enrollment = env("PRINTAPI_OPEN_ENROLLMENT").is_some_and(|s| py_strip(&s) == "1");
     Ok((cfg, db_path, port))
 }

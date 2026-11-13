@@ -203,3 +203,50 @@ fn open_signup_without_retention_warns_on_stderr() {
     assert!(err.contains("PRINTAPI_JOB_RETENTION_DAYS"), "{err:?}");
     assert!(!stderr_at_startup(&[]).contains("PRINTAPI_JOB_RETENTION_DAYS"));
 }
+
+#[test]
+fn bad_terms_settings_exit_1() {
+    let cases: [&[(&str, &str)]; 4] = [
+        &[("PRINTAPI_TERMS_VERSION", "v1")], // no terms URL
+        &[
+            ("PRINTAPI_TERMS_VERSION", "v1"),
+            ("PRINTAPI_TERMS_URL", "ftp://x/t"),
+        ],
+        &[
+            ("PRINTAPI_TERMS_VERSION", "v1"),
+            ("PRINTAPI_TERMS_URL", "https://x/t"),
+            ("PRINTAPI_DPA_URL", "javascript:alert(1)"),
+        ],
+        &[
+            ("PRINTAPI_TERMS_VERSION", "v1"),
+            ("PRINTAPI_TERMS_URL", "https://x/t"),
+            ("PRINTAPI_PRIVACY_URL", "/privacy"),
+        ],
+    ];
+    for envs in cases {
+        let mut cmd = bin();
+        cmd.env("PRINTAPI_TOKEN", "t");
+        for (k, v) in envs {
+            cmd.env(k, v);
+        }
+        let out = cmd.output().unwrap();
+        assert_eq!(out.status.code(), Some(1), "{envs:?}");
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains("PRINTAPI_"),
+            "{envs:?}"
+        );
+    }
+}
+
+#[test]
+fn open_signup_without_terms_warns_on_stderr() {
+    let err = stderr_at_startup(&[("PRINTAPI_SIGNUP", "open")]);
+    assert!(err.contains("PRINTAPI_TERMS_VERSION"), "{err:?}");
+    let err = stderr_at_startup(&[
+        ("PRINTAPI_SIGNUP", "open"),
+        ("PRINTAPI_TERMS_VERSION", "v1"),
+        ("PRINTAPI_TERMS_URL", "https://x.test/terms"),
+    ]);
+    assert!(!err.contains("PRINTAPI_TERMS_VERSION"), "{err:?}");
+    assert!(!stderr_at_startup(&[]).contains("PRINTAPI_TERMS_VERSION"));
+}

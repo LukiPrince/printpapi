@@ -336,7 +336,7 @@ pub fn url_scheme(url: &str) -> String {
     }
 }
 
-fn is_http(url: &str) -> bool {
+pub fn is_http(url: &str) -> bool {
     matches!(url_scheme(url).as_str(), "http" | "https")
 }
 

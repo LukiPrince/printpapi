@@ -370,6 +370,11 @@ CREATE TABLE IF NOT EXISTS printers(
 CREATE TABLE IF NOT EXISTS label_templates(
   id INTEGER PRIMARY KEY, org_id INTEGER NOT NULL, name TEXT NOT NULL, spec TEXT NOT NULL,
   created_at REAL NOT NULL, updated_at REAL NOT NULL, UNIQUE(org_id, name));
+-- Which terms version a signup accepted, and when. Additive, like label_templates: a table of its
+-- own, so the Python-era tables keep their shape. History: a later version adds a row.
+CREATE TABLE IF NOT EXISTS terms_acceptances(
+  id INTEGER PRIMARY KEY, org_id INTEGER NOT NULL, user_id INTEGER NOT NULL,
+  version TEXT NOT NULL, accepted_at REAL NOT NULL);
 CREATE TABLE IF NOT EXISTS jobs(
   id INTEGER PRIMARY KEY AUTOINCREMENT, org_id INTEGER NOT NULL, user_id INTEGER NOT NULL,
   printer_id INTEGER NOT NULL, agent_id INTEGER NOT NULL, type TEXT NOT NULL, mode TEXT NOT NULL,
@@ -697,6 +702,7 @@ pub fn delete_org(conn: &Connection, org_id: i64) -> Result<bool> {
         "api_keys",
         "users",
         "label_templates",
+        "terms_acceptances",
     ] {
         tx.execute(&format!("DELETE FROM {table} WHERE org_id=?"), [org_id])?;
     }
@@ -989,13 +995,15 @@ pub fn create_user(
 
 /// Self-serve: a new org and its first user in one transaction. Err(Conflict) if the e-mail is
 /// taken — the rollback takes the half-made org with it, so a failed signup leaves nothing behind.
-/// `job_quota` is the monthly cap the org starts with (None: unlimited).
+/// `job_quota` is the monthly cap the org starts with (None: unlimited). `terms_version` is the
+/// terms version the user accepted (None: consent is not required), recorded in the same transaction.
 pub fn signup(
     conn: &Connection,
     org_name: &str,
     email: &str,
     password_hash: &str,
     job_quota: Option<i64>,
+    terms_version: Option<&str>,
 ) -> Result<Signup> {
     let now = crate::now();
     let addr = normalize_email(email);
@@ -1010,6 +1018,12 @@ pub fn signup(
         params![org_id, addr, addr, password_hash, now],
     )?;
     let user_id = tx.last_insert_rowid();
+    if let Some(version) = terms_version {
+        tx.execute(
+            "INSERT INTO terms_acceptances(org_id, user_id, version, accepted_at) VALUES(?,?,?,?)",
+            params![org_id, user_id, version, now],
+        )?;
+    }
     tx.commit()?;
     Ok(Signup { org_id, user_id })
 }
@@ -3436,7 +3450,15 @@ mod tests {
     #[test]
     fn signup_creates_an_org_and_its_first_user_in_one_transaction() {
         let conn = db();
-        let r = signup(&conn, "Shop GmbH", "Owner@Shop.test", "scrypt$x", None).unwrap();
+        let r = signup(
+            &conn,
+            "Shop GmbH",
+            "Owner@Shop.test",
+            "scrypt$x",
+            None,
+            None,
+        )
+        .unwrap();
         assert_eq!(get_org(&conn, r.org_id).unwrap().unwrap().job_quota, None);
         assert!(r.org_id != DEFAULT_ORG && r.user_id != DEFAULT_USER);
         assert_eq!(get_org(&conn, r.org_id).unwrap().unwrap().name, "Shop GmbH");
@@ -3449,12 +3471,12 @@ mod tests {
     #[test]
     fn signup_writes_the_default_quota_onto_the_new_org() {
         let conn = db();
-        let r = signup(&conn, "Shop", "a@shop.test", "h", Some(25)).unwrap();
+        let r = signup(&conn, "Shop", "a@shop.test", "h", Some(25), None).unwrap();
         assert_eq!(
             get_org(&conn, r.org_id).unwrap().unwrap().job_quota,
             Some(25)
         );
-        let r = signup(&conn, "Zero", "b@shop.test", "h", Some(0)).unwrap();
+        let r = signup(&conn, "Zero", "b@shop.test", "h", Some(0), None).unwrap();
         assert_eq!(
             get_org(&conn, r.org_id).unwrap().unwrap().job_quota,
             Some(0)
@@ -3467,12 +3489,52 @@ mod tests {
     }
 
     #[test]
+    fn signup_records_the_accepted_terms_version_with_org_and_user() {
+        let conn = db();
+        let r = signup(&conn, "Shop", "a@shop.test", "h", None, Some("2026-11-13")).unwrap();
+        let (org, user, version, at): (i64, i64, String, f64) = conn
+            .query_row(
+                "SELECT org_id, user_id, version, accepted_at FROM terms_acceptances",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            (org, user, version.as_str()),
+            (r.org_id, r.user_id, "2026-11-13")
+        );
+        assert!(at > 1.0e9);
+        // no terms configured: no row
+        signup(&conn, "Other", "b@shop.test", "h", None, None).unwrap();
+        assert_eq!(
+            q::<i64>(&conn, "SELECT COUNT(*) FROM terms_acceptances", []),
+            1
+        );
+    }
+
+    #[test]
+    fn a_failed_signup_leaves_no_terms_row_and_delete_org_removes_them() {
+        let conn = db();
+        let r = signup(&conn, "First", "o@shop.test", "h", None, Some("v1")).unwrap();
+        assert!(signup(&conn, "Second", "O@shop.test", "h", None, Some("v1")).is_err());
+        assert_eq!(
+            q::<i64>(&conn, "SELECT COUNT(*) FROM terms_acceptances", []),
+            1
+        );
+        assert!(delete_org(&conn, r.org_id).unwrap());
+        assert_eq!(
+            q::<i64>(&conn, "SELECT COUNT(*) FROM terms_acceptances", []),
+            0
+        );
+    }
+
+    #[test]
     fn signup_with_a_taken_email_leaves_no_orphan_org() {
         let conn = db();
-        signup(&conn, "First", "owner@shop.test", "h", None).unwrap();
+        signup(&conn, "First", "owner@shop.test", "h", None, None).unwrap();
         let before = list_orgs(&conn).unwrap().len();
         assert!(matches!(
-            signup(&conn, "Second", "Owner@shop.TEST", "h", Some(3)),
+            signup(&conn, "Second", "Owner@shop.TEST", "h", Some(3), None),
             Err(StoreError::Conflict)
         ));
         assert_eq!(list_orgs(&conn).unwrap().len(), before); // the org went back with the failed user

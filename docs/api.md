@@ -290,7 +290,7 @@ hashed.
 
 ### Self-signup
 
-`POST /signup {email, password, org_name?}` creates an org, its first account and a session in one
+`POST /signup {email, password, org_name?, accept_terms?}` creates an org, its first account and a session in one
 call — the same body a login answers with. It is **off unless the operator turns it on**
 (`PRINTAPI_SIGNUP=open`); otherwise it is a `403`, because a self-hosted box on the open internet
 must not hand an org to whoever finds it. `GET /health` reports `"signup": "open"|"closed"` so the
@@ -302,6 +302,15 @@ address unless `PRINTAPI_TRUSTED_PROXIES` names the proxy, which makes printpapi
 from `X-Forwarded-For` (see [Behind a reverse proxy](server.md#behind-a-reverse-proxy)). `org_name` defaults to the e-mail's domain. A taken address is a `409` and leaves no
 half-made org behind. With `PRINTAPI_SIGNUP_QUOTA` set, the new org starts with that monthly
 [job quota](#quotas); without it, it is unlimited.
+
+**Consent.** With `PRINTAPI_TERMS_VERSION` set, `GET /health` adds
+`"terms": {"version", "terms_url", "dpa_url", "privacy_url"}` (the last two may be `null`; the key is
+absent when consent is not required) and `POST /signup` needs `"accept_terms": "<that version>"`:
+missing, `false` or not a string is a `400` (`accept_terms required`), another version is a `409`
+(`terms changed, reload`: the form was loaded before the terms changed). Both are checked before the
+throttle slot is spent. The version and the time are stored with the new org and user. The
+dashboard's form then shows one checkbox ("I act as a business and accept the Terms and the Data
+Processing Agreement") that must be ticked.
 
 ### Password reset
 
