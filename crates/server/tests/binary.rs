@@ -14,6 +14,7 @@ fn bin() -> Command {
         "PRINTAPI_PLANS",
         "PRINTAPI_SIGNUP",
         "PRINTAPI_TRUSTED_PROXIES",
+        "PRINTAPI_SIGNUP_QUOTA",
         "LOG_REQUESTS",
     ] {
         c.env_remove(k);
@@ -73,6 +74,59 @@ fn bad_trusted_proxies_exit_1() {
         .unwrap();
     assert_eq!(out.status.code(), Some(1));
     assert!(String::from_utf8_lossy(&out.stderr).contains("PRINTAPI_TRUSTED_PROXIES"));
+}
+
+#[test]
+fn bad_signup_quota_exits_1() {
+    for bad in ["-1", "ten", "1.5"] {
+        let out = bin()
+            .env("PRINTAPI_TOKEN", "t")
+            .env("PRINTAPI_SIGNUP_QUOTA", bad)
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(1), "{bad}");
+        assert!(String::from_utf8_lossy(&out.stderr).contains("PRINTAPI_SIGNUP_QUOTA"));
+    }
+}
+
+/// Starts the server with `envs`, waits for the listening line and returns what it wrote to stderr
+/// until then.
+fn stderr_at_startup(envs: &[(&str, &str)]) -> String {
+    let dir = tempfile::tempdir().unwrap();
+    let mut cmd = bin();
+    cmd.env("PRINTAPI_TOKEN", "t")
+        .env("PRINT_DB", dir.path().join("p.db"))
+        .env("PRINT_PORT", free_port().to_string())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    for (k, v) in envs {
+        cmd.env(k, v);
+    }
+    let mut child = cmd.spawn().unwrap();
+    let mut line = String::new();
+    BufReader::new(child.stdout.take().unwrap())
+        .read_line(&mut line)
+        .unwrap();
+    child.kill().unwrap();
+    let _ = child.wait();
+    let mut err = String::new();
+    child
+        .stderr
+        .take()
+        .unwrap()
+        .read_to_string(&mut err)
+        .unwrap();
+    err
+}
+
+#[test]
+fn open_signup_without_a_quota_warns_on_stderr() {
+    let err = stderr_at_startup(&[("PRINTAPI_SIGNUP", "open")]);
+    assert!(err.contains("PRINTAPI_SIGNUP_QUOTA"), "{err:?}");
+    let err = stderr_at_startup(&[("PRINTAPI_SIGNUP", "open"), ("PRINTAPI_SIGNUP_QUOTA", "50")]);
+    assert!(!err.contains("PRINTAPI_SIGNUP_QUOTA"), "{err:?}");
+    // a closed door needs no quota
+    assert!(!stderr_at_startup(&[]).contains("PRINTAPI_SIGNUP_QUOTA"));
 }
 
 #[test]

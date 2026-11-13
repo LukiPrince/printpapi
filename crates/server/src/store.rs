@@ -987,18 +987,20 @@ pub fn create_user(
 
 /// Self-serve: a new org and its first user in one transaction. Err(Conflict) if the e-mail is
 /// taken — the rollback takes the half-made org with it, so a failed signup leaves nothing behind.
+/// `job_quota` is the monthly cap the org starts with (None: unlimited).
 pub fn signup(
     conn: &Connection,
     org_name: &str,
     email: &str,
     password_hash: &str,
+    job_quota: Option<i64>,
 ) -> Result<Signup> {
     let now = crate::now();
     let addr = normalize_email(email);
     let tx = begin(conn)?;
     tx.execute(
-        "INSERT INTO orgs(name, created_at) VALUES(?,?)",
-        params![org_name, now],
+        "INSERT INTO orgs(name, job_quota, created_at) VALUES(?,?,?)",
+        params![org_name, job_quota, now],
     )?;
     let org_id = tx.last_insert_rowid();
     tx.execute(
@@ -3264,7 +3266,8 @@ mod tests {
     #[test]
     fn signup_creates_an_org_and_its_first_user_in_one_transaction() {
         let conn = db();
-        let r = signup(&conn, "Shop GmbH", "Owner@Shop.test", "scrypt$x").unwrap();
+        let r = signup(&conn, "Shop GmbH", "Owner@Shop.test", "scrypt$x", None).unwrap();
+        assert_eq!(get_org(&conn, r.org_id).unwrap().unwrap().job_quota, None);
         assert!(r.org_id != DEFAULT_ORG && r.user_id != DEFAULT_USER);
         assert_eq!(get_org(&conn, r.org_id).unwrap().unwrap().name, "Shop GmbH");
         let u = get_user_by_email(&conn, "owner@shop.test")
@@ -3274,12 +3277,32 @@ mod tests {
     }
 
     #[test]
+    fn signup_writes_the_default_quota_onto_the_new_org() {
+        let conn = db();
+        let r = signup(&conn, "Shop", "a@shop.test", "h", Some(25)).unwrap();
+        assert_eq!(
+            get_org(&conn, r.org_id).unwrap().unwrap().job_quota,
+            Some(25)
+        );
+        let r = signup(&conn, "Zero", "b@shop.test", "h", Some(0)).unwrap();
+        assert_eq!(
+            get_org(&conn, r.org_id).unwrap().unwrap().job_quota,
+            Some(0)
+        );
+        // the default org is not touched
+        assert_eq!(
+            get_org(&conn, DEFAULT_ORG).unwrap().unwrap().job_quota,
+            None
+        );
+    }
+
+    #[test]
     fn signup_with_a_taken_email_leaves_no_orphan_org() {
         let conn = db();
-        signup(&conn, "First", "owner@shop.test", "h").unwrap();
+        signup(&conn, "First", "owner@shop.test", "h", None).unwrap();
         let before = list_orgs(&conn).unwrap().len();
         assert!(matches!(
-            signup(&conn, "Second", "Owner@shop.TEST", "h"),
+            signup(&conn, "Second", "Owner@shop.TEST", "h", Some(3)),
             Err(StoreError::Conflict)
         ));
         assert_eq!(list_orgs(&conn).unwrap().len(), before); // the org went back with the failed user

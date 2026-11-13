@@ -3,7 +3,8 @@
 //! server: PRINTAPI_TOKEN (required, non-empty), PRINT_DB (default printpapi.db), PRINT_PORT
 //! (default 3460), PRINTAPI_SIGNUP, PUBLIC_URL, PRINTAPI_PLANS (JSON array or a path to a file
 //! holding one), PRINTAPI_BILLING_SECRET, PRINTAPI_TRUSTED_PROXIES (IPs or CIDRs whose
-//! `X-Forwarded-For` is believed), LOG_REQUESTS, SMTP_*.
+//! `X-Forwarded-For` is believed), PRINTAPI_SIGNUP_QUOTA (monthly job quota of every self-signup
+//! org), LOG_REQUESTS, SMTP_*.
 use printpapi_server::dispatch::{Destinations, HttpFetcher, OUTBOUND_IN_FLIGHT};
 use printpapi_server::mail::{self, SmtpMailer};
 use printpapi_server::server::{AppState, Config};
@@ -19,6 +20,29 @@ fn env(key: &str) -> Option<String> {
 /// Python `str.strip()`: Unicode whitespace plus U+001C..U+001F.
 fn py_strip(s: &str) -> &str {
     s.trim_matches(|c: char| c.is_whitespace() || ('\u{1c}'..='\u{1f}').contains(&c))
+}
+
+/// Empty: no quota. Otherwise a non-negative integer (0 is a real quota: nothing may be printed).
+fn parse_quota(raw: &str) -> Result<Option<i64>, String> {
+    let t = py_strip(raw);
+    if t.is_empty() {
+        return Ok(None);
+    }
+    match t.parse::<i64>() {
+        Ok(n) if n >= 0 => Ok(Some(n)),
+        _ => Err(format!("must be a non-negative integer, not {t:?}")),
+    }
+}
+
+/// One stderr line per hosted-beta safeguard that is off while strangers can sign up.
+fn startup_warnings(cfg: &Config) -> Vec<&'static str> {
+    let mut out = Vec::new();
+    if cfg.signup_open && cfg.signup_quota.is_none() {
+        out.push(
+            "warning: PRINTAPI_SIGNUP=open without PRINTAPI_SIGNUP_QUOTA: new orgs can print without limit",
+        );
+    }
+    out
 }
 
 fn config() -> Result<(Config, String, u16), String> {
@@ -75,6 +99,8 @@ fn config() -> Result<(Config, String, u16), String> {
         &env("PRINTAPI_TRUSTED_PROXIES").unwrap_or_default(),
     )
     .map_err(|e| format!("PRINTAPI_TRUSTED_PROXIES: {e}"))?;
+    cfg.signup_quota = parse_quota(&env("PRINTAPI_SIGNUP_QUOTA").unwrap_or_default())
+        .map_err(|e| format!("PRINTAPI_SIGNUP_QUOTA: {e}"))?;
     cfg.open_enrollment = env("PRINTAPI_OPEN_ENROLLMENT").is_some_and(|s| py_strip(&s) == "1");
     Ok((cfg, db_path, port))
 }
@@ -104,6 +130,9 @@ async fn shutdown_signal() {
 fn run() -> Result<(), String> {
     let (cfg, db_path, port) = config()?;
     let destinations = cfg.destinations;
+    for line in startup_warnings(&cfg) {
+        eprintln!("{line}");
+    }
     let db = Db::open(&db_path).map_err(|e| format!("cannot open database {db_path:?}: {e}"))?;
     let state = Arc::new(AppState::new(
         cfg,

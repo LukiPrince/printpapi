@@ -457,6 +457,46 @@ fn only_the_operator_sets_a_quota() {
 // --- quotas -----------------------------------------------------------------------------------
 
 #[test]
+fn a_signup_quota_caps_the_new_org_but_not_root_created_ones() {
+    let app = App::with(|c| {
+        c.signup_open = true;
+        c.signup_quota = Some(2);
+    });
+    let (_, s) = app.post(
+        "/signup",
+        None,
+        json!({"email": "q@shop.test", "password": PW}),
+    );
+    let (org, session) = (s["org_id"].as_i64().unwrap(), s["token"].as_str().unwrap());
+    assert_eq!(
+        app.get(&format!("/orgs/{org}"), Some(session)).1["job_quota"],
+        2
+    );
+    let pid = register(&app.db, "pc", "agentkey", &[decl("HP", true)], org).pid("HP");
+    let job = json!({"printer_id": pid, "type": "raw_base64", "content": "eA=="});
+    assert_eq!(app.post("/jobs", Some(session), job.clone()).0, 200);
+    assert_eq!(app.post("/jobs", Some(session), job.clone()).0, 200);
+    let (code, body) = app.post("/jobs", Some(session), job);
+    assert!(code == 402 && body["error"].as_str().unwrap().contains("quota"));
+    // an org the operator creates keeps the operator's choice: no quota
+    let (_, o) = app.post("/orgs", Some("t"), json!({"name": "by root"}));
+    let url = format!("/orgs/{}", o["id"]);
+    assert!(app.get(&url, Some("t")).1["job_quota"].is_null());
+}
+
+#[test]
+fn without_a_signup_quota_a_new_org_is_unlimited() {
+    let app = App::with(|c| c.signup_open = true);
+    let (_, s) = app.post(
+        "/signup",
+        None,
+        json!({"email": "q@shop.test", "password": PW}),
+    );
+    let url = format!("/orgs/{}", s["org_id"]);
+    assert!(app.get(&url, s["token"].as_str()).1["job_quota"].is_null());
+}
+
+#[test]
 fn a_spent_quota_answers_402_on_every_submit_path() {
     let app = App::new();
     let pid = register(&app.db, "pc", "agentkey", &[decl("HP", true)], DEFAULT_ORG).pid("HP");

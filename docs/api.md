@@ -300,7 +300,8 @@ Signups are throttled by client address (the same counter a failed login uses), 
 spray orgs. IPv6 clients count per /64. Behind a reverse proxy every signup shares the proxy's
 address unless `PRINTAPI_TRUSTED_PROXIES` names the proxy, which makes printpapi read the client
 from `X-Forwarded-For` (see [Behind a reverse proxy](server.md#behind-a-reverse-proxy)). `org_name` defaults to the e-mail's domain. A taken address is a `409` and leaves no
-half-made org behind.
+half-made org behind. With `PRINTAPI_SIGNUP_QUOTA` set, the new org starts with that monthly
+[job quota](#quotas); without it, it is unlimited.
 
 ### Password reset
 
@@ -341,6 +342,8 @@ curl -s -X PUT localhost:3460/orgs/2 -H 'Authorization: Bearer <PRINTAPI_TOKEN>'
   so `POST /jobs`, `POST /orders`, the Shopify webhook and the PrintNode-compatible
   `POST /printjobs` (`{"code": "QuotaExceeded"}`) are all covered by it.
 - An **idempotent resubmit spends nothing** — it returns the original job, it does not create one.
+- Orgs created through [self-signup](#self-signup) start with the operator's `PRINTAPI_SIGNUP_QUOTA`
+  (none if unset); orgs root creates start unlimited.
 - `GET /orgs/{id}` reports `job_quota` and `jobs_this_month`, which is what the dashboard's
   Settings page shows.
 

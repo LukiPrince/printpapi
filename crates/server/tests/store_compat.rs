@@ -361,7 +361,7 @@ fn write_a_database_for_python_to_read() {
         enqueue_job(c, &job).unwrap();
         let dev = register_cloudprnt(c, DEFAULT_ORG, "cloudprnt-mac1").unwrap();
         assert!(dev.agent_id > reg.computer_id);
-        let uid = signup(c, "Rust Org", "Rust@Shop.test", "scrypt$stub")
+        let uid = signup(c, "Rust Org", "Rust@Shop.test", "scrypt$stub", None)
             .unwrap()
             .user_id;
         create_session(c, uid, "sess_rust", 3600.0, None).unwrap();

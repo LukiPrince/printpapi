@@ -46,6 +46,9 @@ pub struct Config {
     pub open_enrollment: bool,
     /// PRINTAPI_TRUSTED_PROXIES: peers whose `X-Forwarded-For` names the real client. Empty: nobody.
     pub trusted_proxies: crate::proxy::TrustedProxies,
+    /// PRINTAPI_SIGNUP_QUOTA: the monthly `job_quota` of every org `POST /signup` creates.
+    /// None: no quota. Root-created orgs are never touched.
+    pub signup_quota: Option<i64>,
 }
 
 impl Config {
@@ -69,6 +72,7 @@ impl Config {
             destinations: crate::dispatch::Destinations::Any,
             open_enrollment: false,
             trusted_proxies: crate::proxy::TrustedProxies::default(),
+            signup_quota: None,
         }
     }
 }
@@ -841,7 +845,8 @@ impl Ctx<'_> {
             .unwrap_or_else(|| email.split_once('@').map_or("", |(_, d)| d).to_string());
         // a *successful* signup spends a slot too — that is the cap
         self.s.limiter.fail(&slot, None);
-        let new = match self.db(|c| store::signup(c, &name, &email, &pw_hash)) {
+        let quota = self.cfg().signup_quota;
+        let new = match self.db(|c| store::signup(c, &name, &email, &pw_hash, quota)) {
             Ok(n) => n,
             Err(StoreError::Conflict) => return Ok(jerr(409, "email already registered")),
             Err(e) => return Err(e),
