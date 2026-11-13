@@ -47,9 +47,8 @@ fn scrypt_raw(
     Some(dk)
 }
 
-/// `None` (absent or not a JSON string) fails like a too-short password.
-/// Err text: `password must be at least 8 characters` / `password must be at most 1024 characters`.
-pub fn hash_password(password: Option<&str>) -> Result<String, String> {
+/// The length rules of `hash_password`, without the slow hash: the password itself when it passes.
+pub fn validate_password(password: Option<&str>) -> Result<&str, String> {
     let pw = password.unwrap_or("");
     let chars = pw.chars().count();
     if password.is_none() || chars < MIN_PASSWORD_LEN {
@@ -62,6 +61,13 @@ pub fn hash_password(password: Option<&str>) -> Result<String, String> {
             "password must be at most {MAX_PASSWORD_LEN} characters"
         ));
     }
+    Ok(pw)
+}
+
+/// `None` (absent or not a JSON string) fails like a too-short password.
+/// Err text: `password must be at least 8 characters` / `password must be at most 1024 characters`.
+pub fn hash_password(password: Option<&str>) -> Result<String, String> {
+    let pw = validate_password(password)?;
     let salt = random_bytes(16);
     let dk = scrypt_raw(pw, &salt, LOG_N, R, P, DKLEN)
         .ok_or_else(|| "password hashing failed".to_string())?;
@@ -204,7 +210,7 @@ pub fn ct_eq(a: &str, b: &str) -> bool {
     bool::from(a.as_bytes().ct_eq(b.as_bytes()))
 }
 
-/// Failed-login throttle keyed by an arbitrary string (an e-mail, `signup:<ip>`, `reset:<email>`).
+/// Failed-login throttle keyed by an arbitrary string (`login:<email>`, `signup:<ip>`, `reset:<email>`).
 /// ponytail: per-process and in-memory (a restart forgets, several server processes each keep
 /// their own count), no IP dimension, and bounded — a big enough spray of invented addresses
 /// evicts counters rather than growing memory. scrypt already caps a single process at ~20
@@ -248,6 +254,11 @@ impl LoginLimiter {
     pub fn fail(&self, key: &str, now: Option<f64>) {
         let now = now.unwrap_or_else(crate::now);
         let mut fails = self.lock();
+        self.bump(&mut fails, key, now);
+    }
+
+    /// Count one use of `key` (rolling an expired window over) and keep the map bounded.
+    fn bump(&self, fails: &mut HashMap<String, (u32, f64)>, key: &str, now: f64) {
         let (mut count, mut start) = fails.get(key).copied().unwrap_or((0, now));
         if now - start >= self.window_s {
             (count, start) = (0, now); // window rolled over — start counting again
@@ -274,6 +285,20 @@ impl LoginLimiter {
                 }
             }
         }
+    }
+
+    /// Atomic check-and-take: under one lock, roll an expired window over, then count one use and
+    /// return true only while the window still has room. Unlike `allow` + `fail` (two lock
+    /// acquisitions), parallel callers can never all pass the check before any of them counts.
+    pub fn try_take(&self, key: &str, now: Option<f64>) -> bool {
+        let now = now.unwrap_or_else(crate::now);
+        let mut fails = self.lock();
+        let (count, start) = fails.get(key).copied().unwrap_or((0, now));
+        if now - start < self.window_s && count >= self.max_fails {
+            return false;
+        }
+        self.bump(&mut fails, key, now);
+        true
     }
 
     pub fn succeed(&self, key: &str) {
@@ -474,6 +499,22 @@ mod tests {
         assert!(!ct_eq("abc", "abd"));
         assert!(!ct_eq("abc", "abcd"));
         assert!(ct_eq("", ""));
+    }
+
+    #[test]
+    fn try_take_hands_out_max_slots_per_window_then_resets() {
+        let lim = LoginLimiter::new(3, 900.0);
+        for i in 0..3 {
+            assert!(lim.try_take("k", Some(100.0 + i as f64)));
+        }
+        assert!(!lim.try_take("k", Some(110.0)));
+        assert!(!lim.try_take("k", Some(110.0))); // a refusal takes nothing
+        assert!(lim.try_take("other", Some(110.0))); // per key
+        assert!(!lim.allow("k", Some(110.0)));
+        assert!(lim.try_take("k", Some(100.0 + 900.0))); // window rolled over
+        assert!(lim.try_take("k", Some(1001.0)));
+        assert!(lim.try_take("k", Some(1002.0)));
+        assert!(!lim.try_take("k", Some(1003.0)));
     }
 
     #[test]

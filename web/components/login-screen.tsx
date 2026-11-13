@@ -16,6 +16,7 @@ import {
   signup,
   type ServerInfo,
 } from "@/lib/api";
+import { termsMessage } from "@/lib/terms";
 
 const LABEL =
   "font-mono text-[0.68rem] font-semibold tracking-[0.14em] text-muted-foreground uppercase";
@@ -49,6 +50,7 @@ export function LoginScreen({ onSignIn }: { onSignIn: (token: string) => void })
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
+  const [accepted, setAccepted] = useState(false);
   const [shake, setShake] = useState(0);
   const [info, setInfo] = useState<ServerInfo>({ signup: "closed", password_reset: false });
 
@@ -84,7 +86,10 @@ export function LoginScreen({ onSignIn }: { onSignIn: (token: string) => void })
         if (!email.trim() || !password) return;
         onSignIn((await login(email.trim(), password)).token);
       } else if (mode === "signup") {
-        onSignIn((await signup(email.trim(), password, orgName.trim())).token);
+        if (info.terms && !accepted) return;
+        onSignIn(
+          (await signup(email.trim(), password, orgName.trim(), info.terms?.version)).token,
+        );
       } else if (mode === "forgot") {
         await requestPasswordReset(email.trim());
         // Deliberately the same answer for an address with no account.
@@ -105,7 +110,7 @@ export function LoginScreen({ onSignIn }: { onSignIn: (token: string) => void })
       const status = err instanceof ApiError ? err.status : 0;
       if (status === 401) fail("Wrong e-mail or password.");
       else if (status === 429) fail("Too many attempts. Wait a bit.");
-      else if (err instanceof ApiError) fail(err.message);
+      else if (err instanceof ApiError) fail(termsMessage(status, err.message));
       else fail("Cannot reach the server.");
     } finally {
       setBusy(false);
@@ -235,6 +240,40 @@ export function LoginScreen({ onSignIn }: { onSignIn: (token: string) => void })
               className="mt-1.5 font-mono"
             />
             {passwordField("Password", "new-password", 8)}
+            {info.terms && (
+              <label htmlFor="accept-terms" className="mt-3 flex items-start gap-2 text-xs">
+                <input
+                  id="accept-terms"
+                  type="checkbox"
+                  checked={accepted}
+                  onChange={(e) => setAccepted(e.target.checked)}
+                  className="mt-0.5 size-3.5 shrink-0 accent-brand"
+                />
+                <span>
+                  I act as a business and accept the{" "}
+                  <a href={info.terms.terms_url} target="_blank" rel="noreferrer" className="underline">
+                    Terms
+                  </a>
+                  {info.terms.dpa_url && (
+                    <>
+                      {" "}and the{" "}
+                      <a href={info.terms.dpa_url} target="_blank" rel="noreferrer" className="underline">
+                        Data Processing Agreement
+                      </a>
+                    </>
+                  )}{" "}
+                  (version {info.terms.version}).
+                  {info.terms.privacy_url && (
+                    <>
+                      {" "}
+                      <a href={info.terms.privacy_url} target="_blank" rel="noreferrer" className="underline">
+                        Privacy policy
+                      </a>
+                    </>
+                  )}
+                </span>
+              </label>
+            )}
           </>
         )}
 
@@ -279,7 +318,13 @@ export function LoginScreen({ onSignIn }: { onSignIn: (token: string) => void })
           </>
         )}
 
-        <Button type="submit" variant="brand" size="lg" className="mt-4 w-full font-mono" disabled={busy}>
+        <Button
+          type="submit"
+          variant="brand"
+          size="lg"
+          className="mt-4 w-full font-mono"
+          disabled={busy || (mode === "signup" && !!info.terms && !accepted)}
+        >
           {busy ? <Loader2 className="animate-spin" /> : <ArrowRight />}
           {busy ? "WORKING" : ACTION[mode]}
         </Button>

@@ -28,7 +28,7 @@ Token comparison is constant-time (`hmac.compare_digest`).
 | `GET\|POST /labels`, `GET\|PUT\|DELETE /labels/{id}` | client | [Label templates](labels.md): where the content sits on a label; jobs of type `label_*` render through them |
 | `POST /orders` | client | Render an order as a packing slip and print it → `{job_id}` ([e-commerce](ecommerce.md)) |
 | `POST /integrations/shopify/orders` | HMAC | Shopify order webhook (key in the URL, signature in the header) |
-| `GET /jobs` | client | Recent job history |
+| `GET /jobs` | client | Recent job history. With [retention](server.md#retention) set, old jobs lose payload and title (`title` is `null`), and rows from before the current month disappear after at least 7 days |
 | `GET /jobs/{id}` | client | One job's state: `queued` \| `claimed` \| `done` \| `failed` \| `cancelled` |
 | `DELETE /jobs/{id}` | client | Cancel a still-`queued` job (`409` once claimed, `404` if unknown) |
 | `GET /printers` | client | Registered printers + online/offline + capabilities |
@@ -87,11 +87,16 @@ reaches a terminal state. See [Webhooks](#webhooks). A non-`http(s)` scheme → 
 `idempotency_key` is optional (string, ≤128 chars) — **retry-safe submits**. Resubmitting the same
 key inside the same org returns the *original* `job_id` and prints nothing extra, so a timed-out or
 retried `POST /jobs` (order webhook redelivery, flaky network) can never double-print. Keys are
-scoped per org and never expire; use something stable like the order id.
+scoped per org. A key is honoured as long as its job row exists: with
+[retention](server.md#retention) on, at least `max(N, 7)` days after the job finished (longer than a
+webhook redelivery window), without retention for ever. Use something stable like the order id.
 
 `expire_after` is optional (integer seconds, `1`–`2592000`) — **a deadline for the job**. Past it
 the job is failed (`state: failed`, `error: "expired"`) instead of printed, so a stale shipping
-label doesn't come out hours later when an offline agent reconnects. Without it, jobs wait forever.
+label doesn't come out hours later when an offline agent reconnects. Without it, jobs wait until an
+agent takes them, or, with [retention](server.md#retention) set, N days: then the job is failed with
+`error: "retention"` and its `callback_url` still gets the outcome. A job with `expire_after` waits for
+its own deadline instead.
 
 `options` is optional and **pdf jobs only** (raw ZPL/ESC-POS carries its own layout — `400` on a
 raw job). The agent maps them onto its backend's native flags (SumatraPDF `-print-settings` on
@@ -290,16 +295,28 @@ hashed.
 
 ### Self-signup
 
-`POST /signup {email, password, org_name?}` creates an org, its first account and a session in one
+`POST /signup {email, password, org_name?, accept_terms?}` creates an org, its first account and a session in one
 call — the same body a login answers with. It is **off unless the operator turns it on**
 (`PRINTAPI_SIGNUP=open`); otherwise it is a `403`, because a self-hosted box on the open internet
 must not hand an org to whoever finds it. `GET /health` reports `"signup": "open"|"closed"` so the
 dashboard only offers the door when it exists.
 
-Signups are throttled by client address (the same counter a failed login uses), so one host cannot
-spray orgs. Behind a reverse proxy every signup shares one address — put the rate limit in the
-proxy there. `org_name` defaults to the e-mail's domain. A taken address is a `409` and leaves no
-half-made org behind.
+Signups are throttled by client address (the same limit as failed logins, but its own counter: a failed
+login never uses up a signup slot), so one host cannot spray orgs. A password that is too short or too
+long is a `400` before a slot is taken. IPv6 clients count per /64. Behind a reverse proxy every signup shares the proxy's
+address unless `PRINTAPI_TRUSTED_PROXIES` names the proxy, which makes printpapi read the client
+from `X-Forwarded-For` (see [Behind a reverse proxy](server.md#behind-a-reverse-proxy)). `org_name` defaults to the e-mail's domain. A taken address is a `409` and leaves no
+half-made org behind. With `PRINTAPI_SIGNUP_QUOTA` set, the new org starts with that monthly
+[job quota](#quotas); without it, it is unlimited.
+
+**Consent.** With `PRINTAPI_TERMS_VERSION` set, `GET /health` adds
+`"terms": {"version", "terms_url", "dpa_url", "privacy_url"}` (the last two may be `null`; the key is
+absent when consent is not required) and `POST /signup` needs `"accept_terms": "<that version>"`:
+missing, `false` or not a string is a `400` (`accept_terms required`), another version is a `409`
+(`terms changed, reload`: the form was loaded before the terms changed). Both are checked before the
+throttle slot is spent. The version and the time are stored with the new org and user. The
+dashboard's form then shows one checkbox ("I act as a business and accept the Terms", plus "and the
+Data Processing Agreement" when `PRINTAPI_DPA_URL` is set) that must be ticked.
 
 ### Password reset
 
@@ -340,6 +357,8 @@ curl -s -X PUT localhost:3460/orgs/2 -H 'Authorization: Bearer <PRINTAPI_TOKEN>'
   so `POST /jobs`, `POST /orders`, the Shopify webhook and the PrintNode-compatible
   `POST /printjobs` (`{"code": "QuotaExceeded"}`) are all covered by it.
 - An **idempotent resubmit spends nothing** — it returns the original job, it does not create one.
+- Orgs created through [self-signup](#self-signup) start with the operator's `PRINTAPI_SIGNUP_QUOTA`
+  (none if unset); orgs root creates start unlimited.
 - `GET /orgs/{id}` reports `job_quota` and `jobs_this_month`, which is what the dashboard's
   Settings page shows.
 

@@ -21,7 +21,8 @@ Prints a packing slip on your own printer when an order comes in, through a self
 - Queues the print through WP-Cron (`wp_schedule_single_event`), so checkout never waits on a
   printer.
 - Sends `idempotency_key = woo-<order>-<status>` on automatic prints — a retried hook or a status
-  flapping back and forth prints exactly once.
+  flapping back and forth prints once. A key dedupes while its job row exists: with server-side
+  retention on, at least `max(N, 7)` days after the job finished.
 - Adds **Print packing slip (printpapi)** to the order's *Actions* box for reprints (no
   idempotency key, so it really does print again).
 - Writes the outcome into the order notes: the job id on success, the server's error otherwise.

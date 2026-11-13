@@ -41,7 +41,13 @@ Environment variables:
 | `SMTP_STARTTLS` | `1` | `0` to disable STARTTLS (plaintext relay on a trusted network) |
 | `PRINTAPI_PLANS` | *(unset)* | [Billing](billing.md) catalogue: a JSON array of plans, or a path to a file holding one. Unset ⇒ no plans, no billing routes |
 | `PRINTAPI_BILLING_SECRET` | *(unset)* | Shared secret for the `POST /billing/webhook` signature. Unset ⇒ the webhook answers `503` |
+| `PRINTAPI_SIGNUP_QUOTA` | *(unset: no quota)* | Non-negative integer: the monthly [`job_quota`](api.md#quotas) of every org created through `POST /signup`, so a free signup cannot print without limit. `0` blocks printing. Orgs the root token creates (`POST /orgs`) are untouched, and a [billing](billing.md) plan still overrides it per org. Not an integer stops the server at startup. With `PRINTAPI_SIGNUP=open` and no quota, startup prints a warning |
+| `PRINTAPI_JOB_RETENTION_DAYS` | *(unset or `0`: keep for ever)* | Positive integer N: see [Retention](#retention). Not a positive integer stops the server at startup. With `PRINTAPI_SIGNUP=open` and no retention, startup prints a warning |
+| `PRINTAPI_TERMS_VERSION` | *(unset: no consent asked)* | A non-empty version string, e.g. `2026-11-13`. Set: `POST /signup` must carry `accept_terms` equal to it, `GET /health` reports it with the links below, and the dashboard's sign-up form shows a checkbox for the terms and the data processing agreement. Each acceptance (org, user, version, time) is stored in the `terms_acceptances` table. See [Self-signup](api.md#self-signup). With `PRINTAPI_SIGNUP=open` and no version, startup prints a warning |
+| `PRINTAPI_TERMS_URL` | *(required with the version)* | `http(s)` link to the terms. Anything else, or a version without it, stops the server at startup |
+| `PRINTAPI_DPA_URL`, `PRINTAPI_PRIVACY_URL` | *(unset)* | Optional `http(s)` links to the data processing agreement and the privacy policy, shown next to the checkbox. Anything else stops the server at startup |
 | `PRINTAPI_PRIVATE_URLS` | `deny` with open signup, else `allow` | `deny`: payload URLs (`*_uri`, `*_uri_post`), job `callback_url`s and org `event_url`s may only reach public addresses — no loopback, LAN, link-local/cloud-metadata or other private ranges, checked after DNS on every redirect hop. `allow`: anywhere (a self-hosted box fetching PDFs from an internal service). Set `deny` whenever people you do not trust get keys |
+| `PRINTAPI_TRUSTED_PROXIES` | *(unset: nobody)* | Comma-separated IPs or CIDRs (IPv4 and IPv6, e.g. `127.0.0.1,::1` or the one pinned proxy address `172.30.0.2` of the Compose example; list nothing wider) of the reverse proxies in front of printpapi. Only a request whose socket peer is listed has its `X-Forwarded-For` read: the rightmost entry that is not itself listed is the client, which the signup throttle (IPv6 per /64) and the `LOG_REQUESTS` line then use. Unset, the socket peer is the client, so behind a proxy every signup shares one throttle slot. An invalid entry stops the server at startup. See [Behind a reverse proxy](#behind-a-reverse-proxy) |
 | `PRINTAPI_OPEN_ENROLLMENT` | *(off)* | `1`: any Bearer value enrolls a new agent into the default org (the v2 rule). Off: a new agent needs an issued key or the root token |
 
 ```bash
@@ -174,6 +180,32 @@ SQLite in WAL mode with an atomic claim. A visibility-timeout reaper requeues jo
 went silent and fails them after a bounded number of retries. Reaper errors are logged to
 stderr.
 
+### Retention
+
+A job holds its payload (labels, packing slips, addresses) until you say otherwise. With
+`PRINTAPI_JOB_RETENTION_DAYS=N` the reaper runs, at most once an hour:
+
+- a job still `queued` after N days (its agent never came back) and without an `expire_after`
+  deadline is failed with `error: "retention"` and loses payload and title. Its callback URL stays, so
+  the client's outcome webhook still fires (the next step drops it N days later). A job with a
+  deadline waits for it and is failed as `expired`;
+- a `done`, `failed` or `cancelled` job finished more than N days ago loses its payload, title and
+  callback URL. Its row (state, printer, times) stays;
+- of those, the rows created before the current UTC month and finished more than `max(N, 7)` days
+  ago are deleted. The current month's rows stay, because the [monthly quota](api.md#quotas) counts
+  them: deleting them would hand quota back. The 7 day floor keeps the row, and with it the
+  idempotency key, long enough for a webhook redelivery (Shopify retries for 48 h).
+
+`claimed` jobs are never touched. The server always opens SQLite with `secure_delete=ON`, so freed
+pages are zeroed instead of keeping the old bytes (this also covers deleting an org), and after a
+pass that changed rows, and after deleting an org, it truncates the WAL (`PRAGMA wal_checkpoint(TRUNCATE)`),
+so cleared payloads do not stay in `printpapi.db-wal`. A long-running read can block that truncate;
+the server then logs one line and does not wait. The retention pass tries again on its next run; a
+deleted org's frames stay in the WAL until the next truncate or checkpoint. Data freed by an earlier version is not overwritten: to erase it,
+stop the server and run `VACUUM` once (for example `sqlite3 printpapi.db VACUUM`). The server never
+does that by itself. **Backups keep what they copied** until you rotate them out: set your backup
+retention to match.
+
 ## Security
 
 Enforced at every trust boundary: bearer auth on every endpoint, constant-time token compare,
@@ -194,3 +226,55 @@ A key in a URL ends up in access logs and proxy history — prefer the printer's
 
 The server speaks plain HTTP — put your own reverse proxy / TLS in front for anything beyond
 the LAN. Vulnerability reports: see [SECURITY.md](../SECURITY.md).
+
+### Behind a reverse proxy
+
+Behind a proxy every request comes from the proxy's address, so the signup throttle would see one
+client. Set `PRINTAPI_TRUSTED_PROXIES` to the proxy's address and printpapi reads the real client
+from `X-Forwarded-For`. List **only** the proxy: a request from any other peer keeps its socket
+address, whatever header it sends. Caddy's `reverse_proxy` replaces an incoming
+`X-Forwarded-For` from an untrusted client with its own, so it needs no extra configuration
+([Caddy docs](https://caddyserver.com/docs/caddyfile/directives/reverse_proxy#headers)).
+
+With Docker Compose the peer printpapi sees is Caddy's container address, which moves unless it
+is pinned. Put both on one user-defined network with a fixed subnet, give Caddy a fixed
+`ipv4_address` and trust exactly that address, not the whole bridge range. The `ip_range` keeps
+Docker's dynamic addresses (printpapi's own) out of the lower half of the subnet, so printpapi can
+never be handed Caddy's fixed address. Publish **no port for
+printpapi**, only Caddy's 80 and 443: a published printpapi port plus a trusted bridge range would
+let a direct caller's header be believed.
+
+```yaml
+services:
+  printpapi:
+    image: ghcr.io/lukiprince/printpapi:latest
+    environment:
+      PRINTAPI_TOKEN: change-me
+      PRINTAPI_SIGNUP: open
+      PRINT_DB: /app/data/printpapi.db
+      PRINTAPI_TRUSTED_PROXIES: 172.30.0.2   # Caddy's address below, nothing wider
+    volumes: [printpapi-data:/app/data]
+    networks: [edge]                         # no `ports:` for printpapi
+  caddy:
+    image: caddy:2
+    ports: ["80:80", "443:443"]
+    volumes: [./Caddyfile:/etc/caddy/Caddyfile:ro, caddy-data:/data]
+    networks:
+      edge:
+        ipv4_address: 172.30.0.2
+networks:
+  edge:
+    ipam:
+      config:
+        - subnet: 172.30.0.0/24
+          ip_range: 172.30.0.128/25            # dynamic pool: never hands out 172.30.0.2
+volumes:
+  printpapi-data:
+  caddy-data:
+```
+
+```
+print.example.com {
+    reverse_proxy printpapi:3460
+}
+```

@@ -370,6 +370,11 @@ CREATE TABLE IF NOT EXISTS printers(
 CREATE TABLE IF NOT EXISTS label_templates(
   id INTEGER PRIMARY KEY, org_id INTEGER NOT NULL, name TEXT NOT NULL, spec TEXT NOT NULL,
   created_at REAL NOT NULL, updated_at REAL NOT NULL, UNIQUE(org_id, name));
+-- Which terms version a signup accepted, and when. Additive, like label_templates: a table of its
+-- own, so the Python-era tables keep their shape. History: a later version adds a row.
+CREATE TABLE IF NOT EXISTS terms_acceptances(
+  id INTEGER PRIMARY KEY, org_id INTEGER NOT NULL, user_id INTEGER NOT NULL,
+  version TEXT NOT NULL, accepted_at REAL NOT NULL);
 CREATE TABLE IF NOT EXISTS jobs(
   id INTEGER PRIMARY KEY AUTOINCREMENT, org_id INTEGER NOT NULL, user_id INTEGER NOT NULL,
   printer_id INTEGER NOT NULL, agent_id INTEGER NOT NULL, type TEXT NOT NULL, mode TEXT NOT NULL,
@@ -416,6 +421,8 @@ CREATE INDEX IF NOT EXISTS jobs_state_claimed ON jobs(state, claimed_at);
 CREATE INDEX IF NOT EXISTS jobs_hooks ON jobs(id)
   WHERE callback_url IS NOT NULL AND hook_delivered_at IS NULL;
 CREATE INDEX IF NOT EXISTS agents_org ON agents(org_id);
+-- the retention scan (`purge_jobs`) looks at terminal jobs by age
+CREATE INDEX IF NOT EXISTS jobs_state_finished ON jobs(state, finished_at);
 ";
 
 /// The oldest queued job of one agent that has not passed its deadline (`?1` agent, `?2` now).
@@ -436,6 +443,8 @@ const USAGE_SQL: &str = "SELECT COUNT(*) FROM jobs WHERE org_id=?1 AND created_a
 /// partial index `jobs_hooks` holds only the handful of undelivered rows and prefers a state scan.
 const HOOKS_SQL: &str = "SELECT id, callback_url, state, error, title, printer_id FROM jobs INDEXED BY jobs_hooks WHERE callback_url IS NOT NULL AND hook_delivered_at IS NULL AND hook_attempts < ?1 AND state IN ('done','failed','cancelled') ORDER BY id";
 
+const BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(5000);
+
 /// Open the DB: WAL journal, 5 s busy timeout (the Python sqlite3 default).
 ///
 /// `synchronous` stays at its default (FULL) on purpose: with WAL, NORMAL could lose the last
@@ -443,7 +452,7 @@ const HOOKS_SQL: &str = "SELECT id, callback_url, state, error, title, printer_i
 /// Foreign keys stay off, as in the Python server (the schema declares none).
 pub fn connect(path: &str) -> Result<Connection> {
     let conn = Connection::open(path)?;
-    conn.busy_timeout(std::time::Duration::from_millis(5000))?;
+    conn.busy_timeout(BUSY_TIMEOUT)?;
     conn.pragma_update(None, "foreign_keys", false)?;
     // The pragma answers with the resulting mode ("memory" for :memory:), so it is a query.
     conn.query_row("PRAGMA journal_mode=WAL", [], |r| r.get::<_, String>(0))?;
@@ -451,6 +460,11 @@ pub fn connect(path: &str) -> Result<Connection> {
     // known value to return to: a job state that is not on disk after a power cut is a lost or a
     // reprinted label.
     conn.pragma_update(None, "synchronous", "FULL")?;
+    // Freed pages are zeroed, so a scrubbed job or a deleted org (`delete_org`) leaves no bytes in
+    // the main file. The WAL may still hold the old frames until `truncate_wal` gets through
+    // (retention and org deletion both try it; a reader can block it, then it is retried or left
+    // to the next checkpoint). Per connection, hence set here for all of them.
+    conn.pragma_update(None, "secure_delete", true)?;
     Ok(conn)
 }
 
@@ -664,6 +678,46 @@ pub fn set_org_plan(
     Ok(n == 1)
 }
 
+/// Shrink the WAL to nothing so bytes cleared by a scrub or a delete do not linger in `-wal`.
+/// True when it completed, false when a reader blocked it (SQLite reports that as a row with
+/// busy=1, not as an error). It runs without the usual 5 s busy wait, which would hold the only
+/// connection while every request queues behind it; the caller retries later. The normal timeout
+/// is restored before returning, also on error.
+pub fn truncate_wal(conn: &Connection) -> Result<bool> {
+    conn.busy_timeout(std::time::Duration::ZERO)?;
+    let r = conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |r| {
+        r.get::<_, i64>(0)
+    });
+    conn.busy_timeout(BUSY_TIMEOUT)?;
+    match r {
+        Ok(busy) => Ok(busy == 0),
+        Err(rusqlite::Error::SqliteFailure(e, _))
+            if e.code == rusqlite::ErrorCode::DatabaseBusy =>
+        {
+            Ok(false)
+        }
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// `truncate_wal` for callers that must not fail because of it: an error or a busy WAL is one
+/// stderr line, and the result says whether it completed.
+pub fn truncate_wal_logged(conn: &Connection, what: &str) -> bool {
+    match truncate_wal(conn) {
+        Ok(true) => true,
+        Ok(false) => {
+            eprintln!(
+                "{what}: wal truncate blocked by a reader, bytes stay in -wal until the next try"
+            );
+            false
+        }
+        Err(e) => {
+            eprintln!("{what}: wal truncate failed: {e}");
+            false
+        }
+    }
+}
+
 /// Remove an org and everything that belongs to it — jobs, printers, agents, keys, accounts and
 /// their sessions. False if there is no such org.
 ///
@@ -695,6 +749,7 @@ pub fn delete_org(conn: &Connection, org_id: i64) -> Result<bool> {
         "api_keys",
         "users",
         "label_templates",
+        "terms_acceptances",
     ] {
         tx.execute(&format!("DELETE FROM {table} WHERE org_id=?"), [org_id])?;
     }
@@ -987,18 +1042,22 @@ pub fn create_user(
 
 /// Self-serve: a new org and its first user in one transaction. Err(Conflict) if the e-mail is
 /// taken — the rollback takes the half-made org with it, so a failed signup leaves nothing behind.
+/// `job_quota` is the monthly cap the org starts with (None: unlimited). `terms_version` is the
+/// terms version the user accepted (None: consent is not required), recorded in the same transaction.
 pub fn signup(
     conn: &Connection,
     org_name: &str,
     email: &str,
     password_hash: &str,
+    job_quota: Option<i64>,
+    terms_version: Option<&str>,
 ) -> Result<Signup> {
     let now = crate::now();
     let addr = normalize_email(email);
     let tx = begin(conn)?;
     tx.execute(
-        "INSERT INTO orgs(name, created_at) VALUES(?,?)",
-        params![org_name, now],
+        "INSERT INTO orgs(name, job_quota, created_at) VALUES(?,?,?)",
+        params![org_name, job_quota, now],
     )?;
     let org_id = tx.last_insert_rowid();
     tx.execute(
@@ -1006,6 +1065,12 @@ pub fn signup(
         params![org_id, addr, addr, password_hash, now],
     )?;
     let user_id = tx.last_insert_rowid();
+    if let Some(version) = terms_version {
+        tx.execute(
+            "INSERT INTO terms_acceptances(org_id, user_id, version, accepted_at) VALUES(?,?,?,?)",
+            params![org_id, user_id, version, now],
+        )?;
+    }
     tx.commit()?;
     Ok(Signup { org_id, user_id })
 }
@@ -1486,6 +1551,65 @@ pub fn expire_jobs(conn: &Connection, now: Option<f64>) -> Result<usize> {
     )?;
     tx.commit()?;
     Ok(n)
+}
+
+/// What one `purge_jobs` pass did.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct Purged {
+    /// Queued jobs older than the retention that never ran and had no deadline: failed
+    /// (`error='retention'`) and cleared; the callback stays so the client hears the outcome.
+    pub abandoned: usize,
+    /// Terminal jobs whose payload, title and callback were cleared.
+    pub scrubbed: usize,
+    /// Terminal rows from before this month that were deleted.
+    pub deleted: usize,
+    /// The WAL truncate after the pass was blocked by a reader; the caller retries it.
+    pub wal_busy: bool,
+}
+
+/// The least age, in days, a terminal row must reach before `purge_jobs` deletes it, whatever
+/// N is: the row holds the idempotency key, and a webhook redelivery must still find it.
+/// ponytail: 7 days outlasts Shopify's 48 h redelivery window (docs/ecommerce.md) with margin; a
+/// per-integration window would need a setting, so raise this constant if a sender retries longer.
+const MIN_ROW_KEEP_DAYS: i64 = 7;
+
+/// Job retention (PRINTAPI_JOB_RETENTION_DAYS), two clocks: (1) fail and clear `queued` jobs older
+/// than `days` that have no `expires_at` (`expire_jobs` never ends them, and an abandoned trial
+/// would keep its payloads for ever; jobs with a deadline wait for it), keeping the callback so the
+/// outcome webhook fires; (2) scrub terminal jobs finished more than `days` ago (payload, title,
+/// callback); (3) delete those older than `max(days, 7)` that were also created before this UTC
+/// month. The current month's rows stay because the quota counts `jobs` rows (`USAGE_SQL`); the
+/// 7 day floor keeps the idempotency key for webhook redeliveries. `claimed` jobs are never
+/// touched. After a pass that changed rows the WAL is truncated, so cleared bytes do not linger
+/// in `-wal`; a failed checkpoint is logged, never an error.
+/// ponytail: one pass, three statements, no batching: fine for a beta; chunk the DELETE if a pass
+/// ever holds the lock for noticeable time.
+pub fn purge_jobs(conn: &Connection, days: i64, now: Option<f64>) -> Result<Purged> {
+    let now = now.unwrap_or_else(crate::now);
+    let cutoff = now - days as f64 * 86_400.0;
+    let delete_cutoff = now - days.max(MIN_ROW_KEEP_DAYS) as f64 * 86_400.0;
+    let tx = begin(conn)?;
+    let abandoned = tx.execute(
+        "UPDATE jobs SET state='failed', error='retention', finished_at=:now, payload=x'', title=NULL          WHERE state='queued' AND expires_at IS NULL AND created_at < :cutoff",
+        named_params! {":now": now, ":cutoff": cutoff},
+    )?;
+    let scrubbed = tx.execute(
+        "UPDATE jobs SET payload=x'', title=NULL, callback_url=NULL          WHERE state IN ('done','failed','cancelled') AND COALESCE(finished_at, created_at) < :cutoff          AND (length(payload) > 0 OR title IS NOT NULL OR callback_url IS NOT NULL)",
+        named_params! {":cutoff": cutoff},
+    )?;
+    let deleted = tx.execute(
+        "DELETE FROM jobs          WHERE state IN ('done','failed','cancelled') AND COALESCE(finished_at, created_at) < :cutoff          AND created_at < :month",
+        named_params! {":cutoff": delete_cutoff, ":month": month_start(now)},
+    )?;
+    tx.commit()?;
+    // SQLite reuses the WAL without shrinking it, so cleared payload bytes would stay in it.
+    let wal_busy = abandoned + scrubbed + deleted > 0 && !truncate_wal_logged(conn, "retention");
+    Ok(Purged {
+        abandoned,
+        scrubbed,
+        deleted,
+        wal_busy,
+    })
 }
 
 /// Cancel a job while it is still 'queued' (before any agent claims it).
@@ -3043,6 +3167,249 @@ mod tests {
         ); // untouched
     }
 
+    const DAY: f64 = 86_400.0;
+
+    /// A job in `state`, created `created_days` ago and (when terminal) finished `finished_days`
+    /// ago, holding a payload, a title and a callback.
+    fn aged(
+        conn: &Connection,
+        pid: i64,
+        state: &str,
+        created_days: f64,
+        finished_days: Option<f64>,
+        now: f64,
+    ) -> i64 {
+        let jid = enq_with(conn, pid, b"label bytes", |j| {
+            j.title = Some("T".into());
+            j.callback_url = Some("https://hook.test/x".into());
+        });
+        conn.execute(
+            "UPDATE jobs SET state=?, created_at=?, finished_at=? WHERE id=?",
+            params![
+                state,
+                now - created_days * DAY,
+                finished_days.map(|d| now - d * DAY),
+                jid
+            ],
+        )
+        .unwrap();
+        jid
+    }
+
+    fn held(conn: &Connection, jid: i64) -> (i64, Option<String>, Option<String>) {
+        conn.query_row(
+            "SELECT length(payload), title, callback_url FROM jobs WHERE id=?",
+            [jid],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn retention_scrubs_old_terminal_jobs_and_only_those() {
+        let conn = db();
+        let pid = id_of(&reg(&conn, "a", "k", &[("Z", false)]), "Z");
+        // mid-month, so "ten days ago" is still this month and nothing is deleted
+        let now = month_start(crate::now()) + 25.0 * DAY;
+        let old = aged(&conn, pid, "done", 11.0, Some(10.5), now);
+        let young = aged(&conn, pid, "done", 5.0, Some(4.0), now);
+        let claimed = aged(&conn, pid, "claimed", 20.0, None, now);
+        let queued = aged(&conn, pid, "queued", 5.0, None, now);
+        let no_finish = aged(&conn, pid, "cancelled", 12.0, None, now); // falls back to created_at
+        let p = purge_jobs(&conn, 7, Some(now)).unwrap();
+        assert_eq!((p.abandoned, p.scrubbed, p.deleted), (0, 2, 0));
+        assert_eq!(held(&conn, old), (0, None, None));
+        assert_eq!(held(&conn, no_finish), (0, None, None));
+        assert_eq!(
+            held(&conn, young),
+            (11, Some("T".into()), Some("https://hook.test/x".into()))
+        );
+        assert_eq!(held(&conn, claimed).0, 11); // never touched, however old
+        assert_eq!(held(&conn, queued).0, 11);
+        // the row and its state survive a scrub
+        assert_eq!(get_job(&conn, old, None).unwrap().unwrap().state, "done");
+        // a second run right after finds nothing to do
+        assert_eq!(purge_jobs(&conn, 7, Some(now)).unwrap(), Purged::default());
+    }
+
+    #[test]
+    fn retention_fails_and_scrubs_an_abandoned_queued_job() {
+        let conn = db();
+        let pid = id_of(&reg(&conn, "a", "k", &[("Z", false)]), "Z");
+        let now = month_start(crate::now()) + 25.0 * DAY;
+        let abandoned = aged(&conn, pid, "queued", 8.0, None, now);
+        let fresh = aged(&conn, pid, "queued", 6.0, None, now);
+        let p = purge_jobs(&conn, 7, Some(now)).unwrap();
+        assert_eq!((p.abandoned, p.scrubbed, p.deleted), (1, 0, 0));
+        let job = get_job(&conn, abandoned, None).unwrap().unwrap();
+        assert!(job.state == "failed" && job.error.as_deref() == Some("retention"));
+        // the callback stays so the client hears the outcome; the scrub drops it N days later
+        assert_eq!(
+            held(&conn, abandoned),
+            (0, None, Some("https://hook.test/x".into()))
+        );
+        assert_eq!(
+            get_job(&conn, fresh, None).unwrap().unwrap().state,
+            "queued"
+        );
+        assert_eq!(held(&conn, fresh).0, 11);
+    }
+
+    #[test]
+    fn retention_deletes_only_rows_from_before_this_month_and_keeps_usage() {
+        let conn = db();
+        let pid = id_of(&reg(&conn, "a", "k", &[("Z", false)]), "Z");
+        let now = month_start(crate::now()) + 25.0 * DAY;
+        let last_month = aged(&conn, pid, "done", 40.0, Some(39.0), now);
+        let this_month_old = aged(&conn, pid, "failed", 20.0, Some(19.0), now);
+        let last_month_claimed = aged(&conn, pid, "claimed", 40.0, None, now);
+        let usage = org_usage(&conn, DEFAULT_ORG, Some(month_start(now))).unwrap();
+        let p = purge_jobs(&conn, 7, Some(now)).unwrap();
+        assert_eq!(p.deleted, 1);
+        assert!(get_job(&conn, last_month, None).unwrap().is_none());
+        assert!(get_job(&conn, this_month_old, None).unwrap().is_some()); // quota still counts it
+        assert!(get_job(&conn, last_month_claimed, None).unwrap().is_some());
+        assert_eq!(held(&conn, this_month_old).0, 0); // but its content is gone
+        assert_eq!(
+            org_usage(&conn, DEFAULT_ORG, Some(month_start(now))).unwrap(),
+            usage
+        );
+        assert_eq!(purge_jobs(&conn, 7, Some(now)).unwrap(), Purged::default());
+    }
+
+    #[test]
+    fn retention_scan_has_an_index() {
+        let conn = db();
+        let on: i64 = q(
+            &conn,
+            "SELECT count(*) FROM sqlite_master WHERE name='jobs_state_finished'",
+            [],
+        );
+        assert_eq!(on, 1);
+    }
+
+    #[test]
+    fn every_connection_has_secure_delete_on() {
+        assert_eq!(q::<i64>(&db(), "PRAGMA secure_delete", []), 1);
+    }
+
+    #[test]
+    fn an_abandoned_job_keeps_its_callback_until_the_scrub_and_the_hook_still_fires() {
+        let conn = db();
+        let pid = id_of(&reg(&conn, "a", "k", &[("Z", false)]), "Z");
+        let now = month_start(crate::now()) + 10.0 * DAY; // the row is kept: this month
+        let jid = aged(&conn, pid, "queued", 8.0, None, now);
+        purge_jobs(&conn, 7, Some(now)).unwrap();
+        let hooks = pending_webhooks(&conn, 5).unwrap();
+        assert_eq!(hooks.len(), 1);
+        assert_eq!(hooks[0].job_id, jid);
+        assert_eq!(hooks[0].error.as_deref(), Some("retention"));
+        // N days after it was failed, the normal scrub removes the callback
+        purge_jobs(&conn, 7, Some(now + 8.0 * DAY)).unwrap();
+        assert_eq!(held(&conn, jid), (0, None, None));
+    }
+
+    #[test]
+    fn a_queued_job_with_a_deadline_waits_for_it_not_for_retention() {
+        let conn = db();
+        let pid = id_of(&reg(&conn, "a", "k", &[("Z", false)]), "Z");
+        let now = month_start(crate::now()) + 25.0 * DAY;
+        let jid = aged(&conn, pid, "queued", 20.0, None, now);
+        conn.execute(
+            "UPDATE jobs SET expires_at=? WHERE id=?",
+            params![now + 10.0 * DAY, jid],
+        )
+        .unwrap();
+        assert_eq!(purge_jobs(&conn, 7, Some(now)).unwrap(), Purged::default());
+        assert_eq!(state_of(&conn, jid), "queued");
+        assert_eq!(held(&conn, jid).0, 11);
+    }
+
+    #[test]
+    fn an_idempotency_key_outlives_the_scrub_and_a_redelivery_does_not_reprint() {
+        let conn = db();
+        let pid = id_of(&reg(&conn, "a", "k", &[("Z", false)]), "Z");
+        // early in the month: a job two days old is from the previous month
+        let now = month_start(crate::now()) + DAY;
+        let key = |j: &mut NewJob<'_>| j.idempotency_key = Some("order-9".into());
+        let jid = enq_with(&conn, pid, b"label", key);
+        conn.execute(
+            "UPDATE jobs SET state='done', created_at=?1, finished_at=?1 WHERE id=?2",
+            params![now - 2.0 * DAY, jid],
+        )
+        .unwrap();
+        let p = purge_jobs(&conn, 1, Some(now)).unwrap();
+        assert_eq!((p.scrubbed, p.deleted), (1, 0)); // scrubbed at N, kept for the redelivery window
+        let again = try_enq(&conn, &json!(pid), b"label", key).unwrap();
+        assert!(!again.created);
+        assert_eq!(again.job_id, jid);
+        // past the 7 day floor the row goes
+        conn.execute(
+            "UPDATE jobs SET created_at=?1, finished_at=?1 WHERE id=?2",
+            params![now - 8.0 * DAY, jid],
+        )
+        .unwrap();
+        assert_eq!(purge_jobs(&conn, 1, Some(now)).unwrap().deleted, 1);
+    }
+
+    #[test]
+    fn a_purge_leaves_no_payload_bytes_in_the_db_or_the_wal() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("p.db");
+        let conn = connect(path.to_str().unwrap()).unwrap();
+        init_db(&conn).unwrap();
+        let pid = id_of(&reg(&conn, "a", "k", &[("Z", false)]), "Z");
+        let marker = b"UNIQUE-MARKER-9f3a71c2;";
+        let payload = marker.repeat(150_000); // a few MB
+        let jid = enq(&conn, pid, &payload);
+        let now = crate::now();
+        conn.execute(
+            "UPDATE jobs SET state='done', finished_at=? WHERE id=?",
+            params![now - 10.0 * DAY, jid],
+        )
+        .unwrap();
+        assert_eq!(purge_jobs(&conn, 7, Some(now)).unwrap().scrubbed, 1);
+        let has = |p: &std::path::Path| {
+            std::fs::read(p)
+                .map(|b| b.windows(marker.len()).any(|w| w == marker))
+                .unwrap_or(false)
+        };
+        assert!(!has(&path), "payload left in the db file");
+        assert!(
+            !has(&dir.path().join("p.db-wal")),
+            "payload left in the WAL"
+        );
+    }
+
+    #[test]
+    fn truncate_wal_reports_a_reader_instead_of_waiting_for_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("w.db");
+        let conn = connect(path.to_str().unwrap()).unwrap();
+        init_db(&conn).unwrap();
+        conn.execute("CREATE TABLE IF NOT EXISTS t (x)", [])
+            .unwrap();
+        let reader = connect(path.to_str().unwrap()).unwrap();
+        reader
+            .execute_batch("BEGIN; SELECT count(*) FROM t;")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (1)", []).unwrap(); // frames the reader pins
+        let t = std::time::Instant::now();
+        assert!(
+            !truncate_wal(&conn).unwrap(),
+            "a reader blocks the truncate"
+        );
+        assert!(
+            t.elapsed() < std::time::Duration::from_millis(2000),
+            "{:?}",
+            t.elapsed()
+        );
+        // the normal timeout is back afterwards
+        assert_eq!(q::<i64>(&conn, "PRAGMA busy_timeout", []), 5000);
+        reader.execute_batch("COMMIT").unwrap();
+        assert!(truncate_wal(&conn).unwrap());
+    }
+
     #[test]
     fn a_job_inside_its_window_still_prints() {
         let conn = db();
@@ -3264,7 +3631,16 @@ mod tests {
     #[test]
     fn signup_creates_an_org_and_its_first_user_in_one_transaction() {
         let conn = db();
-        let r = signup(&conn, "Shop GmbH", "Owner@Shop.test", "scrypt$x").unwrap();
+        let r = signup(
+            &conn,
+            "Shop GmbH",
+            "Owner@Shop.test",
+            "scrypt$x",
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(get_org(&conn, r.org_id).unwrap().unwrap().job_quota, None);
         assert!(r.org_id != DEFAULT_ORG && r.user_id != DEFAULT_USER);
         assert_eq!(get_org(&conn, r.org_id).unwrap().unwrap().name, "Shop GmbH");
         let u = get_user_by_email(&conn, "owner@shop.test")
@@ -3274,12 +3650,72 @@ mod tests {
     }
 
     #[test]
+    fn signup_writes_the_default_quota_onto_the_new_org() {
+        let conn = db();
+        let r = signup(&conn, "Shop", "a@shop.test", "h", Some(25), None).unwrap();
+        assert_eq!(
+            get_org(&conn, r.org_id).unwrap().unwrap().job_quota,
+            Some(25)
+        );
+        let r = signup(&conn, "Zero", "b@shop.test", "h", Some(0), None).unwrap();
+        assert_eq!(
+            get_org(&conn, r.org_id).unwrap().unwrap().job_quota,
+            Some(0)
+        );
+        // the default org is not touched
+        assert_eq!(
+            get_org(&conn, DEFAULT_ORG).unwrap().unwrap().job_quota,
+            None
+        );
+    }
+
+    #[test]
+    fn signup_records_the_accepted_terms_version_with_org_and_user() {
+        let conn = db();
+        let r = signup(&conn, "Shop", "a@shop.test", "h", None, Some("2026-11-13")).unwrap();
+        let (org, user, version, at): (i64, i64, String, f64) = conn
+            .query_row(
+                "SELECT org_id, user_id, version, accepted_at FROM terms_acceptances",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            (org, user, version.as_str()),
+            (r.org_id, r.user_id, "2026-11-13")
+        );
+        assert!(at > 1.0e9);
+        // no terms configured: no row
+        signup(&conn, "Other", "b@shop.test", "h", None, None).unwrap();
+        assert_eq!(
+            q::<i64>(&conn, "SELECT COUNT(*) FROM terms_acceptances", []),
+            1
+        );
+    }
+
+    #[test]
+    fn a_failed_signup_leaves_no_terms_row_and_delete_org_removes_them() {
+        let conn = db();
+        let r = signup(&conn, "First", "o@shop.test", "h", None, Some("v1")).unwrap();
+        assert!(signup(&conn, "Second", "O@shop.test", "h", None, Some("v1")).is_err());
+        assert_eq!(
+            q::<i64>(&conn, "SELECT COUNT(*) FROM terms_acceptances", []),
+            1
+        );
+        assert!(delete_org(&conn, r.org_id).unwrap());
+        assert_eq!(
+            q::<i64>(&conn, "SELECT COUNT(*) FROM terms_acceptances", []),
+            0
+        );
+    }
+
+    #[test]
     fn signup_with_a_taken_email_leaves_no_orphan_org() {
         let conn = db();
-        signup(&conn, "First", "owner@shop.test", "h").unwrap();
+        signup(&conn, "First", "owner@shop.test", "h", None, None).unwrap();
         let before = list_orgs(&conn).unwrap().len();
         assert!(matches!(
-            signup(&conn, "Second", "Owner@shop.TEST", "h"),
+            signup(&conn, "Second", "Owner@shop.TEST", "h", Some(3), None),
             Err(StoreError::Conflict)
         ));
         assert_eq!(list_orgs(&conn).unwrap().len(), before); // the org went back with the failed user

@@ -2,10 +2,16 @@
 //! `printpapi` — the server binary. Configured from the environment exactly like the Python
 //! server: PRINTAPI_TOKEN (required, non-empty), PRINT_DB (default printpapi.db), PRINT_PORT
 //! (default 3460), PRINTAPI_SIGNUP, PUBLIC_URL, PRINTAPI_PLANS (JSON array or a path to a file
-//! holding one), PRINTAPI_BILLING_SECRET, LOG_REQUESTS, SMTP_*.
+//! holding one), PRINTAPI_BILLING_SECRET, PRINTAPI_TRUSTED_PROXIES (IPs or CIDRs whose
+//! `X-Forwarded-For` is believed), PRINTAPI_SIGNUP_QUOTA (monthly job quota of every self-signup
+//! org), PRINTAPI_JOB_RETENTION_DAYS (days until finished jobs lose payload, title and
+//! callback, and until queued jobs without a deadline are failed; their row goes after
+//! max(N, 7) days if it is from before this UTC month; unset or 0 keeps everything), PRINTAPI_TERMS_VERSION (set: `POST /signup`
+//! must accept that version of the terms), PRINTAPI_TERMS_URL (required with it), PRINTAPI_DPA_URL,
+//! PRINTAPI_PRIVACY_URL (optional links, http(s) only), LOG_REQUESTS, SMTP_*.
 use printpapi_server::dispatch::{Destinations, HttpFetcher, OUTBOUND_IN_FLIGHT};
 use printpapi_server::mail::{self, SmtpMailer};
-use printpapi_server::server::{AppState, Config};
+use printpapi_server::server::{AppState, Config, Terms};
 use printpapi_server::store::Db;
 use printpapi_server::{billing, http};
 use std::sync::Arc;
@@ -18,6 +24,104 @@ fn env(key: &str) -> Option<String> {
 /// Python `str.strip()`: Unicode whitespace plus U+001C..U+001F.
 fn py_strip(s: &str) -> &str {
     s.trim_matches(|c: char| c.is_whitespace() || ('\u{1c}'..='\u{1f}').contains(&c))
+}
+
+/// Empty: no quota. Otherwise a non-negative integer (0 is a real quota: nothing may be printed).
+fn parse_quota(raw: &str) -> Result<Option<i64>, String> {
+    let t = py_strip(raw);
+    if t.is_empty() {
+        return Ok(None);
+    }
+    match t.parse::<i64>() {
+        Ok(n) if n >= 0 => Ok(Some(n)),
+        _ => Err(format!("must be a non-negative integer, not {t:?}")),
+    }
+}
+
+/// Empty or 0: keep for ever. Otherwise a positive number of days.
+fn parse_retention(raw: &str) -> Result<Option<i64>, String> {
+    let t = py_strip(raw);
+    if t.is_empty() {
+        return Ok(None);
+    }
+    match t.parse::<i64>() {
+        Ok(0) => Ok(None),
+        Ok(n) if n > 0 => Ok(Some(n)),
+        _ => Err(format!("must be a positive integer, not {t:?}")),
+    }
+}
+
+/// The one link rule (`web/lib/terms.ts` `isHttpUrl` is its twin): `http://` or `https://`, any
+/// case, then a non-empty host. Printable ASCII only (0x21..=0x7E): Rust's whitespace and JS's
+/// `\s` disagree on U+0085 and U+FEFF, so neither is asked.
+fn is_terms_url(u: &str) -> bool {
+    if !u.bytes().all(|b| (0x21..=0x7E).contains(&b)) {
+        return false;
+    }
+    let lower = u.to_ascii_lowercase();
+    let Some(rest) = lower
+        .strip_prefix("https://")
+        .or_else(|| lower.strip_prefix("http://"))
+    else {
+        return false;
+    };
+    !rest.split(['/', '?', '#']).next().unwrap_or("").is_empty()
+}
+
+/// The terms a signup must accept. A version needs a terms URL. Every link that is set must be
+/// an absolute `http(s)` URL with a host, version or not.
+fn parse_terms(
+    version: &str,
+    terms_url: &str,
+    dpa_url: &str,
+    privacy_url: &str,
+) -> Result<Option<Terms>, String> {
+    let version = py_strip(version);
+    let url = |name: &str, raw: &str| -> Result<Option<String>, String> {
+        let t = py_strip(raw);
+        if t.is_empty() {
+            Ok(None)
+        } else if is_terms_url(t) {
+            Ok(Some(t.to_string()))
+        } else {
+            Err(format!("{name} must be an http(s) URL, not {t:?}"))
+        }
+    };
+    let terms_url = url("PRINTAPI_TERMS_URL", terms_url)?;
+    let dpa_url = url("PRINTAPI_DPA_URL", dpa_url)?;
+    let privacy_url = url("PRINTAPI_PRIVACY_URL", privacy_url)?;
+    if version.is_empty() {
+        return Ok(None); // no consent required: the links are only checked, not used
+    }
+    let terms_url =
+        terms_url.ok_or("PRINTAPI_TERMS_URL is required with PRINTAPI_TERMS_VERSION")?;
+    Ok(Some(Terms {
+        version: version.to_string(),
+        terms_url,
+        dpa_url,
+        privacy_url,
+    }))
+}
+
+/// One stderr line per hosted-beta safeguard that is off while strangers can sign up.
+fn startup_warnings(cfg: &Config) -> Vec<&'static str> {
+    let mut out = Vec::new();
+    if cfg.signup_open && cfg.signup_quota.is_none() {
+        out.push(
+            "warning: PRINTAPI_SIGNUP=open without PRINTAPI_SIGNUP_QUOTA: new orgs can print without limit",
+        );
+    }
+    if cfg.signup_open && cfg.job_retention_days.is_none() {
+        out.push(
+            "warning: PRINTAPI_SIGNUP=open without PRINTAPI_JOB_RETENTION_DAYS: job payloads are kept for ever",
+        );
+    }
+    if cfg.signup_open && cfg.terms.is_none() {
+        out.push(
+            "warning: PRINTAPI_SIGNUP=open without PRINTAPI_TERMS_VERSION: signups do not accept any terms",
+        );
+    }
+    out
 }
 
 fn config() -> Result<(Config, String, u16), String> {
@@ -70,6 +174,22 @@ fn config() -> Result<(Config, String, u16), String> {
             ));
         }
     };
+    cfg.trusted_proxies = printpapi_server::proxy::TrustedProxies::parse(
+        &env("PRINTAPI_TRUSTED_PROXIES").unwrap_or_default(),
+    )
+    .map_err(|e| format!("PRINTAPI_TRUSTED_PROXIES: {e}"))?;
+    cfg.signup_quota = parse_quota(&env("PRINTAPI_SIGNUP_QUOTA").unwrap_or_default())
+        .map_err(|e| format!("PRINTAPI_SIGNUP_QUOTA: {e}"))?;
+    cfg.job_retention_days =
+        parse_retention(&env("PRINTAPI_JOB_RETENTION_DAYS").unwrap_or_default())
+            .map_err(|e| format!("PRINTAPI_JOB_RETENTION_DAYS: {e}"))?;
+
+    cfg.terms = parse_terms(
+        &env("PRINTAPI_TERMS_VERSION").unwrap_or_default(),
+        &env("PRINTAPI_TERMS_URL").unwrap_or_default(),
+        &env("PRINTAPI_DPA_URL").unwrap_or_default(),
+        &env("PRINTAPI_PRIVACY_URL").unwrap_or_default(),
+    )?;
     cfg.open_enrollment = env("PRINTAPI_OPEN_ENROLLMENT").is_some_and(|s| py_strip(&s) == "1");
     Ok((cfg, db_path, port))
 }
@@ -99,6 +219,9 @@ async fn shutdown_signal() {
 fn run() -> Result<(), String> {
     let (cfg, db_path, port) = config()?;
     let destinations = cfg.destinations;
+    for line in startup_warnings(&cfg) {
+        eprintln!("{line}");
+    }
     let db = Db::open(&db_path).map_err(|e| format!("cannot open database {db_path:?}: {e}"))?;
     let state = Arc::new(AppState::new(
         cfg,
@@ -150,5 +273,70 @@ fn main() {
     if let Err(msg) = run() {
         eprintln!("{msg}");
         std::process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod terms_tests {
+    use super::parse_terms;
+
+    #[test]
+    fn urls_need_scheme_slashes_and_a_host() {
+        for bad in [
+            "https:example.com/terms",
+            "http:/terms",
+            "https:",
+            "http:dpa.example",
+            "javascript:x",
+            "https://",
+            "https:///path",
+        ] {
+            assert!(parse_terms("v1", bad, "", "").is_err(), "terms {bad}");
+            assert!(
+                parse_terms("v1", "https://x.test/t", bad, "").is_err(),
+                "dpa {bad}"
+            );
+            assert!(
+                parse_terms("v1", "https://x.test/t", "", bad).is_err(),
+                "privacy {bad}"
+            );
+        }
+        let t = parse_terms("v1", "HTTPS://EXAMPLE.COM/t", "", "")
+            .unwrap()
+            .unwrap();
+        assert_eq!(t.terms_url, "HTTPS://EXAMPLE.COM/t");
+    }
+
+    #[test]
+    fn urls_are_printable_ascii_only() {
+        // U+FEFF is not whitespace to Rust but is to JS `\s`; U+0085 the other way round.
+        for bad in [
+            "https://x.test/t\u{feff}",
+            "https://x.test/\u{85}t",
+            "https://x.test/täglich",
+            "https://x.test/a b",
+            "https://x.test/\u{7f}",
+        ] {
+            assert!(parse_terms("v1", bad, "", "").is_err(), "{bad:?}");
+        }
+        assert!(parse_terms("v1", "https://x.test/a%20b?q=1#f", "", "").is_ok());
+    }
+
+    #[test]
+    fn urls_are_checked_even_without_a_version() {
+        assert!(parse_terms("", "https:example.com", "", "").is_err());
+        assert!(parse_terms("", "", "ftp://x/d", "").is_err());
+        assert!(parse_terms("", "", "", "/privacy").is_err());
+        assert!(parse_terms("", "", "", "").unwrap().is_none());
+        assert!(
+            parse_terms("", "https://x.test/t", "", "")
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn a_version_still_needs_a_terms_url() {
+        assert!(parse_terms("v1", "", "", "").is_err());
     }
 }

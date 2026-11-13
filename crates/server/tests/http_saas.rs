@@ -110,6 +110,25 @@ fn signup_rejects_a_taken_address_a_bad_address_and_a_short_password() {
 }
 
 #[test]
+fn a_bad_password_spends_no_signup_slot() {
+    let app = App::with(|c| c.signup_open = true);
+    for i in 0..10 {
+        let (code, _) = app.post(
+            "/signup",
+            None,
+            json!({"email": format!("s{i}@shop.test"), "password": "sixsix"}),
+        );
+        assert_eq!(code, 400, "attempt {i}");
+    }
+    let (code, _) = app.post(
+        "/signup",
+        None,
+        json!({"email": "ok@shop.test", "password": PW}),
+    );
+    assert_eq!(code, 200);
+}
+
+#[test]
 fn signup_is_throttled_per_client_so_one_host_cannot_spray_orgs() {
     let app = App::with(|c| {
         c.signup_open = true;
@@ -145,6 +164,51 @@ fn signup_is_throttled_per_client_so_one_host_cannot_spray_orgs() {
         .json(&json!({"email": "u4@shop.test", "password": PW}))
         .send();
     assert_eq!(r.status, 200);
+}
+
+#[test]
+fn concurrent_signups_from_one_address_cannot_exceed_the_window_cap() {
+    let app = App::with(|c| {
+        c.signup_open = true;
+        c.max_login_fails = 3;
+    });
+    let orgs = app.db.with(store::list_orgs).unwrap().len();
+    let ok = std::thread::scope(|s| {
+        let hs: Vec<_> = (0..30)
+            .map(|n| {
+                let app = &app;
+                s.spawn(move || {
+                    app.call("POST", "/signup")
+                        .json(&json!({"email": format!("c{n}@shop.test"), "password": PW}))
+                        .send()
+                        .status
+                })
+            })
+            .collect();
+        hs.into_iter()
+            .map(|h| h.join().unwrap())
+            .filter(|c| *c == 200)
+            .count()
+    });
+    assert_eq!(ok, 3);
+    assert_eq!(app.db.with(store::list_orgs).unwrap().len(), orgs + 3);
+}
+
+#[test]
+fn failed_logins_named_like_a_signup_slot_do_not_block_that_address() {
+    let app = App::with(|c| {
+        c.signup_open = true;
+        c.max_login_fails = 2;
+    });
+    for _ in 0..2 {
+        assert_eq!(app.login("signup:127.0.0.1", "wrong").0, 401);
+    }
+    let (code, _) = app.post(
+        "/signup",
+        None,
+        json!({"email": "u1@shop.test", "password": PW}),
+    );
+    assert_eq!(code, 200);
 }
 
 // --- password reset ---------------------------------------------------------------------------
@@ -457,6 +521,46 @@ fn only_the_operator_sets_a_quota() {
 // --- quotas -----------------------------------------------------------------------------------
 
 #[test]
+fn a_signup_quota_caps_the_new_org_but_not_root_created_ones() {
+    let app = App::with(|c| {
+        c.signup_open = true;
+        c.signup_quota = Some(2);
+    });
+    let (_, s) = app.post(
+        "/signup",
+        None,
+        json!({"email": "q@shop.test", "password": PW}),
+    );
+    let (org, session) = (s["org_id"].as_i64().unwrap(), s["token"].as_str().unwrap());
+    assert_eq!(
+        app.get(&format!("/orgs/{org}"), Some(session)).1["job_quota"],
+        2
+    );
+    let pid = register(&app.db, "pc", "agentkey", &[decl("HP", true)], org).pid("HP");
+    let job = json!({"printer_id": pid, "type": "raw_base64", "content": "eA=="});
+    assert_eq!(app.post("/jobs", Some(session), job.clone()).0, 200);
+    assert_eq!(app.post("/jobs", Some(session), job.clone()).0, 200);
+    let (code, body) = app.post("/jobs", Some(session), job);
+    assert!(code == 402 && body["error"].as_str().unwrap().contains("quota"));
+    // an org the operator creates keeps the operator's choice: no quota
+    let (_, o) = app.post("/orgs", Some("t"), json!({"name": "by root"}));
+    let url = format!("/orgs/{}", o["id"]);
+    assert!(app.get(&url, Some("t")).1["job_quota"].is_null());
+}
+
+#[test]
+fn without_a_signup_quota_a_new_org_is_unlimited() {
+    let app = App::with(|c| c.signup_open = true);
+    let (_, s) = app.post(
+        "/signup",
+        None,
+        json!({"email": "q@shop.test", "password": PW}),
+    );
+    let url = format!("/orgs/{}", s["org_id"]);
+    assert!(app.get(&url, s["token"].as_str()).1["job_quota"].is_null());
+}
+
+#[test]
 fn a_spent_quota_answers_402_on_every_submit_path() {
     let app = App::new();
     let pid = register(&app.db, "pc", "agentkey", &[decl("HP", true)], DEFAULT_ORG).pid("HP");
@@ -491,4 +595,92 @@ fn a_spent_quota_answers_402_on_every_submit_path() {
         app.get(&format!("/orgs/{DEFAULT_ORG}"), Some("t")).1["jobs_this_month"],
         1
     );
+}
+
+// --- job retention ----------------------------------------------------------------------------
+
+#[test]
+fn retention_runs_at_most_once_an_hour_and_scrubbed_jobs_still_list() {
+    use printpapi_server::server::retention_pass;
+    let day = 86_400.0;
+    let now = store::month_start(printpapi_server::now()) + 25.0 * day;
+    let app = App::with(|c| c.job_retention_days = Some(7));
+    let pid = agent_z(&app.db).pid("Z");
+    let old = enqueue(&app.db, pid, b"secret", |j| j.title = Some("T".into()));
+    let age = |id: i64| {
+        app.db.with(|c| {
+            c.execute(
+                "UPDATE jobs SET state='done', created_at=?1, finished_at=?1 WHERE id=?2",
+                rusqlite::params![now - 10.0 * day, id],
+            )
+            .unwrap()
+        })
+    };
+    age(old);
+    assert_eq!(retention_pass(&app.state, now).unwrap().scrubbed, 1);
+    // inside the hour nothing runs, even with fresh work waiting
+    let second = enqueue(&app.db, pid, b"secret", |_| {});
+    age(second);
+    assert!(retention_pass(&app.state, now + 3599.0).is_none());
+    assert_eq!(
+        retention_pass(&app.state, now + 3600.0).unwrap().scrubbed,
+        1
+    );
+    // the history and the PrintNode layer cope with a job that lost its title
+    let (code, body) = app.get("/jobs", Some("t"));
+    assert_eq!(code, 200);
+    assert!(body.to_string().contains(&format!("\"id\":{old}")));
+    assert_eq!(
+        app.get(&format!("/jobs/{old}"), Some("t")).1["state"],
+        "done"
+    );
+    let key = "pnkey";
+    add_key(&app.db, "pn", key, DEFAULT_ORG);
+    let (code, body) = app.pn("GET", &format!("/printjobs/{old}"), key, None);
+    assert_eq!(code, 200, "{body}");
+}
+
+#[test]
+fn retention_does_nothing_unless_configured() {
+    use printpapi_server::server::retention_pass;
+    let app = App::new();
+    assert!(retention_pass(&app.state, 1e12).is_none());
+}
+
+#[test]
+fn retention_retries_a_wal_truncate_a_reader_blocked_even_when_nothing_changed() {
+    use printpapi_server::server::retention_pass;
+    let day = 86_400.0;
+    let now = store::month_start(printpapi_server::now()) + 25.0 * day;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("r.db");
+    let path = path.to_str().unwrap();
+    let app = App::on(store::Db::open(path).unwrap(), |c| {
+        c.job_retention_days = Some(7)
+    });
+    let pid = agent_z(&app.db).pid("Z");
+    let marker = b"RETENTION-WAL-MARKER-77;";
+    let id = enqueue(&app.db, pid, &marker.repeat(1000), |_| {});
+    app.db.with(|c| {
+        c.execute(
+            "UPDATE jobs SET state='done', created_at=?1, finished_at=?1 WHERE id=?2",
+            rusqlite::params![now - 10.0 * day, id],
+        )
+        .unwrap()
+    });
+    // a reader pins the WAL while the pass runs
+    let reader = store::connect(path).unwrap();
+    reader
+        .execute_batch("BEGIN; SELECT count(*) FROM jobs;")
+        .unwrap();
+    let t = std::time::Instant::now();
+    assert!(retention_pass(&app.state, now).unwrap().wal_busy);
+    assert!(t.elapsed() < std::time::Duration::from_secs(2));
+    // the next pass changes no rows, but finishes the truncate once the reader is gone
+    reader.execute_batch("COMMIT").unwrap();
+    let p = retention_pass(&app.state, now + 3600.0).unwrap();
+    assert_eq!(p.scrubbed + p.deleted + p.abandoned, 0);
+    assert!(!p.wal_busy);
+    let wal = std::fs::read(dir.path().join("r.db-wal")).unwrap_or_default();
+    assert!(!wal.windows(marker.len()).any(|w| w == marker));
 }

@@ -44,6 +44,25 @@ pub struct Config {
     /// PRINTAPI_OPEN_ENROLLMENT=1: any Bearer value may enroll a new agent into the default org
     /// (the v2 rule). Off: a new agent needs an issued client key (or the root token).
     pub open_enrollment: bool,
+    /// PRINTAPI_TRUSTED_PROXIES: peers whose `X-Forwarded-For` names the real client. Empty: nobody.
+    pub trusted_proxies: crate::proxy::TrustedProxies,
+    /// PRINTAPI_SIGNUP_QUOTA: the monthly `job_quota` of every org `POST /signup` creates.
+    /// None: no quota. Root-created orgs are never touched.
+    pub signup_quota: Option<i64>,
+    /// PRINTAPI_JOB_RETENTION_DAYS: finished jobs lose their content after this many days and the
+    /// rows go with the month. None: keep for ever.
+    pub job_retention_days: Option<i64>,
+    /// PRINTAPI_TERMS_VERSION and its links: set, `POST /signup` needs `accept_terms` = version.
+    pub terms: Option<Terms>,
+}
+
+/// The terms a signup must accept (`PRINTAPI_TERMS_*`). The URLs are `http(s)` (checked at startup).
+#[derive(Clone, Debug, PartialEq)]
+pub struct Terms {
+    pub version: String,
+    pub terms_url: String,
+    pub dpa_url: Option<String>,
+    pub privacy_url: Option<String>,
 }
 
 impl Config {
@@ -66,6 +85,10 @@ impl Config {
             log_requests: false,
             destinations: crate::dispatch::Destinations::Any,
             open_enrollment: false,
+            trusted_proxies: crate::proxy::TrustedProxies::default(),
+            signup_quota: None,
+            job_retention_days: None,
+            terms: None,
         }
     }
 }
@@ -157,6 +180,11 @@ pub struct AppState {
     /// Image renders (`label_uri`, `label_base64`) running at once. A decode can take a few
     /// hundred MB, and the fetcher's slots are free again by the time the render starts.
     pub render_slots: RenderSlots,
+    /// When the retention purge last ran (the reaper ticks far more often than once an hour).
+    last_retention: Mutex<Option<f64>>,
+    /// A retention WAL truncate was blocked by a reader; the next pass retries it even if it
+    /// changes no rows.
+    wal_truncate_pending: std::sync::atomic::AtomicBool,
 }
 
 /// Concurrent image renders (see `AppState::render_slots`). ponytail: one global cap, not per
@@ -221,8 +249,18 @@ impl AppState {
             dummy_hash,
             poll_slots: Arc::new(tokio::sync::Semaphore::new(POLL_SLOTS)),
             render_slots: RenderSlots::new(RENDER_SLOTS),
+            last_retention: Mutex::new(None),
+            wal_truncate_pending: std::sync::atomic::AtomicBool::new(false),
         }
     }
+}
+
+/// The signup throttle key of a client address: IPv6 by /64 (`proxy::throttle_key`). Anything that
+/// is not an IP (a test's placeholder) is used as given.
+fn signup_key(peer_ip: &str) -> String {
+    peer_ip
+        .parse()
+        .map_or_else(|_| peer_ip.to_string(), crate::proxy::throttle_key)
 }
 
 /// One request, fully read. `target` is the raw request-target (path + `?query`), exactly what
@@ -237,7 +275,8 @@ pub struct Req {
     /// broke off). Every route that reads a body answers its own 400 for this, exactly where the
     /// Python `_read_body` raised ValueError ("bad json", "bad content-length", ...).
     pub body_error: bool,
-    /// The socket peer's IP (the signup throttle key).
+    /// The client's IP: the socket peer, or the address `X-Forwarded-For` names when the peer is a
+    /// trusted proxy (`proxy::client_ip`). The signup throttle key and the access log use it.
     pub peer_ip: String,
 }
 
@@ -773,7 +812,9 @@ impl Ctx<'_> {
         let email = str_field(&body, "email")
             .map(store::normalize_email)
             .unwrap_or_default();
-        if !self.s.limiter.allow(&email, None) {
+        // namespaced: the limiter's map is shared with `signup:` and `reset:` keys
+        let slot = format!("login:{email}");
+        if !self.s.limiter.allow(&slot, None) {
             return Ok(jerr(429, "too many failed logins, try again later"));
         }
         let user = self.db(|c| store::get_user_by_email(c, &email))?;
@@ -785,10 +826,10 @@ impl Ctx<'_> {
         };
         let ok = auth::verify_password(str_field(&body, "password"), stored);
         let Some(user) = user.filter(|_| ok) else {
-            self.s.limiter.fail(&email, None);
+            self.s.limiter.fail(&slot, None);
             return Ok(jerr(401, "invalid credentials"));
         };
-        self.s.limiter.succeed(&email);
+        self.s.limiter.succeed(&slot);
         let tok = auth::new_session_token();
         let expires_at =
             self.db(|c| store::create_session(c, user.id, &tok, self.cfg().session_ttl_s, None))?;
@@ -808,9 +849,8 @@ impl Ctx<'_> {
         let body = gate!(self.read_obj());
         // Throttled by client address, not by e-mail: an org sprayer picks a fresh address every
         // time, so counting addresses would bound nothing.
-        // ponytail: the address is the socket peer — behind a reverse proxy every signup shares
-        // one key. Read X-Forwarded-For (and pin the trusted proxy) if that becomes the setup.
-        let slot = format!("signup:{}", self.req.peer_ip);
+        // The address is the client `http.rs` resolved (X-Forwarded-For behind a trusted proxy).
+        let slot = format!("signup:{}", signup_key(&self.req.peer_ip));
         if !self.s.limiter.allow(&slot, None) {
             return Ok(jerr(429, "too many signups, try again later"));
         }
@@ -820,6 +860,24 @@ impl Ctx<'_> {
         if !email.contains('@') {
             return Ok(jerr(400, "email required"));
         }
+        let terms_version = self.cfg().terms.as_ref().map(|t| t.version.as_str());
+        if let Some(current) = terms_version {
+            match body.get("accept_terms") {
+                Some(Value::String(v)) if v == current => {}
+                Some(Value::String(_)) => return Ok(jerr(409, "terms changed, reload")),
+                _ => return Ok(jerr(400, "accept_terms required")),
+            }
+        }
+        // A bad password must not cost a slot: only the cheap length check runs before it.
+        if let Err(e) = auth::validate_password(str_field(&body, "password")) {
+            return Ok(jerr(400, e));
+        }
+        // The slot is taken atomically, before the slow hash: parallel requests from one address
+        // must not all pass the peek above and then count afterwards. A successful signup spends
+        // its slot too, which is the cap.
+        if !self.s.limiter.try_take(&slot, None) {
+            return Ok(jerr(429, "too many signups, try again later"));
+        }
         let pw_hash = match auth::hash_password(str_field(&body, "password")) {
             Ok(h) => h,
             Err(e) => return Ok(jerr(400, e)),
@@ -828,9 +886,9 @@ impl Ctx<'_> {
             .map(|n| printnode::py_trim(n).to_string())
             .filter(|n| !n.is_empty())
             .unwrap_or_else(|| email.split_once('@').map_or("", |(_, d)| d).to_string());
-        // a *successful* signup spends a slot too — that is the cap
-        self.s.limiter.fail(&slot, None);
-        let new = match self.db(|c| store::signup(c, &name, &email, &pw_hash)) {
+        let quota = self.cfg().signup_quota;
+        let new = match self.db(|c| store::signup(c, &name, &email, &pw_hash, quota, terms_version))
+        {
             Ok(n) => n,
             Err(StoreError::Conflict) => return Ok(jerr(409, "email already registered")),
             Err(e) => return Err(e),
@@ -1666,11 +1724,14 @@ impl Ctx<'_> {
             // "create an account" and "forgot password" at all. Both are booleans about the
             // server's configuration, not about any account.
             "/health" => {
-                return Ok(Resp::json(
-                    200,
-                    &json!({ "ok": true, "signup": if self.cfg().signup_open { "open" } else { "closed" },
-                             "password_reset": self.cfg().reset_enabled }),
-                ));
+                let mut h = json!({ "ok": true, "signup": if self.cfg().signup_open { "open" } else { "closed" },
+                                    "password_reset": self.cfg().reset_enabled });
+                // Only when consent is required, so a server without it answers as before.
+                if let Some(t) = &self.cfg().terms {
+                    h["terms"] = json!({ "version": t.version, "terms_url": t.terms_url,
+                                         "dpa_url": t.dpa_url, "privacy_url": t.privacy_url });
+                }
+                return Ok(Resp::json(200, &h));
             }
             "/metrics" => {
                 let org = gate!(self.client_org()?);
@@ -2179,6 +2240,9 @@ impl Ctx<'_> {
                 return Ok(jerr(400, "the default org cannot be removed"));
             }
             return Ok(if self.db(|c| store::delete_org(c, oid))? {
+                // secure_delete zeroed the pages; this clears the WAL frames too. A reader can
+                // block it: logged, never a failed request (the org is gone either way).
+                self.db(|c| store::truncate_wal_logged(c, "delete org"));
                 ok_true()
             } else {
                 not_found()
@@ -2323,6 +2387,46 @@ pub fn deliver_agent_events(
     }
 }
 
+/// How often the retention purge may run.
+const RETENTION_EVERY_S: f64 = 3600.0;
+
+/// The job retention purge (`store::purge_jobs`), at most once an hour and only when
+/// PRINTAPI_JOB_RETENTION_DAYS is set. `None`: not due, not configured, or the purge failed
+/// (logged; the next tick after the hour tries again).
+pub fn retention_pass(state: &AppState, now: f64) -> Option<store::Purged> {
+    let days = state.cfg.job_retention_days?;
+    {
+        let mut last = state
+            .last_retention
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if last.is_some_and(|t| now - t < RETENTION_EVERY_S) {
+            return None;
+        }
+        *last = Some(now);
+    }
+    use std::sync::atomic::Ordering::Relaxed;
+    let retry = state.wal_truncate_pending.load(Relaxed);
+    match state.db.with(|c| {
+        let mut p = store::purge_jobs(c, days, Some(now))?;
+        // A pass that changed nothing does not truncate itself, so an earlier blocked truncate
+        // is retried here.
+        if retry && !p.wal_busy && p.abandoned + p.scrubbed + p.deleted == 0 {
+            p.wal_busy = !store::truncate_wal_logged(c, "retention");
+        }
+        Ok::<_, StoreError>(p)
+    }) {
+        Ok(p) => {
+            state.wal_truncate_pending.store(p.wal_busy, Relaxed);
+            Some(p)
+        }
+        Err(e) => {
+            eprintln!("retention error: {e}");
+            None
+        }
+    }
+}
+
 /// One reaper pass: expire, requeue stale (waking every long-poll if anything was requeued),
 /// purge expired sessions and resets. Errors are logged to stderr, never propagated.
 pub fn reaper_pass(state: &AppState, timeout_s: f64, max_retries: i64) {
@@ -2337,6 +2441,7 @@ pub fn reaper_pass(state: &AppState, timeout_s: f64, max_retries: i64) {
         }
         state.db.with(|c| store::purge_expired_sessions(c, None))?;
         state.db.with(|c| store::purge_expired_resets(c, None))?;
+        retention_pass(state, crate::now());
         Ok(())
     };
     if let Err(e) = run() {
