@@ -44,6 +44,8 @@ pub struct Config {
     /// PRINTAPI_OPEN_ENROLLMENT=1: any Bearer value may enroll a new agent into the default org
     /// (the v2 rule). Off: a new agent needs an issued client key (or the root token).
     pub open_enrollment: bool,
+    /// PRINTAPI_TRUSTED_PROXIES: peers whose `X-Forwarded-For` names the real client. Empty: nobody.
+    pub trusted_proxies: crate::proxy::TrustedProxies,
 }
 
 impl Config {
@@ -66,6 +68,7 @@ impl Config {
             log_requests: false,
             destinations: crate::dispatch::Destinations::Any,
             open_enrollment: false,
+            trusted_proxies: crate::proxy::TrustedProxies::default(),
         }
     }
 }
@@ -225,6 +228,14 @@ impl AppState {
     }
 }
 
+/// The signup throttle key of a client address: IPv6 by /64 (`proxy::throttle_key`). Anything that
+/// is not an IP (a test's placeholder) is used as given.
+fn signup_key(peer_ip: &str) -> String {
+    peer_ip
+        .parse()
+        .map_or_else(|_| peer_ip.to_string(), crate::proxy::throttle_key)
+}
+
 /// One request, fully read. `target` is the raw request-target (path + `?query`), exactly what
 /// the Python handler saw as `self.path`.
 #[derive(Debug, Clone)]
@@ -237,7 +248,8 @@ pub struct Req {
     /// broke off). Every route that reads a body answers its own 400 for this, exactly where the
     /// Python `_read_body` raised ValueError ("bad json", "bad content-length", ...).
     pub body_error: bool,
-    /// The socket peer's IP (the signup throttle key).
+    /// The client's IP: the socket peer, or the address `X-Forwarded-For` names when the peer is a
+    /// trusted proxy (`proxy::client_ip`). The signup throttle key and the access log use it.
     pub peer_ip: String,
 }
 
@@ -808,9 +820,8 @@ impl Ctx<'_> {
         let body = gate!(self.read_obj());
         // Throttled by client address, not by e-mail: an org sprayer picks a fresh address every
         // time, so counting addresses would bound nothing.
-        // ponytail: the address is the socket peer — behind a reverse proxy every signup shares
-        // one key. Read X-Forwarded-For (and pin the trusted proxy) if that becomes the setup.
-        let slot = format!("signup:{}", self.req.peer_ip);
+        // The address is the client `http.rs` resolved (X-Forwarded-For behind a trusted proxy).
+        let slot = format!("signup:{}", signup_key(&self.req.peer_ip));
         if !self.s.limiter.allow(&slot, None) {
             return Ok(jerr(429, "too many signups, try again later"));
         }

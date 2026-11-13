@@ -2,7 +2,8 @@
 //! `printpapi` — the server binary. Configured from the environment exactly like the Python
 //! server: PRINTAPI_TOKEN (required, non-empty), PRINT_DB (default printpapi.db), PRINT_PORT
 //! (default 3460), PRINTAPI_SIGNUP, PUBLIC_URL, PRINTAPI_PLANS (JSON array or a path to a file
-//! holding one), PRINTAPI_BILLING_SECRET, LOG_REQUESTS, SMTP_*.
+//! holding one), PRINTAPI_BILLING_SECRET, PRINTAPI_TRUSTED_PROXIES (IPs or CIDRs whose
+//! `X-Forwarded-For` is believed), LOG_REQUESTS, SMTP_*.
 use printpapi_server::dispatch::{Destinations, HttpFetcher, OUTBOUND_IN_FLIGHT};
 use printpapi_server::mail::{self, SmtpMailer};
 use printpapi_server::server::{AppState, Config};
@@ -70,6 +71,10 @@ fn config() -> Result<(Config, String, u16), String> {
             ));
         }
     };
+    cfg.trusted_proxies = printpapi_server::proxy::TrustedProxies::parse(
+        &env("PRINTAPI_TRUSTED_PROXIES").unwrap_or_default(),
+    )
+    .map_err(|e| format!("PRINTAPI_TRUSTED_PROXIES: {e}"))?;
     cfg.open_enrollment = env("PRINTAPI_OPEN_ENROLLMENT").is_some_and(|s| py_strip(&s) == "1");
     Ok((cfg, db_path, port))
 }

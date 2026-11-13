@@ -157,6 +157,7 @@ async fn respond(
         .map(|p| p.as_str().to_string())
         .unwrap_or_else(|| parts.uri.to_string());
     let version = format!("{:?}", parts.version);
+    let client = client_addr(&ctx.state.cfg.trusted_proxies, peer, &parts.headers);
 
     let mut close = false;
     let resp = if method == "GET" && target == "/agent/jobs" {
@@ -188,7 +189,7 @@ async fn respond(
             headers: parts.headers,
             body,
             body_error,
-            peer_ip: peer.ip().to_string(),
+            peer_ip: client.clone(),
         };
         let (st, handler) = (ctx.state.clone(), ctx.handler);
         match tokio::task::spawn_blocking(move || handler(&st, &req)).await {
@@ -203,7 +204,7 @@ async fn respond(
         eprintln!(
             "{}",
             access_log_line(
-                &peer.ip().to_string(),
+                &client,
                 &log_timestamp(),
                 &method,
                 &target,
@@ -213,6 +214,25 @@ async fn respond(
         );
     }
     Ok(build_response(resp, method == "HEAD", close))
+}
+
+/// The client's address as text: the socket peer, or what `X-Forwarded-For` says when the peer is
+/// a trusted proxy. A header value that is not text counts as garbage, never as absent.
+fn client_addr(
+    trusted: &crate::proxy::TrustedProxies,
+    peer: SocketAddr,
+    headers: &hyper::HeaderMap,
+) -> String {
+    if trusted.is_empty() {
+        return peer.ip().to_string();
+    }
+    let lines: Vec<String> = headers
+        .get_all("x-forwarded-for")
+        .iter()
+        .map(|v| String::from_utf8_lossy(v.as_bytes()).into_owned())
+        .collect();
+    let lines: Vec<&str> = lines.iter().map(String::as_str).collect();
+    crate::proxy::client_ip(peer.ip(), &lines, trusted).to_string()
 }
 
 fn internal_error() -> Resp {

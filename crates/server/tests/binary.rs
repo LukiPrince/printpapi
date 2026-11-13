@@ -13,6 +13,7 @@ fn bin() -> Command {
         "PRINT_PORT",
         "PRINTAPI_PLANS",
         "PRINTAPI_SIGNUP",
+        "PRINTAPI_TRUSTED_PROXIES",
         "LOG_REQUESTS",
     ] {
         c.env_remove(k);
@@ -61,6 +62,17 @@ fn bad_plans_exit_1() {
         .unwrap();
     assert_eq!(out.status.code(), Some(1));
     assert!(String::from_utf8_lossy(&out.stderr).contains("non-empty JSON array"));
+}
+
+#[test]
+fn bad_trusted_proxies_exit_1() {
+    let out = bin()
+        .env("PRINTAPI_TOKEN", "t")
+        .env("PRINTAPI_TRUSTED_PROXIES", "127.0.0.1,172.16.0.0/40")
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("PRINTAPI_TRUSTED_PROXIES"));
 }
 
 #[test]

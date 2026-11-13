@@ -297,8 +297,9 @@ must not hand an org to whoever finds it. `GET /health` reports `"signup": "open
 dashboard only offers the door when it exists.
 
 Signups are throttled by client address (the same counter a failed login uses), so one host cannot
-spray orgs. Behind a reverse proxy every signup shares one address — put the rate limit in the
-proxy there. `org_name` defaults to the e-mail's domain. A taken address is a `409` and leaves no
+spray orgs. IPv6 clients count per /64. Behind a reverse proxy every signup shares the proxy's
+address unless `PRINTAPI_TRUSTED_PROXIES` names the proxy, which makes printpapi read the client
+from `X-Forwarded-For` (see [Behind a reverse proxy](server.md#behind-a-reverse-proxy)). `org_name` defaults to the e-mail's domain. A taken address is a `409` and leaves no
 half-made org behind.
 
 ### Password reset

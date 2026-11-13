@@ -42,6 +42,7 @@ Environment variables:
 | `PRINTAPI_PLANS` | *(unset)* | [Billing](billing.md) catalogue: a JSON array of plans, or a path to a file holding one. Unset ⇒ no plans, no billing routes |
 | `PRINTAPI_BILLING_SECRET` | *(unset)* | Shared secret for the `POST /billing/webhook` signature. Unset ⇒ the webhook answers `503` |
 | `PRINTAPI_PRIVATE_URLS` | `deny` with open signup, else `allow` | `deny`: payload URLs (`*_uri`, `*_uri_post`), job `callback_url`s and org `event_url`s may only reach public addresses — no loopback, LAN, link-local/cloud-metadata or other private ranges, checked after DNS on every redirect hop. `allow`: anywhere (a self-hosted box fetching PDFs from an internal service). Set `deny` whenever people you do not trust get keys |
+| `PRINTAPI_TRUSTED_PROXIES` | *(unset: nobody)* | Comma-separated IPs or CIDRs (IPv4 and IPv6, e.g. `127.0.0.1,::1` or `172.16.0.0/12`) of the reverse proxies in front of printpapi. Only a request whose socket peer is listed has its `X-Forwarded-For` read: the rightmost entry that is not itself listed is the client, which the signup throttle (IPv6 per /64) and the `LOG_REQUESTS` line then use. Unset, the socket peer is the client, so behind a proxy every signup shares one throttle slot. An invalid entry stops the server at startup. See [Behind a reverse proxy](#behind-a-reverse-proxy) |
 | `PRINTAPI_OPEN_ENROLLMENT` | *(off)* | `1`: any Bearer value enrolls a new agent into the default org (the v2 rule). Off: a new agent needs an issued key or the root token |
 
 ```bash
@@ -194,3 +195,51 @@ A key in a URL ends up in access logs and proxy history — prefer the printer's
 
 The server speaks plain HTTP — put your own reverse proxy / TLS in front for anything beyond
 the LAN. Vulnerability reports: see [SECURITY.md](../SECURITY.md).
+
+### Behind a reverse proxy
+
+Behind a proxy every request comes from the proxy's address, so the signup throttle would see one
+client. Set `PRINTAPI_TRUSTED_PROXIES` to the proxy's address and printpapi reads the real client
+from `X-Forwarded-For`. List **only** the proxy: a request from any other peer keeps its socket
+address, whatever header it sends. Caddy's `reverse_proxy` replaces an incoming
+`X-Forwarded-For` from an untrusted client with its own, so it needs no extra configuration
+([Caddy docs](https://caddyserver.com/docs/caddyfile/directives/reverse_proxy#headers)).
+
+With Docker Compose the peer printpapi sees is Caddy's container address, which moves unless it
+is pinned. Put both on one user-defined network with a fixed subnet, give Caddy a fixed
+`ipv4_address` and trust exactly that address, not the whole bridge range. Publish **no port for
+printpapi**, only Caddy's 80 and 443: a published printpapi port plus a trusted bridge range would
+let a direct caller's header be believed.
+
+```yaml
+services:
+  printpapi:
+    image: ghcr.io/lukiprince/printpapi:latest
+    environment:
+      PRINTAPI_TOKEN: change-me
+      PRINTAPI_SIGNUP: open
+      PRINT_DB: /app/data/printpapi.db
+      PRINTAPI_TRUSTED_PROXIES: 172.30.0.2   # Caddy's address below, nothing wider
+    volumes: [printpapi-data:/app/data]
+    networks: [edge]                         # no `ports:` for printpapi
+  caddy:
+    image: caddy:2
+    ports: ["80:80", "443:443"]
+    volumes: [./Caddyfile:/etc/caddy/Caddyfile:ro, caddy-data:/data]
+    networks:
+      edge:
+        ipv4_address: 172.30.0.2
+networks:
+  edge:
+    ipam:
+      config: [{ subnet: 172.30.0.0/24 }]
+volumes:
+  printpapi-data:
+  caddy-data:
+```
+
+```
+print.example.com {
+    reverse_proxy printpapi:3460
+}
+```
