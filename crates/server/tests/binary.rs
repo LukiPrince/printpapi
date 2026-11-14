@@ -273,3 +273,44 @@ fn open_signup_without_terms_warns_on_stderr() {
     assert!(!err.contains("PRINTAPI_TERMS_VERSION"), "{err:?}");
     assert!(!stderr_at_startup(&[]).contains("PRINTAPI_TERMS_VERSION"));
 }
+
+#[test]
+fn locks_without_the_operator_token_are_reported_at_startup() {
+    use printpapi_server::store::{self, Db};
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("locks.db");
+    {
+        let db = Db::open(path.to_str().unwrap()).unwrap();
+        db.with(|c| {
+            let s = store::signup(c, "Acme", "boss@acme.test", "PWHASH", None, None).unwrap();
+            let created: f64 = c
+                .query_row("SELECT created_at FROM orgs WHERE id=?", [s.org_id], |r| {
+                    r.get(0)
+                })
+                .unwrap();
+            c.execute(
+                "INSERT INTO org_locks(org_id, org_created_at, reason, locked_at) VALUES(?,?,?,?)",
+                rusqlite::params![s.org_id, created, "support ticket", 1.0],
+            )
+            .unwrap();
+        });
+    }
+    let db = path.to_str().unwrap();
+    let err = stderr_at_startup(&[("PRINT_DB", db)]);
+    assert!(
+        err.contains("1 org locks are not enforced: PRINTAPI_OPERATOR_TOKEN is unset"),
+        "{err:?}"
+    );
+    // with the token the locks hold: no line
+    let err = stderr_at_startup(&[
+        ("PRINT_DB", db),
+        (
+            "PRINTAPI_OPERATOR_TOKEN",
+            "operator-token-0123456789abcdef-xyz",
+        ),
+        ("PRINTAPI_OPERATOR_FROM", "10.9.0.2"),
+    ]);
+    assert!(!err.contains("not enforced"), "{err:?}");
+    // and a database without locks says nothing
+    assert!(!stderr_at_startup(&[]).contains("not enforced"));
+}

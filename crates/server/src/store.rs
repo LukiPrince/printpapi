@@ -52,6 +52,8 @@ pub enum StoreError {
     Invalid(String),
     /// A UNIQUE/NOT NULL violation (the Python `sqlite3.IntegrityError`) — callers map it to 409.
     Conflict,
+    /// The org is locked by the operator — the server answers 403 `org locked`.
+    Locked,
     Db(rusqlite::Error),
 }
 
@@ -63,6 +65,7 @@ impl std::fmt::Display for StoreError {
             | StoreError::Auth(m)
             | StoreError::Invalid(m) => f.write_str(m),
             StoreError::Conflict => f.write_str("constraint violation"),
+            StoreError::Locked => f.write_str("org locked"),
             StoreError::Db(e) => write!(f, "database error: {e}"),
         }
     }
@@ -388,6 +391,19 @@ CREATE UNIQUE INDEX IF NOT EXISTS jobs_idem ON jobs(org_id, idempotency_key);
 CREATE TABLE IF NOT EXISTS api_keys(
   id INTEGER PRIMARY KEY AUTOINCREMENT, org_id INTEGER NOT NULL, label TEXT NOT NULL,
   key_hash TEXT NOT NULL UNIQUE, active INTEGER NOT NULL DEFAULT 1, created_at REAL NOT NULL);
+-- The operator audit log: one row per `/operator/` write, kept for ever (never changed or deleted by
+-- any API, not removed with an org). Ids, numbers and setting values only, no e-mail or name.
+-- `org_created_at` keeps a reused org id apart from its predecessor. A table of its own, so the
+-- Python-era tables keep their shape and the Python server ignores it.
+CREATE TABLE IF NOT EXISTS operator_audit(
+  id INTEGER PRIMARY KEY AUTOINCREMENT, at REAL NOT NULL, actor TEXT NOT NULL,
+  action TEXT NOT NULL, org_id INTEGER, org_created_at REAL, target TEXT, reason TEXT,
+  detail TEXT);
+-- An org the operator has locked (a pure flag: quota and plan untouched). `org_created_at` keeps a
+-- reused org id apart from its predecessor. A table of its own, like operator_audit.
+CREATE TABLE IF NOT EXISTS org_locks(
+  org_id INTEGER PRIMARY KEY, org_created_at REAL NOT NULL, reason TEXT NOT NULL,
+  locked_at REAL NOT NULL);
 ";
 
 const MIGRATIONS: &[&str] = &[
@@ -423,6 +439,15 @@ CREATE INDEX IF NOT EXISTS jobs_hooks ON jobs(id)
 CREATE INDEX IF NOT EXISTS agents_org ON agents(org_id);
 -- the retention scan (`purge_jobs`) looks at terminal jobs by age
 CREATE INDEX IF NOT EXISTS jobs_state_finished ON jobs(state, finished_at);
+-- the operator overview counts jobs of this month, today and the last week across all orgs
+CREATE INDEX IF NOT EXISTS jobs_created ON jobs(created_at);
+-- the operator's org list and job list look at one org's jobs by id and by state; the three after
+-- them are the per-org counts and e-mail lookups next to them
+CREATE INDEX IF NOT EXISTS jobs_org ON jobs(org_id);
+CREATE INDEX IF NOT EXISTS jobs_org_state ON jobs(org_id, state);
+CREATE INDEX IF NOT EXISTS printers_org ON printers(org_id);
+CREATE INDEX IF NOT EXISTS users_org ON users(org_id);
+CREATE INDEX IF NOT EXISTS terms_org ON terms_acceptances(org_id, accepted_at);
 ";
 
 /// The oldest queued job of one agent that has not passed its deadline (`?1` agent, `?2` now).
@@ -565,15 +590,29 @@ pub fn month_start(now: f64) -> f64 {
 // string-building. Legacy DBs are entirely org_id=1, so org-1 callers see exactly what they saw
 // before.
 
+// The `*_tx` variants run inside a transaction the caller owns (`begin_tx`), so an operator action
+// can make its change and write its audit row under one `BEGIN IMMEDIATE`. The plain functions are
+// `begin` + the `_tx` body + `commit`, nothing else.
+
+/// Open a write transaction (`BEGIN IMMEDIATE`) for a caller that composes several `*_tx` calls.
+/// Dropping it without `commit` rolls back.
+pub fn begin_tx(conn: &Connection) -> Result<Transaction<'_>> {
+    begin(conn)
+}
+
 pub fn create_org(conn: &Connection, name: &str) -> Result<i64> {
     let tx = begin(conn)?;
+    let id = create_org_tx(&tx, name)?;
+    tx.commit()?;
+    Ok(id)
+}
+
+pub fn create_org_tx(tx: &Transaction, name: &str) -> Result<i64> {
     tx.execute(
         "INSERT INTO orgs(name, created_at) VALUES(?,?)",
         params![name, crate::now()],
     )?;
-    let id = tx.last_insert_rowid();
-    tx.commit()?;
-    Ok(id)
+    Ok(tx.last_insert_rowid())
 }
 
 /// Orgs for the root listing. The Shopify webhook secret is reported as a flag, never echoed —
@@ -661,6 +700,42 @@ pub fn set_org_quota(conn: &Connection, org_id: i64, quota: Option<i64>) -> Resu
     )
 }
 
+pub fn set_org_quota_tx(tx: &Transaction, org_id: i64, quota: Option<i64>) -> Result<bool> {
+    let n = tx.execute(
+        "UPDATE orgs SET job_quota=? WHERE id=?",
+        params![quota, org_id],
+    )?;
+    Ok(n == 1)
+}
+
+/// What an operator edit may change on an org. `None` leaves a field alone; `job_quota: Some(None)`
+/// sets unlimited. `plan` carries the catalogue id and the quota it grants, written together.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct OrgUpdate<'a> {
+    pub name: Option<&'a str>,
+    pub job_quota: Option<Option<i64>>,
+    pub plan: Option<(&'a str, Option<i64>)>,
+}
+
+/// Apply every set field of `u` inside the caller's transaction. False if there is no such org.
+/// Validation is the caller's job and happens before this runs, so nothing here rejects half-way.
+/// An explicit `job_quota` is applied after the plan and so wins over the plan's quota.
+pub fn update_org_tx(tx: &Transaction, org_id: i64, u: &OrgUpdate) -> Result<bool> {
+    if !org_exists(tx, org_id)? {
+        return Ok(false);
+    }
+    if let Some(name) = u.name {
+        tx.execute("UPDATE orgs SET name=? WHERE id=?", params![name, org_id])?;
+    }
+    if let Some((plan, quota)) = u.plan {
+        set_org_plan_tx(tx, org_id, plan, quota)?;
+    }
+    if let Some(quota) = u.job_quota {
+        set_org_quota_tx(tx, org_id, quota)?;
+    }
+    Ok(true)
+}
+
 /// Move an org onto a billing plan. The plan id is bookkeeping; its quota is what bites, and
 /// both are written in one UPDATE so they can never disagree. False if no such org.
 pub fn set_org_plan(
@@ -670,11 +745,21 @@ pub fn set_org_plan(
     quota: Option<i64>,
 ) -> Result<bool> {
     let tx = begin(conn)?;
+    let ok = set_org_plan_tx(&tx, org_id, plan, quota)?;
+    tx.commit()?;
+    Ok(ok)
+}
+
+pub fn set_org_plan_tx(
+    tx: &Transaction,
+    org_id: i64,
+    plan: &str,
+    quota: Option<i64>,
+) -> Result<bool> {
     let n = tx.execute(
         "UPDATE orgs SET plan=?, job_quota=? WHERE id=?",
         params![plan, quota, org_id],
     )?;
-    tx.commit()?;
     Ok(n == 1)
 }
 
@@ -726,6 +811,15 @@ pub fn truncate_wal_logged(conn: &Connection, what: &str) -> bool {
 /// key still enrolls there.
 pub fn delete_org(conn: &Connection, org_id: i64) -> Result<bool> {
     let tx = begin(conn)?;
+    let found = delete_org_tx(&tx, org_id)?;
+    if found {
+        tx.commit()?;
+    }
+    Ok(found)
+}
+
+/// `delete_org` inside the caller's transaction; the caller commits (and drops it on `false`).
+pub fn delete_org_tx(tx: &Transaction, org_id: i64) -> Result<bool> {
     if tx
         .query_row("SELECT 1 FROM orgs WHERE id=?", [org_id], |_| Ok(()))
         .optional()?
@@ -750,11 +844,11 @@ pub fn delete_org(conn: &Connection, org_id: i64) -> Result<bool> {
         "users",
         "label_templates",
         "terms_acceptances",
+        "org_locks",
     ] {
         tx.execute(&format!("DELETE FROM {table} WHERE org_id=?"), [org_id])?;
     }
     tx.execute("DELETE FROM orgs WHERE id=?", [org_id])?;
-    tx.commit()?;
     Ok(true)
 }
 
@@ -999,11 +1093,16 @@ pub fn list_api_keys(conn: &Connection, org_id: Option<i64>) -> Result<Vec<ApiKe
 /// Org-filtered like every other id lookup: another org's key is simply not found.
 pub fn revoke_api_key(conn: &Connection, key_id: i64, org_id: Option<i64>) -> Result<bool> {
     let tx = begin(conn)?;
+    let ok = revoke_api_key_tx(&tx, key_id, org_id)?;
+    tx.commit()?;
+    Ok(ok)
+}
+
+pub fn revoke_api_key_tx(tx: &Transaction, key_id: i64, org_id: Option<i64>) -> Result<bool> {
     let n = tx.execute(
         "UPDATE api_keys SET active=0 WHERE id=:kid AND (:org IS NULL OR org_id = :org)",
         named_params! {":kid": key_id, ":org": org_id},
     )?;
-    tx.commit()?;
     Ok(n == 1)
 }
 
@@ -1052,9 +1151,31 @@ pub fn signup(
     job_quota: Option<i64>,
     terms_version: Option<&str>,
 ) -> Result<Signup> {
+    let tx = begin(conn)?;
+    let out = signup_tx(
+        &tx,
+        org_name,
+        email,
+        password_hash,
+        job_quota,
+        terms_version,
+    )?;
+    tx.commit()?;
+    Ok(out)
+}
+
+/// `signup` inside the caller's transaction. Err(Conflict) leaves the half-made org for the
+/// caller's rollback (drop the transaction without committing).
+pub fn signup_tx(
+    tx: &Transaction,
+    org_name: &str,
+    email: &str,
+    password_hash: &str,
+    job_quota: Option<i64>,
+    terms_version: Option<&str>,
+) -> Result<Signup> {
     let now = crate::now();
     let addr = normalize_email(email);
-    let tx = begin(conn)?;
     tx.execute(
         "INSERT INTO orgs(name, job_quota, created_at) VALUES(?,?,?)",
         params![org_name, job_quota, now],
@@ -1071,7 +1192,6 @@ pub fn signup(
             params![org_id, user_id, version, now],
         )?;
     }
-    tx.commit()?;
     Ok(Signup { org_id, user_id })
 }
 
@@ -1117,15 +1237,26 @@ pub fn create_password_reset(
     ttl_s: f64,
     now: Option<f64>,
 ) -> Result<f64> {
+    let tx = begin(conn)?;
+    let expires_at = create_password_reset_tx(&tx, user_id, token, ttl_s, now)?;
+    tx.commit()?;
+    Ok(expires_at)
+}
+
+pub fn create_password_reset_tx(
+    tx: &Transaction,
+    user_id: i64,
+    token: &str,
+    ttl_s: f64,
+    now: Option<f64>,
+) -> Result<f64> {
     let now = now.unwrap_or_else(crate::now);
     let expires_at = now + ttl_s;
-    let tx = begin(conn)?;
     tx.execute("DELETE FROM password_resets WHERE user_id=?", [user_id])?;
     tx.execute(
         "INSERT INTO password_resets(user_id, token_hash, created_at, expires_at) VALUES(?,?,?,?)",
         params![user_id, hash_key(token), now, expires_at],
     )?;
-    tx.commit()?;
     Ok(expires_at)
 }
 
@@ -1313,6 +1444,37 @@ pub fn get_printer(
         .optional()?)
 }
 
+/// How many orgs are locked right now (current generation only).
+pub fn count_org_locks(conn: &Connection) -> Result<i64> {
+    Ok(conn.query_row(
+        "SELECT COUNT(*) FROM org_locks l JOIN orgs o \
+         ON o.id = l.org_id AND o.created_at = l.org_created_at",
+        [],
+        |r| r.get(0),
+    )?)
+}
+
+/// `Locked` while the operator has locked `org_id`. A pure flag: quota and plan are not looked at.
+/// Checked next to `check_quota` wherever a job may enter, and before any payload is fetched.
+///
+/// A lock row counts only while its `org_created_at` is the org's: a row left by an earlier org
+/// of the same (reused) id locks nothing. Callers enforce locks only while the operator token is
+/// configured (`Config::operator_token`): without it nothing could show or lift one.
+pub fn check_not_locked(conn: &Connection, org_id: i64) -> Result<()> {
+    let locked = conn
+        .prepare_cached(
+            "SELECT 1 FROM org_locks l JOIN orgs o \
+             ON o.id = l.org_id AND o.created_at = l.org_created_at WHERE l.org_id=?",
+        )?
+        .query_row([org_id], |_| Ok(()))
+        .optional()?
+        .is_some();
+    if locked {
+        return Err(StoreError::Locked);
+    }
+    Ok(())
+}
+
 /// `QuotaExceeded` once `org_id` has used up its monthly quota.
 pub fn check_quota(conn: &Connection, org_id: i64, now: f64) -> Result<()> {
     let quota: Option<i64> = conn
@@ -1349,7 +1511,17 @@ pub fn find_job_by_key(conn: &Connection, org_id: i64, key: &str) -> Result<Opti
         .optional()?)
 }
 
+/// `enqueue_job_with` with org locks enforced.
 pub fn enqueue_job(conn: &Connection, job: &NewJob<'_>) -> Result<Enqueued> {
+    enqueue_job_with(conn, job, true)
+}
+
+/// `enforce_locks` is false while the operator token is unset (see `check_not_locked`).
+pub fn enqueue_job_with(
+    conn: &Connection,
+    job: &NewJob<'_>,
+    enforce_locks: bool,
+) -> Result<Enqueued> {
     let now = crate::now();
     let unknown = || {
         StoreError::UnknownPrinter(format!(
@@ -1371,6 +1543,10 @@ pub fn enqueue_job(conn: &Connection, job: &NewJob<'_>) -> Result<Enqueued> {
     let Some((org_id, agent_id)) = printer else {
         return Err(unknown());
     };
+    // before the idempotency lookup: a locked org gets no job, not even an old one back
+    if enforce_locks {
+        check_not_locked(&tx, org_id)?;
+    }
     if let Some(key) = &job.idempotency_key {
         // A retried submit returns the original job — the same key never prints twice in an org.
         // The lookup is safe under the write transaction; the UNIQUE index enforces it.
@@ -1531,16 +1707,28 @@ pub fn finish_job(
     Ok(n == 1)
 }
 
-/// Returns how many jobs went back to `queued`.
+/// Returns how many jobs went back to `queued`. With `enforce_locks` a stale job of a locked org
+/// is cancelled (`error: "org locked"`) instead: it was claimed before the lock, and a requeue
+/// would hand it out again.
 pub fn requeue_stale(
     conn: &Connection,
     timeout_s: f64,
     max_retries: i64,
     now: Option<f64>,
+    enforce_locks: bool,
 ) -> Result<usize> {
     let now = now.unwrap_or_else(crate::now);
     let cutoff = now - timeout_s;
     let tx = begin(conn)?;
+    if enforce_locks {
+        tx.execute(
+            "UPDATE jobs SET state='cancelled', error='org locked', finished_at=? \
+             WHERE state='claimed' AND claimed_at < ? AND org_id IN \
+             (SELECT l.org_id FROM org_locks l JOIN orgs o \
+              ON o.id = l.org_id AND o.created_at = l.org_created_at)",
+            params![now, cutoff],
+        )?;
+    }
     tx.execute(
         "UPDATE jobs SET state='failed', error='retry limit exceeded', finished_at=? \
          WHERE state='claimed' AND claimed_at < ? AND retries >= ?",
@@ -1572,7 +1760,7 @@ pub fn expire_jobs(conn: &Connection, now: Option<f64>) -> Result<usize> {
 }
 
 /// What one `purge_jobs` pass did.
-#[derive(Debug, Default, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct Purged {
     /// Queued jobs older than the retention that never ran and had no deadline: failed
     /// (`error='retention'`) and cleared; the callback stays so the client hears the outcome.
@@ -2090,6 +2278,853 @@ pub fn is_cloudprnt_agent(conn: &Connection, agent_id: i64) -> Result<bool> {
         == Some(1))
 }
 
+// --- operator audit log ---------------------------------------------------------------------------
+
+/// One audit row to write. `actor` is always `operator` (service-level identity). Content is ids,
+/// numbers and setting values only: never an e-mail address, name or title.
+#[derive(Debug, Default, Clone)]
+pub struct AuditRow<'a> {
+    pub action: &'a str,
+    pub org_id: Option<i64>,
+    pub org_created_at: Option<f64>,
+    pub target: Option<&'a str>,
+    pub reason: Option<&'a str>,
+    pub detail: Option<&'a str>,
+}
+
+/// One `operator_audit` row as read back.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AuditEntry {
+    pub id: i64,
+    pub at: f64,
+    pub actor: String,
+    pub action: String,
+    pub org_id: Option<i64>,
+    pub org_created_at: Option<f64>,
+    pub target: Option<String>,
+    pub reason: Option<String>,
+    pub detail: Option<String>,
+}
+
+/// The `jobs` queries behind `GET /operator/overview`. Every one must be answered from an index
+/// range (`jobs_created`, `jobs_state_finished`), never a scan: the console polls them.
+/// ponytail: `INDEXED BY` because the planner prefers a covering scan of `jobs_org_created`, which
+/// reads every row; the range on `created_at` alone is what the new index is for.
+pub const OVERVIEW_JOB_QUERIES: [&str; 4] = [
+    "SELECT COUNT(DISTINCT org_id) FROM jobs INDEXED BY jobs_created WHERE created_at >= ?1",
+    "SELECT COUNT(*) FROM jobs INDEXED BY jobs_created WHERE created_at >= ?1",
+    "SELECT COUNT(*) FROM jobs INDEXED BY jobs_state_finished WHERE state='failed' AND finished_at >= ?1",
+    "SELECT state, COUNT(*) FROM jobs INDEXED BY jobs_created WHERE created_at >= ?1 GROUP BY state",
+];
+
+/// Write one audit row inside the caller's transaction, so the action and its row commit or roll
+/// back together. The actor is always `operator` (service-level identity).
+/// ponytail: named operator accounts when more than one person holds the token.
+pub fn insert_audit(tx: &Transaction, row: &AuditRow) -> Result<i64> {
+    tx.execute(
+        "INSERT INTO operator_audit(at, actor, action, org_id, org_created_at, target, reason, detail) \
+         VALUES(?,?,?,?,?,?,?,?)",
+        params![
+            crate::now(),
+            "operator",
+            row.action,
+            row.org_id,
+            row.org_created_at,
+            row.target,
+            row.reason,
+            row.detail
+        ],
+    )
+    // never a Conflict: no caller can have a unique violation here, and a refused audit insert
+    // must not read as "e-mail already registered"
+    .map_err(StoreError::Db)?;
+    Ok(tx.last_insert_rowid())
+}
+
+/// Audit rows newest first (by `id`), optionally one org's or one action's, older than `before_id`.
+/// ponytail: no index beyond the key: the log is meant to stay under ~100 k rows, then prune by hand.
+pub fn list_audit(
+    conn: &Connection,
+    org: Option<i64>,
+    action: Option<&str>,
+    before_id: Option<i64>,
+    limit: i64,
+) -> Result<Vec<AuditEntry>> {
+    let mut st = conn.prepare_cached(
+        "SELECT id, at, actor, action, org_id, org_created_at, target, reason, detail \
+         FROM operator_audit \
+         WHERE (:org IS NULL OR org_id = :org) AND (:action IS NULL OR action = :action) \
+           AND (:before IS NULL OR id < :before) \
+         ORDER BY id DESC LIMIT :limit",
+    )?;
+    let rows = st.query_map(
+        named_params! {":org": org, ":action": action, ":before": before_id, ":limit": limit},
+        |r| {
+            Ok(AuditEntry {
+                id: r.get(0)?,
+                at: r.get(1)?,
+                actor: r.get(2)?,
+                action: r.get(3)?,
+                org_id: r.get(4)?,
+                org_created_at: r.get(5)?,
+                target: r.get(6)?,
+                reason: r.get(7)?,
+                detail: r.get(8)?,
+            })
+        },
+    )?;
+    Ok(rows.collect::<std::result::Result<_, _>>()?)
+}
+
+// --- operator writes -------------------------------------------------------------------------------
+//
+// Each action is one function: one `BEGIN IMMEDIATE`, the change, its audit row, one commit. A
+// refused or failed action drops the transaction, so neither the change nor the row is kept. Audit
+// content is ids and numbers only (never an e-mail address, a name or a title). Mail and the WAL
+// truncate belong to the caller and run after the commit.
+
+/// What an operator action came to when it did not fail.
+#[derive(Debug, PartialEq)]
+pub enum Outcome<T> {
+    Done(T),
+    NotFound,
+    Refused(Refusal),
+}
+
+/// Why an operator action was not carried out although the thing exists.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Refusal {
+    AlreadyLocked,
+    NotLocked,
+    /// The id belongs to another org than the caller named (a stale page, a reused id).
+    OrgMismatch,
+    /// The org is not the generation the caller saw (`org_created_at`): deleted and recreated
+    /// under the same id, or no generation named.
+    OrgChanged,
+    /// The typed name is not the org's current name.
+    ConfirmMismatch,
+    DefaultOrg,
+}
+
+/// When the org was created: what keeps a reused org id apart in the audit log.
+pub fn org_created_at(tx: &Connection, org_id: i64) -> Result<Option<f64>> {
+    Ok(tx
+        .query_row("SELECT created_at FROM orgs WHERE id=?", [org_id], |r| {
+            r.get(0)
+        })
+        .optional()?)
+}
+
+/// `org.update`: every set field of `u` in one transaction. `detail` says which fields (no name).
+pub fn operator_update_org(
+    conn: &Connection,
+    org_id: i64,
+    seen: Option<f64>,
+    u: &OrgUpdate,
+    reason: Option<&str>,
+    detail: &Value,
+) -> Result<Outcome<()>> {
+    let tx = begin(conn)?;
+    let Some(created) = org_created_at(&tx, org_id)? else {
+        return Ok(Outcome::NotFound);
+    };
+    if seen != Some(created) {
+        return Ok(Outcome::Refused(Refusal::OrgChanged));
+    }
+    update_org_tx(&tx, org_id, u)?;
+    insert_audit(
+        &tx,
+        &AuditRow {
+            action: "org.update",
+            org_id: Some(org_id),
+            org_created_at: Some(created),
+            reason,
+            detail: Some(&detail.to_string()),
+            ..Default::default()
+        },
+    )?;
+    tx.commit()?;
+    Ok(Outcome::Done(()))
+}
+
+/// `org.lock`: the flag row, and the org's queued jobs cancelled (`error: "org locked"`). Returns
+/// how many. Claimed jobs run on; quota and plan stay as they are.
+pub fn operator_lock_org(
+    conn: &Connection,
+    org_id: i64,
+    seen: Option<f64>,
+    reason: &str,
+) -> Result<Outcome<i64>> {
+    let tx = begin(conn)?;
+    let Some(created) = org_created_at(&tx, org_id)? else {
+        return Ok(Outcome::NotFound);
+    };
+    if seen != Some(created) {
+        return Ok(Outcome::Refused(Refusal::OrgChanged));
+    }
+    let now = crate::now();
+    // a row of an earlier org of this id locks nothing: make room for the real one
+    tx.execute(
+        "DELETE FROM org_locks WHERE org_id=? AND org_created_at<>?",
+        params![org_id, created],
+    )?;
+    let inserted = tx.execute(
+        "INSERT OR IGNORE INTO org_locks(org_id, org_created_at, reason, locked_at) VALUES(?,?,?,?)",
+        params![org_id, created, reason, now],
+    )?;
+    if inserted == 0 {
+        return Ok(Outcome::Refused(Refusal::AlreadyLocked));
+    }
+    let cancelled = tx.execute(
+        "UPDATE jobs SET state='cancelled', error='org locked', finished_at=? \
+         WHERE org_id=? AND state='queued'",
+        params![now, org_id],
+    )? as i64;
+    insert_audit(
+        &tx,
+        &AuditRow {
+            action: "org.lock",
+            org_id: Some(org_id),
+            org_created_at: Some(created),
+            reason: Some(reason),
+            detail: Some(&serde_json::json!({ "cancelled_jobs": cancelled }).to_string()),
+            ..Default::default()
+        },
+    )?;
+    tx.commit()?;
+    Ok(Outcome::Done(cancelled))
+}
+
+/// `org.unlock`: the flag row removed.
+pub fn operator_unlock_org(
+    conn: &Connection,
+    org_id: i64,
+    seen: Option<f64>,
+    reason: Option<&str>,
+) -> Result<Outcome<()>> {
+    let tx = begin(conn)?;
+    let Some(created) = org_created_at(&tx, org_id)? else {
+        return Ok(Outcome::NotFound);
+    };
+    if seen != Some(created) {
+        return Ok(Outcome::Refused(Refusal::OrgChanged));
+    }
+    if tx.execute(
+        "DELETE FROM org_locks WHERE org_id=? AND org_created_at=?",
+        params![org_id, created],
+    )? == 0
+    {
+        return Ok(Outcome::Refused(Refusal::NotLocked));
+    }
+    insert_audit(
+        &tx,
+        &AuditRow {
+            action: "org.unlock",
+            org_id: Some(org_id),
+            org_created_at: Some(created),
+            reason,
+            ..Default::default()
+        },
+    )?;
+    tx.commit()?;
+    Ok(Outcome::Done(()))
+}
+
+/// `org.delete`: `confirm` must be the org's current name; the default org is never removed. The
+/// audit rows of the org stay (they hold no name).
+pub fn operator_delete_org(
+    conn: &Connection,
+    org_id: i64,
+    seen: Option<f64>,
+    confirm: &str,
+    reason: &str,
+) -> Result<Outcome<()>> {
+    if org_id == DEFAULT_ORG {
+        return Ok(Outcome::Refused(Refusal::DefaultOrg));
+    }
+    let tx = begin(conn)?;
+    let found: Option<(String, f64)> = tx
+        .query_row(
+            "SELECT name, created_at FROM orgs WHERE id=?",
+            [org_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?;
+    let Some((name, created)) = found else {
+        return Ok(Outcome::NotFound);
+    };
+    if seen != Some(created) {
+        return Ok(Outcome::Refused(Refusal::OrgChanged));
+    }
+    if name != confirm {
+        return Ok(Outcome::Refused(Refusal::ConfirmMismatch));
+    }
+    delete_org_tx(&tx, org_id)?;
+    insert_audit(
+        &tx,
+        &AuditRow {
+            action: "org.delete",
+            org_id: Some(org_id),
+            org_created_at: Some(created),
+            reason: Some(reason),
+            ..Default::default()
+        },
+    )?;
+    tx.commit()?;
+    Ok(Outcome::Done(()))
+}
+
+/// `org.create`: a new org, its first user and the invitation token in one transaction.
+/// Err(Conflict) if the e-mail is taken (the rollback takes the half-made org along).
+#[allow(clippy::too_many_arguments)]
+pub fn operator_create_org(
+    conn: &Connection,
+    org_name: &str,
+    email: &str,
+    password_hash: &str,
+    job_quota: Option<i64>,
+    invite_token: &str,
+    invite_ttl_s: f64,
+    reason: Option<&str>,
+) -> Result<Signup> {
+    let tx = begin(conn)?;
+    let new = signup_tx(&tx, org_name, email, password_hash, job_quota, None)?;
+    // the invitation is a reset token, minted in the same transaction as the account it opens
+    create_password_reset_tx(&tx, new.user_id, invite_token, invite_ttl_s, None)?;
+    insert_audit(
+        &tx,
+        &AuditRow {
+            action: "org.create",
+            org_id: Some(new.org_id),
+            org_created_at: org_created_at(&tx, new.org_id)?,
+            target: Some(&format!("user:{}", new.user_id)),
+            reason,
+            detail: Some(&serde_json::json!({ "job_quota": job_quota }).to_string()),
+        },
+    )?;
+    tx.commit()?;
+    Ok(new)
+}
+
+/// `user.reset`: mint the reset token. Returns the user's e-mail address for the mail the caller
+/// sends after the commit. `org_id` must be the user's org; a user without an address (the seeded
+/// legacy one) is not found.
+pub fn operator_reset_user(
+    conn: &Connection,
+    user_id: i64,
+    org_id: i64,
+    seen: Option<f64>,
+    token: &str,
+    ttl_s: f64,
+    reason: Option<&str>,
+) -> Result<Outcome<String>> {
+    let tx = begin(conn)?;
+    let user: Option<(i64, Option<String>)> = tx
+        .query_row(
+            "SELECT org_id, email FROM users WHERE id=?",
+            [user_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?;
+    let Some((owner, Some(email))) = user else {
+        return Ok(Outcome::NotFound);
+    };
+    if owner != org_id {
+        return Ok(Outcome::Refused(Refusal::OrgMismatch));
+    }
+    let created = org_created_at(&tx, org_id)?;
+    if created.is_none() || seen != created {
+        return Ok(Outcome::Refused(Refusal::OrgChanged));
+    }
+    create_password_reset_tx(&tx, user_id, token, ttl_s, None)?;
+    insert_audit(
+        &tx,
+        &AuditRow {
+            action: "user.reset",
+            org_id: Some(org_id),
+            org_created_at: created,
+            target: Some(&format!("user:{user_id}")),
+            reason,
+            ..Default::default()
+        },
+    )?;
+    tx.commit()?;
+    Ok(Outcome::Done(email))
+}
+
+/// A row of its own, for what happens after a commit (a reset mail that did not go out).
+pub fn operator_audit_note(conn: &Connection, row: &AuditRow) -> Result<i64> {
+    let tx = begin(conn)?;
+    let id = insert_audit(&tx, row)?;
+    tx.commit()?;
+    Ok(id)
+}
+
+/// `key.revoke`: `org_id` must be the key's org.
+pub fn operator_revoke_key(
+    conn: &Connection,
+    key_id: i64,
+    org_id: i64,
+    seen: Option<f64>,
+    reason: Option<&str>,
+) -> Result<Outcome<()>> {
+    let tx = begin(conn)?;
+    let owner: Option<i64> = tx
+        .query_row("SELECT org_id FROM api_keys WHERE id=?", [key_id], |r| {
+            r.get(0)
+        })
+        .optional()?;
+    let Some(owner) = owner else {
+        return Ok(Outcome::NotFound);
+    };
+    if owner != org_id {
+        return Ok(Outcome::Refused(Refusal::OrgMismatch));
+    }
+    let created = org_created_at(&tx, org_id)?;
+    if created.is_none() || seen != created {
+        return Ok(Outcome::Refused(Refusal::OrgChanged));
+    }
+    revoke_api_key_tx(&tx, key_id, Some(org_id))?;
+    insert_audit(
+        &tx,
+        &AuditRow {
+            action: "key.revoke",
+            org_id: Some(org_id),
+            org_created_at: created,
+            target: Some(&format!("key:{key_id}")),
+            reason,
+            ..Default::default()
+        },
+    )?;
+    tx.commit()?;
+    Ok(Outcome::Done(()))
+}
+
+// --- operator reads: orgs and their jobs --------------------------------------------------------
+//
+// Metadata only. None of these statements selects a payload, title, callback URL, idempotency
+// key, key hash, password hash or the Shopify secret, so none of them can leak one.
+
+/// One org as the console lists it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct OperatorOrg {
+    pub id: i64,
+    pub name: String,
+    pub created_at: f64,
+    pub plan: Option<String>,
+    pub job_quota: Option<i64>,
+    pub jobs_this_month: i64,
+    pub queued_jobs: i64,
+    pub failed_today: i64,
+    pub last_job_at: Option<f64>,
+    pub agents_online: i64,
+    pub agents_total: i64,
+    pub newest_agent_seen_at: Option<f64>,
+    pub printers: i64,
+    pub locked: bool,
+    pub first_user_email: Option<String>,
+    pub terms_version: Option<String>,
+    pub terms_accepted_at: Option<f64>,
+    /// `locked` | `new` | `idle` | `active`
+    pub status: String,
+}
+
+/// The status values `GET /operator/orgs?status=` takes.
+pub const ORG_STATUSES: [&str; 4] = ["locked", "new", "idle", "active"];
+
+/// Orgs with their numbers, by id. Every subquery is correlated on `org_id`, so each one is an
+/// index lookup per org (`jobs_org`, `jobs_org_state`, `jobs_org_created`, `agents_org`,
+/// `printers_org`, `users_org`, `terms_org`): the cost is the page size, not the size of `jobs`.
+/// `:status` filters on the derived status, which needs the numbers, so a filtered page computes
+/// them for every org it passes over (ponytail: fine for thousands of orgs; past that, store the
+/// status). `:q` is a LIKE pattern (backslash escapes) or NULL; `:only` an org id or NULL.
+const OPERATOR_ORG_LIST_SQL: &str = r"
+SELECT * FROM (
+  SELECT *,
+    CASE WHEN locked THEN 'locked'
+         WHEN created_at >= :new_since THEN 'new'
+         WHEN last_job_at IS NULL OR last_job_at < :idle_since THEN 'idle'
+         ELSE 'active' END AS status
+  FROM (
+    SELECT o.id, o.name, o.created_at, o.plan, o.job_quota,
+      (SELECT COUNT(*) FROM jobs j WHERE j.org_id = o.id AND j.created_at >= :month) AS jobs_this_month,
+      (SELECT COUNT(*) FROM jobs j WHERE j.org_id = o.id AND j.state = 'queued') AS queued_jobs,
+      (SELECT COUNT(*) FROM jobs j WHERE j.org_id = o.id AND j.created_at >= :today
+         AND j.state = 'failed') AS failed_today,
+      (SELECT MAX(j.created_at) FROM jobs j WHERE j.org_id = o.id) AS last_job_at,
+      (SELECT COUNT(*) FROM agents a WHERE a.org_id = o.id
+         AND a.last_seen_at >= :online_since) AS agents_online,
+      (SELECT COUNT(*) FROM agents a WHERE a.org_id = o.id) AS agents_total,
+      (SELECT MAX(a.last_seen_at) FROM agents a WHERE a.org_id = o.id) AS newest_agent_seen_at,
+      (SELECT COUNT(*) FROM printers p WHERE p.org_id = o.id) AS printers,
+      EXISTS(SELECT 1 FROM org_locks l WHERE l.org_id = o.id
+         AND l.org_created_at = o.created_at) AS locked,
+      (SELECT u.email FROM users u WHERE u.org_id = o.id AND u.email IS NOT NULL
+         ORDER BY u.id LIMIT 1) AS first_user_email,
+      (SELECT t.version FROM terms_acceptances t WHERE t.org_id = o.id
+         ORDER BY t.accepted_at DESC, t.id DESC LIMIT 1) AS terms_version,
+      (SELECT MAX(t.accepted_at) FROM terms_acceptances t WHERE t.org_id = o.id) AS terms_accepted_at
+    FROM orgs o
+    WHERE o.id > :after AND (:only IS NULL OR o.id = :only)
+      AND (:q IS NULL OR o.name LIKE :q ESCAPE '\'
+           OR EXISTS(SELECT 1 FROM users u WHERE u.org_id = o.id AND u.email LIKE :q ESCAPE '\'))
+  )
+) WHERE (:status IS NULL OR status = :status)
+ORDER BY id LIMIT :limit";
+
+/// What `operator_list_orgs` filters and pages by. `after` is the last org id of the previous page.
+#[derive(Debug, Clone, Default)]
+pub struct OrgQuery<'a> {
+    pub status: Option<&'a str>,
+    /// A plain search string: matched against org names and user e-mails, `%` and `_` literal.
+    pub q: Option<&'a str>,
+    pub after: i64,
+    pub only: Option<i64>,
+    pub limit: i64,
+}
+
+fn like_pattern(q: &str) -> String {
+    let mut p = String::from("%");
+    for c in q.chars() {
+        if matches!(c, '%' | '_' | '\\') {
+            p.push('\\');
+        }
+        p.push(c);
+    }
+    p.push('%');
+    p
+}
+
+fn operator_org(r: &Row) -> rusqlite::Result<OperatorOrg> {
+    Ok(OperatorOrg {
+        id: r.get("id")?,
+        name: r.get("name")?,
+        created_at: r.get("created_at")?,
+        plan: r.get("plan")?,
+        job_quota: r.get("job_quota")?,
+        jobs_this_month: r.get("jobs_this_month")?,
+        queued_jobs: r.get("queued_jobs")?,
+        failed_today: r.get("failed_today")?,
+        last_job_at: r.get("last_job_at")?,
+        agents_online: r.get("agents_online")?,
+        agents_total: r.get("agents_total")?,
+        newest_agent_seen_at: r.get("newest_agent_seen_at")?,
+        printers: r.get("printers")?,
+        locked: r.get("locked")?,
+        first_user_email: r.get("first_user_email")?,
+        terms_version: r.get("terms_version")?,
+        terms_accepted_at: r.get("terms_accepted_at")?,
+        status: r.get("status")?,
+    })
+}
+
+/// Orgs for `GET /operator/orgs`, by id, at most `query.limit`.
+pub fn operator_list_orgs(
+    conn: &Connection,
+    now: f64,
+    online_window_s: f64,
+    query: &OrgQuery,
+) -> Result<Vec<OperatorOrg>> {
+    const DAY: f64 = 86_400.0;
+    let q = query.q.map(like_pattern);
+    let mut st = conn.prepare_cached(OPERATOR_ORG_LIST_SQL)?;
+    let rows = st.query_map(
+        named_params! {
+            ":new_since": now - 7.0 * DAY,
+            ":idle_since": now - 14.0 * DAY,
+            ":month": month_start(now),
+            ":today": (now / DAY).floor() * DAY,
+            ":online_since": now - online_window_s,
+            ":after": query.after,
+            ":only": query.only,
+            ":q": q,
+            ":status": query.status,
+            ":limit": query.limit,
+        },
+        operator_org,
+    )?;
+    Ok(rows.collect::<rusqlite::Result<_>>()?)
+}
+
+/// One org with the same numbers as the list.
+pub fn operator_get_org(
+    conn: &Connection,
+    now: f64,
+    online_window_s: f64,
+    org_id: i64,
+) -> Result<Option<OperatorOrg>> {
+    let q = OrgQuery {
+        only: Some(org_id),
+        after: i64::MIN,
+        limit: 1,
+        ..Default::default()
+    };
+    Ok(operator_list_orgs(conn, now, online_window_s, &q)?.pop())
+}
+
+/// Jobs of one org per UTC day since `since` (the start of the month): (day index, jobs, failed).
+pub fn org_jobs_by_day(conn: &Connection, org_id: i64, since: f64) -> Result<Vec<(i64, i64, i64)>> {
+    let mut st = conn.prepare_cached(
+        "SELECT CAST((created_at - :since) / 86400 AS INTEGER) AS day, COUNT(*), \
+         SUM(state = 'failed') FROM jobs WHERE org_id = :org AND created_at >= :since \
+         GROUP BY day ORDER BY day",
+    )?;
+    let rows = st.query_map(named_params! {":org": org_id, ":since": since}, |r| {
+        Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+    })?;
+    Ok(rows.collect::<rusqlite::Result<_>>()?)
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct OperatorUser {
+    pub id: i64,
+    pub email: String,
+    pub created_at: f64,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct OperatorKey {
+    pub id: i64,
+    pub label: String,
+    pub active: bool,
+    pub created_at: f64,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct OperatorPrinter {
+    pub id: i64,
+    pub name: String,
+    pub can_pdf: bool,
+    pub state: String,
+    pub agent_id: i64,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct OperatorLock {
+    pub reason: String,
+    pub locked_at: f64,
+}
+
+/// The lists of the org detail, apart from agents (`list_agents`).
+pub struct OrgParts {
+    pub users: Vec<OperatorUser>,
+    pub printers: Vec<OperatorPrinter>,
+    pub keys: Vec<OperatorKey>,
+    /// (version, accepted_at), oldest first.
+    pub terms: Vec<(String, f64)>,
+    pub lock: Option<OperatorLock>,
+}
+
+pub fn operator_org_parts(conn: &Connection, org_id: i64) -> Result<OrgParts> {
+    let mut st = conn.prepare_cached(
+        "SELECT id, email, created_at FROM users WHERE org_id = ? AND email IS NOT NULL ORDER BY id",
+    )?;
+    let users = st
+        .query_map([org_id], |r| {
+            Ok(OperatorUser {
+                id: r.get(0)?,
+                email: r.get(1)?,
+                created_at: r.get(2)?,
+            })
+        })?
+        .collect::<rusqlite::Result<_>>()?;
+    let mut st = conn.prepare_cached(
+        "SELECT id, name, can_pdf, state, agent_id FROM printers WHERE org_id = ? ORDER BY id",
+    )?;
+    let printers = st
+        .query_map([org_id], |r| {
+            Ok(OperatorPrinter {
+                id: r.get(0)?,
+                name: r.get(1)?,
+                can_pdf: r.get(2)?,
+                state: r.get(3)?,
+                agent_id: r.get(4)?,
+            })
+        })?
+        .collect::<rusqlite::Result<_>>()?;
+    let mut st = conn.prepare_cached(
+        "SELECT id, label, active, created_at FROM api_keys WHERE org_id = ? ORDER BY id",
+    )?;
+    let keys = st
+        .query_map([org_id], |r| {
+            Ok(OperatorKey {
+                id: r.get(0)?,
+                label: r.get(1)?,
+                active: r.get(2)?,
+                created_at: r.get(3)?,
+            })
+        })?
+        .collect::<rusqlite::Result<_>>()?;
+    let mut st = conn.prepare_cached(
+        "SELECT version, accepted_at FROM terms_acceptances WHERE org_id = ? \
+         ORDER BY accepted_at, id",
+    )?;
+    let terms = st
+        .query_map([org_id], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+    let lock = conn
+        .query_row(
+            "SELECT l.reason, l.locked_at FROM org_locks l JOIN orgs o \
+             ON o.id = l.org_id AND o.created_at = l.org_created_at WHERE l.org_id = ?",
+            [org_id],
+            |r| {
+                Ok(OperatorLock {
+                    reason: r.get(0)?,
+                    locked_at: r.get(1)?,
+                })
+            },
+        )
+        .optional()?;
+    Ok(OrgParts {
+        users,
+        printers,
+        keys,
+        terms,
+        lock,
+    })
+}
+
+/// One job as the operator sees it: metadata, never the content.
+#[derive(Debug, Clone, PartialEq)]
+pub struct OperatorJob {
+    pub id: i64,
+    pub created_at: f64,
+    pub claimed_at: Option<f64>,
+    pub finished_at: Option<f64>,
+    pub type_: String,
+    pub mode: String,
+    pub state: String,
+    pub printer_id: i64,
+    pub printer_name: Option<String>,
+    pub copies: i64,
+    pub error: Option<String>,
+}
+
+/// Newest first by id (`jobs_org` is ordered by id within an org, so there is no sort).
+const OPERATOR_ORG_JOBS_SQL: &str = "
+SELECT j.id, j.created_at, j.claimed_at, j.finished_at, j.type, j.mode, j.state, j.printer_id,
+       p.name, j.copies, j.error
+FROM jobs j LEFT JOIN printers p ON p.id = j.printer_id
+WHERE j.org_id = :org AND (:before IS NULL OR j.id < :before)
+ORDER BY j.id DESC LIMIT :limit";
+
+pub fn operator_org_jobs(
+    conn: &Connection,
+    org_id: i64,
+    before_id: Option<i64>,
+    limit: i64,
+) -> Result<Vec<OperatorJob>> {
+    let mut st = conn.prepare_cached(OPERATOR_ORG_JOBS_SQL)?;
+    let rows = st.query_map(
+        named_params! {":org": org_id, ":before": before_id, ":limit": limit},
+        |r| {
+            Ok(OperatorJob {
+                id: r.get(0)?,
+                created_at: r.get(1)?,
+                claimed_at: r.get(2)?,
+                finished_at: r.get(3)?,
+                type_: r.get(4)?,
+                mode: r.get(5)?,
+                state: r.get(6)?,
+                printer_id: r.get(7)?,
+                printer_name: r.get(8)?,
+                copies: r.get(9)?,
+                error: r.get(10)?,
+            })
+        },
+    )?;
+    Ok(rows.collect::<rusqlite::Result<_>>()?)
+}
+
+fn explain(conn: &Connection, sql: &str, p: impl rusqlite::Params) -> Result<Vec<String>> {
+    let mut st = conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}"))?;
+    let rows = st.query_map(p, |r| r.get::<_, String>(3))?;
+    Ok(rows.collect::<rusqlite::Result<_>>()?)
+}
+
+/// The query plan of the org list (for the test that keeps it on indexes).
+pub fn explain_operator_org_list(conn: &Connection) -> Result<Vec<String>> {
+    explain(
+        conn,
+        OPERATOR_ORG_LIST_SQL,
+        named_params! {
+            ":new_since": 0, ":idle_since": 0, ":month": 0, ":today": 0, ":online_since": 0,
+            ":after": 0, ":only": None::<i64>, ":q": "%a%", ":status": "active", ":limit": 50,
+        },
+    )
+}
+
+pub fn explain_operator_org_jobs(conn: &Connection) -> Result<Vec<String>> {
+    explain(
+        conn,
+        OPERATOR_ORG_JOBS_SQL,
+        named_params! {":org": 1, ":before": None::<i64>, ":limit": 50},
+    )
+}
+
+/// The numbers of `GET /operator/overview` that come from the tables.
+#[derive(Debug, Default, Clone, PartialEq)]
+pub struct OverviewCounts {
+    pub orgs: i64,
+    pub orgs_active_7d: i64,
+    pub signups_7d: i64,
+    pub jobs_this_month: i64,
+    pub failed_jobs_30d: i64,
+    /// Jobs created today (UTC) per state, in `JOB_STATES` order.
+    pub jobs_today: [i64; 5],
+}
+
+pub const JOB_STATES: [&str; 5] = ["queued", "claimed", "done", "failed", "cancelled"];
+
+pub fn overview_counts(conn: &Connection, now: f64) -> Result<OverviewCounts> {
+    const DAY: f64 = 86_400.0;
+    let one =
+        |sql: &str, since: f64| -> Result<i64> { Ok(conn.query_row(sql, [since], |r| r.get(0))?) };
+    let mut out = OverviewCounts {
+        // the seeded default org is no signup
+        orgs: conn.query_row("SELECT COUNT(*) FROM orgs", [], |r| r.get(0))?,
+        signups_7d: one(
+            "SELECT COUNT(*) FROM orgs WHERE id != 1 AND created_at >= ?1",
+            now - 7.0 * DAY,
+        )?,
+        orgs_active_7d: one(OVERVIEW_JOB_QUERIES[0], now - 7.0 * DAY)?,
+        jobs_this_month: one(OVERVIEW_JOB_QUERIES[1], month_start(now))?,
+        failed_jobs_30d: one(OVERVIEW_JOB_QUERIES[2], now - 30.0 * DAY)?,
+        jobs_today: [0; 5],
+    };
+    let today = (now / DAY).floor() * DAY;
+    let mut st = conn.prepare_cached(OVERVIEW_JOB_QUERIES[3])?;
+    let rows = st.query_map([today], |r| {
+        Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
+    })?;
+    for row in rows {
+        let (state, n) = row?;
+        if let Some(i) = JOB_STATES.iter().position(|s| *s == state) {
+            out.jobs_today[i] = n;
+        }
+    }
+    Ok(out)
+}
+
+/// Size of the database file and its `-wal` in bytes (0 for an in-memory DB or no WAL file).
+pub fn db_sizes(conn: &Connection) -> Result<(i64, i64)> {
+    let pages: i64 = conn.query_row("PRAGMA page_count", [], |r| r.get(0))?;
+    let page_size: i64 = conn.query_row("PRAGMA page_size", [], |r| r.get(0))?;
+    let file: String = conn
+        .query_row(
+            "SELECT file FROM pragma_database_list WHERE name='main'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap_or_default();
+    let wal = if file.is_empty() {
+        0
+    } else {
+        std::fs::metadata(format!("{file}-wal")).map_or(0, |m| m.len() as i64)
+    };
+    Ok((pages * page_size, wal))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2431,9 +3466,9 @@ mod tests {
         let jid = enq(&conn, pid, b"x");
         claim_job(&conn, aid, None).unwrap();
         let base = crate::now();
-        assert_eq!(requeue_stale(&conn, 60.0, 1, Some(base)).unwrap(), 0); // not stale yet
+        assert_eq!(requeue_stale(&conn, 60.0, 1, Some(base), false).unwrap(), 0); // not stale yet
         assert_eq!(
-            requeue_stale(&conn, 60.0, 1, Some(base + 120.0)).unwrap(),
+            requeue_stale(&conn, 60.0, 1, Some(base + 120.0), false).unwrap(),
             1
         ); // under limit
         assert_eq!(state_of(&conn, jid), "queued");
@@ -2443,7 +3478,7 @@ mod tests {
         );
         claim_job(&conn, aid, None).unwrap(); // claim again, go stale again -> over the limit
         assert_eq!(
-            requeue_stale(&conn, 60.0, 1, Some(base + 300.0)).unwrap(),
+            requeue_stale(&conn, 60.0, 1, Some(base + 300.0), false).unwrap(),
             0
         );
         assert_eq!(state_of(&conn, jid), "failed");
@@ -2858,6 +3893,63 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    // --- transaction-aware variants: compose with a caller's write, roll back with it ------------
+
+    #[test]
+    fn update_org_tx_applies_all_fields_and_rolls_back_with_the_caller() {
+        let conn = db();
+        let oid = create_org(&conn, "acme").unwrap();
+        let upd = OrgUpdate {
+            name: Some("acme 2"),
+            job_quota: Some(Some(7)),
+            plan: Some(("pro", Some(500))),
+        };
+        let tx = begin_tx(&conn).unwrap();
+        assert!(update_org_tx(&tx, oid, &upd).unwrap());
+        drop(tx); // the caller's later step failed: nothing may stay
+        let o = get_org(&conn, oid).unwrap().unwrap();
+        assert_eq!((o.name.as_str(), o.job_quota, o.plan), ("acme", None, None));
+
+        let tx = begin_tx(&conn).unwrap();
+        assert!(update_org_tx(&tx, oid, &upd).unwrap());
+        tx.commit().unwrap();
+        let o = get_org(&conn, oid).unwrap().unwrap();
+        assert_eq!(o.name, "acme 2");
+        assert_eq!(o.plan.as_deref(), Some("pro"));
+        assert_eq!(o.job_quota, Some(7)); // the explicit quota wins over the plan's
+
+        let tx = begin_tx(&conn).unwrap();
+        assert!(!update_org_tx(&tx, 999_999, &upd).unwrap());
+    }
+
+    #[test]
+    fn delete_org_tx_leaves_the_commit_to_the_caller() {
+        let conn = db();
+        let oid = create_org(&conn, "gone").unwrap();
+        let tx = begin_tx(&conn).unwrap();
+        assert!(delete_org_tx(&tx, oid).unwrap());
+        drop(tx);
+        assert!(org_exists(&conn, oid).unwrap());
+        let tx = begin_tx(&conn).unwrap();
+        assert!(delete_org_tx(&tx, oid).unwrap());
+        tx.commit().unwrap();
+        assert!(!org_exists(&conn, oid).unwrap());
+        let tx = begin_tx(&conn).unwrap();
+        assert!(!delete_org_tx(&tx, oid).unwrap());
+    }
+
+    #[test]
+    fn signup_tx_rolls_back_the_org_when_the_email_is_taken() {
+        let conn = db();
+        signup(&conn, "a", "x@example.com", "h", None, None).unwrap();
+        let before = list_orgs(&conn).unwrap().len();
+        let tx = begin_tx(&conn).unwrap();
+        let r = signup_tx(&tx, "b", "x@example.com", "h", Some(5), None);
+        assert!(matches!(r, Err(StoreError::Conflict)));
+        drop(tx);
+        assert_eq!(list_orgs(&conn).unwrap().len(), before);
     }
 
     // --- multi-tenancy --------------------------------------------------------------------
@@ -3304,6 +4396,22 @@ mod tests {
             [],
         );
         assert_eq!(on, 1);
+    }
+
+    #[test]
+    fn the_overview_queries_on_jobs_never_scan_the_table() {
+        let conn = db();
+        for sql in OVERVIEW_JOB_QUERIES {
+            let mut st = conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap();
+            let plan: Vec<String> = st
+                .query_map([0.0], |r| r.get::<_, String>(3))
+                .unwrap()
+                .map(Result::unwrap)
+                .collect();
+            for line in &plan {
+                assert!(!line.contains("SCAN jobs"), "{sql}: {plan:?}");
+            }
+        }
     }
 
     #[test]

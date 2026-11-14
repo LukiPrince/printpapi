@@ -57,6 +57,11 @@ pub struct Config {
     /// PRINTAPI_FETCHES_PER_ORG: payload downloads one org may have in flight; 0 = no cap. None:
     /// `MAX_FETCHES_PER_ORG` with open signup, else no cap (see `Config::fetch_cap`).
     pub fetches_per_org: Option<usize>,
+    /// PRINTAPI_OPERATOR_TOKEN: the credential of the `/operator/` API. Never a `Principal`: only
+    /// `operator_gate` reads it. None: every `/operator/` path is a 404.
+    pub operator_token: Option<String>,
+    /// PRINTAPI_OPERATOR_FROM: the socket peers the operator token is accepted from.
+    pub operator_from: crate::proxy::TrustedProxies,
 }
 
 /// The terms a signup must accept (`PRINTAPI_TERMS_*`). The URLs are `http(s)` (checked at startup).
@@ -93,6 +98,8 @@ impl Config {
             job_retention_days: None,
             terms: None,
             fetches_per_org: None,
+            operator_token: None,
+            operator_from: crate::proxy::TrustedProxies::default(),
         }
     }
 }
@@ -193,6 +200,12 @@ pub struct AppState {
     /// A retention WAL truncate was blocked by a reader; the next pass retries it even if it
     /// changes no rows.
     wal_truncate_pending: std::sync::atomic::AtomicBool,
+    /// When the process started (the overview's uptime).
+    started: std::time::Instant,
+    /// The last retention pass that ran: when, and what it did (the operator overview).
+    last_purge: Mutex<Option<(f64, store::Purged)>>,
+    /// The operator overview, kept for `operator::OVERVIEW_TTL`.
+    overview_cache: Mutex<Option<(std::time::Instant, Value)>>,
 }
 
 /// Concurrent image renders (see `AppState::render_slots`). ponytail: one global cap, not per
@@ -365,6 +378,9 @@ impl AppState {
             org_fetches: Mutex::new(std::collections::HashMap::new()),
             keys_in_flight: Mutex::new(std::collections::HashSet::new()),
             wal_truncate_pending: std::sync::atomic::AtomicBool::new(false),
+            started: std::time::Instant::now(),
+            last_purge: Mutex::new(None),
+            overview_cache: Mutex::new(None),
         }
     }
 }
@@ -392,6 +408,8 @@ pub struct Req {
     /// The client's IP: the socket peer, or the address `X-Forwarded-For` names when the peer is a
     /// trusted proxy (`proxy::client_ip`). The signup throttle key and the access log use it.
     pub peer_ip: String,
+    /// The raw socket peer, never `X-Forwarded-For`. Only the operator gate reads it.
+    pub socket_peer: String,
 }
 
 impl Req {
@@ -472,6 +490,12 @@ macro_rules! gate {
         }
     };
 }
+
+mod operator;
+pub use operator::is_operator_token;
+
+/// The answer of every submit path while the operator has locked the org.
+const ORG_LOCKED: &str = "org locked";
 
 fn jerr(status: u16, msg: impl AsRef<str>) -> Resp {
     Resp::json(status, &json!({ "error": msg.as_ref() }))
@@ -629,6 +653,16 @@ fn py_eq_int(v: &Value, i: i64) -> bool {
 
 /// The id in `<prefix><digits><suffix>` — the regex routes. `\d+` that does not fit an i64 is
 /// not a route (the Python crashed binding it), so it falls through to the 404.
+/// A `job_quota` field: a non-negative integer, or null for unlimited. Shared by the root
+/// `PUT /orgs/{id}` and the operator edit, so both reject the same values with the same text.
+pub(crate) fn parse_job_quota(v: &Value) -> Result<Option<i64>, &'static str> {
+    match v {
+        Value::Null => Ok(None),
+        Value::Number(n) if n.as_i64().is_some_and(|q| q >= 0) => Ok(n.as_i64()),
+        _ => Err("job_quota must be a non-negative integer or null"),
+    }
+}
+
 fn id_of(target: &str, prefix: &str, suffix: &str) -> Option<i64> {
     let d = target.strip_prefix(prefix)?.strip_suffix(suffix)?;
     if d.is_empty() || !d.bytes().all(|b| b.is_ascii_digit()) {
@@ -749,6 +783,8 @@ fn fetches_payload(type_v: &Value) -> bool {
 enum SubmitErr {
     Fetch(String),
     Quota(String),
+    /// The org is locked by the operator: 403, whichever way the job came in.
+    Locked,
     Invalid(String),
     /// Too many renders or downloads running; the client may retry.
     Busy(String),
@@ -769,6 +805,11 @@ impl From<dispatch::DispatchError> for SubmitErr {
 struct Ctx<'a> {
     s: &'a AppState,
     req: &'a Req,
+    /// The request carried the operator token (Authorization or a CloudPRNT path key) on a route
+    /// that is not `/operator/`. `handle` has already removed it, so every resolver sees no
+    /// credential; only `enrollment_org` still needs to know, because open enrollment would
+    /// otherwise take a request without a key.
+    operator_cred: bool,
 }
 
 /// The org `key` may enroll an agent into, or why it may not (see `Ctx::agent_register`): the
@@ -781,7 +822,14 @@ fn enrollment_org(
     key: &str,
     root: bool,
     open: bool,
+    operator: bool,
 ) -> Result<Result<i64, &'static str>, StoreError> {
+    // The operator token enrolls nothing, not even with open enrollment.
+    if operator {
+        return Ok(Err(
+            "unknown agent key: issue one with POST /apikeys (the dashboard's Keys page)",
+        ));
+    }
     if root {
         return Ok(Ok(store::DEFAULT_ORG));
     }
@@ -801,7 +849,31 @@ fn enrollment_org(
 
 /// Route one request (every method and path except the `GET /agent/jobs` long-poll).
 pub fn handle(state: &AppState, req: &Req) -> Resp {
-    let cx = Ctx { s: state, req };
+    let path = req.path();
+    if path == "/operator" || path.starts_with("/operator/") {
+        return Ctx {
+            s: state,
+            req,
+            operator_cred: false,
+        }
+        .operator();
+    }
+    // The operator token is no credential anywhere else: take it out of the request before any
+    // session, key, Basic, CloudPRNT or agent lookup can see it.
+    if let Some(token) = state.cfg.operator_token.as_deref()
+        && let Some(clean) = operator::without_operator_credential(req, token)
+    {
+        return route(state, &clean, true);
+    }
+    route(state, req, false)
+}
+
+fn route(state: &AppState, req: &Req, operator_cred: bool) -> Resp {
+    let cx = Ctx {
+        s: state,
+        req,
+        operator_cred,
+    };
     let r = match req.method.as_str() {
         "GET" => cx.get(),
         "HEAD" => Ok(cx.head()),
@@ -1048,6 +1120,26 @@ impl Ctx<'_> {
         ))
     }
 
+    /// The body of a reset mail: `lead`, the link and the token. The link is built from PUBLIC_URL
+    /// only. Deriving it from the Host header would let anyone who can send this server a request
+    /// mail a *valid* token pointing at their own host; without the env var the mail carries the
+    /// bare token instead.
+    fn reset_mail_text(&self, lead: &str, tok: &str) -> String {
+        let public_url = &self.cfg().public_url;
+        let link = if public_url.is_empty() {
+            String::new()
+        } else {
+            format!("\nOpen {public_url}/?reset={tok}\n")
+        };
+        format!(
+            "{lead}\n\
+             {link}\ntoken: {tok}\n\n\
+             It is valid for {} minutes and works once. \
+             If this was not you, ignore this message.\n",
+            (self.cfg().reset_ttl_s / 60.0).floor() as i64
+        )
+    }
+
     /// Always 200, whether or not the address exists — the answer must not enumerate accounts. A
     /// mail goes out only for a real one.
     fn password_reset(&self) -> R {
@@ -1065,21 +1157,9 @@ impl Ctx<'_> {
             let tok = auth::new_session_token();
             let ttl = self.cfg().reset_ttl_s;
             self.db(|c| store::create_password_reset(c, user.id, &tok, ttl, None))?;
-            // The link is built from PUBLIC_URL only. Deriving it from the Host header would let
-            // anyone who can send this server a request mail a *valid* token pointing at their
-            // own host; without the env var the mail carries the bare token instead.
-            let public_url = &self.cfg().public_url;
-            let link = if public_url.is_empty() {
-                String::new()
-            } else {
-                format!("\nOpen {public_url}/?reset={tok}\n")
-            };
-            let text = format!(
-                "Someone asked to reset the printpapi password for {email}.\n\
-                 {link}\ntoken: {tok}\n\n\
-                 It is valid for {} minutes and works once. \
-                 If this was not you, ignore this message.\n",
-                (ttl / 60.0).floor() as i64
+            let text = self.reset_mail_text(
+                &format!("Someone asked to reset the printpapi password for {email}."),
+                &tok,
             );
             // a broken mail server must not answer differently
             if let Err(e) = self
@@ -1206,6 +1286,9 @@ impl Ctx<'_> {
         };
         // One closure, so a retry cannot see "no job yet" and then a quota the original used up.
         let checked = self.db(|c| {
+            if self.cfg().operator_token.is_some() {
+                store::check_not_locked(c, printer.org_id)?;
+            }
             if let Some(key) = key
                 && let Some(e) = store::find_job_by_key(c, printer.org_id, key)?
             {
@@ -1217,6 +1300,7 @@ impl Ctx<'_> {
             Ok(Some(e)) => return Ok(Gate2::Existing(e)),
             Ok(None) => {}
             Err(StoreError::QuotaExceeded(m)) => return Err(SubmitErr::Quota(m)),
+            Err(StoreError::Locked) => return Err(SubmitErr::Locked),
             Err(e) => return Err(SubmitErr::Store(e)),
         }
         if !fetch {
@@ -1321,7 +1405,8 @@ impl Ctx<'_> {
     }
 
     fn enqueue(&self, job: &store::NewJob<'_>) -> Result<store::Enqueued, SubmitErr> {
-        match self.db(|c| store::enqueue_job(c, job)) {
+        let locks = self.cfg().operator_token.is_some();
+        match self.db(|c| store::enqueue_job_with(c, job, locks)) {
             Ok(e) => {
                 if e.created {
                     self.s.waker.wake(e.agent_id);
@@ -1329,6 +1414,7 @@ impl Ctx<'_> {
                 Ok(e)
             }
             Err(StoreError::QuotaExceeded(m)) => Err(SubmitErr::Quota(m)),
+            Err(StoreError::Locked) => Err(SubmitErr::Locked),
             Err(StoreError::UnknownPrinter(m)) => Err(SubmitErr::Invalid(m)),
             Err(e) => Err(SubmitErr::Store(e)),
         }
@@ -1370,6 +1456,7 @@ impl Ctx<'_> {
             Ok(e) => Ok(Resp::json(200, &json!({ "job_id": e.job_id }))),
             Err(SubmitErr::Fetch(m)) => Ok(jerr(502, format!("downstream: {m}"))),
             Err(SubmitErr::Quota(m)) => Ok(jerr(402, m)),
+            Err(SubmitErr::Locked) => Ok(jerr(403, ORG_LOCKED)),
             Err(SubmitErr::Invalid(m)) => Ok(jerr(400, m)),
             Err(SubmitErr::Busy(m)) => Ok(jerr(503, m)),
             Err(SubmitErr::InProgress(m)) => Ok(jerr(409, m)),
@@ -1445,6 +1532,7 @@ impl Ctx<'_> {
         match self.enqueue(&job) {
             Ok(e) => Ok(Resp::json(200, &json!({ "job_id": e.job_id }))),
             Err(SubmitErr::Quota(m)) => Ok(jerr(402, m)),
+            Err(SubmitErr::Locked) => Ok(jerr(403, ORG_LOCKED)),
             Err(
                 SubmitErr::Invalid(m)
                 | SubmitErr::Fetch(m)
@@ -1752,6 +1840,7 @@ impl Ctx<'_> {
             Ok(e) => Resp::json(201, &json!(e.job_id)),
             Err(SubmitErr::Fetch(m)) => self.pn_error(502, "DownstreamError", m),
             Err(SubmitErr::Quota(m)) => self.pn_error(402, "QuotaExceeded", m),
+            Err(SubmitErr::Locked) => self.pn_error(403, "Forbidden", ORG_LOCKED),
             Err(SubmitErr::Invalid(m)) => self.pn_error(400, "BadRequest", m),
             Err(SubmitErr::Busy(m)) => self.pn_error(503, "ServiceUnavailable", m),
             // ponytail: unreachable today, this layer takes no idempotency key
@@ -2257,7 +2346,7 @@ impl Ctx<'_> {
         let (root, open) = (self.admin_ok(), self.cfg().open_enrollment);
         // Checked here so a refused key answers 401 before any body validation, and again below
         // in the same lock hold as the registration, so a revocation in between cannot slip by.
-        if let Err(m) = self.db(|c| enrollment_org(c, key, root, open))? {
+        if let Err(m) = self.db(|c| enrollment_org(c, key, root, open, self.operator_cred))? {
             return Ok(jerr(401, m));
         }
         let mut printers = Vec::new();
@@ -2298,10 +2387,12 @@ impl Ctx<'_> {
         let name = name.as_str();
         // First contact binds name->key; re-register requires the same key.
         let registered = self.db(|c| -> Result<_, StoreError> {
-            Ok(match enrollment_org(c, key, root, open)? {
-                Err(m) => Err(m),
-                Ok(org) => Ok(store::register_agent(c, name, key, &printers, org)),
-            })
+            Ok(
+                match enrollment_org(c, key, root, open, self.operator_cred)? {
+                    Err(m) => Err(m),
+                    Ok(org) => Ok(store::register_agent(c, name, key, &printers, org)),
+                },
+            )
         })?;
         match registered {
             Err(m) => Ok(jerr(401, m)),
@@ -2377,15 +2468,9 @@ impl Ctx<'_> {
             if p.kind != "root" {
                 return Ok(jerr(403, "job_quota is set by the server operator"));
             }
-            let quota_n = match quota {
-                Value::Null => None,
-                Value::Number(n) if n.as_i64().is_some_and(|q| q >= 0) => n.as_i64(),
-                _ => {
-                    return Ok(jerr(
-                        400,
-                        "job_quota must be a non-negative integer or null",
-                    ));
-                }
+            let quota_n = match parse_job_quota(quota) {
+                Ok(q) => q,
+                Err(msg) => return Ok(jerr(400, msg)),
             };
             if !self.db(|c| store::set_org_quota(c, oid, quota_n))? {
                 return Ok(not_found());
@@ -2650,6 +2735,7 @@ pub fn retention_pass(state: &AppState, now: f64) -> Option<store::Purged> {
     }) {
         Ok(p) => {
             state.wal_truncate_pending.store(p.wal_busy, Relaxed);
+            *state.last_purge.lock().unwrap_or_else(|e| e.into_inner()) = Some((now, p.clone()));
             Some(p)
         }
         Err(e) => {
@@ -2664,10 +2750,15 @@ pub fn retention_pass(state: &AppState, now: f64) -> Option<store::Purged> {
 pub fn reaper_pass(state: &AppState, timeout_s: f64, max_retries: i64) {
     let run = || -> store::Result<()> {
         state.db.with(|c| store::expire_jobs(c, None))?;
-        if state
-            .db
-            .with(|c| store::requeue_stale(c, timeout_s, max_retries, None))?
-            > 0
+        if state.db.with(|c| {
+            store::requeue_stale(
+                c,
+                timeout_s,
+                max_retries,
+                None,
+                state.cfg.operator_token.is_some(),
+            )
+        })? > 0
         {
             state.waker.wake_all();
         }
