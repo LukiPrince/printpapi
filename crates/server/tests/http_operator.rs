@@ -750,8 +750,8 @@ fn org_status_is_locked_new_idle_or_active_and_filters() {
     job_at(&app, locked, 60.0, |_| {});
     sql(
         &app.db,
-        "INSERT INTO org_locks(org_id, org_created_at, reason, locked_at) VALUES(?,?,?,?)",
-        rusqlite::params![locked, now() - DAY, "unpaid invoice", now()],
+        "INSERT INTO org_locks(org_id, org_created_at, reason, locked_at) \n         SELECT id, created_at, ?, ? FROM orgs WHERE id=?",
+        rusqlite::params!["unpaid invoice", now(), locked],
     );
     let (st, v) = app.get_op("/operator/orgs");
     assert_eq!(st, 200, "{v}");
@@ -907,8 +907,8 @@ fn org_detail_has_usage_users_agents_printers_keys_terms_and_lock() {
     // a lock shows up with its reason
     sql(
         &app.db,
-        "INSERT INTO org_locks(org_id, org_created_at, reason, locked_at) VALUES(?,?,?,?)",
-        rusqlite::params![acme, 1.0, "unpaid invoice", 1_700_000_500.0],
+        "INSERT INTO org_locks(org_id, org_created_at, reason, locked_at) \n         SELECT id, created_at, ?, ? FROM orgs WHERE id=?",
+        rusqlite::params!["unpaid invoice", 1_700_000_500.0, acme],
     );
     let (_, v) = app.get_op(&format!("/operator/orgs/{acme}"));
     assert_eq!(

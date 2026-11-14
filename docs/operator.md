@@ -182,6 +182,14 @@ commit. Bodies are JSON; the optional `reason` is a string of at most 500 charac
 the audit log, so keep customer data out of it. An org or id that does not exist answers `404`; a
 body that is not a JSON object, or a field that fails validation, answers `400` and changes nothing.
 
+**Every write on an existing org names its generation.** Org and user ids are reused by SQLite after
+the newest row is deleted, so an id alone does not say which customer a page showed. Each write
+(`PUT`, `lock`, `unlock`, `DELETE` of an org, the user reset and the key revoke) carries
+`org_created_at`, the `created_at` the read endpoints returned for that org, and the server compares
+it with the org's `created_at` inside the transaction. A different or missing value answers **`409`
+`the org changed, reload`**; nothing is changed, no audit row is written and no mail goes out.
+`POST /operator/orgs` creates the org and takes none.
+
 | Call | Audit action |
 |---|---|
 | `PUT /operator/orgs/{id}` | `org.update` |
@@ -207,8 +215,9 @@ same body wins over the plan's. Answer: `{"ok": true}`.
 
 `POST /operator/orgs/{id}/lock` with `{reason}` of at least 8 characters inserts a row into the
 table `org_locks` (`org_id`, `org_created_at`, `reason`, `locked_at`) and cancels the org's queued
-jobs (`error: "org locked"`; a job an agent already claimed runs on). Answer:
-`{"ok": true, "cancelled_jobs": 3}`; `409` if the org is already locked.
+jobs (`error: "org locked"`). A job an agent had already claimed is not interrupted; if that agent
+goes quiet, the reaper cancels the job (`org locked`) instead of putting it back in the queue.
+Answer: `{"ok": true, "cancelled_jobs": 3}`; `409` if the org is already locked.
 
 A lock is a **pure flag**: quota and plan stay as they are, so billing and quota writes need no
 change. While it is set, every way a job gets in answers **`403` `org locked`**: `POST /jobs`,
@@ -217,13 +226,22 @@ next to the quota check in the enqueue path and again before any payload is down
 org causes no outbound request, and an idempotent resubmit does not get an old job back either.
 Logins, the dashboard and agents keep working, so the customer can see what is going on.
 
+A lock row belongs to one org generation: it counts only while its `org_created_at` equals the
+org's `created_at`. A row left by an earlier org of the same id locks nothing and shows nowhere.
+
+**Locks are enforced only while `PRINTAPI_OPERATOR_TOKEN` is set.** Without the token the whole
+operator API is a `404`, so nothing could show or lift a lock; it is inert like the rest. The
+submit check and the reaper rule above then do nothing, the rows stay in the database, and the server
+prints one line at startup: `N org locks are not enforced: PRINTAPI_OPERATOR_TOKEN is unset`. Set the
+token again and they hold again.
+
 `POST /operator/orgs/{id}/unlock` (`{reason?}`) deletes the row; `409` if the org is not locked.
 `GET /operator/orgs` and the org detail show the lock (`locked`, `status: "locked"`, `lock`).
 
 > **Rolling back to an older version drops the lock.** Versions before this one (and the Python
 > server of v2.x) do not read `org_locks`: a locked org can submit again, and the table is kept
-> untouched. Unlock first, or accept that. Deleting an org there also leaves its lock row behind, so
-> a later org that reuses the id would still read as locked on a newer version.
+> untouched. Unlock first, or accept that. Deleting an org there also leaves its lock row behind; a
+> later org that reuses the id is not locked by it, because the row names the old org's generation.
 
 ### `DELETE /operator/orgs/{id}`
 
@@ -245,12 +263,14 @@ the commit. Answer: `{"ok": true, "org_id", "user_id", "mail_sent"}`. Without ma
 ### `POST /operator/users/{id}/reset`
 
 `{org_id, reason?}` sends a password-reset mail to the user and never returns the token. `org_id`
-must be the user's org (`409` otherwise), so a stale page cannot reach a user that reuses an id. `409`
+must be the user's org (`409` otherwise) and `org_created_at` that org's generation (`409`
+`the org changed, reload`), so a stale page cannot reach a user that reuses an id. `409`
 `mail is not configured` without mail and `PUBLIC_URL`; `502` if the mail did not go out (the row
 `user.reset_mail_failed` says so). A user without an e-mail address (the seeded legacy one) is `404`.
 
 ### `DELETE /operator/keys/{id}`
 
-`{org_id, reason?}` revokes an API key (`409` if the key belongs to another org). Agents enrolled
+`{org_id, org_created_at, reason?}` revokes an API key (`409` if the key belongs to another org or
+generation). Agents enrolled
 with it end their long-poll with `401`. Removing a single user is not offered here: customers remove
 their own accounts, and root still can.

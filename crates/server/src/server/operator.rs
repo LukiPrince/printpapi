@@ -81,6 +81,16 @@ fn name_of(v: Option<&Value>, what: &str) -> Gate<String> {
 }
 
 /// The `org_id` a write names to prove its page is not stale.
+/// The `org_created_at` the console's page showed (the org's `created_at` of the read endpoints).
+/// Missing or not a number: `None`, which matches no org, so the write is refused as stale.
+fn seen_of(body: &Obj) -> Option<f64> {
+    body.get("org_created_at").and_then(Value::as_f64)
+}
+
+fn org_changed() -> Resp {
+    jerr(409, "the org changed, reload")
+}
+
 fn org_id_of(body: &Obj) -> Gate<i64> {
     body.get("org_id")
         .and_then(Value::as_i64)
@@ -281,22 +291,26 @@ impl Ctx<'_> {
             return Ok(jerr(400, "nothing to update"));
         }
         let detail = Value::Object(detail);
-        let out =
-            self.db(|c| store::operator_update_org(c, id, &update, reason.as_deref(), &detail))?;
+        let seen = seen_of(&body);
+        let out = self
+            .db(|c| store::operator_update_org(c, id, seen, &update, reason.as_deref(), &detail))?;
         Ok(match out {
             store::Outcome::Done(()) => ok_true(),
-            _ => not_found(),
+            store::Outcome::Refused(_) => org_changed(),
+            store::Outcome::NotFound => not_found(),
         })
     }
 
     fn operator_org_lock(&self, id: i64) -> R {
         let body = gate!(self.read_obj());
         let reason = gate!(reason_of(&body, LOCK_REASON_MIN)).unwrap_or_default();
+        let seen = seen_of(&body);
         Ok(
-            match self.db(|c| store::operator_lock_org(c, id, &reason))? {
+            match self.db(|c| store::operator_lock_org(c, id, seen, &reason))? {
                 store::Outcome::Done(n) => {
                     Resp::json(200, &json!({ "ok": true, "cancelled_jobs": n }))
                 }
+                store::Outcome::Refused(store::Refusal::OrgChanged) => org_changed(),
                 store::Outcome::Refused(_) => jerr(409, "org is already locked"),
                 store::Outcome::NotFound => not_found(),
             },
@@ -306,9 +320,11 @@ impl Ctx<'_> {
     fn operator_org_unlock(&self, id: i64) -> R {
         let body = gate!(self.read_obj());
         let reason = gate!(reason_of(&body, 0));
+        let seen = seen_of(&body);
         Ok(
-            match self.db(|c| store::operator_unlock_org(c, id, reason.as_deref()))? {
+            match self.db(|c| store::operator_unlock_org(c, id, seen, reason.as_deref()))? {
                 store::Outcome::Done(()) => ok_true(),
+                store::Outcome::Refused(store::Refusal::OrgChanged) => org_changed(),
                 store::Outcome::Refused(_) => jerr(409, "org is not locked"),
                 store::Outcome::NotFound => not_found(),
             },
@@ -321,7 +337,8 @@ impl Ctx<'_> {
         let Some(Value::String(confirm)) = body.get("confirm") else {
             return Ok(jerr(400, "confirm must be the org name"));
         };
-        let out = self.db(|c| store::operator_delete_org(c, id, confirm, &reason))?;
+        let seen = seen_of(&body);
+        let out = self.db(|c| store::operator_delete_org(c, id, seen, confirm, &reason))?;
         Ok(match out {
             store::Outcome::Done(()) => {
                 // secure_delete zeroed the pages; this clears the WAL frames too. A reader can
@@ -332,6 +349,7 @@ impl Ctx<'_> {
             store::Outcome::Refused(store::Refusal::DefaultOrg) => {
                 jerr(400, "the default org cannot be removed")
             }
+            store::Outcome::Refused(store::Refusal::OrgChanged) => org_changed(),
             store::Outcome::Refused(_) => jerr(400, "confirm must be the org name"),
             store::Outcome::NotFound => not_found(),
         })
@@ -379,8 +397,12 @@ impl Ctx<'_> {
             "You have been invited to printpapi. Choose a password with the link below.",
             &tok,
         );
+        let created = self
+            .db(|c| store::org_created_at(c, new.org_id))
+            .unwrap_or(None);
         let row = store::AuditRow {
             org_id: Some(new.org_id),
+            org_created_at: created,
             target: Some(&format!("user:{}", new.user_id)),
             ..Default::default()
         };
@@ -400,10 +422,13 @@ impl Ctx<'_> {
         }
         let tok = auth::new_session_token();
         let ttl = self.cfg().reset_ttl_s;
-        let out = self
-            .db(|c| store::operator_reset_user(c, user_id, org_id, &tok, ttl, reason.as_deref()))?;
+        let seen = seen_of(&body);
+        let out = self.db(|c| {
+            store::operator_reset_user(c, user_id, org_id, seen, &tok, ttl, reason.as_deref())
+        })?;
         let email = match out {
             store::Outcome::Done(e) => e,
+            store::Outcome::Refused(store::Refusal::OrgChanged) => return Ok(org_changed()),
             store::Outcome::Refused(_) => return Ok(jerr(409, "user belongs to another org")),
             store::Outcome::NotFound => return Ok(not_found()),
         };
@@ -411,8 +436,12 @@ impl Ctx<'_> {
             "An operator started a password reset for your printpapi account.",
             &tok,
         );
+        let created = self
+            .db(|c| store::org_created_at(c, org_id))
+            .unwrap_or(None);
         let row = store::AuditRow {
             org_id: Some(org_id),
+            org_created_at: created,
             target: Some(&format!("user:{user_id}")),
             ..Default::default()
         };
@@ -427,13 +456,16 @@ impl Ctx<'_> {
         let body = gate!(self.read_obj());
         let org_id = gate!(org_id_of(&body));
         let reason = gate!(reason_of(&body, 0));
-        let out = self.db(|c| store::operator_revoke_key(c, key_id, org_id, reason.as_deref()))?;
+        let seen = seen_of(&body);
+        let out =
+            self.db(|c| store::operator_revoke_key(c, key_id, org_id, seen, reason.as_deref()))?;
         Ok(match out {
             store::Outcome::Done(()) => {
                 // a long-poll of an agent enrolled with this key re-checks it and ends with 401
                 self.s.waker.wake_all();
                 ok_true()
             }
+            store::Outcome::Refused(store::Refusal::OrgChanged) => org_changed(),
             store::Outcome::Refused(_) => jerr(409, "key belongs to another org"),
             store::Outcome::NotFound => not_found(),
         })

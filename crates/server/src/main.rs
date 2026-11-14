@@ -287,6 +287,7 @@ async fn shutdown_signal() {
 fn run() -> Result<(), String> {
     let (cfg, db_path, port) = config()?;
     let destinations = cfg.destinations;
+    let hosted_locks_enforced = cfg.operator_token.is_some();
     for line in startup_warnings(&cfg) {
         eprintln!("{line}");
     }
@@ -294,6 +295,12 @@ fn run() -> Result<(), String> {
         eprintln!("operator API on (hosted mode: private URLs denied unless allowed explicitly)");
     }
     let db = Db::open(&db_path).map_err(|e| format!("cannot open database {db_path:?}: {e}"))?;
+    if !hosted_locks_enforced
+        && let Ok(n) = db.with(printpapi_server::store::count_org_locks)
+        && n > 0
+    {
+        eprintln!("{n} org locks are not enforced: PRINTAPI_OPERATOR_TOKEN is unset");
+    }
     let state = Arc::new(AppState::new(
         cfg,
         db,

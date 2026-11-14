@@ -47,9 +47,36 @@ fn op<'a>(app: &'a App, method: &str, target: &str) -> Call<'a> {
     app.call(method, target).bearer(OP).socket(CONSOLE)
 }
 
-fn send(app: &App, method: &str, target: &str, body: Value) -> (u16, Value) {
+/// The write as the console sends it: the body carries `org_created_at`, the generation of the
+/// org the page showed (looked up here, unless the test names one itself).
+fn send(app: &App, method: &str, target: &str, mut body: Value) -> (u16, Value) {
+    let org = match target.strip_prefix("/operator/orgs/") {
+        Some(rest) => rest.split('/').next().and_then(|s| s.parse::<i64>().ok()),
+        None => body["org_id"].as_i64(),
+    };
+    if let Some(org) = org
+        && let Some(obj) = body.as_object_mut()
+        && !obj.contains_key("org_created_at")
+        && let Some(created) = created_of(&app.db, org)
+    {
+        obj.insert("org_created_at".into(), json!(created));
+    }
+    send_bare(app, method, target, body)
+}
+
+/// The write exactly as given.
+fn send_bare(app: &App, method: &str, target: &str, body: Value) -> (u16, Value) {
     let r = op(app, method, target).json(&body).send();
     (r.status, r.json())
+}
+
+fn created_of(db: &Db, org: i64) -> Option<f64> {
+    db.with(|c| {
+        c.query_row("SELECT created_at FROM orgs WHERE id=?", [org], |r| {
+            r.get(0)
+        })
+        .ok()
+    })
 }
 
 fn sql(db: &Db, q: &str, p: impl rusqlite::Params) {
@@ -1125,8 +1152,8 @@ fn a_failing_audit_insert_rolls_every_action_back() {
     // an existing lock stays when its unlock cannot be written
     sql(
         &app.db,
-        "INSERT INTO org_locks(org_id, org_created_at, reason, locked_at) VALUES(?,?,?,?)",
-        rusqlite::params![org, 1.0, REASON, 2.0],
+        "INSERT INTO org_locks(org_id, org_created_at, reason, locked_at)          SELECT id, created_at, ?, ? FROM orgs WHERE id=?",
+        rusqlite::params![REASON, 2.0, org],
     );
     let (st, _) = send(
         &app,
@@ -1287,5 +1314,257 @@ fn the_audit_log_holds_no_email_name_or_secret_after_every_action() {
             actions.iter().any(|x| x == a),
             "{a} missing from {actions:?}"
         );
+    }
+}
+
+// --- the org generation: a reused id is not the org the page showed -----------------------------
+
+/// An org is deleted and a new customer signs up under the same id. Returns (org id, user id, key
+/// id of the new org, the old org's created_at).
+fn reborn(app: &App) -> (i64, i64, i64, f64) {
+    let (org, _) = customer(&app.db, "Acme", "boss@acme.test");
+    let old = created_of(&app.db, org).unwrap();
+    assert!(app.db.with(|c| store::delete_org(c, org)).unwrap());
+    let (again, user) = customer(&app.db, "Newcomer", "new@newcomer.test");
+    assert_eq!(again, org, "SQLite reuses the id of the newest row");
+    // the clock may not have ticked: make the generations differ for certain
+    sql(
+        &app.db,
+        "UPDATE orgs SET created_at=? WHERE id=?",
+        rusqlite::params![old + 10.0, org],
+    );
+    add_key(&app.db, "k", "newcomer-key", org);
+    let kid = count(&app.db, "SELECT id FROM api_keys WHERE org_id=?", [org]);
+    (org, user, kid, old)
+}
+
+#[test]
+fn every_write_with_an_old_org_generation_is_409_and_changes_nothing() {
+    let app = app();
+    let (org, user, kid, old) = reborn(&app);
+    let calls = [
+        (
+            "PUT",
+            format!("/operator/orgs/{org}"),
+            json!({"name": "Renamed"}),
+        ),
+        (
+            "POST",
+            format!("/operator/orgs/{org}/lock"),
+            json!({"reason": REASON}),
+        ),
+        ("POST", format!("/operator/orgs/{org}/unlock"), json!({})),
+        (
+            "DELETE",
+            format!("/operator/orgs/{org}"),
+            json!({"reason": REASON, "confirm": "Newcomer"}),
+        ),
+        (
+            "POST",
+            format!("/operator/users/{user}/reset"),
+            json!({"org_id": org}),
+        ),
+        (
+            "DELETE",
+            format!("/operator/keys/{kid}"),
+            json!({"org_id": org}),
+        ),
+    ];
+    let created = created_of(&app.db, org).unwrap();
+    let lock_row = |app: &App| {
+        sql(
+            &app.db,
+            "INSERT INTO org_locks(org_id, org_created_at, reason, locked_at) VALUES(?,?,?,?)",
+            rusqlite::params![org, created, REASON, 2.0],
+        )
+    };
+    for stale in [Some(old), None] {
+        for (m, p, body) in &calls {
+            let mut body = body.clone();
+            if let Some(old) = stale {
+                body["org_created_at"] = json!(old);
+            }
+            // a lock of the new org, so unlock has something to (wrongly) lift; absent for the
+            // lock call itself, which would be refused as a duplicate
+            let is_lock = p.ends_with("/lock");
+            sql(&app.db, "DELETE FROM org_locks", []);
+            if !is_lock {
+                lock_row(&app);
+            }
+            let (st, v) = send_bare(&app, m, p, body);
+            assert_eq!(
+                (st, v["error"].as_str()),
+                (409, Some("the org changed, reload")),
+                "{m} {p} with {stale:?}"
+            );
+            assert_eq!(
+                count(&app.db, "SELECT COUNT(*) FROM org_locks", []),
+                i64::from(!is_lock),
+                "{m} {p}"
+            );
+        }
+    }
+    assert_eq!(org_name(&app.db, org).as_deref(), Some("Newcomer"));
+    assert_eq!(
+        count(&app.db, "SELECT active FROM api_keys WHERE id=?", [kid]),
+        1
+    );
+    assert_eq!(
+        count(&app.db, "SELECT COUNT(*) FROM password_resets", []),
+        0
+    );
+    assert!(app.mail.all().is_empty());
+    assert!(audit_rows(&app).is_empty());
+    // the current generation goes through
+    let (st, _) = send(
+        &app,
+        "POST",
+        &format!("/operator/orgs/{org}/unlock"),
+        json!({}),
+    );
+    assert_eq!(st, 200);
+}
+
+// --- a lock holds only while the operator token is set, and only for its own org generation -----
+
+/// A claimed job of `org` whose agent went quiet.
+fn stale_claim(app: &App, org: i64) -> i64 {
+    let reg = register(&app.db, "pcs", "agent-key-s", &[decl("HP", true)], org);
+    let job = enqueue(&app.db, reg.pid("HP"), b"A", |j| j.org_id = Some(org));
+    assert!(claim(&app.db, reg.computer_id).is_some());
+    job
+}
+
+#[test]
+fn the_reaper_cancels_a_stale_claimed_job_of_a_locked_org() {
+    let app = app();
+    let (org, _) = customer(&app.db, "Acme", "boss@acme.test");
+    let (other, _) = customer(&app.db, "Other", "o@other.test");
+    let job = stale_claim(&app, org);
+    let reg = register(&app.db, "pco", "agent-key-o", &[decl("HP", true)], other);
+    let theirs = enqueue(&app.db, reg.pid("HP"), b"B", |j| j.org_id = Some(other));
+    assert!(claim(&app.db, reg.computer_id).is_some());
+    let (st, _) = send(
+        &app,
+        "POST",
+        &format!("/operator/orgs/{org}/lock"),
+        json!({"reason": REASON}),
+    );
+    assert_eq!(st, 200);
+    assert_eq!(state_of(&app.db, job).0, "claimed", "claimed jobs run on");
+    printpapi_server::server::reaper_pass(&app.state, -1.0, 3);
+    assert_eq!(
+        state_of(&app.db, job),
+        ("cancelled".into(), Some("org locked".into()))
+    );
+    assert_eq!(
+        state_of(&app.db, theirs).0,
+        "queued",
+        "other orgs are requeued as before"
+    );
+}
+
+#[test]
+fn without_the_operator_token_a_lock_is_not_enforced() {
+    let hosted = app();
+    let (org, _) = customer(&hosted.db, "Acme", "boss@acme.test");
+    let (pid, key) = printer_and_key(&hosted.db, org);
+    let job = stale_claim(&hosted, org);
+    assert_eq!(
+        send(
+            &hosted,
+            "POST",
+            &format!("/operator/orgs/{org}/lock"),
+            json!({"reason": REASON})
+        )
+        .0,
+        200
+    );
+    // the same database, started again without the token
+    let plain = App::on(hosted.db.clone(), |_| {});
+    let r = submit_everywhere(&plain, org, pid, &key, 1);
+    assert_eq!(r[0].0, 200, "POST /jobs: {:?}", r[0]);
+    assert_eq!(r[1].0, 200, "POST /orders: {:?}", r[1]);
+    assert_eq!(r[3].0, 201, "PrintNode: {:?}", r[3]);
+    printpapi_server::server::reaper_pass(&plain.state, -1.0, 3);
+    assert_eq!(state_of(&plain.db, job).0, "queued");
+    // with the token the lock holds again
+    let r = submit_everywhere(&hosted, org, pid, &key, 2);
+    assert_eq!(r[0].0, 403, "{:?}", r[0]);
+}
+
+#[test]
+fn a_lock_row_of_another_org_generation_locks_nothing_and_shows_nothing() {
+    let app = app();
+    let (org, _) = customer(&app.db, "Acme", "boss@acme.test");
+    let (pid, key) = printer_and_key(&app.db, org);
+    let created = created_of(&app.db, org).unwrap();
+    sql(
+        &app.db,
+        "INSERT INTO org_locks(org_id, org_created_at, reason, locked_at) VALUES(?,?,?,?)",
+        rusqlite::params![org, created - 5.0, REASON, 2.0],
+    );
+    let r = submit_everywhere(&app, org, pid, &key, 1);
+    assert_eq!(r[0].0, 200, "{:?}", r[0]);
+    assert_eq!(r[3].0, 201, "{:?}", r[3]);
+    let job = stale_claim(&app, org);
+    printpapi_server::server::reaper_pass(&app.state, -1.0, 3);
+    assert_eq!(state_of(&app.db, job).0, "queued");
+    let d = op(&app, "GET", &format!("/operator/orgs/{org}"))
+        .send()
+        .json();
+    assert_eq!(d["locked"], false, "{d}");
+    assert_eq!(d["lock"], Value::Null, "{d}");
+    assert_ne!(d["status"], "locked");
+    let l = op(&app, "GET", "/operator/orgs").send().json();
+    let row = l["orgs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|o| o["id"] == org)
+        .unwrap();
+    assert_eq!(row["locked"], false);
+    assert_ne!(row["status"], "locked");
+    // a fresh lock replaces the stale row instead of being refused as a duplicate
+    let (st, _) = send(
+        &app,
+        "POST",
+        &format!("/operator/orgs/{org}/lock"),
+        json!({"reason": REASON}),
+    );
+    assert_eq!(st, 200);
+    assert_eq!(submit_everywhere(&app, org, pid, &key, 3)[0].0, 403);
+}
+
+#[test]
+fn a_failed_mail_row_carries_the_org_generation() {
+    let app = app();
+    let (org, user) = customer(&app.db, "Acme", "boss@acme.test");
+    let created = created_of(&app.db, org).unwrap();
+    *app.mail.fail.lock().unwrap() = true;
+    let (st, _) = send(
+        &app,
+        "POST",
+        &format!("/operator/users/{user}/reset"),
+        json!({"org_id": org}),
+    );
+    assert_eq!(st, 502);
+    let (st, c) = send(
+        &app,
+        "POST",
+        "/operator/orgs",
+        json!({"name": "Fresh", "email": "fresh@fresh.test"}),
+    );
+    assert_eq!(st, 200, "{c}");
+    let rows = audit_rows(&app);
+    let failed = audit_of(&rows, "user.reset_mail_failed");
+    assert_eq!(failed.len(), 2);
+    for f in &failed {
+        let want = if f["org_id"] == org {
+            created
+        } else {
+            created_of(&app.db, c["org_id"].as_i64().unwrap()).unwrap()
+        };
+        assert_eq!(f["org_created_at"], want, "{f}");
     }
 }

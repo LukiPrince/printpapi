@@ -1444,11 +1444,28 @@ pub fn get_printer(
         .optional()?)
 }
 
+/// How many orgs are locked right now (current generation only).
+pub fn count_org_locks(conn: &Connection) -> Result<i64> {
+    Ok(conn.query_row(
+        "SELECT COUNT(*) FROM org_locks l JOIN orgs o \
+         ON o.id = l.org_id AND o.created_at = l.org_created_at",
+        [],
+        |r| r.get(0),
+    )?)
+}
+
 /// `Locked` while the operator has locked `org_id`. A pure flag: quota and plan are not looked at.
 /// Checked next to `check_quota` wherever a job may enter, and before any payload is fetched.
+///
+/// A lock row counts only while its `org_created_at` is the org's: a row left by an earlier org
+/// of the same (reused) id locks nothing. Callers enforce locks only while the operator token is
+/// configured (`Config::operator_token`): without it nothing could show or lift one.
 pub fn check_not_locked(conn: &Connection, org_id: i64) -> Result<()> {
     let locked = conn
-        .prepare_cached("SELECT 1 FROM org_locks WHERE org_id=?")?
+        .prepare_cached(
+            "SELECT 1 FROM org_locks l JOIN orgs o \
+             ON o.id = l.org_id AND o.created_at = l.org_created_at WHERE l.org_id=?",
+        )?
         .query_row([org_id], |_| Ok(()))
         .optional()?
         .is_some();
@@ -1494,7 +1511,17 @@ pub fn find_job_by_key(conn: &Connection, org_id: i64, key: &str) -> Result<Opti
         .optional()?)
 }
 
+/// `enqueue_job_with` with org locks enforced.
 pub fn enqueue_job(conn: &Connection, job: &NewJob<'_>) -> Result<Enqueued> {
+    enqueue_job_with(conn, job, true)
+}
+
+/// `enforce_locks` is false while the operator token is unset (see `check_not_locked`).
+pub fn enqueue_job_with(
+    conn: &Connection,
+    job: &NewJob<'_>,
+    enforce_locks: bool,
+) -> Result<Enqueued> {
     let now = crate::now();
     let unknown = || {
         StoreError::UnknownPrinter(format!(
@@ -1517,7 +1544,9 @@ pub fn enqueue_job(conn: &Connection, job: &NewJob<'_>) -> Result<Enqueued> {
         return Err(unknown());
     };
     // before the idempotency lookup: a locked org gets no job, not even an old one back
-    check_not_locked(&tx, org_id)?;
+    if enforce_locks {
+        check_not_locked(&tx, org_id)?;
+    }
     if let Some(key) = &job.idempotency_key {
         // A retried submit returns the original job — the same key never prints twice in an org.
         // The lookup is safe under the write transaction; the UNIQUE index enforces it.
@@ -1678,16 +1707,28 @@ pub fn finish_job(
     Ok(n == 1)
 }
 
-/// Returns how many jobs went back to `queued`.
+/// Returns how many jobs went back to `queued`. With `enforce_locks` a stale job of a locked org
+/// is cancelled (`error: "org locked"`) instead: it was claimed before the lock, and a requeue
+/// would hand it out again.
 pub fn requeue_stale(
     conn: &Connection,
     timeout_s: f64,
     max_retries: i64,
     now: Option<f64>,
+    enforce_locks: bool,
 ) -> Result<usize> {
     let now = now.unwrap_or_else(crate::now);
     let cutoff = now - timeout_s;
     let tx = begin(conn)?;
+    if enforce_locks {
+        tx.execute(
+            "UPDATE jobs SET state='cancelled', error='org locked', finished_at=? \
+             WHERE state='claimed' AND claimed_at < ? AND org_id IN \
+             (SELECT l.org_id FROM org_locks l JOIN orgs o \
+              ON o.id = l.org_id AND o.created_at = l.org_created_at)",
+            params![now, cutoff],
+        )?;
+    }
     tx.execute(
         "UPDATE jobs SET state='failed', error='retry limit exceeded', finished_at=? \
          WHERE state='claimed' AND claimed_at < ? AND retries >= ?",
@@ -2357,13 +2398,16 @@ pub enum Refusal {
     NotLocked,
     /// The id belongs to another org than the caller named (a stale page, a reused id).
     OrgMismatch,
+    /// The org is not the generation the caller saw (`org_created_at`): deleted and recreated
+    /// under the same id, or no generation named.
+    OrgChanged,
     /// The typed name is not the org's current name.
     ConfirmMismatch,
     DefaultOrg,
 }
 
 /// When the org was created: what keeps a reused org id apart in the audit log.
-fn org_created_at(tx: &Transaction, org_id: i64) -> Result<Option<f64>> {
+pub fn org_created_at(tx: &Connection, org_id: i64) -> Result<Option<f64>> {
     Ok(tx
         .query_row("SELECT created_at FROM orgs WHERE id=?", [org_id], |r| {
             r.get(0)
@@ -2375,6 +2419,7 @@ fn org_created_at(tx: &Transaction, org_id: i64) -> Result<Option<f64>> {
 pub fn operator_update_org(
     conn: &Connection,
     org_id: i64,
+    seen: Option<f64>,
     u: &OrgUpdate,
     reason: Option<&str>,
     detail: &Value,
@@ -2383,6 +2428,9 @@ pub fn operator_update_org(
     let Some(created) = org_created_at(&tx, org_id)? else {
         return Ok(Outcome::NotFound);
     };
+    if seen != Some(created) {
+        return Ok(Outcome::Refused(Refusal::OrgChanged));
+    }
     update_org_tx(&tx, org_id, u)?;
     insert_audit(
         &tx,
@@ -2401,12 +2449,25 @@ pub fn operator_update_org(
 
 /// `org.lock`: the flag row, and the org's queued jobs cancelled (`error: "org locked"`). Returns
 /// how many. Claimed jobs run on; quota and plan stay as they are.
-pub fn operator_lock_org(conn: &Connection, org_id: i64, reason: &str) -> Result<Outcome<i64>> {
+pub fn operator_lock_org(
+    conn: &Connection,
+    org_id: i64,
+    seen: Option<f64>,
+    reason: &str,
+) -> Result<Outcome<i64>> {
     let tx = begin(conn)?;
     let Some(created) = org_created_at(&tx, org_id)? else {
         return Ok(Outcome::NotFound);
     };
+    if seen != Some(created) {
+        return Ok(Outcome::Refused(Refusal::OrgChanged));
+    }
     let now = crate::now();
+    // a row of an earlier org of this id locks nothing: make room for the real one
+    tx.execute(
+        "DELETE FROM org_locks WHERE org_id=? AND org_created_at<>?",
+        params![org_id, created],
+    )?;
     let inserted = tx.execute(
         "INSERT OR IGNORE INTO org_locks(org_id, org_created_at, reason, locked_at) VALUES(?,?,?,?)",
         params![org_id, created, reason, now],
@@ -2438,13 +2499,21 @@ pub fn operator_lock_org(conn: &Connection, org_id: i64, reason: &str) -> Result
 pub fn operator_unlock_org(
     conn: &Connection,
     org_id: i64,
+    seen: Option<f64>,
     reason: Option<&str>,
 ) -> Result<Outcome<()>> {
     let tx = begin(conn)?;
     let Some(created) = org_created_at(&tx, org_id)? else {
         return Ok(Outcome::NotFound);
     };
-    if tx.execute("DELETE FROM org_locks WHERE org_id=?", [org_id])? == 0 {
+    if seen != Some(created) {
+        return Ok(Outcome::Refused(Refusal::OrgChanged));
+    }
+    if tx.execute(
+        "DELETE FROM org_locks WHERE org_id=? AND org_created_at=?",
+        params![org_id, created],
+    )? == 0
+    {
         return Ok(Outcome::Refused(Refusal::NotLocked));
     }
     insert_audit(
@@ -2466,6 +2535,7 @@ pub fn operator_unlock_org(
 pub fn operator_delete_org(
     conn: &Connection,
     org_id: i64,
+    seen: Option<f64>,
     confirm: &str,
     reason: &str,
 ) -> Result<Outcome<()>> {
@@ -2483,6 +2553,9 @@ pub fn operator_delete_org(
     let Some((name, created)) = found else {
         return Ok(Outcome::NotFound);
     };
+    if seen != Some(created) {
+        return Ok(Outcome::Refused(Refusal::OrgChanged));
+    }
     if name != confirm {
         return Ok(Outcome::Refused(Refusal::ConfirmMismatch));
     }
@@ -2540,6 +2613,7 @@ pub fn operator_reset_user(
     conn: &Connection,
     user_id: i64,
     org_id: i64,
+    seen: Option<f64>,
     token: &str,
     ttl_s: f64,
     reason: Option<&str>,
@@ -2558,13 +2632,17 @@ pub fn operator_reset_user(
     if owner != org_id {
         return Ok(Outcome::Refused(Refusal::OrgMismatch));
     }
+    let created = org_created_at(&tx, org_id)?;
+    if created.is_none() || seen != created {
+        return Ok(Outcome::Refused(Refusal::OrgChanged));
+    }
     create_password_reset_tx(&tx, user_id, token, ttl_s, None)?;
     insert_audit(
         &tx,
         &AuditRow {
             action: "user.reset",
             org_id: Some(org_id),
-            org_created_at: org_created_at(&tx, org_id)?,
+            org_created_at: created,
             target: Some(&format!("user:{user_id}")),
             reason,
             ..Default::default()
@@ -2587,6 +2665,7 @@ pub fn operator_revoke_key(
     conn: &Connection,
     key_id: i64,
     org_id: i64,
+    seen: Option<f64>,
     reason: Option<&str>,
 ) -> Result<Outcome<()>> {
     let tx = begin(conn)?;
@@ -2601,13 +2680,17 @@ pub fn operator_revoke_key(
     if owner != org_id {
         return Ok(Outcome::Refused(Refusal::OrgMismatch));
     }
+    let created = org_created_at(&tx, org_id)?;
+    if created.is_none() || seen != created {
+        return Ok(Outcome::Refused(Refusal::OrgChanged));
+    }
     revoke_api_key_tx(&tx, key_id, Some(org_id))?;
     insert_audit(
         &tx,
         &AuditRow {
             action: "key.revoke",
             org_id: Some(org_id),
-            org_created_at: org_created_at(&tx, org_id)?,
+            org_created_at: created,
             target: Some(&format!("key:{key_id}")),
             reason,
             ..Default::default()
@@ -2674,7 +2757,8 @@ SELECT * FROM (
       (SELECT COUNT(*) FROM agents a WHERE a.org_id = o.id) AS agents_total,
       (SELECT MAX(a.last_seen_at) FROM agents a WHERE a.org_id = o.id) AS newest_agent_seen_at,
       (SELECT COUNT(*) FROM printers p WHERE p.org_id = o.id) AS printers,
-      EXISTS(SELECT 1 FROM org_locks l WHERE l.org_id = o.id) AS locked,
+      EXISTS(SELECT 1 FROM org_locks l WHERE l.org_id = o.id
+         AND l.org_created_at = o.created_at) AS locked,
       (SELECT u.email FROM users u WHERE u.org_id = o.id AND u.email IS NOT NULL
          ORDER BY u.id LIMIT 1) AS first_user_email,
       (SELECT t.version FROM terms_acceptances t WHERE t.org_id = o.id
@@ -2880,7 +2964,8 @@ pub fn operator_org_parts(conn: &Connection, org_id: i64) -> Result<OrgParts> {
         .collect::<rusqlite::Result<_>>()?;
     let lock = conn
         .query_row(
-            "SELECT reason, locked_at FROM org_locks WHERE org_id = ?",
+            "SELECT l.reason, l.locked_at FROM org_locks l JOIN orgs o \
+             ON o.id = l.org_id AND o.created_at = l.org_created_at WHERE l.org_id = ?",
             [org_id],
             |r| {
                 Ok(OperatorLock {
@@ -3381,9 +3466,9 @@ mod tests {
         let jid = enq(&conn, pid, b"x");
         claim_job(&conn, aid, None).unwrap();
         let base = crate::now();
-        assert_eq!(requeue_stale(&conn, 60.0, 1, Some(base)).unwrap(), 0); // not stale yet
+        assert_eq!(requeue_stale(&conn, 60.0, 1, Some(base), false).unwrap(), 0); // not stale yet
         assert_eq!(
-            requeue_stale(&conn, 60.0, 1, Some(base + 120.0)).unwrap(),
+            requeue_stale(&conn, 60.0, 1, Some(base + 120.0), false).unwrap(),
             1
         ); // under limit
         assert_eq!(state_of(&conn, jid), "queued");
@@ -3393,7 +3478,7 @@ mod tests {
         );
         claim_job(&conn, aid, None).unwrap(); // claim again, go stale again -> over the limit
         assert_eq!(
-            requeue_stale(&conn, 60.0, 1, Some(base + 300.0)).unwrap(),
+            requeue_stale(&conn, 60.0, 1, Some(base + 300.0), false).unwrap(),
             0
         );
         assert_eq!(state_of(&conn, jid), "failed");

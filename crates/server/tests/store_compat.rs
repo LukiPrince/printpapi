@@ -291,7 +291,10 @@ fn expiring_and_reaping_python_rows() {
             ("failed", Some("expired"))
         );
         // job 3 was claimed long ago and is stale
-        assert_eq!(requeue_stale(c, 60.0, 3, Some(BASE + 1000.0)).unwrap(), 1);
+        assert_eq!(
+            requeue_stale(c, 60.0, 3, Some(BASE + 1000.0), false).unwrap(),
+            1
+        );
         assert_eq!(get_job(c, 3, None).unwrap().unwrap().state, "queued");
     });
 }

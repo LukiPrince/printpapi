@@ -1286,7 +1286,9 @@ impl Ctx<'_> {
         };
         // One closure, so a retry cannot see "no job yet" and then a quota the original used up.
         let checked = self.db(|c| {
-            store::check_not_locked(c, printer.org_id)?;
+            if self.cfg().operator_token.is_some() {
+                store::check_not_locked(c, printer.org_id)?;
+            }
             if let Some(key) = key
                 && let Some(e) = store::find_job_by_key(c, printer.org_id, key)?
             {
@@ -1403,7 +1405,8 @@ impl Ctx<'_> {
     }
 
     fn enqueue(&self, job: &store::NewJob<'_>) -> Result<store::Enqueued, SubmitErr> {
-        match self.db(|c| store::enqueue_job(c, job)) {
+        let locks = self.cfg().operator_token.is_some();
+        match self.db(|c| store::enqueue_job_with(c, job, locks)) {
             Ok(e) => {
                 if e.created {
                     self.s.waker.wake(e.agent_id);
@@ -2747,10 +2750,15 @@ pub fn retention_pass(state: &AppState, now: f64) -> Option<store::Purged> {
 pub fn reaper_pass(state: &AppState, timeout_s: f64, max_retries: i64) {
     let run = || -> store::Result<()> {
         state.db.with(|c| store::expire_jobs(c, None))?;
-        if state
-            .db
-            .with(|c| store::requeue_stale(c, timeout_s, max_retries, None))?
-            > 0
+        if state.db.with(|c| {
+            store::requeue_stale(
+                c,
+                timeout_s,
+                max_retries,
+                None,
+                state.cfg.operator_token.is_some(),
+            )
+        })? > 0
         {
             state.waker.wake_all();
         }
