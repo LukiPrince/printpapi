@@ -7,8 +7,8 @@ as numbers, an audit log) and nothing in it is specific to one business. **It is
 `404`, as if the API did not exist.
 
 This page covers the gate, hosted mode, the audit log, the read endpoints (overview, orgs and their
-jobs) and the write endpoints (change, lock, delete and create an org, send a reset mail, revoke a
-key).
+jobs), the write endpoints (change, lock, delete and create an org, send a reset mail, revoke a
+key), support access and live settings.
 
 ## The gate
 
@@ -103,7 +103,7 @@ callback, idempotency key, key secret or password hash.
   "server": {"version": "3.5.0", "uptime_s": 86400},
   "db": {"size_bytes": 12582912, "wal_bytes": 0},
   "retention": {"last_pass_at": 1760000000.0, "abandoned": 0, "scrubbed": 14, "deleted": 0},
-  "features": ["support"]
+  "features": ["support", "settings"]
 }
 ```
 
@@ -278,6 +278,101 @@ must be the user's org (`409` otherwise) and `org_created_at` that org's generat
 generation). Agents enrolled
 with it end their long-poll with `401`. Removing a single user is not offered here: customers remove
 their own accounts, and root still can.
+
+## Live settings
+
+Four settings can be changed while the server runs, so the console does not need a restart or
+shell access. They are start values read from the environment; with `PRINTAPI_OPERATOR_TOKEN` set,
+an override stored in the database applies on top of them.
+
+| Key | Value | Env variable it overrides |
+|---|---|---|
+| `signup` | `"open"` or `"closed"` | `PRINTAPI_SIGNUP` |
+| `signup_quota` | integer, 0 or more (0 blocks printing) | `PRINTAPI_SIGNUP_QUOTA` |
+| `job_retention_days` | integer, 1 or more | `PRINTAPI_JOB_RETENTION_DAYS` |
+| `terms` | `{"version", "terms_url", "dpa_url"?, "privacy_url"?}`, a non-empty version, `http(s)` links, `terms_url` required | `PRINTAPI_TERMS_VERSION` and the three link variables |
+
+The values follow the rules of the environment variables. They apply to the next request, with no
+restart: the signup form, `GET /health`, `POST /operator/orgs` (the quota of the new org) and the
+next retention pass read them.
+
+### `GET /operator/settings`
+
+```json
+{
+  "settings": {
+    "signup": {"value": "closed", "source": "env-locked"},
+    "signup_quota": {"value": 50, "source": "db"},
+    "job_retention_days": {"value": null, "source": "default"},
+    "terms": {"value": {"version": "2026-11", "terms_url": "https://example.com/terms"}, "source": "env"}
+  },
+  "env_only": {
+    "fetches_per_org": 4, "private_urls": "deny", "trusted_proxies": ["10.0.0.0/8"],
+    "operator_from": ["10.9.0.2"], "public_url": "https://print.example.com", "mail": true
+  }
+}
+```
+
+`source` says where the effective value comes from:
+
+- `db`: an override of the operator API.
+- `env`: the environment variable is set.
+- `default`: neither (`value` is `"closed"` for `signup`, `null` for the others).
+- `env-locked`: `signup` only, see [the emergency brake](#the-emergency-brake).
+
+`env_only` shows the settings that stay in the environment, as they were at startup. It never
+holds a token, a password or a key.
+
+### `PUT /operator/settings`
+
+`{"set": {key: value}, "unset": [key], "reason"?}`. `set` changes a key, `unset` removes the
+override so the environment value (or the default) applies again. There are no `null` values.
+Everything is checked first and written in one transaction with one audit row; the answer is the
+same as `GET`. `reason` is optional, at most 500 characters.
+
+| Status | Why |
+|---|---|
+| `400` | an unknown key or field, a key in both `set` and `unset`, an empty request, a `null`, a value that fails the rules above, a bad `reason`, or a missing reason (see [retention](#retention-needs-a-reason)) |
+| `409` | `signup` is locked by the environment, or `set.signup = "open"` while private URLs are allowed |
+| `401` | not the operator token, or not from an address in `PRINTAPI_OPERATOR_FROM` (root does not pass) |
+| `404` | `PRINTAPI_OPERATOR_TOKEN` is not set |
+
+Audit: `settings.update`, `detail` `{"set": {key: value}, "unset": [key]}`. Setting values are
+allowed in the log (a mode, numbers, links); no e-mail address is.
+
+### The emergency brake
+
+`PRINTAPI_SIGNUP=closed` written into the environment explicitly beats every override: `source`
+is `env-locked` and any `set` or `unset` of `signup` answers `409`. Leaving the variable out means
+closed by default and is not a lock. To shut signup at once even if the console is compromised,
+set the variable to `closed` and restart.
+
+### Retention needs a reason
+
+Retention is the one irreversible setting: the next pass scrubs payloads and titles for good, and
+at once if retention was off. A `set` of `job_retention_days` that lowers the effective value, or
+turns it on while jobs were kept for ever, needs a `reason` of at least 8 characters (`400`
+otherwise). So does an `unset` that falls back to a lower or enabled environment value. Raising
+it needs none.
+
+### What stays in the environment, and why
+
+- `fetches_per_org`, private URLs (`PRINTAPI_PRIVATE_URLS`) and trusted proxies decide what the
+  server may reach and whose address it believes. They are fixed at startup, and the live
+  `signup` value never moves them: hosted mode keeps the private-URL deny whether signup is open
+  or closed. Opening signup is refused (`409`) while private URLs are allowed.
+- `PRINTAPI_OPERATOR_FROM` and the token are the gate itself: a console must not be able to widen
+  who can reach it.
+- SMTP and `PUBLIC_URL` hold credentials and the address links in mails point to.
+
+### Startup and rollback
+
+Only with the operator token set does the server read the `settings` table; without it every
+value is the environment one, as in 3.5.0, and a database carried over from a hosted box changes
+nothing. At startup each applied override prints one line to stderr (never a secret). A stored
+value that no longer validates is ignored with a line, and so is `signup = open` while private
+URLs are allowed or `PRINTAPI_SIGNUP=closed` is explicit. An older version ignores the table, so
+the environment values apply again after a rollback; the table is left in place.
 
 ## Support access
 

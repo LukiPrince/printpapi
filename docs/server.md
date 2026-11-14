@@ -31,7 +31,7 @@ Environment variables:
 | `PRINT_DB` | `printpapi.db` | SQLite database path |
 | `PRINT_PORT` | `3460` | Listen port |
 | `LOG_REQUESTS` | *(off)* | Set to log every HTTP request |
-| `PRINTAPI_SIGNUP` | `closed` | `open` lets anyone create an org via `POST /signup` — for a hosted deployment, not a private box |
+| `PRINTAPI_SIGNUP` | `closed` | `open` lets anyone create an org via `POST /signup` — for a hosted deployment, not a private box. `PRINTAPI_SIGNUP`, `PRINTAPI_SIGNUP_QUOTA`, `PRINTAPI_JOB_RETENTION_DAYS` and `PRINTAPI_TERMS_VERSION` (with its links) are start values: while `PRINTAPI_OPERATOR_TOKEN` is set, the operator console can override them at runtime ([live settings](operator.md#live-settings)). Written explicitly as `closed`, `PRINTAPI_SIGNUP` locks signup shut and no override can open it |
 | `PUBLIC_URL` | *(unset)* | This server's own address, e.g. `https://print.example`. Only then does a password-reset mail carry a link (see [api.md](api.md#password-reset)) |
 | `SMTP_HOST` | *(unset)* | Mail server for password resets. Unset ⇒ the reset token is printed to stderr instead |
 | `SMTP_PORT` | `587` (`465` with `SMTP_SSL`) | |

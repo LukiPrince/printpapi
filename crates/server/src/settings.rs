@@ -503,10 +503,26 @@ pub fn validate_put(
         Parsed::JobRetentionDays(n) => live.job_retention_days.value.is_none_or(|cur| *n < cur),
         _ => false,
     });
-    if irreversible && reason.is_none_or(|r| r.trim().chars().count() < REASON_MIN) {
+    if irreversible && !reason_is_enough(reason) {
         return Err(PutError::ReasonNeeded);
     }
     Ok(Change { set: parsed, unset })
+}
+
+/// Would dropping the override of `job_retention_days` (`change.unset`) lower the effective
+/// retention, or enable it over keep-for-ever? The same irreversible write as a `set` that does,
+/// so it needs the same reason. `env` is the value it falls back to.
+pub fn unset_needs_reason(change: &Change, live: &Live, env: &EnvStart) -> bool {
+    change.unset.contains(&"job_retention_days")
+        && live.job_retention_days.source == Source::Db
+        && env
+            .job_retention_days
+            .is_some_and(|e| live.job_retention_days.value.is_none_or(|cur| e < cur))
+}
+
+/// Does this reason satisfy `REASON_MIN`?
+pub fn reason_is_enough(reason: Option<&str>) -> bool {
+    reason.is_some_and(|r| r.trim().chars().count() >= REASON_MIN)
 }
 
 #[cfg(test)]

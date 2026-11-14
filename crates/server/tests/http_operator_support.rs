@@ -603,7 +603,7 @@ fn the_org_page_shows_the_active_grant_or_null() {
 fn the_overview_reports_the_support_feature() {
     let app = app();
     let v = op(&app, "GET", "/operator/overview").send().json();
-    assert_eq!(v["features"], json!(["support"]));
+    assert_eq!(v["features"], json!(["support", "settings"]));
 }
 
 // --- what the audit rows hold -------------------------------------------------------------------

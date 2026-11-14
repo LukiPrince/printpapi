@@ -422,8 +422,27 @@ impl AppState {
         change: &crate::settings::Change,
         reason: Option<&str>,
     ) -> store::Result<Arc<crate::settings::Live>> {
+        let out = self.try_apply_settings(
+            |_| Ok::<_, std::convert::Infallible>(change.clone()),
+            reason,
+        )?;
+        Ok(out.unwrap_or_else(|never| match never {}))
+    }
+
+    /// `apply_settings`, with the change decided inside the critical section: `decide` sees the
+    /// live values as they are at that moment, so a second writer cannot slip in between the check
+    /// and the write. `Err` from `decide` writes nothing.
+    pub fn try_apply_settings<E>(
+        &self,
+        decide: impl FnOnce(&crate::settings::Live) -> Result<crate::settings::Change, E>,
+        reason: Option<&str>,
+    ) -> store::Result<Result<Arc<crate::settings::Live>, E>> {
         self.db.with(|c| {
-            store::operator_update_settings(c, change, reason)?;
+            let change = match decide(&self.live()) {
+                Ok(change) => change,
+                Err(e) => return Ok(Err(e)),
+            };
+            store::operator_update_settings(c, &change, reason)?;
             let rows = store::settings_rows(c)?;
             let (live, _) = crate::settings::build_live(
                 &self.cfg.env_start(),
@@ -432,7 +451,7 @@ impl AppState {
             );
             let live = Arc::new(live);
             *self.live.lock().unwrap_or_else(|e| e.into_inner()) = live.clone();
-            Ok(live)
+            Ok(Ok(live))
         })
     }
 }
