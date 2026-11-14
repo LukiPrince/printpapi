@@ -248,6 +248,7 @@ fn routes() -> Vec<(&'static str, &'static str)> {
         ("PUT", "/orgs/1"),
         ("DELETE", "/orgs/1"),
         ("GET", "/plans"),
+        ("GET", "/support-access"),
         ("POST", "/billing/webhook"),
         ("POST", "/apikeys"),
         ("GET", "/apikeys"),
@@ -460,7 +461,7 @@ fn overview_counts_orgs_jobs_and_failures() {
     assert_eq!(v["orgs"], 1);
     assert_eq!(v["signups_7d"], 0);
     assert_eq!(v["jobs_this_month"], 0);
-    assert_eq!(v["features"], json!([]));
+    assert_eq!(v["features"], json!(["support"]));
     assert_eq!(
         v["jobs_today"],
         json!({"queued": 0, "claimed": 0, "done": 0, "failed": 0, "cancelled": 0})

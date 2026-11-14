@@ -12,7 +12,7 @@
     "build:demo": "node scripts/build-demo.mjs",
     "build:setup": "node scripts/build-setup.mjs",
     "check:bundles": "node scripts/check-bundles.mjs",
-    "test": "node --test demo/*.test.ts lib/*.test.ts setup/*.test.ts"
+    "test": "node --test demo/*.test.ts hooks/*.test.ts lib/*.test.ts setup/*.test.ts"
   },
   "dependencies": {
     "@tauri-apps/api": "^2.12.4",

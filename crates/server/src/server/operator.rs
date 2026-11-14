@@ -22,17 +22,21 @@ const LIST_DEFAULT_LIMIT: i64 = 50;
 
 /// The longest reason the audit log takes: it is kept for ever.
 const REASON_MAX: usize = 500;
-/// The shortest reason a lock needs.
+/// The shortest reason a lock or a support grant needs.
 const LOCK_REASON_MIN: usize = 8;
+/// The lengths a support grant may have, in minutes.
+const SUPPORT_MINUTES: [i64; 3] = [15, 30, 60];
+/// The answer when a support read has no active grant behind it.
+const NO_SUPPORT_ACCESS: &str = "no active support access";
 /// The longest org name, in characters.
 const NAME_MAX: usize = 200;
 
-/// `/operator/orgs/{id}` with its suffix (`""`, `"jobs"`, `"lock"` or `"unlock"`), the id all
-/// digits.
+/// `/operator/orgs/{id}` with its suffix (`""`, `"jobs"`, `"lock"`, `"unlock"` or `"support"`),
+/// the id all digits.
 fn org_route(path: &str) -> Option<(i64, &str)> {
     let rest = path.strip_prefix("/operator/orgs/")?;
     let (id, suffix) = match rest.split_once('/') {
-        Some((id, s @ ("jobs" | "lock" | "unlock"))) => (id, s),
+        Some((id, s @ ("jobs" | "lock" | "unlock" | "support"))) => (id, s),
         Some(_) => return None,
         None => (rest, ""),
     };
@@ -116,6 +120,20 @@ fn org_json(o: &store::OperatorOrg) -> Value {
     })
 }
 
+/// A job of the operator's list; `title` only on a support read.
+fn job_json(j: &store::OperatorJob, title: Option<&Option<String>>) -> Value {
+    let mut v = json!({
+        "id": j.id, "created_at": j.created_at, "claimed_at": j.claimed_at,
+        "finished_at": j.finished_at, "type": j.type_, "mode": j.mode,
+        "state": j.state, "printer_id": j.printer_id,
+        "printer_name": j.printer_name, "copies": j.copies, "error": j.error,
+    });
+    if let Some(t) = title {
+        v["title"] = json!(t);
+    }
+    v
+}
+
 /// Is `key` the operator token (constant-time)? An empty key never is.
 pub fn is_operator_token(cfg: &Config, key: &str) -> bool {
     cfg.operator_token
@@ -197,14 +215,25 @@ impl Ctx<'_> {
                 ("DELETE", Some((id, ""))) => self.operator_org_delete(id),
                 ("POST", Some((id, "lock"))) => self.operator_org_lock(id),
                 ("POST", Some((id, "unlock"))) => self.operator_org_unlock(id),
-                ("POST", None) => match id_of(path, "/operator/users/", "/reset") {
-                    Some(uid) => self.operator_user_reset(uid),
-                    None => Ok(not_found()),
-                },
-                ("DELETE", None) => match id_of(path, "/operator/keys/", "") {
-                    Some(kid) => self.operator_key_revoke(kid),
-                    None => Ok(not_found()),
-                },
+                ("POST", Some((id, "support"))) => self.operator_support_grant(id),
+                ("POST", None) => {
+                    if let Some(uid) = id_of(path, "/operator/users/", "/reset") {
+                        self.operator_user_reset(uid)
+                    } else if let Some(jid) = id_of(path, "/operator/jobs/", "/payload") {
+                        self.operator_support_payload(jid)
+                    } else {
+                        Ok(not_found())
+                    }
+                }
+                ("DELETE", None) => {
+                    if let Some(kid) = id_of(path, "/operator/keys/", "") {
+                        self.operator_key_revoke(kid)
+                    } else if let Some(gid) = id_of(path, "/operator/support/", "") {
+                        self.operator_support_end(gid)
+                    } else {
+                        Ok(not_found())
+                    }
+                }
                 _ => Ok(not_found()),
             },
         };
@@ -329,6 +358,74 @@ impl Ctx<'_> {
                 store::Outcome::NotFound => not_found(),
             },
         )
+    }
+
+    fn operator_support_grant(&self, org_id: i64) -> R {
+        let body = gate!(self.read_obj());
+        let reason = gate!(reason_of(&body, LOCK_REASON_MIN)).unwrap_or_default();
+        let minutes = body
+            .get("minutes")
+            .and_then(Value::as_i64)
+            .filter(|m| SUPPORT_MINUTES.contains(m));
+        let Some(minutes) = minutes else {
+            return Ok(jerr(400, "minutes must be 15, 30 or 60"));
+        };
+        let seen = seen_of(&body);
+        let out = self.db(|c| store::operator_grant_support(c, org_id, seen, &reason, minutes))?;
+        Ok(match out {
+            store::Outcome::Done(g) => Resp::json(
+                200,
+                &json!({
+                    "id": g.id, "reason": g.reason, "granted_at": g.granted_at,
+                    "expires_at": g.expires_at,
+                }),
+            ),
+            store::Outcome::Refused(store::Refusal::OrgChanged) => org_changed(),
+            store::Outcome::Refused(_) => jerr(409, "the org already has an active support grant"),
+            store::Outcome::NotFound => not_found(),
+        })
+    }
+
+    fn operator_support_end(&self, grant_id: i64) -> R {
+        let body = gate!(self.read_obj());
+        let reason = gate!(reason_of(&body, 0));
+        Ok(
+            match self.db(|c| store::operator_end_support(c, grant_id, reason.as_deref()))? {
+                store::Outcome::Done(()) => ok_true(),
+                store::Outcome::Refused(_) => jerr(409, "the support grant is not active"),
+                store::Outcome::NotFound => not_found(),
+            },
+        )
+    }
+
+    /// The raw bytes of one job's payload, if its org has an active grant. POST, so nothing that
+    /// prefetches or embeds a URL can trigger the (audited) read. The bytes go out as a download
+    /// no browser renders: customer data may be a hostile PDF or HTML.
+    fn operator_support_payload(&self, job_id: i64) -> R {
+        Ok(match self.db(|c| store::support_read_payload(c, job_id))? {
+            store::PayloadRead::Bytes { bytes, mode } => Resp {
+                status: 200,
+                headers: vec![
+                    ("Content-Type", "application/octet-stream".into()),
+                    (
+                        "Content-Disposition",
+                        format!(
+                            "attachment; filename=\"job-{job_id}.{}\"",
+                            if mode == "pdf" { "pdf" } else { "bin" }
+                        ),
+                    ),
+                    ("X-Content-Type-Options", "nosniff".into()),
+                    (
+                        "Content-Security-Policy",
+                        "sandbox; default-src 'none'".into(),
+                    ),
+                ],
+                body: RespBody::Bytes(bytes.into()),
+            },
+            store::PayloadRead::NotFound => not_found(),
+            store::PayloadRead::Refused(_) => jerr(403, NO_SUPPORT_ACCESS),
+            store::PayloadRead::Scrubbed => jerr(410, "the payload was removed by retention"),
+        })
     }
 
     fn operator_org_delete(&self, id: i64) -> R {
@@ -515,9 +612,10 @@ impl Ctx<'_> {
                 store::org_jobs_by_day(c, id, month)?,
                 store::operator_org_parts(c, id)?,
                 store::list_agents(c, win, Some(now), Some(id))?,
+                store::active_support_grant(c, id)?,
             )))
         })?;
-        let Some((org, by_day, parts, agents)) = found else {
+        let Some((org, by_day, parts, agents, support)) = found else {
             return Ok(not_found());
         };
         // every day of the month so far, quiet ones as zeros
@@ -595,11 +693,22 @@ impl Ctx<'_> {
                 "reason": l.reason, "locked_at": l.locked_at
             }))),
         );
+        o.insert(
+            "support".into(),
+            json!(support.map(|g| json!({
+                "id": g.id, "reason": g.reason, "granted_at": g.granted_at,
+                "expires_at": g.expires_at, "reads": g.reads,
+            }))),
+        );
         Ok(Resp::json(200, &v))
     }
 
     fn operator_org_jobs(&self, id: i64) -> R {
         let (limit, before_id) = gate!(self.paging("before_id"));
+        // titles are opt-in: a page without `titles=1` is metadata only, whatever the grant state
+        if qfirst(&query_params(self.target()), "titles") == Some("1") {
+            return self.operator_org_jobs_titled(id, limit, before_id);
+        }
         let found = self.db(|c| {
             if !store::org_exists(c, id)? {
                 return Ok::<_, StoreError>(None);
@@ -616,16 +725,32 @@ impl Ctx<'_> {
         } else {
             None
         };
+        let jobs: Vec<Value> = jobs.iter().map(|j| job_json(j, None)).collect();
+        Ok(Resp::json(
+            200,
+            &json!({ "jobs": jobs, "next_before_id": next }),
+        ))
+    }
+
+    /// The same page with titles, for an org with an active support grant (one audit row).
+    fn operator_org_jobs_titled(&self, id: i64, limit: i64, before_id: Option<i64>) -> R {
+        // exactly `limit` rows: the audit row names every id the store read, so no peeked extra
+        // row may be among them. A full page therefore always offers a cursor (the next page may
+        // be empty, and an empty page writes no row).
+        let out = self.db(|c| store::support_org_jobs(c, id, before_id, limit))?;
+        let jobs = match out {
+            store::Outcome::Done(j) => j,
+            store::Outcome::Refused(_) => return Ok(jerr(403, NO_SUPPORT_ACCESS)),
+            store::Outcome::NotFound => return Ok(not_found()),
+        };
+        let next = if jobs.len() as i64 == limit {
+            jobs.last().map(|(j, _)| j.id)
+        } else {
+            None
+        };
         let jobs: Vec<Value> = jobs
             .iter()
-            .map(|j| {
-                json!({
-                    "id": j.id, "created_at": j.created_at, "claimed_at": j.claimed_at,
-                    "finished_at": j.finished_at, "type": j.type_, "mode": j.mode,
-                    "state": j.state, "printer_id": j.printer_id,
-                    "printer_name": j.printer_name, "copies": j.copies, "error": j.error,
-                })
-            })
+            .map(|(j, title)| job_json(j, Some(title)))
             .collect();
         Ok(Resp::json(
             200,
@@ -724,7 +849,7 @@ impl Ctx<'_> {
                 "deleted": purge.as_ref().map(|p| p.1.deleted),
             },
             // the console shows a section only when the server reports its feature
-            "features": [],
+            "features": ["support"],
         });
         *cache = Some((std::time::Instant::now(), v.clone()));
         Ok(Resp::json(200, &v))

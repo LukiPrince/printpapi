@@ -3,6 +3,7 @@
 
 import { getToken } from "./token";
 import { parseTerms, type Terms } from "./terms";
+import type { SupportAccess } from "./support-access";
 
 export { TOKEN_KEY, clearToken, getToken, setToken, subscribeToken } from "./token";
 export const UNAUTHORIZED_EVENT = "printpapi:unauthorized";
@@ -159,10 +160,15 @@ async function request(path: string, init: RequestInit = {}, token = getToken())
     headers: { ...init.headers, Authorization: `Bearer ${token}` },
   });
   if (res.status === 401) {
-    // /apikeys and /users need an account (or the bootstrap token), so a 401 there is "this
-    // credential cannot manage the org", not "session dead". Only a rejected token on a client
-    // endpoint signs you out.
-    if (!path.startsWith("/apikeys") && !path.startsWith("/users") && !path.startsWith("/orgs")) {
+    // /apikeys, /users, /orgs and /support-access need an account (or the bootstrap token), so a
+    // 401 there is "this credential cannot manage the org", not "session dead". Only a rejected
+    // token on a client endpoint signs you out.
+    if (
+      !path.startsWith("/apikeys") &&
+      !path.startsWith("/users") &&
+      !path.startsWith("/orgs") &&
+      !path.startsWith("/support-access")
+    ) {
       window.dispatchEvent(new CustomEvent(UNAUTHORIZED_EVENT));
     }
     throw new ApiError(401, "unauthorized");
@@ -257,6 +263,10 @@ export const confirmPasswordReset = (token: string, password: string) =>
 export const deleteUser = (id: number) => request(`/users/${id}`, { method: "DELETE" });
 
 export const getOrg = (id: number) => getJSON<Org>(`/orgs/${id}`);
+
+/** Operator support access to an org: the grants so far. Root names the org; a session's own is implied. */
+export const getSupportAccess = (orgId?: number) =>
+  getJSON<SupportAccess>(orgId === undefined ? "/support-access" : `/support-access?org=${orgId}`);
 
 /** Root only — every org on the server, for the settings page's org picker. */
 export const listOrgs = () => getJSON<{ orgs: Org[] }>("/orgs").then((r) => r.orgs ?? []);

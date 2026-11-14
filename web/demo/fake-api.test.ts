@@ -374,3 +374,10 @@ test("label jobs are checked like the server checks them", () => {
   assert.equal(s.jobs[0].id, 1291); // none of them was queued
   assert.equal(post({}).status, 200);
 });
+
+test("GET /support-access is off in the demo", () => {
+  const r = call(seedState(now), "GET", "/support-access");
+  assert.equal(r.status, 200);
+  assert.deepEqual(r.json, { enabled: false, grants: [] });
+  assert.equal(isFakeRoute("GET", "/support-access"), true);
+});

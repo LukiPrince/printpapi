@@ -52,6 +52,7 @@ Token comparison is constant-time (`hmac.compare_digest`).
 | `GET /plans` | any | The [billing](billing.md) plan catalogue + the caller's current plan |
 | `POST /billing/webhook` | HMAC | The payment provider's callback: this org is on that plan now |
 | `POST /apikeys` | manage | Issue a client key → `{id, label, org_id, key}` (key shown once) |
+| `GET /support-access` | manage | The [support access](#support-access) grants of the caller's org (root: `?org=`) |
 | `GET /apikeys` | manage | List keys with their org (never the secret) |
 | `DELETE /apikeys/{id}` | manage | Revoke a key |
 | `POST /agent/register` | agent | Declare name + printers → `{computer_id, printer_ids}` |
@@ -373,6 +374,25 @@ curl -s -X PUT localhost:3460/orgs/2 -H 'Authorization: Bearer <PRINTAPI_TOKEN>'
   (none if unset); orgs root creates start unlimited.
 - `GET /orgs/{id}` reports `job_quota` and `jobs_this_month`, which is what the dashboard's
   Settings page shows.
+
+### Support access
+
+`GET /support-access` is what the dashboard's "Support access" card reads: the times the operator
+of a hosted deployment was [granted access](operator.md#support-access) to the caller's org, newest
+first and for the org's current generation only. Every grant that was used is listed; of the
+unused ones, the 50 newest.
+
+```json
+{ "enabled": true,
+  "grants": [ { "id": 7, "reason": "ticket 4711", "granted_at": 1.7e9, "expires_at": 1.7e9,
+                "ended_at": null, "active": true,
+                "listed_job_ids": [12, 13], "opened_job_ids": [12] } ] }
+```
+
+A browser session sees its own org (`?org=` of another org: `403`); root passes `?org=` and
+otherwise reads the default org (`404` for an unknown one); an API key is `401`. `enabled` is
+`false`, with no grants, while the server has no operator token: nothing can be granted then. The
+job ids come from the audit log, deduplicated and ascending. The answer is `no-store`.
 
 ### Plans and billing
 

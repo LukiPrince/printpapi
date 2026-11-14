@@ -461,6 +461,19 @@ fn a_python_database_gets_the_operator_audit_table_and_the_python_tables_stay_as
         columns(&path, "org_locks"),
         ["org_id", "org_created_at", "reason", "locked_at"]
     );
+    assert_eq!(
+        columns(&path, "support_grants"),
+        [
+            "id",
+            "org_id",
+            "org_created_at",
+            "reason",
+            "granted_at",
+            "expires_at",
+            "ended_at",
+            "reads"
+        ]
+    );
     // the new table adds nothing to a table Python knows beyond the old migrations
     for (t, was) in python_tables.iter().zip(&before) {
         let now = columns(&path, t);
@@ -471,6 +484,11 @@ fn a_python_database_gets_the_operator_audit_table_and_the_python_tables_stay_as
     }
     // a row survives a second start
     db.with(|c| {
+        c.execute(
+            "INSERT INTO support_grants(org_id, org_created_at, reason, granted_at, expires_at)              VALUES(?,?,?,?,?)",
+            rusqlite::params![ORG, BASE, "ticket 4711", BASE, BASE + 900.0],
+        )
+        .unwrap();
         let tx = begin_tx(c).unwrap();
         insert_audit(
             &tx,
@@ -489,4 +507,10 @@ fn a_python_database_gets_the_operator_audit_table_and_the_python_tables_stay_as
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].action, "org.update");
     assert_eq!(rows[0].actor, "operator");
+    // the grant is still there, and the Python-era tables are not what holds it
+    let grants: i64 = db.with(|c| {
+        c.query_row("SELECT COUNT(*) FROM support_grants", [], |r| r.get(0))
+            .unwrap()
+    });
+    assert_eq!(grants, 1);
 }

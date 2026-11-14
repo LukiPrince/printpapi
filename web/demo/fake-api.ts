@@ -372,6 +372,7 @@ const ROUTES: Route[] = [
   { method: "GET", re: /^\/orgs$/, run: () => err(401, "unauthorized") },
   { method: "GET", re: /^\/orgs\/\d+$/, run: getOrg },
   { method: "PUT", re: /^\/orgs\/\d+$/, run: putOrg },
+  { method: "GET", re: /^\/support-access$/, run: () => ok({ enabled: false, grants: [] }) },
   { method: "GET", re: /^\/plans$/, run: () => ok({ plans: [], current: null }) },
   { method: "POST", re: /^\/logout$/, run: () => ok() },
 ];
