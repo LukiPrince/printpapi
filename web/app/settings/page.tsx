@@ -2,9 +2,9 @@
 
 import { useCallback, useState } from "react";
 import { toast } from "sonner";
-import { CreditCard, Gauge, Loader2, Lock, Save, Webhook } from "lucide-react";
+import { CreditCard, Gauge, LifeBuoy, Loader2, Lock, Save, Webhook } from "lucide-react";
 import { usePoll } from "@/hooks/use-poll";
-import { getMe, getOrg, listOrgs, listPlans, updateOrg, type Org } from "@/lib/api";
+import { getMe, getOrg, getSupportAccess, listOrgs, listPlans, updateOrg, type Org } from "@/lib/api";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -19,6 +19,14 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { EmptyState, FieldLabel } from "@/components/bits";
+import { fmtTime } from "@/lib/format";
+import {
+  activeGrant,
+  grantMinutes,
+  grantOutcome,
+  idsSummary,
+  showSupportCard,
+} from "@/lib/support-access";
 
 const message = (err: unknown) => (err instanceof Error ? err.message : String(err));
 
@@ -32,6 +40,15 @@ export default function SettingsPage() {
 
   const { data: org, refresh } = usePoll(
     useCallback(() => (chosen === null ? Promise.resolve(null) : getOrg(chosen)), [chosen]),
+    0,
+  );
+  // Root names the org; a session's own is implied and a foreign ?org= would be refused.
+  const { data: support } = usePoll(
+    useCallback(
+      () =>
+        chosen === null ? Promise.resolve(null) : getSupportAccess(isRoot ? chosen : undefined),
+      [chosen, isRoot],
+    ),
     0,
   );
   // Empty on a server without a plan catalogue — then the whole billing card stays hidden.
@@ -261,6 +278,55 @@ export default function SettingsPage() {
           </form>
         </CardContent>
       </Card>
+
+      {support && showSupportCard(support) && (
+        <Card>
+          <CardHeader>
+            <CardTitle className="flex items-center gap-2">
+              <LifeBuoy className="size-4" /> Support access
+            </CardTitle>
+            <CardDescription>
+              Whenever the operator of this server looks at your jobs to help you, it is recorded
+              here: when, why, and which jobs were listed or opened.
+            </CardDescription>
+          </CardHeader>
+          <CardContent className="space-y-3">
+            {(() => {
+              const now = activeGrant(support.grants);
+              return (
+                now && (
+                  <div className="bg-muted rounded-lg border p-3 text-sm">
+                    <div className="font-medium">Support has access right now</div>
+                    <div className="text-muted-foreground">
+                      {now.reason} — until {fmtTime(now.expires_at)}. Jobs listed:{" "}
+                      {idsSummary(now.listed_job_ids)}; opened: {idsSummary(now.opened_job_ids)}.
+                    </div>
+                  </div>
+                )
+              );
+            })()}
+            {support.grants.length === 0 ? (
+              <p className="text-muted-foreground text-sm">No support access so far.</p>
+            ) : (
+              <ul className="space-y-2">
+                {support.grants.map((g) => (
+                  <li key={g.id} className="rounded-lg border p-3 text-sm">
+                    <div className="flex flex-wrap items-center gap-2">
+                      <span className="font-medium">{fmtTime(g.granted_at)}</span>
+                      <Badge variant={g.active ? "default" : "secondary"}>{grantOutcome(g)}</Badge>
+                      <span className="text-muted-foreground">{grantMinutes(g)} min</span>
+                    </div>
+                    <div>{g.reason}</div>
+                    <div className="text-muted-foreground">
+                      Listed: {idsSummary(g.listed_job_ids)}. Opened: {idsSummary(g.opened_job_ids)}.
+                    </div>
+                  </li>
+                ))}
+              </ul>
+            )}
+          </CardContent>
+        </Card>
+      )}
 
       <Card>
         <CardHeader>
