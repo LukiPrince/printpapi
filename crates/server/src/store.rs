@@ -388,6 +388,14 @@ CREATE UNIQUE INDEX IF NOT EXISTS jobs_idem ON jobs(org_id, idempotency_key);
 CREATE TABLE IF NOT EXISTS api_keys(
   id INTEGER PRIMARY KEY AUTOINCREMENT, org_id INTEGER NOT NULL, label TEXT NOT NULL,
   key_hash TEXT NOT NULL UNIQUE, active INTEGER NOT NULL DEFAULT 1, created_at REAL NOT NULL);
+-- The operator audit log: one row per `/operator/` write, kept for ever (never changed or deleted by
+-- any API, not removed with an org). Ids, numbers and setting values only, no e-mail or name.
+-- `org_created_at` keeps a reused org id apart from its predecessor. A table of its own, so the
+-- Python-era tables keep their shape and the Python server ignores it.
+CREATE TABLE IF NOT EXISTS operator_audit(
+  id INTEGER PRIMARY KEY AUTOINCREMENT, at REAL NOT NULL, actor TEXT NOT NULL,
+  action TEXT NOT NULL, org_id INTEGER, org_created_at REAL, target TEXT, reason TEXT,
+  detail TEXT);
 ";
 
 const MIGRATIONS: &[&str] = &[
@@ -423,6 +431,8 @@ CREATE INDEX IF NOT EXISTS jobs_hooks ON jobs(id)
 CREATE INDEX IF NOT EXISTS agents_org ON agents(org_id);
 -- the retention scan (`purge_jobs`) looks at terminal jobs by age
 CREATE INDEX IF NOT EXISTS jobs_state_finished ON jobs(state, finished_at);
+-- the operator overview counts jobs of this month, today and the last week across all orgs
+CREATE INDEX IF NOT EXISTS jobs_created ON jobs(created_at);
 ";
 
 /// The oldest queued job of one agent that has not passed its deadline (`?1` agent, `?2` now).
@@ -1677,7 +1687,7 @@ pub fn expire_jobs(conn: &Connection, now: Option<f64>) -> Result<usize> {
 }
 
 /// What one `purge_jobs` pass did.
-#[derive(Debug, Default, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct Purged {
     /// Queued jobs older than the retention that never ran and had no deadline: failed
     /// (`error='retention'`) and cleared; the callback stays so the client hears the outcome.
@@ -2193,6 +2203,164 @@ pub fn is_cloudprnt_agent(conn: &Connection, agent_id: i64) -> Result<bool> {
         )
         .optional()?
         == Some(1))
+}
+
+// --- operator audit log ---------------------------------------------------------------------------
+
+/// One audit row to write. `actor` is always `operator` (service-level identity). Content is ids,
+/// numbers and setting values only: never an e-mail address, name or title.
+#[derive(Debug, Default, Clone)]
+pub struct AuditRow<'a> {
+    pub action: &'a str,
+    pub org_id: Option<i64>,
+    pub org_created_at: Option<f64>,
+    pub target: Option<&'a str>,
+    pub reason: Option<&'a str>,
+    pub detail: Option<&'a str>,
+}
+
+/// One `operator_audit` row as read back.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AuditEntry {
+    pub id: i64,
+    pub at: f64,
+    pub actor: String,
+    pub action: String,
+    pub org_id: Option<i64>,
+    pub org_created_at: Option<f64>,
+    pub target: Option<String>,
+    pub reason: Option<String>,
+    pub detail: Option<String>,
+}
+
+/// The `jobs` queries behind `GET /operator/overview`. Every one must be answered from an index
+/// range (`jobs_created`, `jobs_state_finished`), never a scan: the console polls them.
+/// ponytail: `INDEXED BY` because the planner prefers a covering scan of `jobs_org_created`, which
+/// reads every row; the range on `created_at` alone is what the new index is for.
+pub const OVERVIEW_JOB_QUERIES: [&str; 4] = [
+    "SELECT COUNT(DISTINCT org_id) FROM jobs INDEXED BY jobs_created WHERE created_at >= ?1",
+    "SELECT COUNT(*) FROM jobs INDEXED BY jobs_created WHERE created_at >= ?1",
+    "SELECT COUNT(*) FROM jobs INDEXED BY jobs_state_finished WHERE state='failed' AND finished_at >= ?1",
+    "SELECT state, COUNT(*) FROM jobs INDEXED BY jobs_created WHERE created_at >= ?1 GROUP BY state",
+];
+
+/// Write one audit row inside the caller's transaction, so the action and its row commit or roll
+/// back together. The actor is always `operator` (service-level identity).
+/// ponytail: named operator accounts when more than one person holds the token.
+pub fn insert_audit(tx: &Transaction, row: &AuditRow) -> Result<i64> {
+    tx.execute(
+        "INSERT INTO operator_audit(at, actor, action, org_id, org_created_at, target, reason, detail) \
+         VALUES(?,?,?,?,?,?,?,?)",
+        params![
+            crate::now(),
+            "operator",
+            row.action,
+            row.org_id,
+            row.org_created_at,
+            row.target,
+            row.reason,
+            row.detail
+        ],
+    )?;
+    Ok(tx.last_insert_rowid())
+}
+
+/// Audit rows newest first (by `id`), optionally one org's or one action's, older than `before_id`.
+/// ponytail: no index beyond the key: the log is meant to stay under ~100 k rows, then prune by hand.
+pub fn list_audit(
+    conn: &Connection,
+    org: Option<i64>,
+    action: Option<&str>,
+    before_id: Option<i64>,
+    limit: i64,
+) -> Result<Vec<AuditEntry>> {
+    let mut st = conn.prepare_cached(
+        "SELECT id, at, actor, action, org_id, org_created_at, target, reason, detail \
+         FROM operator_audit \
+         WHERE (:org IS NULL OR org_id = :org) AND (:action IS NULL OR action = :action) \
+           AND (:before IS NULL OR id < :before) \
+         ORDER BY id DESC LIMIT :limit",
+    )?;
+    let rows = st.query_map(
+        named_params! {":org": org, ":action": action, ":before": before_id, ":limit": limit},
+        |r| {
+            Ok(AuditEntry {
+                id: r.get(0)?,
+                at: r.get(1)?,
+                actor: r.get(2)?,
+                action: r.get(3)?,
+                org_id: r.get(4)?,
+                org_created_at: r.get(5)?,
+                target: r.get(6)?,
+                reason: r.get(7)?,
+                detail: r.get(8)?,
+            })
+        },
+    )?;
+    Ok(rows.collect::<std::result::Result<_, _>>()?)
+}
+
+/// The numbers of `GET /operator/overview` that come from the tables.
+#[derive(Debug, Default, Clone, PartialEq)]
+pub struct OverviewCounts {
+    pub orgs: i64,
+    pub orgs_active_7d: i64,
+    pub signups_7d: i64,
+    pub jobs_this_month: i64,
+    pub failed_jobs_30d: i64,
+    /// Jobs created today (UTC) per state, in `JOB_STATES` order.
+    pub jobs_today: [i64; 5],
+}
+
+pub const JOB_STATES: [&str; 5] = ["queued", "claimed", "done", "failed", "cancelled"];
+
+pub fn overview_counts(conn: &Connection, now: f64) -> Result<OverviewCounts> {
+    const DAY: f64 = 86_400.0;
+    let one =
+        |sql: &str, since: f64| -> Result<i64> { Ok(conn.query_row(sql, [since], |r| r.get(0))?) };
+    let mut out = OverviewCounts {
+        // the seeded default org is no signup
+        orgs: conn.query_row("SELECT COUNT(*) FROM orgs", [], |r| r.get(0))?,
+        signups_7d: one(
+            "SELECT COUNT(*) FROM orgs WHERE id != 1 AND created_at >= ?1",
+            now - 7.0 * DAY,
+        )?,
+        orgs_active_7d: one(OVERVIEW_JOB_QUERIES[0], now - 7.0 * DAY)?,
+        jobs_this_month: one(OVERVIEW_JOB_QUERIES[1], month_start(now))?,
+        failed_jobs_30d: one(OVERVIEW_JOB_QUERIES[2], now - 30.0 * DAY)?,
+        jobs_today: [0; 5],
+    };
+    let today = (now / DAY).floor() * DAY;
+    let mut st = conn.prepare_cached(OVERVIEW_JOB_QUERIES[3])?;
+    let rows = st.query_map([today], |r| {
+        Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
+    })?;
+    for row in rows {
+        let (state, n) = row?;
+        if let Some(i) = JOB_STATES.iter().position(|s| *s == state) {
+            out.jobs_today[i] = n;
+        }
+    }
+    Ok(out)
+}
+
+/// Size of the database file and its `-wal` in bytes (0 for an in-memory DB or no WAL file).
+pub fn db_sizes(conn: &Connection) -> Result<(i64, i64)> {
+    let pages: i64 = conn.query_row("PRAGMA page_count", [], |r| r.get(0))?;
+    let page_size: i64 = conn.query_row("PRAGMA page_size", [], |r| r.get(0))?;
+    let file: String = conn
+        .query_row(
+            "SELECT file FROM pragma_database_list WHERE name='main'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap_or_default();
+    let wal = if file.is_empty() {
+        0
+    } else {
+        std::fs::metadata(format!("{file}-wal")).map_or(0, |m| m.len() as i64)
+    };
+    Ok((pages * page_size, wal))
 }
 
 #[cfg(test)]
@@ -3466,6 +3634,22 @@ mod tests {
             [],
         );
         assert_eq!(on, 1);
+    }
+
+    #[test]
+    fn the_overview_queries_on_jobs_never_scan_the_table() {
+        let conn = db();
+        for sql in OVERVIEW_JOB_QUERIES {
+            let mut st = conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap();
+            let plan: Vec<String> = st
+                .query_map([0.0], |r| r.get::<_, String>(3))
+                .unwrap()
+                .map(Result::unwrap)
+                .collect();
+            for line in &plan {
+                assert!(!line.contains("SCAN jobs"), "{sql}: {plan:?}");
+            }
+        }
     }
 
     #[test]

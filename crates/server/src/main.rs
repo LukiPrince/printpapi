@@ -9,7 +9,10 @@
 //! callback, and until queued jobs without a deadline are failed; their row goes after
 //! max(N, 7) days if it is from before this UTC month; unset or 0 keeps everything), PRINTAPI_TERMS_VERSION (set: `POST /signup`
 //! must accept that version of the terms), PRINTAPI_TERMS_URL (required with it), PRINTAPI_DPA_URL,
-//! PRINTAPI_PRIVACY_URL (optional links, http(s) only), LOG_REQUESTS, SMTP_*.
+//! PRINTAPI_PRIVACY_URL (optional links, http(s) only), PRINTAPI_OPERATOR_TOKEN (set: the
+//! `/operator/` API is on, at least 32 characters, and hosted mode with it: private URLs denied and
+//! 4 fetches per org unless set), PRINTAPI_OPERATOR_FROM (required with it: IPs or CIDRs the token is
+//! accepted from), LOG_REQUESTS, SMTP_*.
 use printpapi_server::dispatch::{Destinations, HttpFetcher, OUTBOUND_IN_FLIGHT};
 use printpapi_server::mail::{self, SmtpMailer};
 use printpapi_server::server::{AppState, Config, Terms};
@@ -115,6 +118,39 @@ fn parse_terms(
     }))
 }
 
+/// The operator token and the peers it is accepted from. Unset or blank: the operator API is off.
+/// The token is at least 32 characters, never starts with `sess_` (a session's prefix, which the
+/// credential lookup treats specially) and is not the root token. The peer list is required: a
+/// token that works from anywhere is not what the operator API is for.
+fn parse_operator(
+    token: &str,
+    from: &str,
+    root: &str,
+) -> Result<Option<(String, printpapi_server::proxy::TrustedProxies)>, String> {
+    let token = py_strip(token);
+    if token.is_empty() {
+        return Ok(None);
+    }
+    if token.chars().count() < 32 {
+        return Err("PRINTAPI_OPERATOR_TOKEN must be at least 32 characters".into());
+    }
+    if token.starts_with("sess_") {
+        return Err("PRINTAPI_OPERATOR_TOKEN must not start with sess_".into());
+    }
+    if token == root {
+        return Err("PRINTAPI_OPERATOR_TOKEN must differ from PRINTAPI_TOKEN".into());
+    }
+    let from = printpapi_server::proxy::TrustedProxies::parse(from)
+        .map_err(|e| format!("PRINTAPI_OPERATOR_FROM: {e}"))?;
+    if from.is_empty() {
+        return Err(
+            "PRINTAPI_OPERATOR_FROM is required with PRINTAPI_OPERATOR_TOKEN (the console's address, e.g. 172.30.0.3)"
+                .into(),
+        );
+    }
+    Ok(Some((token.to_string(), from)))
+}
+
 /// One stderr line per hosted-beta safeguard that is off while strangers can sign up.
 fn startup_warnings(cfg: &Config) -> Vec<&'static str> {
     let mut out = Vec::new();
@@ -137,6 +173,10 @@ fn startup_warnings(cfg: &Config) -> Vec<&'static str> {
 }
 
 fn config() -> Result<(Config, String, u16), String> {
+    config_from(&env)
+}
+
+fn config_from(env: &dyn Fn(&str) -> Option<String>) -> Result<(Config, String, u16), String> {
     let token = env("PRINTAPI_TOKEN").ok_or("PRINTAPI_TOKEN is required")?;
     if py_strip(&token).is_empty() {
         // An empty bootstrap token would compare-equal every missing Authorization header,
@@ -173,11 +213,22 @@ fn config() -> Result<(Config, String, u16), String> {
     cfg.plans = billing::load_plans(&raw_plans).map_err(|e| e.to_string())?;
     cfg.billing_secret = env("PRINTAPI_BILLING_SECRET").filter(|s| !s.is_empty());
     cfg.log_requests = env("LOG_REQUESTS").is_some_and(|s| !s.is_empty());
+    if let Some((token, from)) = parse_operator(
+        &env("PRINTAPI_OPERATOR_TOKEN").unwrap_or_default(),
+        &env("PRINTAPI_OPERATOR_FROM").unwrap_or_default(),
+        &cfg.token,
+    )? {
+        cfg.operator_token = Some(token);
+        cfg.operator_from = from;
+    }
+    // Hosted mode comes with the operator token: strangers' jobs run here, so the safe defaults
+    // hold whatever signup says, fixed at startup (a later live setting never moves them).
+    let hosted = cfg.operator_token.is_some();
     // Private destinations are refused by default exactly when strangers get accounts (open
-    // signup); a self-hosted box keeps fetching from its LAN.
+    // signup, or hosted mode); a self-hosted box keeps fetching from its LAN.
     let private = env("PRINTAPI_PRIVATE_URLS").unwrap_or_default();
     cfg.destinations = match py_strip(&private) {
-        "" if cfg.signup_open => Destinations::PublicOnly,
+        "" if cfg.signup_open || hosted => Destinations::PublicOnly,
         "" | "allow" => Destinations::Any,
         "deny" => Destinations::PublicOnly,
         other => {
@@ -188,6 +239,9 @@ fn config() -> Result<(Config, String, u16), String> {
     };
     cfg.fetches_per_org = parse_fetch_cap(&env("PRINTAPI_FETCHES_PER_ORG").unwrap_or_default())
         .map_err(|e| format!("PRINTAPI_FETCHES_PER_ORG: {e}"))?;
+    if hosted && cfg.fetches_per_org.is_none() {
+        cfg.fetches_per_org = Some(printpapi_server::server::MAX_FETCHES_PER_ORG);
+    }
     cfg.trusted_proxies = printpapi_server::proxy::TrustedProxies::parse(
         &env("PRINTAPI_TRUSTED_PROXIES").unwrap_or_default(),
     )
@@ -235,6 +289,9 @@ fn run() -> Result<(), String> {
     let destinations = cfg.destinations;
     for line in startup_warnings(&cfg) {
         eprintln!("{line}");
+    }
+    if cfg.operator_token.is_some() {
+        eprintln!("operator API on (hosted mode: private URLs denied unless allowed explicitly)");
     }
     let db = Db::open(&db_path).map_err(|e| format!("cannot open database {db_path:?}: {e}"))?;
     let state = Arc::new(AppState::new(
@@ -352,5 +409,105 @@ mod terms_tests {
     #[test]
     fn a_version_still_needs_a_terms_url() {
         assert!(parse_terms("v1", "", "", "").is_err());
+    }
+}
+
+#[cfg(test)]
+mod operator_tests {
+    use super::config_from;
+    use printpapi_server::dispatch::Destinations;
+    use printpapi_server::server::Config;
+
+    const ROOT: &str = "root-token";
+    const OP: &str = "operator-token-0123456789abcdef-xyz";
+
+    fn cfg(extra: &[(&str, &str)]) -> Result<Config, String> {
+        let mut vars: Vec<(String, String)> = vec![("PRINTAPI_TOKEN".into(), ROOT.into())];
+        vars.extend(extra.iter().map(|(k, v)| (k.to_string(), v.to_string())));
+        config_from(&|k| vars.iter().rfind(|(n, _)| n == k).map(|(_, v)| v.clone()))
+            .map(|(c, _, _)| c)
+    }
+
+    /// The operator variables plus `extra`; an entry of `extra` replaces the default of its name.
+    fn with_op(extra: &[(&str, &str)]) -> Result<Config, String> {
+        let mut v = vec![
+            ("PRINTAPI_OPERATOR_TOKEN", OP),
+            ("PRINTAPI_OPERATOR_FROM", "10.9.0.2"),
+        ];
+        for (k, val) in extra {
+            v.retain(|(n, _)| n != k);
+            v.push((k, val));
+        }
+        cfg(&v)
+    }
+
+    #[test]
+    fn unset_the_operator_api_is_off_and_nothing_else_changes() {
+        let c = cfg(&[]).unwrap();
+        assert!(c.operator_token.is_none());
+        assert_eq!(c.destinations, Destinations::Any);
+        assert_eq!(c.fetches_per_org, None);
+    }
+
+    #[test]
+    fn a_token_needs_from() {
+        let e = cfg(&[("PRINTAPI_OPERATOR_TOKEN", OP)]).unwrap_err();
+        assert!(e.contains("PRINTAPI_OPERATOR_FROM"), "{e}");
+        let e = cfg(&[
+            ("PRINTAPI_OPERATOR_TOKEN", OP),
+            ("PRINTAPI_OPERATOR_FROM", "  "),
+        ])
+        .unwrap_err();
+        assert!(e.contains("PRINTAPI_OPERATOR_FROM"), "{e}");
+        let c = with_op(&[]).unwrap();
+        assert_eq!(c.operator_token.as_deref(), Some(OP));
+        assert!(!c.operator_from.is_empty());
+    }
+
+    #[test]
+    fn the_token_must_be_long_and_not_look_like_a_session_or_the_root_token() {
+        let short = "a".repeat(31);
+        let e = with_op(&[("PRINTAPI_OPERATOR_TOKEN", &short)]).unwrap_err();
+        assert!(e.contains("PRINTAPI_OPERATOR_TOKEN"), "{e}");
+        let ok = "a".repeat(32);
+        assert!(with_op(&[("PRINTAPI_OPERATOR_TOKEN", &ok)]).is_ok());
+        let sess = format!("sess_{}", "a".repeat(40));
+        assert!(with_op(&[("PRINTAPI_OPERATOR_TOKEN", &sess)]).is_err());
+        let e = with_op(&[("PRINTAPI_TOKEN", OP)]).unwrap_err();
+        assert!(e.contains("PRINTAPI_TOKEN"), "{e}");
+        // surrounding whitespace never counts towards the length
+        let padded = format!(" {} ", "a".repeat(31));
+        assert!(with_op(&[("PRINTAPI_OPERATOR_TOKEN", &padded)]).is_err());
+    }
+
+    #[test]
+    fn an_invalid_from_entry_stops_the_server() {
+        let e = with_op(&[("PRINTAPI_OPERATOR_FROM", "10.9.0.2,not-an-ip")]).unwrap_err();
+        assert!(e.contains("PRINTAPI_OPERATOR_FROM"), "{e}");
+    }
+
+    #[test]
+    fn hosted_mode_comes_with_the_token() {
+        let c = with_op(&[]).unwrap();
+        assert_eq!(c.destinations, Destinations::PublicOnly);
+        assert_eq!(c.fetches_per_org, Some(4));
+        assert_eq!(c.fetch_cap(), 4);
+        // whatever signup says
+        let c = with_op(&[("PRINTAPI_SIGNUP", "closed")]).unwrap();
+        assert_eq!(c.destinations, Destinations::PublicOnly);
+        assert_eq!(c.fetch_cap(), 4);
+    }
+
+    #[test]
+    fn explicit_settings_beat_the_hosted_defaults() {
+        let c = with_op(&[
+            ("PRINTAPI_PRIVATE_URLS", "allow"),
+            ("PRINTAPI_FETCHES_PER_ORG", "0"),
+        ])
+        .unwrap();
+        assert_eq!(c.destinations, Destinations::Any);
+        assert_eq!(c.fetch_cap(), 0);
+        let c = with_op(&[("PRINTAPI_FETCHES_PER_ORG", "9")]).unwrap();
+        assert_eq!(c.fetch_cap(), 9);
     }
 }

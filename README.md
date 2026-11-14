@@ -185,6 +185,7 @@ sponsored by PrintNode.*
 | [Recipes](docs/recipes.md) | print from n8n, Zapier, Make, curl in one HTTP node |
 | [E-commerce](docs/ecommerce.md) | WooCommerce plugin, Shopify webhook, `POST /orders` |
 | [Billing](docs/billing.md) | plans, checkout links, the signed provider webhook, org deletion |
+| [Operator API](docs/operator.md) | for a hosted deployment: a service token, the audit log and the overview a separate console reads |
 | [Migration](docs/migration.md) | upgrading from v2 (Python) to v3 (Rust): server, agents, changed defaults, rollback |
 | [Roadmap](docs/roadmap.md) | what shipped and what is next |
 

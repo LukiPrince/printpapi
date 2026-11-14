@@ -366,6 +366,18 @@ fn write_a_database_for_python_to_read() {
             .user_id;
         create_session(c, uid, "sess_rust", 3600.0, None).unwrap();
         add_api_key(c, "rust-key", "pk_rust", DEFAULT_ORG).unwrap();
+        // the new table is in the file Python opens, with a row in it
+        let tx = begin_tx(c).unwrap();
+        insert_audit(
+            &tx,
+            &AuditRow {
+                action: "org.update",
+                org_id: Some(ORG),
+                ..AuditRow::default()
+            },
+        )
+        .unwrap();
+        tx.commit().unwrap();
     });
 }
 
@@ -402,4 +414,72 @@ fn a_python_database_gets_the_label_templates_table_at_startup() {
     let list = db.with(|c| list_label_templates(c, Some(ORG))).unwrap();
     assert_eq!(list.len(), 1);
     assert_eq!(list[0].spec.name, "shipping");
+}
+
+#[test]
+fn a_python_database_gets_the_operator_audit_table_and_the_python_tables_stay_as_they_were() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("python_v2.sqlite3");
+    let fixture = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/python_v2.sqlite3"
+    );
+    std::fs::copy(fixture, &path).unwrap();
+    let columns = |path: &std::path::Path, table: &str| -> Vec<String> {
+        let c = rusqlite::Connection::open(path).unwrap();
+        let mut st = c.prepare(&format!("PRAGMA table_info({table})")).unwrap();
+        st.query_map([], |r| r.get::<_, String>(1))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect()
+    };
+    let python_tables = [
+        "orgs", "users", "sessions", "agents", "printers", "jobs", "api_keys",
+    ];
+    let before: Vec<_> = python_tables.iter().map(|t| columns(&path, t)).collect();
+    assert!(columns(&path, "operator_audit").is_empty());
+
+    let db = Db::open(path.to_str().unwrap()).unwrap();
+    assert_eq!(
+        columns(&path, "operator_audit"),
+        [
+            "id",
+            "at",
+            "actor",
+            "action",
+            "org_id",
+            "org_created_at",
+            "target",
+            "reason",
+            "detail"
+        ]
+    );
+    // the new table adds nothing to a table Python knows beyond the old migrations
+    for (t, was) in python_tables.iter().zip(&before) {
+        let now = columns(&path, t);
+        assert!(
+            was.iter().all(|c| now.contains(c)),
+            "{t}: {was:?} -> {now:?}"
+        );
+    }
+    // a row survives a second start
+    db.with(|c| {
+        let tx = begin_tx(c).unwrap();
+        insert_audit(
+            &tx,
+            &AuditRow {
+                action: "org.update",
+                org_id: Some(ORG),
+                ..AuditRow::default()
+            },
+        )
+        .unwrap();
+        tx.commit().unwrap();
+    });
+    drop(db);
+    let db = Db::open(path.to_str().unwrap()).unwrap();
+    let rows = db.with(|c| list_audit(c, None, None, None, 10)).unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].action, "org.update");
+    assert_eq!(rows[0].actor, "operator");
 }

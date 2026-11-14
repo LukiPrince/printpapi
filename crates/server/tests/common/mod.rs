@@ -146,6 +146,7 @@ impl App {
                 body: Bytes::new(),
                 body_error: false,
                 peer_ip: "127.0.0.1".into(),
+                socket_peer: "127.0.0.1".into(),
             },
         }
     }
@@ -278,6 +279,12 @@ impl Call<'_> {
 
     pub fn peer(mut self, ip: &str) -> Self {
         self.req.peer_ip = ip.into();
+        self
+    }
+
+    /// The raw socket peer (what the operator gate checks), apart from the resolved `peer_ip`.
+    pub fn socket(mut self, ip: &str) -> Self {
+        self.req.socket_peer = ip.into();
         self
     }
 

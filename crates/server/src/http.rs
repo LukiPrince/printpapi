@@ -162,7 +162,14 @@ async fn respond(
     let mut close = false;
     let resp = if method == "GET" && target == "/agent/jobs" {
         // Python compared self.path, so "/agent/jobs?x=1" is not the long-poll.
-        long_poll(&ctx.state, bearer(&parts.headers)).await
+        let key = bearer(&parts.headers);
+        // The operator token is no agent key either: an empty key answers 401 at once.
+        let key = if server::is_operator_token(&ctx.state.cfg, key) {
+            ""
+        } else {
+            key
+        };
+        long_poll(&ctx.state, key).await
     } else {
         let declared = parts
             .headers
@@ -190,6 +197,7 @@ async fn respond(
             body,
             body_error,
             peer_ip: client.clone(),
+            socket_peer: peer.ip().to_string(),
         };
         let (st, handler) = (ctx.state.clone(), ctx.handler);
         match tokio::task::spawn_blocking(move || handler(&st, &req)).await {
@@ -442,6 +450,13 @@ fn access_log_line(
     version: &str,
     status: u16,
 ) -> String {
+    // The query of an `/operator/` request can name a customer (`q=` searches e-mail addresses),
+    // so it stays out of the log.
+    let target = if target.starts_with("/operator/") {
+        target.split('?').next().unwrap_or(target)
+    } else {
+        target
+    };
     format!("{ip} - - [{when}] \"{method} {target} {version}\" {status} -")
 }
 
@@ -556,6 +571,25 @@ mod tests {
             ),
             "10.0.0.7 - - [31/Oct/2026 01:52:18] \"GET /health HTTP/1.1\" 200 -"
         );
+    }
+
+    #[test]
+    fn operator_paths_are_logged_without_their_query_string() {
+        let line = access_log_line(
+            "10.0.0.7",
+            "31/Oct/2026 01:52:18",
+            "GET",
+            "/operator/orgs?q=alice%40shop.test&status=active",
+            "HTTP/1.1",
+            200,
+        );
+        assert_eq!(
+            line,
+            "10.0.0.7 - - [31/Oct/2026 01:52:18] \"GET /operator/orgs HTTP/1.1\" 200 -"
+        );
+        // every other path keeps what it always logged
+        let line = access_log_line("10.0.0.7", "t", "GET", "/jobs?limit=5", "HTTP/1.1", 200);
+        assert!(line.contains("/jobs?limit=5"), "{line}");
     }
 
     #[test]

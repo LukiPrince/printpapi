@@ -57,6 +57,11 @@ pub struct Config {
     /// PRINTAPI_FETCHES_PER_ORG: payload downloads one org may have in flight; 0 = no cap. None:
     /// `MAX_FETCHES_PER_ORG` with open signup, else no cap (see `Config::fetch_cap`).
     pub fetches_per_org: Option<usize>,
+    /// PRINTAPI_OPERATOR_TOKEN: the credential of the `/operator/` API. Never a `Principal`: only
+    /// `operator_gate` reads it. None: every `/operator/` path is a 404.
+    pub operator_token: Option<String>,
+    /// PRINTAPI_OPERATOR_FROM: the socket peers the operator token is accepted from.
+    pub operator_from: crate::proxy::TrustedProxies,
 }
 
 /// The terms a signup must accept (`PRINTAPI_TERMS_*`). The URLs are `http(s)` (checked at startup).
@@ -93,6 +98,8 @@ impl Config {
             job_retention_days: None,
             terms: None,
             fetches_per_org: None,
+            operator_token: None,
+            operator_from: crate::proxy::TrustedProxies::default(),
         }
     }
 }
@@ -193,6 +200,12 @@ pub struct AppState {
     /// A retention WAL truncate was blocked by a reader; the next pass retries it even if it
     /// changes no rows.
     wal_truncate_pending: std::sync::atomic::AtomicBool,
+    /// When the process started (the overview's uptime).
+    started: std::time::Instant,
+    /// The last retention pass that ran: when, and what it did (the operator overview).
+    last_purge: Mutex<Option<(f64, store::Purged)>>,
+    /// The operator overview, kept for `operator::OVERVIEW_TTL`.
+    overview_cache: Mutex<Option<(std::time::Instant, Value)>>,
 }
 
 /// Concurrent image renders (see `AppState::render_slots`). ponytail: one global cap, not per
@@ -365,6 +378,9 @@ impl AppState {
             org_fetches: Mutex::new(std::collections::HashMap::new()),
             keys_in_flight: Mutex::new(std::collections::HashSet::new()),
             wal_truncate_pending: std::sync::atomic::AtomicBool::new(false),
+            started: std::time::Instant::now(),
+            last_purge: Mutex::new(None),
+            overview_cache: Mutex::new(None),
         }
     }
 }
@@ -392,6 +408,8 @@ pub struct Req {
     /// The client's IP: the socket peer, or the address `X-Forwarded-For` names when the peer is a
     /// trusted proxy (`proxy::client_ip`). The signup throttle key and the access log use it.
     pub peer_ip: String,
+    /// The raw socket peer, never `X-Forwarded-For`. Only the operator gate reads it.
+    pub socket_peer: String,
 }
 
 impl Req {
@@ -472,6 +490,9 @@ macro_rules! gate {
         }
     };
 }
+
+mod operator;
+pub use operator::is_operator_token;
 
 fn jerr(status: u16, msg: impl AsRef<str>) -> Resp {
     Resp::json(status, &json!({ "error": msg.as_ref() }))
@@ -779,6 +800,11 @@ impl From<dispatch::DispatchError> for SubmitErr {
 struct Ctx<'a> {
     s: &'a AppState,
     req: &'a Req,
+    /// The request carried the operator token (Authorization or a CloudPRNT path key) on a route
+    /// that is not `/operator/`. `handle` has already removed it, so every resolver sees no
+    /// credential; only `enrollment_org` still needs to know, because open enrollment would
+    /// otherwise take a request without a key.
+    operator_cred: bool,
 }
 
 /// The org `key` may enroll an agent into, or why it may not (see `Ctx::agent_register`): the
@@ -791,7 +817,14 @@ fn enrollment_org(
     key: &str,
     root: bool,
     open: bool,
+    operator: bool,
 ) -> Result<Result<i64, &'static str>, StoreError> {
+    // The operator token enrolls nothing, not even with open enrollment.
+    if operator {
+        return Ok(Err(
+            "unknown agent key: issue one with POST /apikeys (the dashboard's Keys page)",
+        ));
+    }
     if root {
         return Ok(Ok(store::DEFAULT_ORG));
     }
@@ -811,7 +844,31 @@ fn enrollment_org(
 
 /// Route one request (every method and path except the `GET /agent/jobs` long-poll).
 pub fn handle(state: &AppState, req: &Req) -> Resp {
-    let cx = Ctx { s: state, req };
+    let path = req.path();
+    if path == "/operator" || path.starts_with("/operator/") {
+        return Ctx {
+            s: state,
+            req,
+            operator_cred: false,
+        }
+        .operator();
+    }
+    // The operator token is no credential anywhere else: take it out of the request before any
+    // session, key, Basic, CloudPRNT or agent lookup can see it.
+    if let Some(token) = state.cfg.operator_token.as_deref()
+        && let Some(clean) = operator::without_operator_credential(req, token)
+    {
+        return route(state, &clean, true);
+    }
+    route(state, req, false)
+}
+
+fn route(state: &AppState, req: &Req, operator_cred: bool) -> Resp {
+    let cx = Ctx {
+        s: state,
+        req,
+        operator_cred,
+    };
     let r = match req.method.as_str() {
         "GET" => cx.get(),
         "HEAD" => Ok(cx.head()),
@@ -2267,7 +2324,7 @@ impl Ctx<'_> {
         let (root, open) = (self.admin_ok(), self.cfg().open_enrollment);
         // Checked here so a refused key answers 401 before any body validation, and again below
         // in the same lock hold as the registration, so a revocation in between cannot slip by.
-        if let Err(m) = self.db(|c| enrollment_org(c, key, root, open))? {
+        if let Err(m) = self.db(|c| enrollment_org(c, key, root, open, self.operator_cred))? {
             return Ok(jerr(401, m));
         }
         let mut printers = Vec::new();
@@ -2308,10 +2365,12 @@ impl Ctx<'_> {
         let name = name.as_str();
         // First contact binds name->key; re-register requires the same key.
         let registered = self.db(|c| -> Result<_, StoreError> {
-            Ok(match enrollment_org(c, key, root, open)? {
-                Err(m) => Err(m),
-                Ok(org) => Ok(store::register_agent(c, name, key, &printers, org)),
-            })
+            Ok(
+                match enrollment_org(c, key, root, open, self.operator_cred)? {
+                    Err(m) => Err(m),
+                    Ok(org) => Ok(store::register_agent(c, name, key, &printers, org)),
+                },
+            )
         })?;
         match registered {
             Err(m) => Ok(jerr(401, m)),
@@ -2654,6 +2713,7 @@ pub fn retention_pass(state: &AppState, now: f64) -> Option<store::Purged> {
     }) {
         Ok(p) => {
             state.wal_truncate_pending.store(p.wal_busy, Relaxed);
+            *state.last_purge.lock().unwrap_or_else(|e| e.into_inner()) = Some((now, p.clone()));
             Some(p)
         }
         Err(e) => {
