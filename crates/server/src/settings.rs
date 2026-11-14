@@ -155,6 +155,17 @@ pub struct EnvStart {
     pub terms_set: bool,
 }
 
+/// Which startup variables were set at all (a default and an explicit value can be equal).
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct EnvFlags {
+    pub signup_set: bool,
+    /// `PRINTAPI_SIGNUP` is present and says `closed`.
+    pub signup_explicit_closed: bool,
+    pub signup_quota_set: bool,
+    pub job_retention_days_set: bool,
+    pub terms_set: bool,
+}
+
 /// One validated override value.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Parsed {

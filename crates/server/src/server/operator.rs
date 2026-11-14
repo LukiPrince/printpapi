@@ -473,7 +473,7 @@ impl Ctx<'_> {
         };
         let tok = auth::new_session_token();
         let ttl = self.cfg().reset_ttl_s;
-        let quota = self.cfg().signup_quota;
+        let quota = self.live.signup_quota.value;
         let new = match self.db(|c| {
             store::operator_create_org(
                 c,

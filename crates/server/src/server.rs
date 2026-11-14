@@ -62,6 +62,8 @@ pub struct Config {
     pub operator_token: Option<String>,
     /// PRINTAPI_OPERATOR_FROM: the socket peers the operator token is accepted from.
     pub operator_from: crate::proxy::TrustedProxies,
+    /// Which of the live settings' variables were set (`main` fills it): the source of a value.
+    pub env_flags: crate::settings::EnvFlags,
 }
 
 /// The terms a signup must accept (`PRINTAPI_TERMS_*`). The URLs are `http(s)` (checked at startup).
@@ -100,6 +102,23 @@ impl Config {
             fetches_per_org: None,
             operator_token: None,
             operator_from: crate::proxy::TrustedProxies::default(),
+            env_flags: crate::settings::EnvFlags::default(),
+        }
+    }
+
+    /// The startup values of the live settings and whether the environment set them.
+    pub fn env_start(&self) -> crate::settings::EnvStart {
+        let f = &self.env_flags;
+        crate::settings::EnvStart {
+            signup_open: self.signup_open,
+            signup_set: f.signup_set,
+            signup_explicit_closed: f.signup_explicit_closed,
+            signup_quota: self.signup_quota,
+            signup_quota_set: f.signup_quota_set,
+            job_retention_days: self.job_retention_days,
+            job_retention_days_set: f.job_retention_days_set,
+            terms: self.terms.clone(),
+            terms_set: f.terms_set,
         }
     }
 }
@@ -206,6 +225,9 @@ pub struct AppState {
     last_purge: Mutex<Option<(f64, store::Purged)>>,
     /// The operator overview, kept for `operator::OVERVIEW_TTL`.
     overview_cache: Mutex<Option<(std::time::Instant, Value)>>,
+    /// The effective live settings. The lock is held only to clone or replace the `Arc`; each
+    /// request clones it once, at its start (`AppState::live`).
+    live: Mutex<Arc<crate::settings::Live>>,
 }
 
 /// Concurrent image renders (see `AppState::render_slots`). ponytail: one global cap, not per
@@ -362,6 +384,7 @@ impl AppState {
         fetcher: Arc<dyn Fetcher>,
     ) -> AppState {
         let limiter = LoginLimiter::new(cfg.max_login_fails, cfg.login_window_s);
+        let live = initial_live(&cfg, &db);
         let dummy_hash = crate::auth::hash_password(Some("no such user, no such password"))
             .expect("the dummy password is long enough");
         AppState {
@@ -381,8 +404,59 @@ impl AppState {
             started: std::time::Instant::now(),
             last_purge: Mutex::new(None),
             overview_cache: Mutex::new(None),
+            live: Mutex::new(Arc::new(live)),
         }
     }
+
+    /// The live settings as they are now. A request calls this once and keeps the snapshot.
+    pub fn live(&self) -> Arc<crate::settings::Live> {
+        self.live.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    /// Write a validated change (and its audit row), re-read the rows, rebuild the live values
+    /// from them and swap them in, all inside one `db.with`: two writers cannot commit in one
+    /// order and swap in the other. The live values come from the rows, never from the request.
+    /// Only the operator API calls this (it is a 404 without the token).
+    pub fn apply_settings(
+        &self,
+        change: &crate::settings::Change,
+        reason: Option<&str>,
+    ) -> store::Result<Arc<crate::settings::Live>> {
+        self.db.with(|c| {
+            store::operator_update_settings(c, change, reason)?;
+            let rows = store::settings_rows(c)?;
+            let (live, _) = crate::settings::build_live(
+                &self.cfg.env_start(),
+                self.cfg.destinations == crate::dispatch::Destinations::Any,
+                &rows,
+            );
+            let live = Arc::new(live);
+            *self.live.lock().unwrap_or_else(|e| e.into_inner()) = live.clone();
+            Ok(live)
+        })
+    }
+}
+
+/// The live values at startup: the env ones, and with the operator token set the override rows
+/// on top (one stderr line per applied or ignored row). Without the token the table is never read.
+fn initial_live(cfg: &Config, db: &Db) -> crate::settings::Live {
+    let rows = if cfg.operator_token.is_some() {
+        db.with(store::settings_rows).unwrap_or_else(|e| {
+            eprintln!("settings: cannot read the overrides ({e}); the environment values apply");
+            Vec::new()
+        })
+    } else {
+        Vec::new()
+    };
+    let (live, notes) = crate::settings::build_live(
+        &cfg.env_start(),
+        cfg.destinations == crate::dispatch::Destinations::Any,
+        &rows,
+    );
+    for n in notes {
+        eprintln!("{n}");
+    }
+    live
 }
 
 /// The signup throttle key of a client address: IPv6 by /64 (`proxy::throttle_key`). Anything that
@@ -810,6 +884,8 @@ struct Ctx<'a> {
     /// credential; only `enrollment_org` still needs to know, because open enrollment would
     /// otherwise take a request without a key.
     operator_cred: bool,
+    /// The live settings as they were when the request began: one snapshot for all of it.
+    live: Arc<crate::settings::Live>,
 }
 
 /// The org `key` may enroll an agent into, or why it may not (see `Ctx::agent_register`): the
@@ -855,6 +931,7 @@ pub fn handle(state: &AppState, req: &Req) -> Resp {
             s: state,
             req,
             operator_cred: false,
+            live: state.live(),
         }
         .operator();
     }
@@ -873,6 +950,7 @@ fn route(state: &AppState, req: &Req, operator_cred: bool) -> Resp {
         s: state,
         req,
         operator_cred,
+        live: state.live(),
     };
     let r = match req.method.as_str() {
         "GET" => cx.get(),
@@ -1097,7 +1175,7 @@ impl Ctx<'_> {
     /// Self-serve: a new org, its first user, and a session in one call — the hosted deployment's
     /// front door. Off by default (`signup_open`).
     fn signup(&self) -> R {
-        if !self.cfg().signup_open {
+        if !self.live.signup.value {
             return Ok(jerr(403, "signup is disabled on this server"));
         }
         let body = gate!(self.read_obj());
@@ -1114,7 +1192,7 @@ impl Ctx<'_> {
         if !email.contains('@') {
             return Ok(jerr(400, "email required"));
         }
-        let terms_version = self.cfg().terms.as_ref().map(|t| t.version.as_str());
+        let terms_version = self.live.terms.value.as_ref().map(|t| t.version.as_str());
         if let Some(current) = terms_version {
             match body.get("accept_terms") {
                 Some(Value::String(v)) if v == current => {}
@@ -1140,7 +1218,7 @@ impl Ctx<'_> {
             .map(|n| printnode::py_trim(n).to_string())
             .filter(|n| !n.is_empty())
             .unwrap_or_else(|| email.split_once('@').map_or("", |(_, d)| d).to_string());
-        let quota = self.cfg().signup_quota;
+        let quota = self.live.signup_quota.value;
         let new = match self.db(|c| store::signup(c, &name, &email, &pw_hash, quota, terms_version))
         {
             Ok(n) => n,
@@ -2086,10 +2164,10 @@ impl Ctx<'_> {
             // "create an account" and "forgot password" at all. Both are booleans about the
             // server's configuration, not about any account.
             "/health" => {
-                let mut h = json!({ "ok": true, "signup": if self.cfg().signup_open { "open" } else { "closed" },
+                let mut h = json!({ "ok": true, "signup": if self.live.signup.value { "open" } else { "closed" },
                                     "password_reset": self.cfg().reset_enabled });
                 // Only when consent is required, so a server without it answers as before.
-                if let Some(t) = &self.cfg().terms {
+                if let Some(t) = &self.live.terms.value {
                     h["terms"] = json!({ "version": t.version, "terms_url": t.terms_url,
                                          "dpa_url": t.dpa_url, "privacy_url": t.privacy_url });
                 }
@@ -2752,7 +2830,7 @@ const RETENTION_EVERY_S: f64 = 3600.0;
 /// PRINTAPI_JOB_RETENTION_DAYS is set. `None`: not due, not configured, or the purge failed
 /// (logged; the next tick after the hour tries again).
 pub fn retention_pass(state: &AppState, now: f64) -> Option<store::Purged> {
-    let days = state.cfg.job_retention_days?;
+    let days = state.live().job_retention_days.value?;
     {
         let mut last = state
             .last_retention
