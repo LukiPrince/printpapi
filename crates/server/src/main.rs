@@ -15,7 +15,10 @@
 //! accepted from), LOG_REQUESTS, SMTP_*.
 use printpapi_server::dispatch::{Destinations, HttpFetcher, OUTBOUND_IN_FLIGHT};
 use printpapi_server::mail::{self, SmtpMailer};
-use printpapi_server::server::{AppState, Config, Terms};
+use printpapi_server::server::{AppState, Config};
+use printpapi_server::settings::{
+    parse_fetch_cap, parse_quota, parse_retention, parse_terms, py_strip,
+};
 use printpapi_server::store::Db;
 use printpapi_server::{billing, http};
 use std::sync::Arc;
@@ -23,99 +26,6 @@ use std::time::Duration;
 
 fn env(key: &str) -> Option<String> {
     std::env::var(key).ok()
-}
-
-/// Python `str.strip()`: Unicode whitespace plus U+001C..U+001F.
-fn py_strip(s: &str) -> &str {
-    s.trim_matches(|c: char| c.is_whitespace() || ('\u{1c}'..='\u{1f}').contains(&c))
-}
-
-/// Empty: no quota. Otherwise a non-negative integer (0 is a real quota: nothing may be printed).
-fn parse_quota(raw: &str) -> Result<Option<i64>, String> {
-    let t = py_strip(raw);
-    if t.is_empty() {
-        return Ok(None);
-    }
-    match t.parse::<i64>() {
-        Ok(n) if n >= 0 => Ok(Some(n)),
-        _ => Err(format!("must be a non-negative integer, not {t:?}")),
-    }
-}
-
-/// Empty: unset (the default follows the signup mode). Otherwise a non-negative integer, 0 = no cap.
-fn parse_fetch_cap(raw: &str) -> Result<Option<usize>, String> {
-    let t = py_strip(raw);
-    if t.is_empty() {
-        return Ok(None);
-    }
-    t.parse::<usize>()
-        .map(Some)
-        .map_err(|_| format!("must be a non-negative integer, not {t:?}"))
-}
-
-/// Empty or 0: keep for ever. Otherwise a positive number of days.
-fn parse_retention(raw: &str) -> Result<Option<i64>, String> {
-    let t = py_strip(raw);
-    if t.is_empty() {
-        return Ok(None);
-    }
-    match t.parse::<i64>() {
-        Ok(0) => Ok(None),
-        Ok(n) if n > 0 => Ok(Some(n)),
-        _ => Err(format!("must be a positive integer, not {t:?}")),
-    }
-}
-
-/// The one link rule (`web/lib/terms.ts` `isHttpUrl` is its twin): `http://` or `https://`, any
-/// case, then a non-empty host. Printable ASCII only (0x21..=0x7E): Rust's whitespace and JS's
-/// `\s` disagree on U+0085 and U+FEFF, so neither is asked.
-fn is_terms_url(u: &str) -> bool {
-    if !u.bytes().all(|b| (0x21..=0x7E).contains(&b)) {
-        return false;
-    }
-    let lower = u.to_ascii_lowercase();
-    let Some(rest) = lower
-        .strip_prefix("https://")
-        .or_else(|| lower.strip_prefix("http://"))
-    else {
-        return false;
-    };
-    !rest.split(['/', '?', '#']).next().unwrap_or("").is_empty()
-}
-
-/// The terms a signup must accept. A version needs a terms URL. Every link that is set must be
-/// an absolute `http(s)` URL with a host, version or not.
-fn parse_terms(
-    version: &str,
-    terms_url: &str,
-    dpa_url: &str,
-    privacy_url: &str,
-) -> Result<Option<Terms>, String> {
-    let version = py_strip(version);
-    let url = |name: &str, raw: &str| -> Result<Option<String>, String> {
-        let t = py_strip(raw);
-        if t.is_empty() {
-            Ok(None)
-        } else if is_terms_url(t) {
-            Ok(Some(t.to_string()))
-        } else {
-            Err(format!("{name} must be an http(s) URL, not {t:?}"))
-        }
-    };
-    let terms_url = url("PRINTAPI_TERMS_URL", terms_url)?;
-    let dpa_url = url("PRINTAPI_DPA_URL", dpa_url)?;
-    let privacy_url = url("PRINTAPI_PRIVACY_URL", privacy_url)?;
-    if version.is_empty() {
-        return Ok(None); // no consent required: the links are only checked, not used
-    }
-    let terms_url =
-        terms_url.ok_or("PRINTAPI_TERMS_URL is required with PRINTAPI_TERMS_VERSION")?;
-    Ok(Some(Terms {
-        version: version.to_string(),
-        terms_url,
-        dpa_url,
-        privacy_url,
-    }))
 }
 
 /// The operator token and the peers it is accepted from. Unset or blank: the operator API is off.
