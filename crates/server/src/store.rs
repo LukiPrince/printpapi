@@ -13,6 +13,7 @@
 use rusqlite::Connection;
 use serde::Serialize;
 use serde_json::{Map, Value};
+use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex};
 
 pub const DEFAULT_ORG: i64 = 1;
@@ -404,6 +405,16 @@ CREATE TABLE IF NOT EXISTS operator_audit(
 CREATE TABLE IF NOT EXISTS org_locks(
   org_id INTEGER PRIMARY KEY, org_created_at REAL NOT NULL, reason TEXT NOT NULL,
   locked_at REAL NOT NULL);
+-- Support access: the operator may read one org's job titles and payloads while a grant is active
+-- (the customer sees every grant). `org_created_at` keeps a reused org id apart from its
+-- predecessor. Kept for ever like the audit log; only `delete_org` removes an org's rows.
+CREATE TABLE IF NOT EXISTS support_grants(
+  id INTEGER PRIMARY KEY AUTOINCREMENT, org_id INTEGER NOT NULL, org_created_at REAL NOT NULL,
+  reason TEXT NOT NULL, granted_at REAL NOT NULL, expires_at REAL NOT NULL, ended_at REAL,
+  reads INTEGER NOT NULL DEFAULT 0);
+CREATE INDEX IF NOT EXISTS support_grants_org ON support_grants(org_id);
+-- finds the audit rows of one grant (`grant:<id>`) without a scan
+CREATE INDEX IF NOT EXISTS operator_audit_target ON operator_audit(target);
 ";
 
 const MIGRATIONS: &[&str] = &[
@@ -845,6 +856,7 @@ pub fn delete_org_tx(tx: &Transaction, org_id: i64) -> Result<bool> {
         "label_templates",
         "terms_acceptances",
         "org_locks",
+        "support_grants",
     ] {
         tx.execute(&format!("DELETE FROM {table} WHERE org_id=?"), [org_id])?;
     }
@@ -2404,6 +2416,12 @@ pub enum Refusal {
     /// The typed name is not the org's current name.
     ConfirmMismatch,
     DefaultOrg,
+    /// The org already has an active support grant.
+    SupportGrantActive,
+    /// The support grant is ended or expired (or its org is gone).
+    GrantNotActive,
+    /// The org has no active support grant.
+    NoSupportGrant,
 }
 
 /// When the org was created: what keeps a reused org id apart in the audit log.
@@ -3034,6 +3052,332 @@ pub fn operator_org_jobs(
         },
     )?;
     Ok(rows.collect::<rusqlite::Result<_>>()?)
+}
+
+// --- support access ----------------------------------------------------------------------------
+
+/// An active support grant, as the operator sees it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SupportGrant {
+    pub id: i64,
+    pub reason: String,
+    pub granted_at: f64,
+    pub expires_at: f64,
+    pub reads: i64,
+}
+
+/// One grant in the customer's history.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SupportGrantRow {
+    pub id: i64,
+    pub reason: String,
+    pub granted_at: f64,
+    pub expires_at: f64,
+    pub ended_at: Option<f64>,
+    pub active: bool,
+    pub listed_job_ids: Vec<i64>,
+    pub opened_job_ids: Vec<i64>,
+}
+
+/// What reading one job's payload came to.
+#[derive(Debug, PartialEq)]
+pub enum PayloadRead {
+    Bytes {
+        bytes: Vec<u8>,
+        mode: String,
+    },
+    NotFound,
+    Refused(Refusal),
+    /// The retention pass emptied the payload.
+    Scrubbed,
+}
+
+/// A job of the operator's titled page: the metadata and the title.
+pub type TitledJob = (OperatorJob, Option<String>);
+
+/// The one definition of an active grant (alias `g`, parameter `:now`): not ended, not expired, and
+/// made for the org's current generation. An org that is gone has no `created_at` to match.
+const ACTIVE_GRANT: &str = "g.ended_at IS NULL AND g.expires_at > :now \
+     AND g.org_created_at = (SELECT o.created_at FROM orgs o WHERE o.id = g.org_id)";
+
+/// The active grant of an org, if any (see `ACTIVE_GRANT`).
+pub fn active_support_grant(conn: &Connection, org_id: i64) -> Result<Option<SupportGrant>> {
+    Ok(conn
+        .prepare_cached(&format!(
+            "SELECT g.id, g.reason, g.granted_at, g.expires_at, g.reads FROM support_grants g \
+             WHERE g.org_id = :org AND {ACTIVE_GRANT} ORDER BY g.id DESC LIMIT 1"
+        ))?
+        .query_row(named_params! {":org": org_id, ":now": crate::now()}, |r| {
+            Ok(SupportGrant {
+                id: r.get(0)?,
+                reason: r.get(1)?,
+                granted_at: r.get(2)?,
+                expires_at: r.get(3)?,
+                reads: r.get(4)?,
+            })
+        })
+        .optional()?)
+}
+
+fn grant_target(id: i64) -> String {
+    format!("grant:{id}")
+}
+
+/// `support.grant`: one grant for `minutes`, unless the org has an active one.
+pub fn operator_grant_support(
+    conn: &Connection,
+    org_id: i64,
+    seen: Option<f64>,
+    reason: &str,
+    minutes: i64,
+) -> Result<Outcome<SupportGrant>> {
+    let tx = begin(conn)?;
+    let Some(created) = org_created_at(&tx, org_id)? else {
+        return Ok(Outcome::NotFound);
+    };
+    if seen != Some(created) {
+        return Ok(Outcome::Refused(Refusal::OrgChanged));
+    }
+    if active_support_grant(&tx, org_id)?.is_some() {
+        return Ok(Outcome::Refused(Refusal::SupportGrantActive));
+    }
+    let now = crate::now();
+    let expires = now + minutes as f64 * 60.0;
+    tx.execute(
+        "INSERT INTO support_grants(org_id, org_created_at, reason, granted_at, expires_at) \
+         VALUES(?,?,?,?,?)",
+        params![org_id, created, reason, now, expires],
+    )?;
+    let id = tx.last_insert_rowid();
+    insert_audit(
+        &tx,
+        &AuditRow {
+            action: "support.grant",
+            org_id: Some(org_id),
+            org_created_at: Some(created),
+            target: Some(&grant_target(id)),
+            reason: Some(reason),
+            detail: Some(&serde_json::json!({ "minutes": minutes }).to_string()),
+        },
+    )?;
+    tx.commit()?;
+    Ok(Outcome::Done(SupportGrant {
+        id,
+        reason: reason.to_string(),
+        granted_at: now,
+        expires_at: expires,
+        reads: 0,
+    }))
+}
+
+/// `support.end`: end a grant now, by its id alone (ids are never reused).
+pub fn operator_end_support(
+    conn: &Connection,
+    grant_id: i64,
+    reason: Option<&str>,
+) -> Result<Outcome<()>> {
+    let tx = begin(conn)?;
+    let now = crate::now();
+    let found: Option<(i64, f64, bool)> = tx
+        .query_row(
+            &format!(
+                "SELECT g.org_id, g.org_created_at, COALESCE({ACTIVE_GRANT}, 0) \
+                 FROM support_grants g WHERE g.id = :id"
+            ),
+            named_params! {":id": grant_id, ":now": now},
+            |r| Ok((r.get(0)?, r.get(1)?, r.get::<_, i64>(2)? != 0)),
+        )
+        .optional()?;
+    let Some((org_id, org_created, active)) = found else {
+        return Ok(Outcome::NotFound);
+    };
+    if !active {
+        return Ok(Outcome::Refused(Refusal::GrantNotActive));
+    }
+    tx.execute(
+        "UPDATE support_grants SET ended_at=? WHERE id=?",
+        params![now, grant_id],
+    )?;
+    insert_audit(
+        &tx,
+        &AuditRow {
+            action: "support.end",
+            org_id: Some(org_id),
+            org_created_at: Some(org_created),
+            target: Some(&grant_target(grant_id)),
+            reason,
+            detail: None,
+        },
+    )?;
+    tx.commit()?;
+    Ok(Outcome::Done(()))
+}
+
+/// One support access inside the caller's transaction: the audit row (none without `job_ids`) and
+/// the grant's read counter.
+fn record_support_read(
+    tx: &Transaction,
+    grant: &SupportGrant,
+    org_id: i64,
+    action: &str,
+    job_ids: &[i64],
+) -> Result<()> {
+    if !job_ids.is_empty() {
+        insert_audit(
+            tx,
+            &AuditRow {
+                action,
+                org_id: Some(org_id),
+                org_created_at: org_created_at(tx, org_id)?,
+                target: Some(&grant_target(grant.id)),
+                reason: None,
+                detail: Some(&serde_json::json!({ "job_ids": job_ids }).to_string()),
+            },
+        )?;
+    }
+    tx.execute(
+        "UPDATE support_grants SET reads = reads + 1 WHERE id=?",
+        [grant.id],
+    )?;
+    Ok(())
+}
+
+/// `support.read_job`: the payload of one job, if its org has an active grant. The audit row and
+/// the read counter commit before the bytes leave the store; a failing audit row is an error and
+/// no bytes.
+pub fn support_read_payload(conn: &Connection, job_id: i64) -> Result<PayloadRead> {
+    let tx = begin(conn)?;
+    let job: Option<(i64, String, i64)> = tx
+        .query_row(
+            "SELECT org_id, mode, length(payload) FROM jobs WHERE id=?",
+            [job_id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .optional()?;
+    let Some((org_id, mode, len)) = job else {
+        return Ok(PayloadRead::NotFound);
+    };
+    let Some(grant) = active_support_grant(&tx, org_id)? else {
+        return Ok(PayloadRead::Refused(Refusal::NoSupportGrant));
+    };
+    // ponytail: an empty payload means "scrubbed by retention" (`purge_jobs` is the only writer of
+    // `x''`); a fetched URL that returned zero bytes reads as scrubbed too, with nothing to show.
+    if len == 0 {
+        return Ok(PayloadRead::Scrubbed);
+    }
+    record_support_read(&tx, &grant, org_id, "support.read_job", &[job_id])?;
+    let bytes: Vec<u8> = tx.query_row("SELECT payload FROM jobs WHERE id=?", [job_id], |r| {
+        r.get(0)
+    })?;
+    tx.commit()?;
+    Ok(PayloadRead::Bytes { bytes, mode })
+}
+
+/// Same columns as `OPERATOR_ORG_JOBS_SQL` plus the title, for a support grant only.
+const SUPPORT_ORG_JOBS_SQL: &str = "
+SELECT j.id, j.created_at, j.claimed_at, j.finished_at, j.type, j.mode, j.state, j.printer_id,
+       p.name, j.copies, j.error, j.title
+FROM jobs j LEFT JOIN printers p ON p.id = j.printer_id
+WHERE j.org_id = :org AND (:before IS NULL OR j.id < :before)
+ORDER BY j.id DESC LIMIT :limit";
+
+/// `support.list_jobs`: a page of the org's jobs with titles, if it has an active grant. One audit
+/// row with the ids (none for an empty page); every page counts as one read.
+pub fn support_org_jobs(
+    conn: &Connection,
+    org_id: i64,
+    before_id: Option<i64>,
+    limit: i64,
+) -> Result<Outcome<Vec<TitledJob>>> {
+    let tx = begin(conn)?;
+    if org_created_at(&tx, org_id)?.is_none() {
+        return Ok(Outcome::NotFound);
+    }
+    let Some(grant) = active_support_grant(&tx, org_id)? else {
+        return Ok(Outcome::Refused(Refusal::NoSupportGrant));
+    };
+    let jobs: Vec<TitledJob> = {
+        let mut st = tx.prepare_cached(SUPPORT_ORG_JOBS_SQL)?;
+        let rows = st.query_map(
+            named_params! {":org": org_id, ":before": before_id, ":limit": limit},
+            |r| {
+                Ok((
+                    OperatorJob {
+                        id: r.get(0)?,
+                        created_at: r.get(1)?,
+                        claimed_at: r.get(2)?,
+                        finished_at: r.get(3)?,
+                        type_: r.get(4)?,
+                        mode: r.get(5)?,
+                        state: r.get(6)?,
+                        printer_id: r.get(7)?,
+                        printer_name: r.get(8)?,
+                        copies: r.get(9)?,
+                        error: r.get(10)?,
+                    },
+                    r.get(11)?,
+                ))
+            },
+        )?;
+        rows.collect::<rusqlite::Result<_>>()?
+    };
+    let ids: Vec<i64> = jobs.iter().map(|(j, _)| j.id).collect();
+    record_support_read(&tx, &grant, org_id, "support.list_jobs", &ids)?;
+    tx.commit()?;
+    Ok(Outcome::Done(jobs))
+}
+
+/// The grants of the org's current generation, newest first (at most 50), with the job ids the
+/// operator listed and opened under each, from the audit rows.
+pub fn support_grants_of_org(conn: &Connection, org_id: i64) -> Result<Vec<SupportGrantRow>> {
+    let mut st = conn.prepare_cached(&format!(
+        "SELECT g.id, g.reason, g.granted_at, g.expires_at, g.ended_at, COALESCE({ACTIVE_GRANT}, 0) \
+         FROM support_grants g \
+         WHERE g.org_id = :org \
+           AND g.org_created_at = (SELECT o.created_at FROM orgs o WHERE o.id = g.org_id) \
+         ORDER BY g.id DESC LIMIT 50"
+    ))?;
+    let mut grants: Vec<SupportGrantRow> = st
+        .query_map(named_params! {":org": org_id, ":now": crate::now()}, |r| {
+            Ok(SupportGrantRow {
+                id: r.get(0)?,
+                reason: r.get(1)?,
+                granted_at: r.get(2)?,
+                expires_at: r.get(3)?,
+                ended_at: r.get(4)?,
+                active: r.get::<_, i64>(5)? != 0,
+                listed_job_ids: vec![],
+                opened_job_ids: vec![],
+            })
+        })?
+        .collect::<rusqlite::Result<_>>()?;
+    let mut rows = conn.prepare_cached(
+        "SELECT action, detail FROM operator_audit \
+         WHERE target = ? AND action IN ('support.list_jobs', 'support.read_job')",
+    )?;
+    for g in &mut grants {
+        let (mut listed, mut opened) = (BTreeSet::new(), BTreeSet::new());
+        let found = rows.query_map([grant_target(g.id)], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?))
+        })?;
+        for row in found {
+            let (action, detail) = row?;
+            let ids = detail
+                .and_then(|d| serde_json::from_str::<Value>(&d).ok())
+                .and_then(|v| v.get("job_ids").cloned())
+                .and_then(|v| serde_json::from_value::<Vec<i64>>(v).ok())
+                .unwrap_or_default();
+            let into = if action == "support.read_job" {
+                &mut opened
+            } else {
+                &mut listed
+            };
+            into.extend(ids);
+        }
+        g.listed_job_ids = listed.into_iter().collect();
+        g.opened_job_ids = opened.into_iter().collect();
+    }
+    Ok(grants)
 }
 
 fn explain(conn: &Connection, sql: &str, p: impl rusqlite::Params) -> Result<Vec<String>> {
