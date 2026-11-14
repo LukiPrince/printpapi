@@ -4,6 +4,7 @@
 //! 404. The token is never a `Principal`: only `operator_gate` reads it, and on every other route
 //! `without_operator_credential` takes it out of the request before any lookup runs.
 use super::*;
+use crate::settings;
 use std::net::IpAddr;
 use std::time::Duration;
 
@@ -206,6 +207,8 @@ impl Ctx<'_> {
         let r = match (self.req.method.as_str(), path) {
             ("GET", "/operator/overview") => self.operator_overview(),
             ("GET", "/operator/audit") => self.operator_audit(),
+            ("GET", "/operator/settings") => self.operator_settings(),
+            ("PUT", "/operator/settings") => self.operator_settings_put(),
             ("GET", "/operator/orgs") => self.operator_orgs(),
             ("POST", "/operator/orgs") => self.operator_org_create(),
             (m, _) => match (m, org_route(path)) {
@@ -473,7 +476,7 @@ impl Ctx<'_> {
         };
         let tok = auth::new_session_token();
         let ttl = self.cfg().reset_ttl_s;
-        let quota = self.cfg().signup_quota;
+        let quota = self.live.signup_quota.value;
         let new = match self.db(|c| {
             store::operator_create_org(
                 c,
@@ -805,6 +808,96 @@ impl Ctx<'_> {
         ))
     }
 
+    /// The live values with their source, and the startup-only values beside them (never a
+    /// secret: no token, no password, no key).
+    fn settings_json(&self, live: &settings::Live) -> Value {
+        let cfg = self.cfg();
+        let terms = live.terms.value.as_ref().map(settings::terms_json);
+        // `ignored` (only when a row exists but is not applied) is the stored value, so a stale
+        // row can be seen and cleared.
+        let entry = |key: &str, value: Value, source: settings::Source| {
+            let mut m = serde_json::Map::new();
+            m.insert("value".into(), value);
+            m.insert("source".into(), json!(source.as_str()));
+            if let Some((_, stored)) = live.ignored.iter().find(|(k, _)| *k == key) {
+                m.insert("ignored".into(), stored.clone());
+            }
+            Value::Object(m)
+        };
+        json!({
+            "settings": {
+                "signup": entry(
+                    "signup",
+                    json!(if live.signup.value { "open" } else { "closed" }),
+                    live.signup.source,
+                ),
+                "signup_quota": entry(
+                    "signup_quota", json!(live.signup_quota.value), live.signup_quota.source,
+                ),
+                "job_retention_days": entry(
+                    "job_retention_days",
+                    json!(live.job_retention_days.value),
+                    live.job_retention_days.source,
+                ),
+                "terms": entry("terms", json!(terms), live.terms.source),
+            },
+            "env_only": {
+                "fetches_per_org": cfg.fetch_cap(),
+                "private_urls": if cfg.destinations == dispatch::Destinations::Any {
+                    "allow"
+                } else {
+                    "deny"
+                },
+                "trusted_proxies": cfg.trusted_proxies.entries(),
+                "operator_from": cfg.operator_from.entries(),
+                "public_url": cfg.public_url,
+                "mail": cfg.reset_enabled,
+            },
+        })
+    }
+
+    fn operator_settings(&self) -> R {
+        Ok(Resp::json(200, &self.settings_json(&self.live)))
+    }
+
+    fn operator_settings_put(&self) -> R {
+        use settings::{Conflict, PutError};
+        let body = gate!(self.read_obj());
+        let reason = gate!(reason_of(&body, 0));
+        let env = self.cfg().env_start();
+        let any = self.cfg().destinations == dispatch::Destinations::Any;
+        let decide = |live: &settings::Live| {
+            let change = settings::validate_put(&body, reason.as_deref(), live, &env, any)?;
+            if settings::unset_needs_reason(&change, live, &env)
+                && !settings::reason_is_enough(reason.as_deref())
+            {
+                return Err(PutError::ReasonNeeded);
+            }
+            Ok(change)
+        };
+        Ok(
+            match self.s.try_apply_settings(decide, reason.as_deref())? {
+                Ok(live) => Resp::json(200, &self.settings_json(&live)),
+                Err(PutError::Invalid(m)) => jerr(400, m),
+                Err(PutError::ReasonNeeded) => jerr(
+                    400,
+                    format!(
+                        "reason of at least {} characters required: this scrubs payloads and titles for good",
+                        settings::REASON_MIN
+                    ),
+                ),
+                Err(PutError::Conflict(Conflict::SignupLocked)) => jerr(
+                    409,
+                    "signup is locked closed by PRINTAPI_SIGNUP in the environment: only closing it is accepted",
+                ),
+                Err(PutError::Conflict(Conflict::OpenWithPrivateUrls)) => jerr(
+                    409,
+                    "signup cannot be opened while private URLs are allowed (PRINTAPI_PRIVATE_URLS=allow)",
+                ),
+            },
+        )
+    }
+
     fn operator_overview(&self) -> R {
         let mut cache = self
             .s
@@ -849,7 +942,7 @@ impl Ctx<'_> {
                 "deleted": purge.as_ref().map(|p| p.1.deleted),
             },
             // the console shows a section only when the server reports its feature
-            "features": ["support"],
+            "features": ["support", "settings"],
         });
         *cache = Some((std::time::Instant::now(), v.clone()));
         Ok(Resp::json(200, &v))

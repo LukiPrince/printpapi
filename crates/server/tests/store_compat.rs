@@ -514,3 +514,43 @@ fn a_python_database_gets_the_operator_audit_table_and_the_python_tables_stay_as
     });
     assert_eq!(grants, 1);
 }
+
+#[test]
+fn a_python_database_gets_the_settings_table_and_keeps_it_across_a_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("python_v2.sqlite3");
+    let fixture = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/python_v2.sqlite3"
+    );
+    std::fs::copy(fixture, &path).unwrap();
+    let table_columns = |path: &std::path::Path| -> Vec<String> {
+        let c = rusqlite::Connection::open(path).unwrap();
+        let mut st = c.prepare("PRAGMA table_info(settings)").unwrap();
+        st.query_map([], |r| r.get::<_, String>(1))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect()
+    };
+    // the name is free in the v2.5.1 schema: the fixture has no such table
+    assert!(table_columns(&path).is_empty());
+    let db = Db::open(path.to_str().unwrap()).unwrap();
+    assert_eq!(table_columns(&path), ["key", "value", "updated_at"]);
+    db.with(|c| {
+        operator_update_settings(
+            c,
+            &printpapi_server::settings::Change {
+                set: vec![printpapi_server::settings::Parsed::SignupQuota(7)],
+                unset: vec![],
+            },
+            None,
+        )
+        .unwrap()
+    });
+    drop(db);
+    let db = Db::open(path.to_str().unwrap()).unwrap();
+    assert_eq!(
+        db.with(settings_rows).unwrap(),
+        [("signup_quota".to_string(), "7".to_string())]
+    );
+}

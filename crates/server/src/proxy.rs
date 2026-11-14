@@ -109,6 +109,21 @@ impl TrustedProxies {
     pub fn contains(&self, ip: IpAddr) -> bool {
         self.0.iter().any(|n| n.contains(ip))
     }
+
+    /// The entries as text, for display: an address, with `/prefix` unless it names one host.
+    pub fn entries(&self) -> Vec<String> {
+        self.0
+            .iter()
+            .map(|n| {
+                let max = if n.addr.is_ipv4() { 32 } else { 128 };
+                if n.prefix == max {
+                    n.addr.to_string()
+                } else {
+                    format!("{}/{}", n.addr, n.prefix)
+                }
+            })
+            .collect()
+    }
 }
 
 /// One `X-Forwarded-For` entry: a plain IPv4/IPv6 address or `[IPv6]`.

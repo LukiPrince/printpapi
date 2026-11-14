@@ -3,7 +3,7 @@
 //!
 //! Module map (each mirrors the Python module it replaced, see git history before v3.0.0):
 //! - pure logic: `dispatch`, `auth`, `billing`, `cloudprnt`, `label`, `orders`, `packing_slip`,
-//!   `printnode`, `proxy` (client address), `mail` (env -> SMTP plan), `pyfmt` (Python-compatible value formatting)
+//!   `printnode`, `proxy` (client address), `mail` (env -> SMTP plan), `settings` (env parsers, live values), `pyfmt` (Python-compatible value formatting)
 //! - IO: `store` (SQLite), `server` (routing, sync), `http` (hyper glue, long-poll), `web`
 //!   (embedded dashboard bundle)
 
@@ -20,6 +20,7 @@ pub mod printnode;
 pub mod proxy;
 pub mod pyfmt;
 pub mod server;
+pub mod settings;
 pub mod store;
 pub mod web;
 

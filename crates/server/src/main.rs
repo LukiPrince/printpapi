@@ -15,7 +15,11 @@
 //! accepted from), LOG_REQUESTS, SMTP_*.
 use printpapi_server::dispatch::{Destinations, HttpFetcher, OUTBOUND_IN_FLIGHT};
 use printpapi_server::mail::{self, SmtpMailer};
-use printpapi_server::server::{AppState, Config, Terms};
+use printpapi_server::server::{AppState, Config};
+use printpapi_server::settings::{
+    EnvFlags, Live, parse_fetch_cap, parse_quota, parse_retention, parse_terms, py_strip,
+    signup_env_locks,
+};
 use printpapi_server::store::Db;
 use printpapi_server::{billing, http};
 use std::sync::Arc;
@@ -23,99 +27,6 @@ use std::time::Duration;
 
 fn env(key: &str) -> Option<String> {
     std::env::var(key).ok()
-}
-
-/// Python `str.strip()`: Unicode whitespace plus U+001C..U+001F.
-fn py_strip(s: &str) -> &str {
-    s.trim_matches(|c: char| c.is_whitespace() || ('\u{1c}'..='\u{1f}').contains(&c))
-}
-
-/// Empty: no quota. Otherwise a non-negative integer (0 is a real quota: nothing may be printed).
-fn parse_quota(raw: &str) -> Result<Option<i64>, String> {
-    let t = py_strip(raw);
-    if t.is_empty() {
-        return Ok(None);
-    }
-    match t.parse::<i64>() {
-        Ok(n) if n >= 0 => Ok(Some(n)),
-        _ => Err(format!("must be a non-negative integer, not {t:?}")),
-    }
-}
-
-/// Empty: unset (the default follows the signup mode). Otherwise a non-negative integer, 0 = no cap.
-fn parse_fetch_cap(raw: &str) -> Result<Option<usize>, String> {
-    let t = py_strip(raw);
-    if t.is_empty() {
-        return Ok(None);
-    }
-    t.parse::<usize>()
-        .map(Some)
-        .map_err(|_| format!("must be a non-negative integer, not {t:?}"))
-}
-
-/// Empty or 0: keep for ever. Otherwise a positive number of days.
-fn parse_retention(raw: &str) -> Result<Option<i64>, String> {
-    let t = py_strip(raw);
-    if t.is_empty() {
-        return Ok(None);
-    }
-    match t.parse::<i64>() {
-        Ok(0) => Ok(None),
-        Ok(n) if n > 0 => Ok(Some(n)),
-        _ => Err(format!("must be a positive integer, not {t:?}")),
-    }
-}
-
-/// The one link rule (`web/lib/terms.ts` `isHttpUrl` is its twin): `http://` or `https://`, any
-/// case, then a non-empty host. Printable ASCII only (0x21..=0x7E): Rust's whitespace and JS's
-/// `\s` disagree on U+0085 and U+FEFF, so neither is asked.
-fn is_terms_url(u: &str) -> bool {
-    if !u.bytes().all(|b| (0x21..=0x7E).contains(&b)) {
-        return false;
-    }
-    let lower = u.to_ascii_lowercase();
-    let Some(rest) = lower
-        .strip_prefix("https://")
-        .or_else(|| lower.strip_prefix("http://"))
-    else {
-        return false;
-    };
-    !rest.split(['/', '?', '#']).next().unwrap_or("").is_empty()
-}
-
-/// The terms a signup must accept. A version needs a terms URL. Every link that is set must be
-/// an absolute `http(s)` URL with a host, version or not.
-fn parse_terms(
-    version: &str,
-    terms_url: &str,
-    dpa_url: &str,
-    privacy_url: &str,
-) -> Result<Option<Terms>, String> {
-    let version = py_strip(version);
-    let url = |name: &str, raw: &str| -> Result<Option<String>, String> {
-        let t = py_strip(raw);
-        if t.is_empty() {
-            Ok(None)
-        } else if is_terms_url(t) {
-            Ok(Some(t.to_string()))
-        } else {
-            Err(format!("{name} must be an http(s) URL, not {t:?}"))
-        }
-    };
-    let terms_url = url("PRINTAPI_TERMS_URL", terms_url)?;
-    let dpa_url = url("PRINTAPI_DPA_URL", dpa_url)?;
-    let privacy_url = url("PRINTAPI_PRIVACY_URL", privacy_url)?;
-    if version.is_empty() {
-        return Ok(None); // no consent required: the links are only checked, not used
-    }
-    let terms_url =
-        terms_url.ok_or("PRINTAPI_TERMS_URL is required with PRINTAPI_TERMS_VERSION")?;
-    Ok(Some(Terms {
-        version: version.to_string(),
-        terms_url,
-        dpa_url,
-        privacy_url,
-    }))
 }
 
 /// The operator token and the peers it is accepted from. Unset or blank: the operator API is off.
@@ -151,22 +62,26 @@ fn parse_operator(
     Ok(Some((token.to_string(), from)))
 }
 
-/// One stderr line per hosted-beta safeguard that is off while strangers can sign up.
-fn startup_warnings(cfg: &Config) -> Vec<&'static str> {
+/// One stderr line per hosted-beta safeguard that is off while strangers can sign up, judged on
+/// the effective values (an override from the database counts).
+fn startup_warnings(live: &Live) -> Vec<&'static str> {
     let mut out = Vec::new();
-    if cfg.signup_open && cfg.signup_quota.is_none() {
+    if !live.signup.value {
+        return out;
+    }
+    if live.signup_quota.value.is_none() {
         out.push(
-            "warning: PRINTAPI_SIGNUP=open without PRINTAPI_SIGNUP_QUOTA: new orgs can print without limit",
+            "warning: signup is open (PRINTAPI_SIGNUP or the operator console) without PRINTAPI_SIGNUP_QUOTA: new orgs can print without limit",
         );
     }
-    if cfg.signup_open && cfg.job_retention_days.is_none() {
+    if live.job_retention_days.value.is_none() {
         out.push(
-            "warning: PRINTAPI_SIGNUP=open without PRINTAPI_JOB_RETENTION_DAYS: job payloads are kept for ever",
+            "warning: signup is open (PRINTAPI_SIGNUP or the operator console) without PRINTAPI_JOB_RETENTION_DAYS: job payloads are kept for ever",
         );
     }
-    if cfg.signup_open && cfg.terms.is_none() {
+    if live.terms.value.is_none() {
         out.push(
-            "warning: PRINTAPI_SIGNUP=open without PRINTAPI_TERMS_VERSION: signups do not accept any terms",
+            "warning: signup is open (PRINTAPI_SIGNUP or the operator console) without PRINTAPI_TERMS_VERSION: signups do not accept any terms",
         );
     }
     out
@@ -258,6 +173,16 @@ fn config_from(env: &dyn Fn(&str) -> Option<String>) -> Result<(Config, String, 
         &env("PRINTAPI_DPA_URL").unwrap_or_default(),
         &env("PRINTAPI_PRIVACY_URL").unwrap_or_default(),
     )?;
+    // Which of the live settings' variables are set at all: it decides a value's source and
+    // whether `PRINTAPI_SIGNUP` locks signup shut (any value but `open`).
+    let set = |k: &str| env(k).is_some_and(|v| !py_strip(&v).is_empty());
+    cfg.env_flags = EnvFlags {
+        signup_set: env("PRINTAPI_SIGNUP").is_some(),
+        signup_explicit_closed: env("PRINTAPI_SIGNUP").is_some_and(|v| signup_env_locks(&v)),
+        signup_quota_set: set("PRINTAPI_SIGNUP_QUOTA"),
+        job_retention_days_set: set("PRINTAPI_JOB_RETENTION_DAYS"),
+        terms_set: set("PRINTAPI_TERMS_VERSION"),
+    };
     cfg.open_enrollment = env("PRINTAPI_OPEN_ENROLLMENT").is_some_and(|s| py_strip(&s) == "1");
     Ok((cfg, db_path, port))
 }
@@ -288,9 +213,6 @@ fn run() -> Result<(), String> {
     let (cfg, db_path, port) = config()?;
     let destinations = cfg.destinations;
     let hosted_locks_enforced = cfg.operator_token.is_some();
-    for line in startup_warnings(&cfg) {
-        eprintln!("{line}");
-    }
     if cfg.operator_token.is_some() {
         eprintln!("operator API on (hosted mode: private URLs denied unless allowed explicitly)");
     }
@@ -312,6 +234,9 @@ fn run() -> Result<(), String> {
             destinations,
         )),
     ));
+    for line in startup_warnings(&state.live()) {
+        eprintln!("{line}");
+    }
     http::start_background(state.clone());
     // The heavy lifting (SQLite, scrypt, outbound HTTP) runs on the blocking pool, so a few
     // workers are plenty and idle ones would only cost RSS.
@@ -516,5 +441,126 @@ mod operator_tests {
         assert_eq!(c.fetch_cap(), 0);
         let c = with_op(&[("PRINTAPI_FETCHES_PER_ORG", "9")]).unwrap();
         assert_eq!(c.fetch_cap(), 9);
+    }
+}
+
+#[cfg(test)]
+mod live_tests {
+    use super::{config_from, startup_warnings};
+    use printpapi_server::server::Config;
+    use printpapi_server::settings::{Source, Sourced};
+
+    fn cfg(extra: &[(&str, &str)]) -> Config {
+        let mut vars: Vec<(String, String)> = vec![("PRINTAPI_TOKEN".into(), "root".into())];
+        vars.extend(extra.iter().map(|(k, v)| (k.to_string(), v.to_string())));
+        config_from(&|k| vars.iter().rfind(|(n, _)| n == k).map(|(_, v)| v.clone()))
+            .map(|(c, _, _)| c)
+            .unwrap()
+    }
+
+    #[test]
+    fn nothing_set_means_no_flag_is_set() {
+        let f = cfg(&[]).env_flags;
+        assert!(
+            !f.signup_set
+                && !f.signup_explicit_closed
+                && !f.signup_quota_set
+                && !f.job_retention_days_set
+                && !f.terms_set,
+            "{f:?}"
+        );
+        // blank is unset, as the parsers read it
+        let f = cfg(&[
+            ("PRINTAPI_SIGNUP_QUOTA", "  "),
+            ("PRINTAPI_JOB_RETENTION_DAYS", ""),
+        ])
+        .env_flags;
+        assert!(!f.signup_quota_set && !f.job_retention_days_set, "{f:?}");
+    }
+
+    #[test]
+    fn the_flags_follow_the_variables() {
+        let f = cfg(&[("PRINTAPI_SIGNUP", "closed")]).env_flags;
+        assert!(f.signup_set && f.signup_explicit_closed);
+        let f = cfg(&[("PRINTAPI_SIGNUP", "open")]).env_flags;
+        assert!(f.signup_set && !f.signup_explicit_closed);
+        let f = cfg(&[
+            ("PRINTAPI_SIGNUP_QUOTA", "5"),
+            ("PRINTAPI_JOB_RETENTION_DAYS", "0"),
+            ("PRINTAPI_TERMS_VERSION", "v1"),
+            ("PRINTAPI_TERMS_URL", "https://x.test/t"),
+        ])
+        .env_flags;
+        assert!(f.signup_quota_set && f.job_retention_days_set && f.terms_set);
+    }
+
+    #[test]
+    fn any_signup_value_but_open_locks_signup_shut() {
+        for v in [
+            "closed",
+            "CLOSED",
+            "Closed",
+            "off",
+            "0",
+            "closd",
+            "\"closed\"",
+            "no",
+        ] {
+            let c = cfg(&[("PRINTAPI_SIGNUP", v)]);
+            assert!(
+                c.env_flags.signup_set && c.env_flags.signup_explicit_closed,
+                "{v:?}"
+            );
+            assert!(!c.signup_open, "{v:?} never opens signup");
+        }
+        // padding does not matter, blank is unset, `open` opens and never locks
+        let f = cfg(&[("PRINTAPI_SIGNUP", "  closed ")]).env_flags;
+        assert!(f.signup_explicit_closed);
+        for v in ["", "   "] {
+            let f = cfg(&[("PRINTAPI_SIGNUP", v)]).env_flags;
+            assert!(!f.signup_explicit_closed, "{v:?}");
+        }
+        let c = cfg(&[("PRINTAPI_SIGNUP", "open")]);
+        assert!(c.signup_open && !c.env_flags.signup_explicit_closed);
+    }
+
+    #[test]
+    fn a_terms_version_with_a_control_character_stops_the_server() {
+        let vars = [
+            ("PRINTAPI_TERMS_VERSION", "v1\u{1b}[2J"),
+            ("PRINTAPI_TERMS_URL", "https://x.test/t"),
+        ];
+        let mut all: Vec<(String, String)> = vec![("PRINTAPI_TOKEN".into(), "root".into())];
+        all.extend(vars.iter().map(|(k, v)| (k.to_string(), v.to_string())));
+        let e = config_from(&|k| all.iter().rfind(|(n, _)| n == k).map(|(_, v)| v.clone()))
+            .unwrap_err();
+        assert!(e.contains("PRINTAPI_TERMS_VERSION"), "{e:?}");
+        assert!(!e.contains('\u{1b}'), "{e:?}");
+    }
+
+    #[test]
+    fn the_open_signup_warnings_read_the_effective_values() {
+        let c = cfg(&[]);
+        let mut live = printpapi_server::settings::build_live(&c.env_start(), false, &[]).0;
+        assert!(startup_warnings(&live).is_empty());
+        // the database opened signup: all three safeguards are missing
+        live.signup = Sourced {
+            value: true,
+            source: Source::Db,
+        };
+        assert_eq!(startup_warnings(&live).len(), 3);
+        // the cause may be the console, so no warning blames the variable alone
+        for w in startup_warnings(&live) {
+            assert!(w.starts_with("warning: signup is open"), "{w}");
+            assert!(!w.contains("PRINTAPI_SIGNUP=open"), "{w}");
+            assert!(w.contains("operator console"), "{w}");
+        }
+        // an override that supplies them silences the warning
+        live.signup_quota.value = Some(5);
+        live.job_retention_days.value = Some(30);
+        assert_eq!(startup_warnings(&live).len(), 1);
+        // a database close beats an env open: nothing to warn about
+        live.signup.value = false;
+        assert!(startup_warnings(&live).is_empty());
     }
 }

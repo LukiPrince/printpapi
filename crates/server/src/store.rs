@@ -413,6 +413,12 @@ CREATE TABLE IF NOT EXISTS support_grants(
   reason TEXT NOT NULL, granted_at REAL NOT NULL, expires_at REAL NOT NULL, ended_at REAL,
   reads INTEGER NOT NULL DEFAULT 0);
 CREATE INDEX IF NOT EXISTS support_grants_org ON support_grants(org_id);
+-- Live setting overrides the operator console writes (signup, signup_quota, job_retention_days,
+-- terms), read only while the operator token is set; the env value applies without a row. `value`
+-- is text (`open`, a number, or the terms as JSON). A table of its own, like operator_audit: the
+-- name is free in the v2.5.1 schema, so the Python server ignores it.
+CREATE TABLE IF NOT EXISTS settings(
+  key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at REAL NOT NULL);
 -- finds the audit rows of one grant (`grant:<id>`) without a scan
 CREATE INDEX IF NOT EXISTS operator_audit_target ON operator_audit(target);
 ";
@@ -3474,6 +3480,56 @@ pub fn db_sizes(conn: &Connection) -> Result<(i64, i64)> {
         std::fs::metadata(format!("{file}-wal")).map_or(0, |m| m.len() as i64)
     };
     Ok((pages * page_size, wal))
+}
+
+/// The override rows of the four live settings (key, stored text), by key. Anything else in the
+/// table is not read.
+pub fn settings_rows(conn: &Connection) -> Result<Vec<(String, String)>> {
+    let keys = crate::settings::LIVE_KEYS
+        .map(|k| format!("'{k}'"))
+        .join(",");
+    let mut st = conn.prepare(&format!(
+        "SELECT key, value FROM settings WHERE key IN ({keys}) ORDER BY key"
+    ))?;
+    let rows = st
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+/// `settings.update`: the validated change and its one audit row in one transaction.
+pub fn operator_update_settings(
+    conn: &Connection,
+    change: &crate::settings::Change,
+    reason: Option<&str>,
+) -> Result<()> {
+    let tx = begin(conn)?;
+    let now = crate::now();
+    let mut set = Map::new();
+    for p in &change.set {
+        tx.execute(
+            "INSERT INTO settings(key, value, updated_at) VALUES(?,?,?) \
+             ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at",
+            params![p.key(), p.encode(), now],
+        )?;
+        set.insert(p.key().to_string(), p.to_json());
+    }
+    for key in &change.unset {
+        tx.execute("DELETE FROM settings WHERE key=?", [key])?;
+    }
+    // setting values are allowed in the log (spec A2): ids, numbers, modes and links, no secret
+    let detail = serde_json::json!({ "set": set, "unset": change.unset }).to_string();
+    insert_audit(
+        &tx,
+        &AuditRow {
+            action: "settings.update",
+            reason,
+            detail: Some(&detail),
+            ..Default::default()
+        },
+    )?;
+    tx.commit()?;
+    Ok(())
 }
 
 #[cfg(test)]
