@@ -100,10 +100,10 @@ callback, idempotency key, key secret or password hash.
   "orgs": 41, "orgs_active_7d": 17, "signups_7d": 3,
   "jobs_this_month": 5120, "failed_jobs_30d": 12,
   "jobs_today": {"queued": 0, "claimed": 1, "done": 188, "failed": 2, "cancelled": 0},
-  "server": {"version": "3.4.0", "uptime_s": 86400},
+  "server": {"version": "3.5.0", "uptime_s": 86400},
   "db": {"size_bytes": 12582912, "wal_bytes": 0},
   "retention": {"last_pass_at": 1760000000.0, "abandoned": 0, "scrubbed": 14, "deleted": 0},
-  "features": []
+  "features": ["support"]
 }
 ```
 
@@ -162,6 +162,7 @@ The row above plus:
 | `keys` | `id`, `label`, `active`, `created_at`: the key itself is never shown |
 | `terms` | the acceptance history, oldest first: `version`, `accepted_at` |
 | `lock` | `null`, or `{reason, locked_at}` while the org is locked |
+| `support` | `null`, or the active support grant `{id, reason, granted_at, expires_at, reads}` (see [Support access](#support-access)) |
 
 ### `GET /operator/orgs/{id}/jobs`
 
@@ -169,6 +170,9 @@ Query: `limit` (default 50, at most 200), `before_id`. Newest first by id. Each 
 `created_at`, `claimed_at`, `finished_at`, `type`, `mode`, `state`, `printer_id`, `printer_name`,
 `copies` and `error`. `next_before_id` is the id to pass as `before_id` for the next page, `null`
 on the last one.
+
+`?titles=1` adds each job's `title` while the org has an active support grant, and writes an audit
+row (see [Support access](#support-access)). Without `titles=1` a job never carries a title.
 
 The reads add indexes (`jobs(org_id)`, `jobs(org_id, state)` and three small ones) to an existing
 database at startup. They are additive and the Python server of v2.x ignores them.
@@ -274,3 +278,64 @@ must be the user's org (`409` otherwise) and `org_created_at` that org's generat
 generation). Agents enrolled
 with it end their long-poll with `401`. Removing a single user is not offered here: customers remove
 their own accounts, and root still can.
+
+## Support access
+
+Support access lets the operator read what the customer's jobs contain, for a limited time, with
+the customer able to see every access. Without it the operator API never shows a job title or
+payload. It is on whenever the operator token is set; `features` lists `support`.
+
+A **grant** covers a whole org for 15, 30 or 60 minutes. An org has at most one active grant at a
+time. A grant is active while it is not ended, not expired and was made for the org's current
+generation (`org_created_at`): an org deleted and recreated under the same id does not inherit it.
+An expired grant that was never ended does not block a new one.
+
+### `POST /operator/orgs/{id}/support`
+
+`{reason, minutes, org_created_at}`: `reason` is 8 to 500 characters, `minutes` is `15`, `30` or
+`60` (`400` otherwise), `org_created_at` is the generation the page showed (`409`
+`the org changed, reload`). `404` for an unknown org, `409` when the org already has an active
+grant. Answers the grant: `{id, reason, granted_at, expires_at}`.
+
+### `DELETE /operator/support/{grant_id}`
+
+Optional `{reason}`. Ends the grant now, by its id alone, so a stale page cannot fail it. `404` for
+an unknown grant, `409` when it is already ended or expired.
+
+### `POST /operator/jobs/{job_id}/payload`
+
+Answers the stored payload as raw bytes. It is a `POST` so that no prefetch and no embedded URL can
+trigger the read; no body is needed. `403` `no active support access` when the job's org has no
+active grant, `404` for an unknown job, `410` when the retention pass has already emptied the
+payload (see `PRINTAPI_JOB_RETENTION_DAYS`). The response is built so a browser never renders it:
+`Content-Type: application/octet-stream`, `Content-Disposition: attachment;
+filename="job-<id>.pdf"` (`.bin` unless the job's mode is `pdf`), `X-Content-Type-Options: nosniff`,
+`Content-Security-Policy: sandbox; default-src 'none'` and `Cache-Control: no-store`. If the audit
+row cannot be written the answer is `500` and no bytes are sent.
+
+### `GET /operator/orgs/{id}/jobs?titles=1`
+
+Titles are opt-in. Without `titles=1` the list is the metadata of [the jobs endpoint](#get-operatororgsidjobs),
+whatever the grant state, and writes nothing: a tab that refetches does not fill the log or the
+customer's card. With `titles=1` and no active grant the answer is `403` `no active support access`.
+With an active grant each job also carries its `title`. A full page always offers
+`next_before_id`; the page after the last one is empty.
+
+### What is audited
+
+| Action | When | `detail` |
+|---|---|---|
+| `support.grant` | a grant is made | `{"minutes": n}` |
+| `support.end` | a grant is ended | none |
+| `support.list_jobs` | a titled page with at least one job is returned | `{"job_ids": [...]}` |
+| `support.read_job` | a payload is returned | `{"job_ids": [id]}` |
+
+Every row has `target` `grant:<id>` and the org it concerns. Each titled page and each payload
+read also adds one to the grant's `reads`. The rows hold ids only: no e-mail address, name, title
+or payload. Each of these writes is one transaction with its audit row.
+
+### What the customer sees
+
+The customer's Settings page lists every grant of their org: `reason`, when it started, when it
+expires or was ended, and the ids of the jobs the operator listed and opened. The grants stay for
+ever like the audit log; deleting an org removes its grants, and the audit rows stay.
