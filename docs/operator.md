@@ -381,8 +381,9 @@ Only with the operator token set does the server read the `settings` table; with
 value is the environment one, as in 3.5.0, and a database carried over from a hosted box changes
 nothing. At startup each applied override prints one line to stderr (never a secret). A stored
 value that no longer validates is ignored with a line, and so is `signup = open` while private
-URLs are allowed or `PRINTAPI_SIGNUP` locks signup shut. Values in these lines are quoted. An older version ignores the table, so
-the environment values apply again after a rollback; the table is left in place.
+URLs are allowed or `PRINTAPI_SIGNUP` locks signup shut. Values in these lines are quoted. An older
+version ignores the table, so the environment values apply again after a rollback; the table is
+left in place.
 
 ## Support access
 
