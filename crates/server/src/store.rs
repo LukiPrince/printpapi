@@ -52,6 +52,8 @@ pub enum StoreError {
     Invalid(String),
     /// A UNIQUE/NOT NULL violation (the Python `sqlite3.IntegrityError`) — callers map it to 409.
     Conflict,
+    /// The org is locked by the operator — the server answers 403 `org locked`.
+    Locked,
     Db(rusqlite::Error),
 }
 
@@ -63,6 +65,7 @@ impl std::fmt::Display for StoreError {
             | StoreError::Auth(m)
             | StoreError::Invalid(m) => f.write_str(m),
             StoreError::Conflict => f.write_str("constraint violation"),
+            StoreError::Locked => f.write_str("org locked"),
             StoreError::Db(e) => write!(f, "database error: {e}"),
         }
     }
@@ -841,6 +844,7 @@ pub fn delete_org_tx(tx: &Transaction, org_id: i64) -> Result<bool> {
         "users",
         "label_templates",
         "terms_acceptances",
+        "org_locks",
     ] {
         tx.execute(&format!("DELETE FROM {table} WHERE org_id=?"), [org_id])?;
     }
@@ -1440,6 +1444,20 @@ pub fn get_printer(
         .optional()?)
 }
 
+/// `Locked` while the operator has locked `org_id`. A pure flag: quota and plan are not looked at.
+/// Checked next to `check_quota` wherever a job may enter, and before any payload is fetched.
+pub fn check_not_locked(conn: &Connection, org_id: i64) -> Result<()> {
+    let locked = conn
+        .prepare_cached("SELECT 1 FROM org_locks WHERE org_id=?")?
+        .query_row([org_id], |_| Ok(()))
+        .optional()?
+        .is_some();
+    if locked {
+        return Err(StoreError::Locked);
+    }
+    Ok(())
+}
+
 /// `QuotaExceeded` once `org_id` has used up its monthly quota.
 pub fn check_quota(conn: &Connection, org_id: i64, now: f64) -> Result<()> {
     let quota: Option<i64> = conn
@@ -1498,6 +1516,8 @@ pub fn enqueue_job(conn: &Connection, job: &NewJob<'_>) -> Result<Enqueued> {
     let Some((org_id, agent_id)) = printer else {
         return Err(unknown());
     };
+    // before the idempotency lookup: a locked org gets no job, not even an old one back
+    check_not_locked(&tx, org_id)?;
     if let Some(key) = &job.idempotency_key {
         // A retried submit returns the original job — the same key never prints twice in an org.
         // The lookup is safe under the write transaction; the UNIQUE index enforces it.
@@ -2273,7 +2293,10 @@ pub fn insert_audit(tx: &Transaction, row: &AuditRow) -> Result<i64> {
             row.reason,
             row.detail
         ],
-    )?;
+    )
+    // never a Conflict: no caller can have a unique violation here, and a refused audit insert
+    // must not read as "e-mail already registered"
+    .map_err(StoreError::Db)?;
     Ok(tx.last_insert_rowid())
 }
 
@@ -2310,6 +2333,288 @@ pub fn list_audit(
         },
     )?;
     Ok(rows.collect::<std::result::Result<_, _>>()?)
+}
+
+// --- operator writes -------------------------------------------------------------------------------
+//
+// Each action is one function: one `BEGIN IMMEDIATE`, the change, its audit row, one commit. A
+// refused or failed action drops the transaction, so neither the change nor the row is kept. Audit
+// content is ids and numbers only (never an e-mail address, a name or a title). Mail and the WAL
+// truncate belong to the caller and run after the commit.
+
+/// What an operator action came to when it did not fail.
+#[derive(Debug, PartialEq)]
+pub enum Outcome<T> {
+    Done(T),
+    NotFound,
+    Refused(Refusal),
+}
+
+/// Why an operator action was not carried out although the thing exists.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Refusal {
+    AlreadyLocked,
+    NotLocked,
+    /// The id belongs to another org than the caller named (a stale page, a reused id).
+    OrgMismatch,
+    /// The typed name is not the org's current name.
+    ConfirmMismatch,
+    DefaultOrg,
+}
+
+/// When the org was created: what keeps a reused org id apart in the audit log.
+fn org_created_at(tx: &Transaction, org_id: i64) -> Result<Option<f64>> {
+    Ok(tx
+        .query_row("SELECT created_at FROM orgs WHERE id=?", [org_id], |r| {
+            r.get(0)
+        })
+        .optional()?)
+}
+
+/// `org.update`: every set field of `u` in one transaction. `detail` says which fields (no name).
+pub fn operator_update_org(
+    conn: &Connection,
+    org_id: i64,
+    u: &OrgUpdate,
+    reason: Option<&str>,
+    detail: &Value,
+) -> Result<Outcome<()>> {
+    let tx = begin(conn)?;
+    let Some(created) = org_created_at(&tx, org_id)? else {
+        return Ok(Outcome::NotFound);
+    };
+    update_org_tx(&tx, org_id, u)?;
+    insert_audit(
+        &tx,
+        &AuditRow {
+            action: "org.update",
+            org_id: Some(org_id),
+            org_created_at: Some(created),
+            reason,
+            detail: Some(&detail.to_string()),
+            ..Default::default()
+        },
+    )?;
+    tx.commit()?;
+    Ok(Outcome::Done(()))
+}
+
+/// `org.lock`: the flag row, and the org's queued jobs cancelled (`error: "org locked"`). Returns
+/// how many. Claimed jobs run on; quota and plan stay as they are.
+pub fn operator_lock_org(conn: &Connection, org_id: i64, reason: &str) -> Result<Outcome<i64>> {
+    let tx = begin(conn)?;
+    let Some(created) = org_created_at(&tx, org_id)? else {
+        return Ok(Outcome::NotFound);
+    };
+    let now = crate::now();
+    let inserted = tx.execute(
+        "INSERT OR IGNORE INTO org_locks(org_id, org_created_at, reason, locked_at) VALUES(?,?,?,?)",
+        params![org_id, created, reason, now],
+    )?;
+    if inserted == 0 {
+        return Ok(Outcome::Refused(Refusal::AlreadyLocked));
+    }
+    let cancelled = tx.execute(
+        "UPDATE jobs SET state='cancelled', error='org locked', finished_at=? \
+         WHERE org_id=? AND state='queued'",
+        params![now, org_id],
+    )? as i64;
+    insert_audit(
+        &tx,
+        &AuditRow {
+            action: "org.lock",
+            org_id: Some(org_id),
+            org_created_at: Some(created),
+            reason: Some(reason),
+            detail: Some(&serde_json::json!({ "cancelled_jobs": cancelled }).to_string()),
+            ..Default::default()
+        },
+    )?;
+    tx.commit()?;
+    Ok(Outcome::Done(cancelled))
+}
+
+/// `org.unlock`: the flag row removed.
+pub fn operator_unlock_org(
+    conn: &Connection,
+    org_id: i64,
+    reason: Option<&str>,
+) -> Result<Outcome<()>> {
+    let tx = begin(conn)?;
+    let Some(created) = org_created_at(&tx, org_id)? else {
+        return Ok(Outcome::NotFound);
+    };
+    if tx.execute("DELETE FROM org_locks WHERE org_id=?", [org_id])? == 0 {
+        return Ok(Outcome::Refused(Refusal::NotLocked));
+    }
+    insert_audit(
+        &tx,
+        &AuditRow {
+            action: "org.unlock",
+            org_id: Some(org_id),
+            org_created_at: Some(created),
+            reason,
+            ..Default::default()
+        },
+    )?;
+    tx.commit()?;
+    Ok(Outcome::Done(()))
+}
+
+/// `org.delete`: `confirm` must be the org's current name; the default org is never removed. The
+/// audit rows of the org stay (they hold no name).
+pub fn operator_delete_org(
+    conn: &Connection,
+    org_id: i64,
+    confirm: &str,
+    reason: &str,
+) -> Result<Outcome<()>> {
+    if org_id == DEFAULT_ORG {
+        return Ok(Outcome::Refused(Refusal::DefaultOrg));
+    }
+    let tx = begin(conn)?;
+    let found: Option<(String, f64)> = tx
+        .query_row(
+            "SELECT name, created_at FROM orgs WHERE id=?",
+            [org_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?;
+    let Some((name, created)) = found else {
+        return Ok(Outcome::NotFound);
+    };
+    if name != confirm {
+        return Ok(Outcome::Refused(Refusal::ConfirmMismatch));
+    }
+    delete_org_tx(&tx, org_id)?;
+    insert_audit(
+        &tx,
+        &AuditRow {
+            action: "org.delete",
+            org_id: Some(org_id),
+            org_created_at: Some(created),
+            reason: Some(reason),
+            ..Default::default()
+        },
+    )?;
+    tx.commit()?;
+    Ok(Outcome::Done(()))
+}
+
+/// `org.create`: a new org, its first user and the invitation token in one transaction.
+/// Err(Conflict) if the e-mail is taken (the rollback takes the half-made org along).
+#[allow(clippy::too_many_arguments)]
+pub fn operator_create_org(
+    conn: &Connection,
+    org_name: &str,
+    email: &str,
+    password_hash: &str,
+    job_quota: Option<i64>,
+    invite_token: &str,
+    invite_ttl_s: f64,
+    reason: Option<&str>,
+) -> Result<Signup> {
+    let tx = begin(conn)?;
+    let new = signup_tx(&tx, org_name, email, password_hash, job_quota, None)?;
+    // the invitation is a reset token, minted in the same transaction as the account it opens
+    create_password_reset_tx(&tx, new.user_id, invite_token, invite_ttl_s, None)?;
+    insert_audit(
+        &tx,
+        &AuditRow {
+            action: "org.create",
+            org_id: Some(new.org_id),
+            org_created_at: org_created_at(&tx, new.org_id)?,
+            target: Some(&format!("user:{}", new.user_id)),
+            reason,
+            detail: Some(&serde_json::json!({ "job_quota": job_quota }).to_string()),
+        },
+    )?;
+    tx.commit()?;
+    Ok(new)
+}
+
+/// `user.reset`: mint the reset token. Returns the user's e-mail address for the mail the caller
+/// sends after the commit. `org_id` must be the user's org; a user without an address (the seeded
+/// legacy one) is not found.
+pub fn operator_reset_user(
+    conn: &Connection,
+    user_id: i64,
+    org_id: i64,
+    token: &str,
+    ttl_s: f64,
+    reason: Option<&str>,
+) -> Result<Outcome<String>> {
+    let tx = begin(conn)?;
+    let user: Option<(i64, Option<String>)> = tx
+        .query_row(
+            "SELECT org_id, email FROM users WHERE id=?",
+            [user_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?;
+    let Some((owner, Some(email))) = user else {
+        return Ok(Outcome::NotFound);
+    };
+    if owner != org_id {
+        return Ok(Outcome::Refused(Refusal::OrgMismatch));
+    }
+    create_password_reset_tx(&tx, user_id, token, ttl_s, None)?;
+    insert_audit(
+        &tx,
+        &AuditRow {
+            action: "user.reset",
+            org_id: Some(org_id),
+            org_created_at: org_created_at(&tx, org_id)?,
+            target: Some(&format!("user:{user_id}")),
+            reason,
+            ..Default::default()
+        },
+    )?;
+    tx.commit()?;
+    Ok(Outcome::Done(email))
+}
+
+/// A row of its own, for what happens after a commit (a reset mail that did not go out).
+pub fn operator_audit_note(conn: &Connection, row: &AuditRow) -> Result<i64> {
+    let tx = begin(conn)?;
+    let id = insert_audit(&tx, row)?;
+    tx.commit()?;
+    Ok(id)
+}
+
+/// `key.revoke`: `org_id` must be the key's org.
+pub fn operator_revoke_key(
+    conn: &Connection,
+    key_id: i64,
+    org_id: i64,
+    reason: Option<&str>,
+) -> Result<Outcome<()>> {
+    let tx = begin(conn)?;
+    let owner: Option<i64> = tx
+        .query_row("SELECT org_id FROM api_keys WHERE id=?", [key_id], |r| {
+            r.get(0)
+        })
+        .optional()?;
+    let Some(owner) = owner else {
+        return Ok(Outcome::NotFound);
+    };
+    if owner != org_id {
+        return Ok(Outcome::Refused(Refusal::OrgMismatch));
+    }
+    revoke_api_key_tx(&tx, key_id, Some(org_id))?;
+    insert_audit(
+        &tx,
+        &AuditRow {
+            action: "key.revoke",
+            org_id: Some(org_id),
+            org_created_at: org_created_at(&tx, org_id)?,
+            target: Some(&format!("key:{key_id}")),
+            reason,
+            ..Default::default()
+        },
+    )?;
+    tx.commit()?;
+    Ok(Outcome::Done(()))
 }
 
 // --- operator reads: orgs and their jobs --------------------------------------------------------

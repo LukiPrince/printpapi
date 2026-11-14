@@ -366,6 +366,8 @@ curl -s -X PUT localhost:3460/orgs/2 -H 'Authorization: Bearer <PRINTAPI_TOKEN>'
 - A submit past the cap answers **`402`** and prints nothing. The guard sits in the enqueue path,
   so `POST /jobs`, `POST /orders`, the Shopify webhook and the PrintNode-compatible
   `POST /printjobs` (`{"code": "QuotaExceeded"}`) are all covered by it.
+- An org the operator has [locked](operator.md#lock-and-unlock) answers **`403` `org locked`** on
+  all of those submit paths, whatever its quota.
 - An **idempotent resubmit spends nothing** — it returns the original job, it does not create one.
 - Orgs created through [self-signup](#self-signup) start with the operator's `PRINTAPI_SIGNUP_QUOTA`
   (none if unset); orgs root creates start unlimited.

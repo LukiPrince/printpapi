@@ -494,6 +494,9 @@ macro_rules! gate {
 mod operator;
 pub use operator::is_operator_token;
 
+/// The answer of every submit path while the operator has locked the org.
+const ORG_LOCKED: &str = "org locked";
+
 fn jerr(status: u16, msg: impl AsRef<str>) -> Resp {
     Resp::json(status, &json!({ "error": msg.as_ref() }))
 }
@@ -780,6 +783,8 @@ fn fetches_payload(type_v: &Value) -> bool {
 enum SubmitErr {
     Fetch(String),
     Quota(String),
+    /// The org is locked by the operator: 403, whichever way the job came in.
+    Locked,
     Invalid(String),
     /// Too many renders or downloads running; the client may retry.
     Busy(String),
@@ -1115,6 +1120,26 @@ impl Ctx<'_> {
         ))
     }
 
+    /// The body of a reset mail: `lead`, the link and the token. The link is built from PUBLIC_URL
+    /// only. Deriving it from the Host header would let anyone who can send this server a request
+    /// mail a *valid* token pointing at their own host; without the env var the mail carries the
+    /// bare token instead.
+    fn reset_mail_text(&self, lead: &str, tok: &str) -> String {
+        let public_url = &self.cfg().public_url;
+        let link = if public_url.is_empty() {
+            String::new()
+        } else {
+            format!("\nOpen {public_url}/?reset={tok}\n")
+        };
+        format!(
+            "{lead}\n\
+             {link}\ntoken: {tok}\n\n\
+             It is valid for {} minutes and works once. \
+             If this was not you, ignore this message.\n",
+            (self.cfg().reset_ttl_s / 60.0).floor() as i64
+        )
+    }
+
     /// Always 200, whether or not the address exists — the answer must not enumerate accounts. A
     /// mail goes out only for a real one.
     fn password_reset(&self) -> R {
@@ -1132,21 +1157,9 @@ impl Ctx<'_> {
             let tok = auth::new_session_token();
             let ttl = self.cfg().reset_ttl_s;
             self.db(|c| store::create_password_reset(c, user.id, &tok, ttl, None))?;
-            // The link is built from PUBLIC_URL only. Deriving it from the Host header would let
-            // anyone who can send this server a request mail a *valid* token pointing at their
-            // own host; without the env var the mail carries the bare token instead.
-            let public_url = &self.cfg().public_url;
-            let link = if public_url.is_empty() {
-                String::new()
-            } else {
-                format!("\nOpen {public_url}/?reset={tok}\n")
-            };
-            let text = format!(
-                "Someone asked to reset the printpapi password for {email}.\n\
-                 {link}\ntoken: {tok}\n\n\
-                 It is valid for {} minutes and works once. \
-                 If this was not you, ignore this message.\n",
-                (ttl / 60.0).floor() as i64
+            let text = self.reset_mail_text(
+                &format!("Someone asked to reset the printpapi password for {email}."),
+                &tok,
             );
             // a broken mail server must not answer differently
             if let Err(e) = self
@@ -1273,6 +1286,7 @@ impl Ctx<'_> {
         };
         // One closure, so a retry cannot see "no job yet" and then a quota the original used up.
         let checked = self.db(|c| {
+            store::check_not_locked(c, printer.org_id)?;
             if let Some(key) = key
                 && let Some(e) = store::find_job_by_key(c, printer.org_id, key)?
             {
@@ -1284,6 +1298,7 @@ impl Ctx<'_> {
             Ok(Some(e)) => return Ok(Gate2::Existing(e)),
             Ok(None) => {}
             Err(StoreError::QuotaExceeded(m)) => return Err(SubmitErr::Quota(m)),
+            Err(StoreError::Locked) => return Err(SubmitErr::Locked),
             Err(e) => return Err(SubmitErr::Store(e)),
         }
         if !fetch {
@@ -1396,6 +1411,7 @@ impl Ctx<'_> {
                 Ok(e)
             }
             Err(StoreError::QuotaExceeded(m)) => Err(SubmitErr::Quota(m)),
+            Err(StoreError::Locked) => Err(SubmitErr::Locked),
             Err(StoreError::UnknownPrinter(m)) => Err(SubmitErr::Invalid(m)),
             Err(e) => Err(SubmitErr::Store(e)),
         }
@@ -1437,6 +1453,7 @@ impl Ctx<'_> {
             Ok(e) => Ok(Resp::json(200, &json!({ "job_id": e.job_id }))),
             Err(SubmitErr::Fetch(m)) => Ok(jerr(502, format!("downstream: {m}"))),
             Err(SubmitErr::Quota(m)) => Ok(jerr(402, m)),
+            Err(SubmitErr::Locked) => Ok(jerr(403, ORG_LOCKED)),
             Err(SubmitErr::Invalid(m)) => Ok(jerr(400, m)),
             Err(SubmitErr::Busy(m)) => Ok(jerr(503, m)),
             Err(SubmitErr::InProgress(m)) => Ok(jerr(409, m)),
@@ -1512,6 +1529,7 @@ impl Ctx<'_> {
         match self.enqueue(&job) {
             Ok(e) => Ok(Resp::json(200, &json!({ "job_id": e.job_id }))),
             Err(SubmitErr::Quota(m)) => Ok(jerr(402, m)),
+            Err(SubmitErr::Locked) => Ok(jerr(403, ORG_LOCKED)),
             Err(
                 SubmitErr::Invalid(m)
                 | SubmitErr::Fetch(m)
@@ -1819,6 +1837,7 @@ impl Ctx<'_> {
             Ok(e) => Resp::json(201, &json!(e.job_id)),
             Err(SubmitErr::Fetch(m)) => self.pn_error(502, "DownstreamError", m),
             Err(SubmitErr::Quota(m)) => self.pn_error(402, "QuotaExceeded", m),
+            Err(SubmitErr::Locked) => self.pn_error(403, "Forbidden", ORG_LOCKED),
             Err(SubmitErr::Invalid(m)) => self.pn_error(400, "BadRequest", m),
             Err(SubmitErr::Busy(m)) => self.pn_error(503, "ServiceUnavailable", m),
             // ponytail: unreachable today, this layer takes no idempotency key

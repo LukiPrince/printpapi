@@ -20,18 +20,71 @@ const AUDIT_DEFAULT_LIMIT: i64 = 50;
 const LIST_MAX_LIMIT: i64 = 200;
 const LIST_DEFAULT_LIMIT: i64 = 50;
 
-/// `/operator/orgs/{id}` (false) or `/operator/orgs/{id}/jobs` (true), the id all digits.
-fn org_route(path: &str) -> Option<(i64, bool)> {
+/// The longest reason the audit log takes: it is kept for ever.
+const REASON_MAX: usize = 500;
+/// The shortest reason a lock needs.
+const LOCK_REASON_MIN: usize = 8;
+/// The longest org name, in characters.
+const NAME_MAX: usize = 200;
+
+/// `/operator/orgs/{id}` with its suffix (`""`, `"jobs"`, `"lock"` or `"unlock"`), the id all
+/// digits.
+fn org_route(path: &str) -> Option<(i64, &str)> {
     let rest = path.strip_prefix("/operator/orgs/")?;
-    let (id, jobs) = match rest.split_once('/') {
-        Some((id, "jobs")) => (id, true),
+    let (id, suffix) = match rest.split_once('/') {
+        Some((id, s @ ("jobs" | "lock" | "unlock"))) => (id, s),
         Some(_) => return None,
-        None => (rest, false),
+        None => (rest, ""),
     };
     if id.is_empty() || !id.bytes().all(|b| b.is_ascii_digit()) {
         return None;
     }
-    Some((id.parse().ok()?, jobs))
+    Some((id.parse().ok()?, suffix))
+}
+
+/// The optional `reason` of a write body: absent, null or blank is none; anything but a string,
+/// or a string over `REASON_MAX` characters, is a 400. `min` characters make it required.
+fn reason_of(body: &Obj, min: usize) -> Gate<Option<String>> {
+    let reason = match body.get("reason") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(s)) => Some(printnode::py_trim(s).to_string()).filter(|s| !s.is_empty()),
+        Some(_) => return Err(jerr(400, "reason must be a string")),
+    };
+    if reason
+        .as_ref()
+        .is_some_and(|r| r.chars().count() > REASON_MAX)
+    {
+        return Err(jerr(400, "reason is too long"));
+    }
+    if min > 0 && reason.as_ref().is_none_or(|r| r.chars().count() < min) {
+        return Err(jerr(
+            400,
+            format!("reason of at least {min} characters required"),
+        ));
+    }
+    Ok(reason)
+}
+
+/// A required, trimmed, non-empty string field of at most `NAME_MAX` characters.
+fn name_of(v: Option<&Value>, what: &str) -> Gate<String> {
+    match v {
+        Some(Value::String(s))
+            if !printnode::py_trim(s).is_empty() && s.chars().count() <= NAME_MAX =>
+        {
+            Ok(printnode::py_trim(s).to_string())
+        }
+        _ => Err(jerr(
+            400,
+            format!("{what} must be a non-empty string of at most {NAME_MAX} characters"),
+        )),
+    }
+}
+
+/// The `org_id` a write names to prove its page is not stale.
+fn org_id_of(body: &Obj) -> Gate<i64> {
+    body.get("org_id")
+        .and_then(Value::as_i64)
+        .ok_or_else(|| jerr(400, "org_id required"))
 }
 
 /// The date of day `n` of the month starting at `month_start`, `YYYY-MM-DD` (UTC).
@@ -126,12 +179,24 @@ impl Ctx<'_> {
             ("GET", "/operator/overview") => self.operator_overview(),
             ("GET", "/operator/audit") => self.operator_audit(),
             ("GET", "/operator/orgs") => self.operator_orgs(),
-            ("GET", _) => match org_route(path) {
-                Some((id, false)) => self.operator_org(id),
-                Some((id, true)) => self.operator_org_jobs(id),
-                None => Ok(not_found()),
+            ("POST", "/operator/orgs") => self.operator_org_create(),
+            (m, _) => match (m, org_route(path)) {
+                ("GET", Some((id, ""))) => self.operator_org(id),
+                ("GET", Some((id, "jobs"))) => self.operator_org_jobs(id),
+                ("PUT", Some((id, ""))) => self.operator_org_update(id),
+                ("DELETE", Some((id, ""))) => self.operator_org_delete(id),
+                ("POST", Some((id, "lock"))) => self.operator_org_lock(id),
+                ("POST", Some((id, "unlock"))) => self.operator_org_unlock(id),
+                ("POST", None) => match id_of(path, "/operator/users/", "/reset") {
+                    Some(uid) => self.operator_user_reset(uid),
+                    None => Ok(not_found()),
+                },
+                ("DELETE", None) => match id_of(path, "/operator/keys/", "") {
+                    Some(kid) => self.operator_key_revoke(kid),
+                    None => Ok(not_found()),
+                },
+                _ => Ok(not_found()),
             },
-            _ => Ok(not_found()),
         };
         r.unwrap_or_else(|e| {
             eprintln!("internal error: {e}");
@@ -155,6 +220,223 @@ impl Ctx<'_> {
             return Err(jerr(400, "bad limit"));
         }
         Ok((limit.min(LIST_MAX_LIMIT), int(cursor)?))
+    }
+
+    /// Reset mails and invitations need a mail server and a `PUBLIC_URL` to link to.
+    fn mail_ready(&self) -> bool {
+        self.cfg().reset_enabled && !self.cfg().public_url.is_empty()
+    }
+
+    /// Send `text` to `to`. A mail that did not go out writes a second audit row (`row`, as
+    /// `user.reset_mail_failed`); it names ids only.
+    fn send_operator_mail(
+        &self,
+        to: &str,
+        subject: &str,
+        text: &str,
+        row: &store::AuditRow,
+    ) -> bool {
+        let sent = matches!(self.s.mailer.send(to, subject, text), Ok(true));
+        if !sent {
+            eprintln!("operator mail failed");
+            let note = store::AuditRow {
+                action: "user.reset_mail_failed",
+                ..row.clone()
+            };
+            if let Err(e) = self.db(|c| store::operator_audit_note(c, &note)) {
+                eprintln!("audit row for a failed mail not written: {e}");
+            }
+        }
+        sent
+    }
+
+    fn operator_org_update(&self, id: i64) -> R {
+        let body = gate!(self.read_obj());
+        let reason = gate!(reason_of(&body, 0));
+        let mut update = store::OrgUpdate::default();
+        let mut detail = serde_json::Map::new();
+        let name;
+        if body.contains_key("name") {
+            name = gate!(name_of(body.get("name"), "name"));
+            update.name = Some(&name);
+            detail.insert("name".into(), json!(true));
+        }
+        if let Some(plan_v) = body.get("plan") {
+            let Some(plan) = billing::find(&self.cfg().plans, plan_v) else {
+                return Ok(jerr(400, format!("unknown plan: {}", repr(plan_v))));
+            };
+            update.plan = Some((&plan.id, plan.jobs));
+            detail.insert("plan".into(), json!(plan.id));
+            detail.insert("job_quota".into(), json!(plan.jobs));
+        }
+        if let Some(quota) = body.get("job_quota") {
+            let quota = match parse_job_quota(quota) {
+                Ok(q) => q,
+                Err(msg) => return Ok(jerr(400, msg)),
+            };
+            update.job_quota = Some(quota);
+            detail.insert("job_quota".into(), json!(quota));
+        }
+        if detail.is_empty() {
+            return Ok(jerr(400, "nothing to update"));
+        }
+        let detail = Value::Object(detail);
+        let out =
+            self.db(|c| store::operator_update_org(c, id, &update, reason.as_deref(), &detail))?;
+        Ok(match out {
+            store::Outcome::Done(()) => ok_true(),
+            _ => not_found(),
+        })
+    }
+
+    fn operator_org_lock(&self, id: i64) -> R {
+        let body = gate!(self.read_obj());
+        let reason = gate!(reason_of(&body, LOCK_REASON_MIN)).unwrap_or_default();
+        Ok(
+            match self.db(|c| store::operator_lock_org(c, id, &reason))? {
+                store::Outcome::Done(n) => {
+                    Resp::json(200, &json!({ "ok": true, "cancelled_jobs": n }))
+                }
+                store::Outcome::Refused(_) => jerr(409, "org is already locked"),
+                store::Outcome::NotFound => not_found(),
+            },
+        )
+    }
+
+    fn operator_org_unlock(&self, id: i64) -> R {
+        let body = gate!(self.read_obj());
+        let reason = gate!(reason_of(&body, 0));
+        Ok(
+            match self.db(|c| store::operator_unlock_org(c, id, reason.as_deref()))? {
+                store::Outcome::Done(()) => ok_true(),
+                store::Outcome::Refused(_) => jerr(409, "org is not locked"),
+                store::Outcome::NotFound => not_found(),
+            },
+        )
+    }
+
+    fn operator_org_delete(&self, id: i64) -> R {
+        let body = gate!(self.read_obj());
+        let reason = gate!(reason_of(&body, 1)).unwrap_or_default();
+        let Some(Value::String(confirm)) = body.get("confirm") else {
+            return Ok(jerr(400, "confirm must be the org name"));
+        };
+        let out = self.db(|c| store::operator_delete_org(c, id, confirm, &reason))?;
+        Ok(match out {
+            store::Outcome::Done(()) => {
+                // secure_delete zeroed the pages; this clears the WAL frames too. A reader can
+                // block it: logged, never a failed request (the org is gone either way).
+                self.db(|c| store::truncate_wal_logged(c, "operator delete org"));
+                ok_true()
+            }
+            store::Outcome::Refused(store::Refusal::DefaultOrg) => {
+                jerr(400, "the default org cannot be removed")
+            }
+            store::Outcome::Refused(_) => jerr(400, "confirm must be the org name"),
+            store::Outcome::NotFound => not_found(),
+        })
+    }
+
+    fn operator_org_create(&self) -> R {
+        let body = gate!(self.read_obj());
+        let reason = gate!(reason_of(&body, 0));
+        let name = gate!(name_of(body.get("name"), "name"));
+        let email = str_field(&body, "email")
+            .map(store::normalize_email)
+            .unwrap_or_default();
+        if !email.contains('@') {
+            return Ok(jerr(400, "email required"));
+        }
+        if !self.mail_ready() {
+            return Ok(jerr(409, "mail is not configured"));
+        }
+        // a hash of a random password, never a NULL one: login timing reveals nothing about the
+        // invited account, and nobody can log in before the invitation is used
+        let pw_hash = match auth::hash_password(Some(&auth::token_urlsafe(32))) {
+            Ok(h) => h,
+            Err(e) => return Ok(jerr(500, e)),
+        };
+        let tok = auth::new_session_token();
+        let ttl = self.cfg().reset_ttl_s;
+        let quota = self.cfg().signup_quota;
+        let new = match self.db(|c| {
+            store::operator_create_org(
+                c,
+                &name,
+                &email,
+                &pw_hash,
+                quota,
+                &tok,
+                ttl,
+                reason.as_deref(),
+            )
+        }) {
+            Ok(n) => n,
+            Err(StoreError::Conflict) => return Ok(jerr(409, "email already registered")),
+            Err(e) => return Err(e),
+        };
+        let text = self.reset_mail_text(
+            "You have been invited to printpapi. Choose a password with the link below.",
+            &tok,
+        );
+        let row = store::AuditRow {
+            org_id: Some(new.org_id),
+            target: Some(&format!("user:{}", new.user_id)),
+            ..Default::default()
+        };
+        let sent = self.send_operator_mail(&email, "Your printpapi invitation", &text, &row);
+        Ok(Resp::json(
+            200,
+            &json!({ "ok": true, "org_id": new.org_id, "user_id": new.user_id, "mail_sent": sent }),
+        ))
+    }
+
+    fn operator_user_reset(&self, user_id: i64) -> R {
+        let body = gate!(self.read_obj());
+        let org_id = gate!(org_id_of(&body));
+        let reason = gate!(reason_of(&body, 0));
+        if !self.mail_ready() {
+            return Ok(jerr(409, "mail is not configured"));
+        }
+        let tok = auth::new_session_token();
+        let ttl = self.cfg().reset_ttl_s;
+        let out = self
+            .db(|c| store::operator_reset_user(c, user_id, org_id, &tok, ttl, reason.as_deref()))?;
+        let email = match out {
+            store::Outcome::Done(e) => e,
+            store::Outcome::Refused(_) => return Ok(jerr(409, "user belongs to another org")),
+            store::Outcome::NotFound => return Ok(not_found()),
+        };
+        let text = self.reset_mail_text(
+            "An operator started a password reset for your printpapi account.",
+            &tok,
+        );
+        let row = store::AuditRow {
+            org_id: Some(org_id),
+            target: Some(&format!("user:{user_id}")),
+            ..Default::default()
+        };
+        if self.send_operator_mail(&email, "Reset your printpapi password", &text, &row) {
+            Ok(ok_true())
+        } else {
+            Ok(jerr(502, "mail could not be sent"))
+        }
+    }
+
+    fn operator_key_revoke(&self, key_id: i64) -> R {
+        let body = gate!(self.read_obj());
+        let org_id = gate!(org_id_of(&body));
+        let reason = gate!(reason_of(&body, 0));
+        let out = self.db(|c| store::operator_revoke_key(c, key_id, org_id, reason.as_deref()))?;
+        Ok(match out {
+            store::Outcome::Done(()) => {
+                // a long-poll of an agent enrolled with this key re-checks it and ends with 401
+                self.s.waker.wake_all();
+                ok_true()
+            }
+            store::Outcome::Refused(_) => jerr(409, "key belongs to another org"),
+            store::Outcome::NotFound => not_found(),
+        })
     }
 
     fn operator_orgs(&self) -> R {

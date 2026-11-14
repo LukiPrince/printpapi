@@ -654,7 +654,10 @@ fn org_read_endpoints_need_the_gate_and_are_get_only() {
             401,
             "{t}"
         );
-        assert_eq!(op(&app, "DELETE", t).send().status, 404, "DELETE {t}");
+        // /operator/orgs/{id} has writes of its own now; the list and the jobs stay read-only
+        if t != "/operator/orgs/1" {
+            assert_eq!(op(&app, "DELETE", t).send().status, 404, "DELETE {t}");
+        }
     }
     let r = op(&app, "GET", "/operator/orgs").send();
     assert_eq!(r.status, 200, "{}", r.text());

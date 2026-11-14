@@ -6,8 +6,9 @@ as numbers, an audit log) and nothing in it is specific to one business. **It is
 `PRINTAPI_OPERATOR_TOKEN` is set**: with the token unset, every path under `/operator/` answers
 `404`, as if the API did not exist.
 
-This page covers the gate, hosted mode, the audit log and the read endpoints available so far
-(overview, orgs and their jobs).
+This page covers the gate, hosted mode, the audit log, the read endpoints (overview, orgs and their
+jobs) and the write endpoints (change, lock, delete and create an org, send a reset mail, revoke a
+key).
 
 ## The gate
 
@@ -170,5 +171,86 @@ Query: `limit` (default 50, at most 200), `before_id`. Newest first by id. Each 
 on the last one.
 
 The reads add indexes (`jobs(org_id)`, `jobs(org_id, state)` and three small ones) to an existing
-database at startup. They are additive and the Python server of v2.x ignores them. The `org_locks`
-table that holds the lock row is created empty; locking itself comes with the write endpoints.
+database at startup. They are additive and the Python server of v2.x ignores them.
+
+## Writes
+
+Every write is **one store function and one transaction with its audit row**: the change and the
+row are committed together or not at all. If the audit row cannot be written, the change is rolled
+back and the answer is `500`. A mail and the WAL truncate that belong to an action run **after** the
+commit. Bodies are JSON; the optional `reason` is a string of at most 500 characters and lands in
+the audit log, so keep customer data out of it. An org or id that does not exist answers `404`; a
+body that is not a JSON object, or a field that fails validation, answers `400` and changes nothing.
+
+| Call | Audit action |
+|---|---|
+| `PUT /operator/orgs/{id}` | `org.update` |
+| `POST /operator/orgs/{id}/lock`, `.../unlock` | `org.lock`, `org.unlock` |
+| `DELETE /operator/orgs/{id}` | `org.delete` |
+| `POST /operator/orgs` | `org.create` |
+| `POST /operator/users/{id}/reset` | `user.reset` (`user.reset_mail_failed` when the mail did not go out) |
+| `DELETE /operator/keys/{id}` | `key.revoke` |
+
+The audit rows hold ids and numbers: `org.update` says which fields changed (`name: true`, never the
+name), `org.lock` how many queued jobs it cancelled, `org.create` the quota the org started with.
+No e-mail address, org name or title is ever written.
+
+### `PUT /operator/orgs/{id}`
+
+`{name?, job_quota?, plan?, reason?}`, at least one of the three fields. Everything is validated
+first and applied in one transaction. `name` is a non-empty string of at most 200 characters;
+`job_quota` a non-negative integer or `null` (unlimited); `plan` an id of the plan catalogue
+([billing](billing.md)), which also sets the quota the plan grants. An explicit `job_quota` in the
+same body wins over the plan's. Answer: `{"ok": true}`.
+
+### Lock and unlock
+
+`POST /operator/orgs/{id}/lock` with `{reason}` of at least 8 characters inserts a row into the
+table `org_locks` (`org_id`, `org_created_at`, `reason`, `locked_at`) and cancels the org's queued
+jobs (`error: "org locked"`; a job an agent already claimed runs on). Answer:
+`{"ok": true, "cancelled_jobs": 3}`; `409` if the org is already locked.
+
+A lock is a **pure flag**: quota and plan stay as they are, so billing and quota writes need no
+change. While it is set, every way a job gets in answers **`403` `org locked`**: `POST /jobs`,
+`POST /orders`, the Shopify webhook and the PrintNode-compatible `POST /printjobs`. The check sits
+next to the quota check in the enqueue path and again before any payload is downloaded, so a locked
+org causes no outbound request, and an idempotent resubmit does not get an old job back either.
+Logins, the dashboard and agents keep working, so the customer can see what is going on.
+
+`POST /operator/orgs/{id}/unlock` (`{reason?}`) deletes the row; `409` if the org is not locked.
+`GET /operator/orgs` and the org detail show the lock (`locked`, `status: "locked"`, `lock`).
+
+> **Rolling back to an older version drops the lock.** Versions before this one (and the Python
+> server of v2.x) do not read `org_locks`: a locked org can submit again, and the table is kept
+> untouched. Unlock first, or accept that. Deleting an org there also leaves its lock row behind, so
+> a later org that reuses the id would still read as locked on a newer version.
+
+### `DELETE /operator/orgs/{id}`
+
+`{reason, confirm}`: `confirm` must equal the org's **current name** exactly, otherwise `400`. The
+default org is never removed (`400`). The org's jobs, printers, agents, keys, accounts, label
+templates, terms history and its `org_locks` row go with it; the audit rows stay. The WAL is
+truncated after the commit, so removed payloads do not linger in the `-wal` file.
+
+### `POST /operator/orgs`
+
+`{name, email, reason?}` creates the org with the signup quota (`PRINTAPI_SIGNUP_QUOTA`, as a
+self-signup would get) and its first user. The user's password hash is that of 32 random bytes,
+never `NULL`, so a login attempt reveals nothing; the **reset mail is the invitation**, sent after
+the commit. Answer: `{"ok": true, "org_id", "user_id", "mail_sent"}`. Without mail (`SMTP_HOST`) and
+`PUBLIC_URL` the answer is `409` `mail is not configured` and nothing is created; a taken address is
+`409` too. If the mail server fails after the commit, the org stays, `mail_sent` is `false` and a
+`user.reset_mail_failed` row is written: use the reset below to send it again.
+
+### `POST /operator/users/{id}/reset`
+
+`{org_id, reason?}` sends a password-reset mail to the user and never returns the token. `org_id`
+must be the user's org (`409` otherwise), so a stale page cannot reach a user that reuses an id. `409`
+`mail is not configured` without mail and `PUBLIC_URL`; `502` if the mail did not go out (the row
+`user.reset_mail_failed` says so). A user without an e-mail address (the seeded legacy one) is `404`.
+
+### `DELETE /operator/keys/{id}`
+
+`{org_id, reason?}` revokes an API key (`409` if the key belongs to another org). Agents enrolled
+with it end their long-poll with `401`. Removing a single user is not offered here: customers remove
+their own accounts, and root still can.
