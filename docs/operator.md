@@ -338,4 +338,4 @@ or payload. Each of these writes is one transaction with its audit row.
 
 The customer's Settings page lists every grant of their org: `reason`, when it started, when it
 expires or was ended, and the ids of the jobs the operator listed and opened. The grants stay for
-ever like the audit log; deleting an org removes its grants, and the audit rows stay.
+ever like the audit log; deleting an org removes its grants, and the audit rows stay. The dashboard reads them from [`GET /support-access`](api.md#support-access).

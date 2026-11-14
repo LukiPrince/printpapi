@@ -248,6 +248,7 @@ fn routes() -> Vec<(&'static str, &'static str)> {
         ("PUT", "/orgs/1"),
         ("DELETE", "/orgs/1"),
         ("GET", "/plans"),
+        ("GET", "/support-access"),
         ("POST", "/billing/webhook"),
         ("POST", "/apikeys"),
         ("GET", "/apikeys"),

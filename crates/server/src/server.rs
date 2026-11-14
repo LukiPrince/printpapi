@@ -962,6 +962,43 @@ impl Ctx<'_> {
         })
     }
 
+    /// `GET /support-access`: the support grants of one org, for the dashboard card. A session
+    /// sees its own org, root any (default: the default org). Always `no-store`: it is a log.
+    fn support_access(&self) -> R {
+        let p = gate!(self.manager()?);
+        let asked = qfirst(&query_params(self.target()), "org").map(str::parse::<i64>);
+        let oid = match (asked, p.org_id) {
+            (Some(Ok(o)), _) => o,
+            (Some(Err(_)), _) => return Ok(jerr(400, "org must be a number")),
+            (None, own) => own.unwrap_or(store::DEFAULT_ORG),
+        };
+        if p.foreign_org(oid) {
+            return Ok(jerr(403, "forbidden"));
+        }
+        if self.db(|c| store::get_org(c, oid))?.is_none() {
+            return Ok(not_found());
+        }
+        let enabled = self.cfg().operator_token.is_some();
+        let grants = if enabled {
+            self.db(|c| store::support_grants_of_org(c, oid))?
+        } else {
+            Vec::new()
+        };
+        let list: Vec<Value> = grants
+            .iter()
+            .map(|g| {
+                json!({
+                    "id": g.id, "reason": g.reason, "granted_at": g.granted_at,
+                    "expires_at": g.expires_at, "ended_at": g.ended_at, "active": g.active,
+                    "listed_job_ids": g.listed_job_ids, "opened_job_ids": g.opened_job_ids,
+                })
+            })
+            .collect();
+        let mut r = Resp::json(200, &json!({ "enabled": enabled, "grants": list }));
+        r.headers.push(("Cache-Control", "no-store".into()));
+        Ok(r)
+    }
+
     fn admin(&self) -> Gate<()> {
         if self.admin_ok() {
             Ok(())
@@ -2038,6 +2075,10 @@ impl Ctx<'_> {
         }
         if let Some(key) = cloudprnt_route(self.req.path()) {
             return self.cloudprnt_payload(key);
+        }
+        if self.req.path() == "/support-access" {
+            // the target carries a query (`?org=`), so it is matched by path, not in the table below
+            return self.support_access();
         }
         match t {
             "/" | "/index.html" => return Ok(self.dashboard(false).unwrap_or_else(not_found)),
