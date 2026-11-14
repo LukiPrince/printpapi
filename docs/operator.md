@@ -290,7 +290,7 @@ an override stored in the database applies on top of them.
 | `signup` | `"open"` or `"closed"` | `PRINTAPI_SIGNUP` |
 | `signup_quota` | integer, 0 or more (0 blocks printing) | `PRINTAPI_SIGNUP_QUOTA` |
 | `job_retention_days` | integer, 1 or more | `PRINTAPI_JOB_RETENTION_DAYS` |
-| `terms` | `{"version", "terms_url", "dpa_url"?, "privacy_url"?}`, a non-empty version, `http(s)` links, `terms_url` required | `PRINTAPI_TERMS_VERSION` and the three link variables |
+| `terms` | `{"version", "terms_url", "dpa_url"?, "privacy_url"?}`, a non-empty version without control characters, at most 100 characters, `http(s)` links without spaces, `terms_url` required | `PRINTAPI_TERMS_VERSION` and the three link variables |
 
 The values follow the rules of the environment variables. They apply to the next request, with no
 restart: the signup form, `GET /health`, `POST /operator/orgs` (the quota of the new org) and the
@@ -320,6 +320,10 @@ next retention pass read them.
 - `default`: neither (`value` is `"closed"` for `signup`, `null` for the others).
 - `env-locked`: `signup` only, see [the emergency brake](#the-emergency-brake).
 
+A key also has `ignored`, the stored row value, when a row exists but is not applied: signup is
+env-locked, a `signup` row of `open` while private URLs are allowed, or a value that no longer
+validates. It is absent otherwise. `unset` clears such a row.
+
 `env_only` shows the settings that stay in the environment, as they were at startup. It never
 holds a token, a password or a key.
 
@@ -333,7 +337,7 @@ same as `GET`. `reason` is optional, at most 500 characters.
 | Status | Why |
 |---|---|
 | `400` | an unknown key or field, a key in both `set` and `unset`, an empty request, a `null`, a value that fails the rules above, a bad `reason`, or a missing reason (see [retention](#retention-needs-a-reason)) |
-| `409` | `signup` is locked by the environment, or `set.signup = "open"` while private URLs are allowed |
+| `409` | `signup` is locked by the environment and the change sets `open`, or the change (a `set` or an `unset` of `signup`) would leave signup open while private URLs are allowed. A PUT that does not touch `signup` is never refused for this |
 | `401` | not the operator token, or not from an address in `PRINTAPI_OPERATOR_FROM` (root does not pass) |
 | `404` | `PRINTAPI_OPERATOR_TOKEN` is not set |
 
@@ -342,10 +346,16 @@ allowed in the log (a mode, numbers, links); no e-mail address is.
 
 ### The emergency brake
 
-`PRINTAPI_SIGNUP=closed` written into the environment explicitly beats every override: `source`
-is `env-locked` and any `set` or `unset` of `signup` answers `409`. Leaving the variable out means
-closed by default and is not a lock. To shut signup at once even if the console is compromised,
-set the variable to `closed` and restart.
+While the operator token is set, any value of `PRINTAPI_SIGNUP` other than `open` (`closed`, but
+also `CLOSED`, `off` or a typo) locks signup shut and beats every override: `source` is
+`env-locked`. Only changes that close signup are accepted then: `set` to `closed` and `unset`;
+setting `open` answers `409`. Leaving the variable out, or blank, means closed by default and is
+not a lock. To shut signup at once even if the console is compromised, set the variable to
+`closed` and restart.
+
+A stored `signup` row is not applied while locked, but it stays in the database and shows as
+`ignored`. Clear it (`unset` or `set` to `closed`) before lifting the brake, or it applies again
+once the variable is removed.
 
 ### Retention needs a reason
 
@@ -360,7 +370,7 @@ it needs none.
 - `fetches_per_org`, private URLs (`PRINTAPI_PRIVATE_URLS`) and trusted proxies decide what the
   server may reach and whose address it believes. They are fixed at startup, and the live
   `signup` value never moves them: hosted mode keeps the private-URL deny whether signup is open
-  or closed. Opening signup is refused (`409`) while private URLs are allowed.
+  or closed. A change that leaves signup open is refused (`409`) while private URLs are allowed.
 - `PRINTAPI_OPERATOR_FROM` and the token are the gate itself: a console must not be able to widen
   who can reach it.
 - SMTP and `PUBLIC_URL` hold credentials and the address links in mails point to.
@@ -371,7 +381,7 @@ Only with the operator token set does the server read the `settings` table; with
 value is the environment one, as in 3.5.0, and a database carried over from a hosted box changes
 nothing. At startup each applied override prints one line to stderr (never a secret). A stored
 value that no longer validates is ignored with a line, and so is `signup = open` while private
-URLs are allowed or `PRINTAPI_SIGNUP=closed` is explicit. An older version ignores the table, so
+URLs are allowed or `PRINTAPI_SIGNUP` locks signup shut. Values in these lines are quoted. An older version ignores the table, so
 the environment values apply again after a rollback; the table is left in place.
 
 ## Support access

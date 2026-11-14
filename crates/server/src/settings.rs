@@ -63,8 +63,13 @@ pub fn is_terms_url(u: &str) -> bool {
     !rest.split(['/', '?', '#']).next().unwrap_or("").is_empty()
 }
 
-/// The terms a signup must accept. A version needs a terms URL. Every link that is set must be
-/// an absolute `http(s)` URL with a host, version or not.
+/// Longest terms version, in characters.
+pub const TERMS_VERSION_MAX: usize = 100;
+
+/// The terms a signup must accept. A version needs a terms URL and has no control character (it
+/// lands in stderr and `GET /health`) and at most `TERMS_VERSION_MAX` characters. Every link that
+/// is set must be an absolute `http(s)` URL with a host, version or not (`is_terms_url` already
+/// refuses control characters and whitespace).
 pub fn parse_terms(
     version: &str,
     terms_url: &str,
@@ -82,6 +87,14 @@ pub fn parse_terms(
             Err(format!("{name} must be an http(s) URL, not {t:?}"))
         }
     };
+    if version.chars().any(char::is_control) {
+        return Err("PRINTAPI_TERMS_VERSION must not contain control characters".into());
+    }
+    if version.chars().count() > TERMS_VERSION_MAX {
+        return Err(format!(
+            "PRINTAPI_TERMS_VERSION must be at most {TERMS_VERSION_MAX} characters"
+        ));
+    }
     let terms_url = url("PRINTAPI_TERMS_URL", terms_url)?;
     let dpa_url = url("PRINTAPI_DPA_URL", dpa_url)?;
     let privacy_url = url("PRINTAPI_PRIVACY_URL", privacy_url)?;
@@ -98,6 +111,13 @@ pub fn parse_terms(
     }))
 }
 
+/// Does this `PRINTAPI_SIGNUP` value lock signup shut (the emergency brake)? Any present, non-blank
+/// value that is not exactly `open` does, so a near miss (`CLOSED`, `off`, `closd`) fails closed.
+pub fn signup_env_locks(raw: &str) -> bool {
+    let t = py_strip(raw);
+    !t.is_empty() && t != "open"
+}
+
 /// The four keys an operator may change at runtime; everything else stays env-only.
 pub const LIVE_KEYS: [&str; 4] = ["signup", "signup_quota", "job_retention_days", "terms"];
 
@@ -108,7 +128,7 @@ pub enum Source {
     Db,
     /// The variable is set.
     Env,
-    /// `PRINTAPI_SIGNUP=closed` set explicitly: the emergency brake, no override applies.
+    /// `PRINTAPI_SIGNUP` set to anything but `open`: the emergency brake, no override applies.
     EnvLocked,
     /// Neither a row nor a variable.
     Default,
@@ -138,6 +158,9 @@ pub struct Live {
     pub signup_quota: Sourced<Option<i64>>,
     pub job_retention_days: Sourced<Option<i64>>,
     pub terms: Sourced<Option<Terms>>,
+    /// Keys whose stored row is not applied (env-locked, the private-URL rule, or a value that no
+    /// longer validates), with the row as stored (as the API shows it, else the raw text).
+    pub ignored: Vec<(&'static str, Json)>,
 }
 
 /// The values the environment gave at startup and whether each variable was set at all.
@@ -145,7 +168,8 @@ pub struct Live {
 pub struct EnvStart {
     pub signup_open: bool,
     pub signup_set: bool,
-    /// `PRINTAPI_SIGNUP` is present and says `closed`: unset means closed by default, not a lock.
+    /// `PRINTAPI_SIGNUP` is present and not `open` (`signup_env_locks`): unset means closed by
+    /// default, not a lock.
     pub signup_explicit_closed: bool,
     pub signup_quota: Option<i64>,
     pub signup_quota_set: bool,
@@ -159,7 +183,7 @@ pub struct EnvStart {
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct EnvFlags {
     pub signup_set: bool,
-    /// `PRINTAPI_SIGNUP` is present and says `closed`.
+    /// `PRINTAPI_SIGNUP` is present, not blank and not exactly `open` (`signup_env_locks`).
     pub signup_explicit_closed: bool,
     pub signup_quota_set: bool,
     pub job_retention_days_set: bool,
@@ -293,7 +317,8 @@ pub fn terms_json(t: &Terms) -> Json {
 /// The effective values from the startup env, the effective destinations policy and the override
 /// rows (key, stored text), plus one stderr note per applied or ignored override. A row that no
 /// longer validates, a `signup = open` while private URLs are allowed, and any signup row while
-/// `PRINTAPI_SIGNUP=closed` is explicit are ignored. Notes never hold a secret.
+/// `PRINTAPI_SIGNUP` locks signup are ignored (and listed in `Live::ignored`). Notes never hold a
+/// secret and print every user-supplied value with `{:?}`.
 pub fn build_live(
     env: &EnvStart,
     destinations_any: bool,
@@ -321,6 +346,7 @@ pub fn build_live(
             value: env.terms.clone(),
             source: src(env.terms_set),
         },
+        ignored: Vec::new(),
     };
     let opt = |v: Option<i64>| v.map_or("unset".to_string(), |n| n.to_string());
     let env_says = |key: &str| match key {
@@ -330,7 +356,7 @@ pub fn build_live(
         "terms" => env
             .terms
             .as_ref()
-            .map_or("unset".to_string(), |t| format!("version {}", t.version)),
+            .map_or("unset".to_string(), |t| format!("version {:?}", t.version)),
         _ => "unset".to_string(),
     };
     let mut notes = Vec::new();
@@ -344,15 +370,17 @@ pub fn build_live(
                 notes.push(format!(
                     "setting {key}: ignoring the database value ({e}); the environment value applies"
                 ));
+                live.ignored.push((key, json!(raw)));
                 continue;
             }
         };
         if let Parsed::Signup(open) = &parsed {
             if env.signup_explicit_closed {
                 notes.push(
-                    "setting signup: ignoring the database value, PRINTAPI_SIGNUP=closed is set"
+                    "setting signup: ignoring the database value, PRINTAPI_SIGNUP locks signup closed"
                         .to_string(),
                 );
+                live.ignored.push((key, parsed.to_json()));
                 continue;
             }
             if *open && destinations_any {
@@ -360,11 +388,12 @@ pub fn build_live(
                     "setting signup: ignoring the database value open, private URLs are allowed"
                         .to_string(),
                 );
+                live.ignored.push((key, parsed.to_json()));
                 continue;
             }
         }
         let shown = match &parsed {
-            Parsed::Terms(t) => format!("version {}", t.version),
+            Parsed::Terms(t) => format!("version {:?}", t.version),
             other => other.encode(),
         };
         notes.push(format!(
@@ -411,9 +440,9 @@ pub struct Change {
 /// A change that is well formed but not allowed right now (409 at the HTTP layer).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Conflict {
-    /// `signup = open` while private URLs are allowed.
+    /// The change would leave signup open while private URLs are allowed.
     OpenWithPrivateUrls,
-    /// `PRINTAPI_SIGNUP=closed` is explicit: signup is locked shut.
+    /// `PRINTAPI_SIGNUP` locks signup shut: only a change that closes it is accepted.
     SignupLocked,
 }
 
@@ -437,6 +466,7 @@ pub fn validate_put(
     body: &Map<String, Json>,
     reason: Option<&str>,
     live: &Live,
+    env: &EnvStart,
     destinations_any: bool,
 ) -> Result<Change, PutError> {
     let bad = |m: String| PutError::Invalid(m);
@@ -491,12 +521,22 @@ pub fn validate_put(
     unset.sort_by_key(|k| LIVE_KEYS.iter().position(|l| l == k));
     unset.dedup();
     // well formed; now what the current state allows
-    let touches_signup = unset.contains(&"signup") || parsed.iter().any(|p| p.key() == "signup");
-    if touches_signup && live.signup.source == Source::EnvLocked {
-        return Err(PutError::Conflict(Conflict::SignupLocked));
-    }
-    if destinations_any && parsed.contains(&Parsed::Signup(true)) {
-        return Err(PutError::Conflict(Conflict::OpenWithPrivateUrls));
+    // What signup ends up as, worked out as startup would (build_live): a set value, or with
+    // `unset` the env one. A PUT that does not touch signup is never refused here.
+    let new_signup = parsed.iter().find_map(|p| match p {
+        Parsed::Signup(open) => Some(*open),
+        _ => None,
+    });
+    let touches_signup = new_signup.is_some() || unset.contains(&"signup");
+    if touches_signup {
+        if live.signup.source == Source::EnvLocked {
+            // the brake: only changes that can close signup get through
+            if new_signup == Some(true) {
+                return Err(PutError::Conflict(Conflict::SignupLocked));
+            }
+        } else if new_signup.unwrap_or(env.signup_open) && destinations_any {
+            return Err(PutError::Conflict(Conflict::OpenWithPrivateUrls));
+        }
     }
     // the next retention pass scrubs payloads and titles for good: say why
     let irreversible = parsed.iter().any(|p| match p {
@@ -662,7 +702,7 @@ mod tests {
         );
         assert_eq!(notes.len(), 1);
         assert!(
-            notes[0].contains("ignor") && notes[0].contains("PRINTAPI_SIGNUP=closed"),
+            notes[0].contains("ignor") && notes[0].contains("PRINTAPI_SIGNUP"),
             "{notes:?}"
         );
         // locked without any row, too
@@ -752,6 +792,41 @@ mod tests {
         assert!(notes.is_empty());
     }
 
+    #[test]
+    fn ignored_rows_are_listed_with_their_stored_value() {
+        let locked = EnvStart {
+            signup_set: true,
+            signup_explicit_closed: true,
+            ..env()
+        };
+        let l = build_live(&locked, false, &rows(&[("signup", "open")])).0;
+        assert_eq!(l.ignored, vec![("signup", json!("open"))]);
+        let l = build_live(&env(), true, &rows(&[("signup", "open")])).0;
+        assert_eq!(l.ignored, vec![("signup", json!("open"))]);
+        let l = build_live(&env(), false, &rows(&[("signup_quota", "-3")])).0;
+        assert_eq!(l.ignored, vec![("signup_quota", json!("-3"))]);
+        // an applied row is not ignored
+        let l = build_live(&env(), false, &rows(&[("signup", "open")])).0;
+        assert!(l.ignored.is_empty());
+    }
+
+    #[test]
+    fn the_terms_version_has_no_control_character_and_at_most_100_characters() {
+        let ok = |v: &str| parse_terms(v, "https://x.test/t", "", "");
+        assert!(ok("v1").unwrap().is_some());
+        assert!(ok(&"a".repeat(100)).is_ok());
+        assert!(ok(&"a".repeat(101)).is_err());
+        assert!(ok(&"é".repeat(100)).is_ok(), "characters, not bytes");
+        for v in ["v1\u{1b}[2J", "v1\nx", "a\tb", "a\u{7f}b", "a\u{85}b"] {
+            let e = ok(v).unwrap_err();
+            assert!(e.contains("control"), "{v:?}: {e}");
+        }
+        // padding is stripped before the check, links with a control character are refused
+        assert!(ok(" v1\n").is_ok());
+        assert!(parse_terms("v1", "https://x.test/\u{1b}", "", "").is_err());
+        assert!(parse_terms("", "", "https://x.test/a\nb", "").is_err());
+    }
+
     // ---- stored text and request values ----
 
     #[test]
@@ -815,7 +890,17 @@ mod tests {
     // ---- validate_put ----
 
     fn put(body: Json, reason: Option<&str>, live: &Live, any: bool) -> Result<Change, PutError> {
-        validate_put(body.as_object().unwrap(), reason, live, any)
+        put_env(body, reason, live, &env(), any)
+    }
+
+    fn put_env(
+        body: Json,
+        reason: Option<&str>,
+        live: &Live,
+        env: &EnvStart,
+        any: bool,
+    ) -> Result<Change, PutError> {
+        validate_put(body.as_object().unwrap(), reason, live, env, any)
     }
 
     fn base() -> Live {
@@ -907,7 +992,28 @@ mod tests {
     }
 
     #[test]
-    fn an_env_locked_signup_refuses_every_set_and_unset() {
+    fn unset_cannot_reopen_signup_while_private_urls_are_allowed() {
+        let e = EnvStart {
+            signup_open: true,
+            signup_set: true,
+            ..env()
+        };
+        let rows = rows(&[("signup", "closed")]);
+        let l = build_live(&e, true, &rows).0;
+        assert!(!l.signup.value);
+        assert_eq!(
+            put_env(json!({"unset": ["signup"]}), None, &l, &e, true),
+            Err(PutError::Conflict(Conflict::OpenWithPrivateUrls))
+        );
+        // not touching signup, closing it, or an env that says closed: all fine
+        assert!(put_env(json!({"set": {"signup_quota": 2}}), None, &l, &e, true).is_ok());
+        assert!(put_env(json!({"set": {"signup": "closed"}}), None, &l, &e, true).is_ok());
+        assert!(put_env(json!({"unset": ["signup"]}), None, &l, &env(), true).is_ok());
+        assert!(put_env(json!({"unset": ["signup"]}), None, &l, &e, false).is_ok());
+    }
+
+    #[test]
+    fn an_env_locked_signup_accepts_only_changes_that_close_it() {
         let e = EnvStart {
             signup_set: true,
             signup_explicit_closed: true,
@@ -916,8 +1022,6 @@ mod tests {
         let l = build_live(&e, false, &[]).0;
         for body in [
             json!({"set": {"signup": "open"}}),
-            json!({"set": {"signup": "closed"}}),
-            json!({"unset": ["signup"]}),
             json!({"set": {"signup": "open", "signup_quota": 1}}),
         ] {
             assert_eq!(
@@ -926,6 +1030,8 @@ mod tests {
                 "{body}"
             );
         }
+        assert!(put(json!({"set": {"signup": "closed"}}), None, &l, false).is_ok());
+        assert!(put(json!({"unset": ["signup"]}), None, &l, false).is_ok());
         // the other keys stay writable
         assert!(put(json!({"set": {"signup_quota": 1}}), None, &l, false).is_ok());
     }

@@ -285,7 +285,7 @@ fn signup_open_is_refused_with_409_while_private_urls_are_allowed() {
 }
 
 #[test]
-fn an_explicit_env_closed_locks_signup_for_set_and_unset() {
+fn an_env_lock_refuses_every_open_and_leaves_the_other_keys_open() {
     let app = App::with(|c| {
         hosted_cfg(c);
         c.env_flags.signup_set = true;
@@ -293,8 +293,6 @@ fn an_explicit_env_closed_locks_signup_for_set_and_unset() {
     });
     for body in [
         json!({"set": {"signup": "open"}}),
-        json!({"set": {"signup": "closed"}}),
-        json!({"unset": ["signup"]}),
         json!({"set": {"signup": "open", "signup_quota": 3}}),
     ] {
         let r = put(&app, body.clone());
@@ -303,6 +301,144 @@ fn an_explicit_env_closed_locks_signup_for_set_and_unset() {
     assert!(rows(&app.db).is_empty(), "nothing written on a 409");
     // the other keys stay open to change
     put_ok(&app, json!({"set": {"signup_quota": 3}}));
+}
+
+/// Env open, private URLs allowed: signup may be closed but never reopened over the API.
+fn open_with_private_urls(c: &mut Config) {
+    hosted_cfg(c);
+    c.signup_open = true;
+    c.env_flags.signup_set = true;
+    c.destinations = Destinations::Any;
+}
+
+#[test]
+fn unset_signup_cannot_reopen_signup_while_private_urls_are_allowed() {
+    let app = App::with(open_with_private_urls);
+    put_ok(&app, json!({"set": {"signup": "closed"}}));
+    let r = put(&app, json!({"unset": ["signup"]}));
+    assert_eq!(r.status, 409, "{}", r.text());
+    assert_eq!(
+        get(&app)["settings"]["signup"],
+        json!({"value": "closed", "source": "db"})
+    );
+    assert_eq!(
+        rows(&app.db),
+        vec![("signup".to_string(), "closed".to_string())]
+    );
+    // a PUT that leaves signup alone is not affected
+    put_ok(&app, json!({"set": {"signup_quota": 3}}));
+    // and unset is fine when it does not reopen: the env says closed
+    let app = App::with(|c| {
+        hosted_cfg(c);
+        c.destinations = Destinations::Any;
+    });
+    put_ok(&app, json!({"set": {"signup": "closed"}}));
+    put_ok(&app, json!({"unset": ["signup"]}));
+}
+
+fn locked(c: &mut Config) {
+    hosted_cfg(c);
+    c.env_flags.signup_set = true;
+    c.env_flags.signup_explicit_closed = true;
+}
+
+fn seed_row(db: &Db, key: &str, value: &str) {
+    db.with(|c| {
+        c.execute(
+            "INSERT OR REPLACE INTO settings(key, value, updated_at) VALUES(?,?,1.0)",
+            rusqlite::params![key, value],
+        )
+        .unwrap();
+    });
+}
+
+#[test]
+fn while_locked_only_closing_changes_are_accepted() {
+    let db = mem();
+    seed_row(&db, "signup", "open");
+    let app = App::on(db, locked);
+    let r = put(&app, json!({"set": {"signup": "open"}}));
+    assert_eq!(r.status, 409, "{}", r.text());
+    assert_eq!(rows(&app.db).len(), 1, "nothing written on a 409");
+    put_ok(&app, json!({"set": {"signup": "closed"}}));
+    assert_eq!(
+        rows(&app.db),
+        vec![("signup".to_string(), "closed".to_string())]
+    );
+    let v = put_ok(&app, json!({"unset": ["signup"]}));
+    assert!(rows(&app.db).is_empty());
+    assert_eq!(
+        v["settings"]["signup"],
+        json!({"value": "closed", "source": "env-locked"})
+    );
+}
+
+#[test]
+fn get_and_put_show_a_row_that_is_not_applied_as_ignored() {
+    // env-locked: the stale open row is visible and can be cleared
+    let db = mem();
+    seed_row(&db, "signup", "open");
+    let app = App::on(db, locked);
+    assert_eq!(
+        get(&app)["settings"]["signup"],
+        json!({"value": "closed", "source": "env-locked", "ignored": "open"})
+    );
+    // the PUT answer has the same shape
+    let v = put_ok(&app, json!({"set": {"signup_quota": 3}}));
+    assert_eq!(v["settings"]["signup"]["ignored"], "open");
+    assert!(v["settings"]["signup_quota"].get("ignored").is_none());
+    let v = put_ok(&app, json!({"unset": ["signup"]}));
+    assert!(v["settings"]["signup"].get("ignored").is_none());
+    // the private-URL cross-rule
+    let db = mem();
+    seed_row(&db, "signup", "open");
+    let app = App::on(db, |c| {
+        hosted_cfg(c);
+        c.destinations = Destinations::Any;
+    });
+    assert_eq!(
+        get(&app)["settings"]["signup"],
+        json!({"value": "closed", "source": "default", "ignored": "open"})
+    );
+    // a value that no longer validates; an applied row shows nothing
+    let db = mem();
+    seed_row(&db, "signup_quota", "-3");
+    seed_row(&db, "job_retention_days", "14");
+    let app = App::on(db, hosted_cfg);
+    let v = get(&app);
+    assert_eq!(v["settings"]["signup_quota"]["ignored"], "-3");
+    assert!(v["settings"]["job_retention_days"].get("ignored").is_none());
+    assert_eq!(v["settings"]["job_retention_days"]["source"], "db");
+}
+
+#[test]
+fn a_terms_version_with_control_characters_or_over_100_chars_is_refused() {
+    let app = app();
+    for version in [
+        "v1\u{1b}[2J".to_string(),
+        "v1\nsetting x".to_string(),
+        "v1\0".to_string(),
+        "a".repeat(101),
+    ] {
+        let r = put(
+            &app,
+            json!({"set": {"terms": {"version": version, "terms_url": "https://x.test/t"}}}),
+        );
+        assert_eq!(r.status, 400, "{version:?}: {}", r.text());
+    }
+    // a URL with a control character or a space inside is refused as well
+    for u in ["https://x.test/\u{1b}t", "https://x.test/a b"] {
+        let r = put(
+            &app,
+            json!({"set": {"terms": {"version": "v1", "terms_url": u}}}),
+        );
+        assert_eq!(r.status, 400, "{u:?}");
+    }
+    assert!(rows(&app.db).is_empty());
+    put_ok(
+        &app,
+        json!({"set": {"terms": {"version": "a".repeat(100), "terms_url": "https://x.test/t"}}}),
+    );
 }
 
 #[test]

@@ -813,20 +813,33 @@ impl Ctx<'_> {
     fn settings_json(&self, live: &settings::Live) -> Value {
         let cfg = self.cfg();
         let terms = live.terms.value.as_ref().map(settings::terms_json);
+        // `ignored` (only when a row exists but is not applied) is the stored value, so a stale
+        // row can be seen and cleared.
+        let entry = |key: &str, value: Value, source: settings::Source| {
+            let mut m = serde_json::Map::new();
+            m.insert("value".into(), value);
+            m.insert("source".into(), json!(source.as_str()));
+            if let Some((_, stored)) = live.ignored.iter().find(|(k, _)| *k == key) {
+                m.insert("ignored".into(), stored.clone());
+            }
+            Value::Object(m)
+        };
         json!({
             "settings": {
-                "signup": {
-                    "value": if live.signup.value { "open" } else { "closed" },
-                    "source": live.signup.source.as_str(),
-                },
-                "signup_quota": {
-                    "value": live.signup_quota.value, "source": live.signup_quota.source.as_str(),
-                },
-                "job_retention_days": {
-                    "value": live.job_retention_days.value,
-                    "source": live.job_retention_days.source.as_str(),
-                },
-                "terms": { "value": terms, "source": live.terms.source.as_str() },
+                "signup": entry(
+                    "signup",
+                    json!(if live.signup.value { "open" } else { "closed" }),
+                    live.signup.source,
+                ),
+                "signup_quota": entry(
+                    "signup_quota", json!(live.signup_quota.value), live.signup_quota.source,
+                ),
+                "job_retention_days": entry(
+                    "job_retention_days",
+                    json!(live.job_retention_days.value),
+                    live.job_retention_days.source,
+                ),
+                "terms": entry("terms", json!(terms), live.terms.source),
             },
             "env_only": {
                 "fetches_per_org": cfg.fetch_cap(),
@@ -854,7 +867,7 @@ impl Ctx<'_> {
         let env = self.cfg().env_start();
         let any = self.cfg().destinations == dispatch::Destinations::Any;
         let decide = |live: &settings::Live| {
-            let change = settings::validate_put(&body, reason.as_deref(), live, any)?;
+            let change = settings::validate_put(&body, reason.as_deref(), live, &env, any)?;
             if settings::unset_needs_reason(&change, live, &env)
                 && !settings::reason_is_enough(reason.as_deref())
             {
@@ -875,7 +888,7 @@ impl Ctx<'_> {
                 ),
                 Err(PutError::Conflict(Conflict::SignupLocked)) => jerr(
                     409,
-                    "signup is locked closed by PRINTAPI_SIGNUP=closed in the environment",
+                    "signup is locked closed by PRINTAPI_SIGNUP in the environment: only closing it is accepted",
                 ),
                 Err(PutError::Conflict(Conflict::OpenWithPrivateUrls)) => jerr(
                     409,

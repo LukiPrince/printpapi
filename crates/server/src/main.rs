@@ -18,6 +18,7 @@ use printpapi_server::mail::{self, SmtpMailer};
 use printpapi_server::server::{AppState, Config};
 use printpapi_server::settings::{
     EnvFlags, Live, parse_fetch_cap, parse_quota, parse_retention, parse_terms, py_strip,
+    signup_env_locks,
 };
 use printpapi_server::store::Db;
 use printpapi_server::{billing, http};
@@ -70,17 +71,17 @@ fn startup_warnings(live: &Live) -> Vec<&'static str> {
     }
     if live.signup_quota.value.is_none() {
         out.push(
-            "warning: PRINTAPI_SIGNUP=open without PRINTAPI_SIGNUP_QUOTA: new orgs can print without limit",
+            "warning: signup is open (PRINTAPI_SIGNUP or the operator console) without PRINTAPI_SIGNUP_QUOTA: new orgs can print without limit",
         );
     }
     if live.job_retention_days.value.is_none() {
         out.push(
-            "warning: PRINTAPI_SIGNUP=open without PRINTAPI_JOB_RETENTION_DAYS: job payloads are kept for ever",
+            "warning: signup is open (PRINTAPI_SIGNUP or the operator console) without PRINTAPI_JOB_RETENTION_DAYS: job payloads are kept for ever",
         );
     }
     if live.terms.value.is_none() {
         out.push(
-            "warning: PRINTAPI_SIGNUP=open without PRINTAPI_TERMS_VERSION: signups do not accept any terms",
+            "warning: signup is open (PRINTAPI_SIGNUP or the operator console) without PRINTAPI_TERMS_VERSION: signups do not accept any terms",
         );
     }
     out
@@ -173,11 +174,11 @@ fn config_from(env: &dyn Fn(&str) -> Option<String>) -> Result<(Config, String, 
         &env("PRINTAPI_PRIVACY_URL").unwrap_or_default(),
     )?;
     // Which of the live settings' variables are set at all: it decides a value's source and
-    // whether an explicit `PRINTAPI_SIGNUP=closed` locks signup shut.
+    // whether `PRINTAPI_SIGNUP` locks signup shut (any value but `open`).
     let set = |k: &str| env(k).is_some_and(|v| !py_strip(&v).is_empty());
     cfg.env_flags = EnvFlags {
         signup_set: env("PRINTAPI_SIGNUP").is_some(),
-        signup_explicit_closed: env("PRINTAPI_SIGNUP").is_some_and(|v| py_strip(&v) == "closed"),
+        signup_explicit_closed: env("PRINTAPI_SIGNUP").is_some_and(|v| signup_env_locks(&v)),
         signup_quota_set: set("PRINTAPI_SIGNUP_QUOTA"),
         job_retention_days_set: set("PRINTAPI_JOB_RETENTION_DAYS"),
         terms_set: set("PRINTAPI_TERMS_VERSION"),
@@ -494,6 +495,50 @@ mod live_tests {
     }
 
     #[test]
+    fn any_signup_value_but_open_locks_signup_shut() {
+        for v in [
+            "closed",
+            "CLOSED",
+            "Closed",
+            "off",
+            "0",
+            "closd",
+            "\"closed\"",
+            "no",
+        ] {
+            let c = cfg(&[("PRINTAPI_SIGNUP", v)]);
+            assert!(
+                c.env_flags.signup_set && c.env_flags.signup_explicit_closed,
+                "{v:?}"
+            );
+            assert!(!c.signup_open, "{v:?} never opens signup");
+        }
+        // padding does not matter, blank is unset, `open` opens and never locks
+        let f = cfg(&[("PRINTAPI_SIGNUP", "  closed ")]).env_flags;
+        assert!(f.signup_explicit_closed);
+        for v in ["", "   "] {
+            let f = cfg(&[("PRINTAPI_SIGNUP", v)]).env_flags;
+            assert!(!f.signup_explicit_closed, "{v:?}");
+        }
+        let c = cfg(&[("PRINTAPI_SIGNUP", "open")]);
+        assert!(c.signup_open && !c.env_flags.signup_explicit_closed);
+    }
+
+    #[test]
+    fn a_terms_version_with_a_control_character_stops_the_server() {
+        let vars = [
+            ("PRINTAPI_TERMS_VERSION", "v1\u{1b}[2J"),
+            ("PRINTAPI_TERMS_URL", "https://x.test/t"),
+        ];
+        let mut all: Vec<(String, String)> = vec![("PRINTAPI_TOKEN".into(), "root".into())];
+        all.extend(vars.iter().map(|(k, v)| (k.to_string(), v.to_string())));
+        let e = config_from(&|k| all.iter().rfind(|(n, _)| n == k).map(|(_, v)| v.clone()))
+            .unwrap_err();
+        assert!(e.contains("PRINTAPI_TERMS_VERSION"), "{e:?}");
+        assert!(!e.contains('\u{1b}'), "{e:?}");
+    }
+
+    #[test]
     fn the_open_signup_warnings_read_the_effective_values() {
         let c = cfg(&[]);
         let mut live = printpapi_server::settings::build_live(&c.env_start(), false, &[]).0;
@@ -504,6 +549,12 @@ mod live_tests {
             source: Source::Db,
         };
         assert_eq!(startup_warnings(&live).len(), 3);
+        // the cause may be the console, so no warning blames the variable alone
+        for w in startup_warnings(&live) {
+            assert!(w.starts_with("warning: signup is open"), "{w}");
+            assert!(!w.contains("PRINTAPI_SIGNUP=open"), "{w}");
+            assert!(w.contains("operator console"), "{w}");
+        }
         // an override that supplies them silences the warning
         live.signup_quota.value = Some(5);
         live.job_retention_days.value = Some(30);

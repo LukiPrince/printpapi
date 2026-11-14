@@ -8,7 +8,7 @@ use common::*;
 use printpapi_server::dispatch::{Destinations, Fetcher, HttpFetcher};
 use printpapi_server::proxy::TrustedProxies;
 use printpapi_server::server::{AppState, Config, Terms, retention_pass};
-use printpapi_server::settings::{Change, Parsed, Source};
+use printpapi_server::settings::{Change, Parsed, Source, signup_env_locks};
 use printpapi_server::store::{self, DEFAULT_ORG, Db};
 use serde_json::{Value, json};
 use std::sync::Arc;
@@ -323,6 +323,38 @@ fn an_explicit_env_closed_beats_a_database_open_across_a_restart() {
     // the same DB with a plain (unset) env is open again: unset is not a lock
     let app = App::on(db, hosted_cfg);
     assert_eq!(health(&app)["signup"], "open");
+}
+
+#[test]
+fn a_near_miss_of_closed_in_the_env_is_a_lock_across_a_restart() {
+    for value in ["CLOSED", "off", "closd"] {
+        let db = mem();
+        seed(&db, &[("signup", "open")]);
+        let app = App::on(db, |c| {
+            hosted_cfg(c);
+            c.env_flags.signup_set = true;
+            c.env_flags.signup_explicit_closed = signup_env_locks(value);
+        });
+        assert_eq!(health(&app)["signup"], "closed", "{value}");
+        assert_eq!(signup(&app, good()).0, 403, "{value}");
+        assert_eq!(app.state.live().signup.source, Source::EnvLocked, "{value}");
+    }
+}
+
+#[test]
+fn a_terms_row_with_a_control_character_is_ignored_at_startup() {
+    let db = mem();
+    seed(
+        &db,
+        &[(
+            "terms",
+            &json!({"version": "v1\u{1b}[2J", "terms_url": "https://x.test/t"}).to_string(),
+        )],
+    );
+    let app = App::on(db, hosted_cfg);
+    assert_eq!(app.state.live().terms.value, None);
+    assert_eq!(app.state.live().terms.source, Source::Default);
+    assert_eq!(health(&app)["terms"], Value::Null);
 }
 
 #[test]
