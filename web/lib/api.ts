@@ -160,10 +160,15 @@ async function request(path: string, init: RequestInit = {}, token = getToken())
     headers: { ...init.headers, Authorization: `Bearer ${token}` },
   });
   if (res.status === 401) {
-    // /apikeys and /users need an account (or the bootstrap token), so a 401 there is "this
-    // credential cannot manage the org", not "session dead". Only a rejected token on a client
-    // endpoint signs you out.
-    if (!path.startsWith("/apikeys") && !path.startsWith("/users") && !path.startsWith("/orgs")) {
+    // /apikeys, /users, /orgs and /support-access need an account (or the bootstrap token), so a
+    // 401 there is "this credential cannot manage the org", not "session dead". Only a rejected
+    // token on a client endpoint signs you out.
+    if (
+      !path.startsWith("/apikeys") &&
+      !path.startsWith("/users") &&
+      !path.startsWith("/orgs") &&
+      !path.startsWith("/support-access")
+    ) {
       window.dispatchEvent(new CustomEvent(UNAUTHORIZED_EVENT));
     }
     throw new ApiError(401, "unauthorized");

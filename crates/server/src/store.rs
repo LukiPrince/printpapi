@@ -3327,15 +3327,22 @@ pub fn support_org_jobs(
     Ok(Outcome::Done(jobs))
 }
 
-/// The grants of the org's current generation, newest first (at most 50), with the job ids the
-/// operator listed and opened under each, from the audit rows.
+/// The grants of the org's current generation, newest first, with the job ids the operator
+/// listed and opened under each, from the audit rows. Every grant that was used (`reads > 0`) is
+/// in it; of the unused ones only the 50 newest, so a run of empty grants cannot push an access
+/// out of the customer's view.
+// ponytail: no cap on used grants; each is at most an hour of reads, so the list grows slowly.
 pub fn support_grants_of_org(conn: &Connection, org_id: i64) -> Result<Vec<SupportGrantRow>> {
     let mut st = conn.prepare_cached(&format!(
         "SELECT g.id, g.reason, g.granted_at, g.expires_at, g.ended_at, COALESCE({ACTIVE_GRANT}, 0) \
          FROM support_grants g \
          WHERE g.org_id = :org \
            AND g.org_created_at = (SELECT o.created_at FROM orgs o WHERE o.id = g.org_id) \
-         ORDER BY g.id DESC LIMIT 50"
+           AND (g.reads > 0 OR g.id IN ( \
+             SELECT u.id FROM support_grants u \
+             WHERE u.org_id = :org AND u.org_created_at = g.org_created_at AND u.reads = 0 \
+             ORDER BY u.id DESC LIMIT 50)) \
+         ORDER BY g.id DESC"
     ))?;
     let mut grants: Vec<SupportGrantRow> = st
         .query_map(named_params! {":org": org_id, ":now": crate::now()}, |r| {

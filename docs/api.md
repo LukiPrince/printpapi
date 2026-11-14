@@ -377,9 +377,10 @@ curl -s -X PUT localhost:3460/orgs/2 -H 'Authorization: Bearer <PRINTAPI_TOKEN>'
 
 ### Support access
 
-`GET /support-access` is what the dashboard's "Support access" card reads: every time the operator
+`GET /support-access` is what the dashboard's "Support access" card reads: the times the operator
 of a hosted deployment was [granted access](operator.md#support-access) to the caller's org, newest
-first (at most 50), for the org's current generation only.
+first and for the org's current generation only. Every grant that was used is listed; of the
+unused ones, the 50 newest.
 
 ```json
 { "enabled": true,

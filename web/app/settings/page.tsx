@@ -41,6 +41,8 @@ export default function SettingsPage() {
   const { data: org, refresh } = usePoll(
     useCallback(() => (chosen === null ? Promise.resolve(null) : getOrg(chosen)), [chosen]),
     0,
+    true,
+    chosen,
   );
   // Root names the org; a session's own is implied and a foreign ?org= would be refused.
   const { data: support } = usePoll(
@@ -50,6 +52,8 @@ export default function SettingsPage() {
       [chosen, isRoot],
     ),
     0,
+    true,
+    `${chosen}/${isRoot}`,
   );
   // Empty on a server without a plan catalogue — then the whole billing card stays hidden.
   const { data: catalogue } = usePoll(useCallback(() => listPlans(), []), 0);

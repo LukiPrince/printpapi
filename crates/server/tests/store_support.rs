@@ -507,6 +507,29 @@ fn the_customer_list_stops_at_50_and_an_expired_grant_is_not_active() {
     assert!(rows.iter().all(|r| !r.active));
 }
 
+/// A grant that was used never drops out of the customer's view, however many unused ones follow:
+/// otherwise 50 empty grants in a row would hide an access from the customer.
+#[test]
+fn a_used_grant_stays_in_the_customer_list_behind_50_unused_ones() {
+    let conn = db();
+    let (org, _) = org_with_printer(&conn, "acme");
+    let c = created(&conn, org).unwrap();
+    let used = raw_grant(&conn, org, c, 5.0, Some(4.0));
+    conn.execute("UPDATE support_grants SET reads = 1 WHERE id = ?", [used])
+        .unwrap();
+    for i in 0..60 {
+        raw_grant(&conn, org, c, 10.0 + i as f64, Some(5.0));
+    }
+    let rows = support_grants_of_org(&conn, org).unwrap();
+    assert_eq!(
+        rows.len(),
+        51,
+        "the 50 newest unused grants and the used one"
+    );
+    assert_eq!(rows.last().map(|r| r.id), Some(used));
+    assert!(rows.windows(2).all(|w| w[0].id > w[1].id));
+}
+
 #[test]
 fn deleting_an_org_removes_its_grants_and_keeps_the_audit_rows() {
     let conn = db();

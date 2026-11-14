@@ -12,13 +12,24 @@ type PollState<T> = {
 /**
  * Fetch on mount, then re-fetch every `intervalMs` while `enabled`. Errors are
  * kept but stale data stays on screen, so a blip does not blank the dashboard.
+ *
+ * `key` names what the fetcher fetches (an org id, say). The fetcher itself is no
+ * dependency (see below), so a fetcher that changes with its inputs must pass them
+ * as `key`: a new key fetches at once and drops the old data, so one org's answer
+ * never shows under another's name.
  */
-export function usePoll<T>(fetcher: () => Promise<T>, intervalMs = 5000, enabled = true): PollState<T> {
+export function usePoll<T>(
+  fetcher: () => Promise<T>,
+  intervalMs = 5000,
+  enabled = true,
+  key: string | number | null = null,
+): PollState<T> {
   const [data, setData] = useState<T>();
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [tick, setTick] = useState(0);
   const ref = useRef(fetcher);
+  const fetchedKey = useRef(key);
 
   const refresh = useCallback(() => setTick((t) => t + 1), []);
 
@@ -30,6 +41,11 @@ export function usePoll<T>(fetcher: () => Promise<T>, intervalMs = 5000, enabled
 
   useEffect(() => {
     let alive = true;
+    if (fetchedKey.current !== key) {
+      fetchedKey.current = key;
+      setData(undefined);
+      setLoading(true);
+    }
     const run = async () => {
       try {
         const next = await ref.current();
@@ -50,7 +66,7 @@ export function usePoll<T>(fetcher: () => Promise<T>, intervalMs = 5000, enabled
       alive = false;
       clearInterval(id);
     };
-  }, [intervalMs, enabled, tick]);
+  }, [intervalMs, enabled, tick, key]);
 
   return { data, error, loading, refresh };
 }
