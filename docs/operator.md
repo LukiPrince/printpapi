@@ -100,7 +100,7 @@ callback, idempotency key, key secret or password hash.
   "orgs": 41, "orgs_active_7d": 17, "signups_7d": 3,
   "jobs_this_month": 5120, "failed_jobs_30d": 12,
   "jobs_today": {"queued": 0, "claimed": 1, "done": 188, "failed": 2, "cancelled": 0},
-  "server": {"version": "3.5.0", "uptime_s": 86400},
+  "server": {"version": "3.6.0", "uptime_s": 86400},
   "db": {"size_bytes": 12582912, "wal_bytes": 0},
   "retention": {"last_pass_at": 1760000000.0, "abandoned": 0, "scrubbed": 14, "deleted": 0},
   "features": ["support", "settings"]
