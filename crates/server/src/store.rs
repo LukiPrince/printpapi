@@ -396,6 +396,11 @@ CREATE TABLE IF NOT EXISTS operator_audit(
   id INTEGER PRIMARY KEY AUTOINCREMENT, at REAL NOT NULL, actor TEXT NOT NULL,
   action TEXT NOT NULL, org_id INTEGER, org_created_at REAL, target TEXT, reason TEXT,
   detail TEXT);
+-- An org the operator has locked (a pure flag: quota and plan untouched). `org_created_at` keeps a
+-- reused org id apart from its predecessor. A table of its own, like operator_audit.
+CREATE TABLE IF NOT EXISTS org_locks(
+  org_id INTEGER PRIMARY KEY, org_created_at REAL NOT NULL, reason TEXT NOT NULL,
+  locked_at REAL NOT NULL);
 ";
 
 const MIGRATIONS: &[&str] = &[
@@ -433,6 +438,13 @@ CREATE INDEX IF NOT EXISTS agents_org ON agents(org_id);
 CREATE INDEX IF NOT EXISTS jobs_state_finished ON jobs(state, finished_at);
 -- the operator overview counts jobs of this month, today and the last week across all orgs
 CREATE INDEX IF NOT EXISTS jobs_created ON jobs(created_at);
+-- the operator's org list and job list look at one org's jobs by id and by state; the three after
+-- them are the per-org counts and e-mail lookups next to them
+CREATE INDEX IF NOT EXISTS jobs_org ON jobs(org_id);
+CREATE INDEX IF NOT EXISTS jobs_org_state ON jobs(org_id, state);
+CREATE INDEX IF NOT EXISTS printers_org ON printers(org_id);
+CREATE INDEX IF NOT EXISTS users_org ON users(org_id);
+CREATE INDEX IF NOT EXISTS terms_org ON terms_acceptances(org_id, accepted_at);
 ";
 
 /// The oldest queued job of one agent that has not passed its deadline (`?1` agent, `?2` now).
@@ -2298,6 +2310,366 @@ pub fn list_audit(
         },
     )?;
     Ok(rows.collect::<std::result::Result<_, _>>()?)
+}
+
+// --- operator reads: orgs and their jobs --------------------------------------------------------
+//
+// Metadata only. None of these statements selects a payload, title, callback URL, idempotency
+// key, key hash, password hash or the Shopify secret, so none of them can leak one.
+
+/// One org as the console lists it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct OperatorOrg {
+    pub id: i64,
+    pub name: String,
+    pub created_at: f64,
+    pub plan: Option<String>,
+    pub job_quota: Option<i64>,
+    pub jobs_this_month: i64,
+    pub queued_jobs: i64,
+    pub failed_today: i64,
+    pub last_job_at: Option<f64>,
+    pub agents_online: i64,
+    pub agents_total: i64,
+    pub newest_agent_seen_at: Option<f64>,
+    pub printers: i64,
+    pub locked: bool,
+    pub first_user_email: Option<String>,
+    pub terms_version: Option<String>,
+    pub terms_accepted_at: Option<f64>,
+    /// `locked` | `new` | `idle` | `active`
+    pub status: String,
+}
+
+/// The status values `GET /operator/orgs?status=` takes.
+pub const ORG_STATUSES: [&str; 4] = ["locked", "new", "idle", "active"];
+
+/// Orgs with their numbers, by id. Every subquery is correlated on `org_id`, so each one is an
+/// index lookup per org (`jobs_org`, `jobs_org_state`, `jobs_org_created`, `agents_org`,
+/// `printers_org`, `users_org`, `terms_org`): the cost is the page size, not the size of `jobs`.
+/// `:status` filters on the derived status, which needs the numbers, so a filtered page computes
+/// them for every org it passes over (ponytail: fine for thousands of orgs; past that, store the
+/// status). `:q` is a LIKE pattern (backslash escapes) or NULL; `:only` an org id or NULL.
+const OPERATOR_ORG_LIST_SQL: &str = r"
+SELECT * FROM (
+  SELECT *,
+    CASE WHEN locked THEN 'locked'
+         WHEN created_at >= :new_since THEN 'new'
+         WHEN last_job_at IS NULL OR last_job_at < :idle_since THEN 'idle'
+         ELSE 'active' END AS status
+  FROM (
+    SELECT o.id, o.name, o.created_at, o.plan, o.job_quota,
+      (SELECT COUNT(*) FROM jobs j WHERE j.org_id = o.id AND j.created_at >= :month) AS jobs_this_month,
+      (SELECT COUNT(*) FROM jobs j WHERE j.org_id = o.id AND j.state = 'queued') AS queued_jobs,
+      (SELECT COUNT(*) FROM jobs j WHERE j.org_id = o.id AND j.created_at >= :today
+         AND j.state = 'failed') AS failed_today,
+      (SELECT MAX(j.created_at) FROM jobs j WHERE j.org_id = o.id) AS last_job_at,
+      (SELECT COUNT(*) FROM agents a WHERE a.org_id = o.id
+         AND a.last_seen_at >= :online_since) AS agents_online,
+      (SELECT COUNT(*) FROM agents a WHERE a.org_id = o.id) AS agents_total,
+      (SELECT MAX(a.last_seen_at) FROM agents a WHERE a.org_id = o.id) AS newest_agent_seen_at,
+      (SELECT COUNT(*) FROM printers p WHERE p.org_id = o.id) AS printers,
+      EXISTS(SELECT 1 FROM org_locks l WHERE l.org_id = o.id) AS locked,
+      (SELECT u.email FROM users u WHERE u.org_id = o.id AND u.email IS NOT NULL
+         ORDER BY u.id LIMIT 1) AS first_user_email,
+      (SELECT t.version FROM terms_acceptances t WHERE t.org_id = o.id
+         ORDER BY t.accepted_at DESC, t.id DESC LIMIT 1) AS terms_version,
+      (SELECT MAX(t.accepted_at) FROM terms_acceptances t WHERE t.org_id = o.id) AS terms_accepted_at
+    FROM orgs o
+    WHERE o.id > :after AND (:only IS NULL OR o.id = :only)
+      AND (:q IS NULL OR o.name LIKE :q ESCAPE '\'
+           OR EXISTS(SELECT 1 FROM users u WHERE u.org_id = o.id AND u.email LIKE :q ESCAPE '\'))
+  )
+) WHERE (:status IS NULL OR status = :status)
+ORDER BY id LIMIT :limit";
+
+/// What `operator_list_orgs` filters and pages by. `after` is the last org id of the previous page.
+#[derive(Debug, Clone, Default)]
+pub struct OrgQuery<'a> {
+    pub status: Option<&'a str>,
+    /// A plain search string: matched against org names and user e-mails, `%` and `_` literal.
+    pub q: Option<&'a str>,
+    pub after: i64,
+    pub only: Option<i64>,
+    pub limit: i64,
+}
+
+fn like_pattern(q: &str) -> String {
+    let mut p = String::from("%");
+    for c in q.chars() {
+        if matches!(c, '%' | '_' | '\\') {
+            p.push('\\');
+        }
+        p.push(c);
+    }
+    p.push('%');
+    p
+}
+
+fn operator_org(r: &Row) -> rusqlite::Result<OperatorOrg> {
+    Ok(OperatorOrg {
+        id: r.get("id")?,
+        name: r.get("name")?,
+        created_at: r.get("created_at")?,
+        plan: r.get("plan")?,
+        job_quota: r.get("job_quota")?,
+        jobs_this_month: r.get("jobs_this_month")?,
+        queued_jobs: r.get("queued_jobs")?,
+        failed_today: r.get("failed_today")?,
+        last_job_at: r.get("last_job_at")?,
+        agents_online: r.get("agents_online")?,
+        agents_total: r.get("agents_total")?,
+        newest_agent_seen_at: r.get("newest_agent_seen_at")?,
+        printers: r.get("printers")?,
+        locked: r.get("locked")?,
+        first_user_email: r.get("first_user_email")?,
+        terms_version: r.get("terms_version")?,
+        terms_accepted_at: r.get("terms_accepted_at")?,
+        status: r.get("status")?,
+    })
+}
+
+/// Orgs for `GET /operator/orgs`, by id, at most `query.limit`.
+pub fn operator_list_orgs(
+    conn: &Connection,
+    now: f64,
+    online_window_s: f64,
+    query: &OrgQuery,
+) -> Result<Vec<OperatorOrg>> {
+    const DAY: f64 = 86_400.0;
+    let q = query.q.map(like_pattern);
+    let mut st = conn.prepare_cached(OPERATOR_ORG_LIST_SQL)?;
+    let rows = st.query_map(
+        named_params! {
+            ":new_since": now - 7.0 * DAY,
+            ":idle_since": now - 14.0 * DAY,
+            ":month": month_start(now),
+            ":today": (now / DAY).floor() * DAY,
+            ":online_since": now - online_window_s,
+            ":after": query.after,
+            ":only": query.only,
+            ":q": q,
+            ":status": query.status,
+            ":limit": query.limit,
+        },
+        operator_org,
+    )?;
+    Ok(rows.collect::<rusqlite::Result<_>>()?)
+}
+
+/// One org with the same numbers as the list.
+pub fn operator_get_org(
+    conn: &Connection,
+    now: f64,
+    online_window_s: f64,
+    org_id: i64,
+) -> Result<Option<OperatorOrg>> {
+    let q = OrgQuery {
+        only: Some(org_id),
+        after: i64::MIN,
+        limit: 1,
+        ..Default::default()
+    };
+    Ok(operator_list_orgs(conn, now, online_window_s, &q)?.pop())
+}
+
+/// Jobs of one org per UTC day since `since` (the start of the month): (day index, jobs, failed).
+pub fn org_jobs_by_day(conn: &Connection, org_id: i64, since: f64) -> Result<Vec<(i64, i64, i64)>> {
+    let mut st = conn.prepare_cached(
+        "SELECT CAST((created_at - :since) / 86400 AS INTEGER) AS day, COUNT(*), \
+         SUM(state = 'failed') FROM jobs WHERE org_id = :org AND created_at >= :since \
+         GROUP BY day ORDER BY day",
+    )?;
+    let rows = st.query_map(named_params! {":org": org_id, ":since": since}, |r| {
+        Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+    })?;
+    Ok(rows.collect::<rusqlite::Result<_>>()?)
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct OperatorUser {
+    pub id: i64,
+    pub email: String,
+    pub created_at: f64,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct OperatorKey {
+    pub id: i64,
+    pub label: String,
+    pub active: bool,
+    pub created_at: f64,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct OperatorPrinter {
+    pub id: i64,
+    pub name: String,
+    pub can_pdf: bool,
+    pub state: String,
+    pub agent_id: i64,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct OperatorLock {
+    pub reason: String,
+    pub locked_at: f64,
+}
+
+/// The lists of the org detail, apart from agents (`list_agents`).
+pub struct OrgParts {
+    pub users: Vec<OperatorUser>,
+    pub printers: Vec<OperatorPrinter>,
+    pub keys: Vec<OperatorKey>,
+    /// (version, accepted_at), oldest first.
+    pub terms: Vec<(String, f64)>,
+    pub lock: Option<OperatorLock>,
+}
+
+pub fn operator_org_parts(conn: &Connection, org_id: i64) -> Result<OrgParts> {
+    let mut st = conn.prepare_cached(
+        "SELECT id, email, created_at FROM users WHERE org_id = ? AND email IS NOT NULL ORDER BY id",
+    )?;
+    let users = st
+        .query_map([org_id], |r| {
+            Ok(OperatorUser {
+                id: r.get(0)?,
+                email: r.get(1)?,
+                created_at: r.get(2)?,
+            })
+        })?
+        .collect::<rusqlite::Result<_>>()?;
+    let mut st = conn.prepare_cached(
+        "SELECT id, name, can_pdf, state, agent_id FROM printers WHERE org_id = ? ORDER BY id",
+    )?;
+    let printers = st
+        .query_map([org_id], |r| {
+            Ok(OperatorPrinter {
+                id: r.get(0)?,
+                name: r.get(1)?,
+                can_pdf: r.get(2)?,
+                state: r.get(3)?,
+                agent_id: r.get(4)?,
+            })
+        })?
+        .collect::<rusqlite::Result<_>>()?;
+    let mut st = conn.prepare_cached(
+        "SELECT id, label, active, created_at FROM api_keys WHERE org_id = ? ORDER BY id",
+    )?;
+    let keys = st
+        .query_map([org_id], |r| {
+            Ok(OperatorKey {
+                id: r.get(0)?,
+                label: r.get(1)?,
+                active: r.get(2)?,
+                created_at: r.get(3)?,
+            })
+        })?
+        .collect::<rusqlite::Result<_>>()?;
+    let mut st = conn.prepare_cached(
+        "SELECT version, accepted_at FROM terms_acceptances WHERE org_id = ? \
+         ORDER BY accepted_at, id",
+    )?;
+    let terms = st
+        .query_map([org_id], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+    let lock = conn
+        .query_row(
+            "SELECT reason, locked_at FROM org_locks WHERE org_id = ?",
+            [org_id],
+            |r| {
+                Ok(OperatorLock {
+                    reason: r.get(0)?,
+                    locked_at: r.get(1)?,
+                })
+            },
+        )
+        .optional()?;
+    Ok(OrgParts {
+        users,
+        printers,
+        keys,
+        terms,
+        lock,
+    })
+}
+
+/// One job as the operator sees it: metadata, never the content.
+#[derive(Debug, Clone, PartialEq)]
+pub struct OperatorJob {
+    pub id: i64,
+    pub created_at: f64,
+    pub claimed_at: Option<f64>,
+    pub finished_at: Option<f64>,
+    pub type_: String,
+    pub mode: String,
+    pub state: String,
+    pub printer_id: i64,
+    pub printer_name: Option<String>,
+    pub copies: i64,
+    pub error: Option<String>,
+}
+
+/// Newest first by id (`jobs_org` is ordered by id within an org, so there is no sort).
+const OPERATOR_ORG_JOBS_SQL: &str = "
+SELECT j.id, j.created_at, j.claimed_at, j.finished_at, j.type, j.mode, j.state, j.printer_id,
+       p.name, j.copies, j.error
+FROM jobs j LEFT JOIN printers p ON p.id = j.printer_id
+WHERE j.org_id = :org AND (:before IS NULL OR j.id < :before)
+ORDER BY j.id DESC LIMIT :limit";
+
+pub fn operator_org_jobs(
+    conn: &Connection,
+    org_id: i64,
+    before_id: Option<i64>,
+    limit: i64,
+) -> Result<Vec<OperatorJob>> {
+    let mut st = conn.prepare_cached(OPERATOR_ORG_JOBS_SQL)?;
+    let rows = st.query_map(
+        named_params! {":org": org_id, ":before": before_id, ":limit": limit},
+        |r| {
+            Ok(OperatorJob {
+                id: r.get(0)?,
+                created_at: r.get(1)?,
+                claimed_at: r.get(2)?,
+                finished_at: r.get(3)?,
+                type_: r.get(4)?,
+                mode: r.get(5)?,
+                state: r.get(6)?,
+                printer_id: r.get(7)?,
+                printer_name: r.get(8)?,
+                copies: r.get(9)?,
+                error: r.get(10)?,
+            })
+        },
+    )?;
+    Ok(rows.collect::<rusqlite::Result<_>>()?)
+}
+
+fn explain(conn: &Connection, sql: &str, p: impl rusqlite::Params) -> Result<Vec<String>> {
+    let mut st = conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}"))?;
+    let rows = st.query_map(p, |r| r.get::<_, String>(3))?;
+    Ok(rows.collect::<rusqlite::Result<_>>()?)
+}
+
+/// The query plan of the org list (for the test that keeps it on indexes).
+pub fn explain_operator_org_list(conn: &Connection) -> Result<Vec<String>> {
+    explain(
+        conn,
+        OPERATOR_ORG_LIST_SQL,
+        named_params! {
+            ":new_since": 0, ":idle_since": 0, ":month": 0, ":today": 0, ":online_since": 0,
+            ":after": 0, ":only": None::<i64>, ":q": "%a%", ":status": "active", ":limit": 50,
+        },
+    )
+}
+
+pub fn explain_operator_org_jobs(conn: &Connection) -> Result<Vec<String>> {
+    explain(
+        conn,
+        OPERATOR_ORG_JOBS_SQL,
+        named_params! {":org": 1, ":before": None::<i64>, ":limit": 50},
+    )
 }
 
 /// The numbers of `GET /operator/overview` that come from the tables.

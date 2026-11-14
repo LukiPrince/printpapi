@@ -6,7 +6,8 @@ as numbers, an audit log) and nothing in it is specific to one business. **It is
 `PRINTAPI_OPERATOR_TOKEN` is set**: with the token unset, every path under `/operator/` answers
 `404`, as if the API did not exist.
 
-This page covers the gate, hosted mode, the audit log and the read endpoints available so far.
+This page covers the gate, hosted mode, the audit log and the read endpoints available so far
+(overview, orgs and their jobs).
 
 ## The gate
 
@@ -109,3 +110,65 @@ callback, idempotency key, key secret or password hash.
 `jobs_today` is the current UTC day. `retention` is `null` fields until the first pass has run.
 `features` lists the optional sections this server offers, so a console can hide the ones an older
 server lacks. The answer is cached for 10 seconds.
+
+## Orgs and their jobs
+
+Metadata only. Never in any answer: a job's payload, title, callback URL or idempotency key, an
+API or agent key (nor its hash), a password hash, or an org's Shopify secret. All three are `GET`
+only, and an org that does not exist (or an id that is not a number) answers `404`.
+
+### `GET /operator/orgs`
+
+Query: `status` (`locked`, `new`, `idle` or `active`), `q`, `limit` (default 50, at most 200),
+`after`. Ordered by org id, oldest first.
+
+- `q` matches a part of the org name or of a user's e-mail address. `%` and `_` mean themselves.
+  Case is ignored for ASCII letters only (SQLite `LIKE`).
+- `status` is derived, in this order: `locked` (the org has a lock), `new` (created less than 7
+  days ago), `idle` (no job in the last 14 days, or never one), otherwise `active`.
+- `after` is the `next_after` of the previous page; `next_after` is `null` on the last page.
+  A parameter that is not an integer, or an unknown `status`, answers `400`.
+
+```json
+{
+  "orgs": [
+    {"id": 3, "name": "Acme", "created_at": 1750000000.0, "plan": "pro", "job_quota": 500,
+     "jobs_this_month": 212, "queued_jobs": 0, "failed_today": 1, "last_job_at": 1760000000.0,
+     "agents_online": 1, "agents_total": 2, "newest_agent_seen_at": 1760000100.0, "printers": 3,
+     "locked": false, "first_user_email": "boss@acme.example",
+     "terms_version": "2026-11", "terms_accepted_at": 1750000000.0, "status": "active"}
+  ],
+  "next_after": null
+}
+```
+
+`job_quota` is `null` for unlimited. `jobs_this_month` is the current UTC month, `failed_today`
+counts jobs created today (UTC) that failed, `queued_jobs` all jobs still queued. An agent is
+online when it polled in the last minute. The statement
+runs on indexes only (one lookup per org), so a page costs its size, not the size of `jobs`. A
+`status` filter computes the numbers of every org it passes over.
+
+### `GET /operator/orgs/{id}`
+
+The row above plus:
+
+| Field | Content |
+|---|---|
+| `usage_by_day` | every UTC day of the **current month** up to today: `{date, jobs, failed}`. Earlier months are not offered: with job retention they would be incomplete |
+| `users` | `id`, `email`, `created_at` |
+| `agents` | `id`, `name`, `last_seen_at`, `online` |
+| `printers` | `id`, `name`, `can_pdf`, `state`, `agent_id` |
+| `keys` | `id`, `label`, `active`, `created_at`: the key itself is never shown |
+| `terms` | the acceptance history, oldest first: `version`, `accepted_at` |
+| `lock` | `null`, or `{reason, locked_at}` while the org is locked |
+
+### `GET /operator/orgs/{id}/jobs`
+
+Query: `limit` (default 50, at most 200), `before_id`. Newest first by id. Each job has `id`,
+`created_at`, `claimed_at`, `finished_at`, `type`, `mode`, `state`, `printer_id`, `printer_name`,
+`copies` and `error`. `next_before_id` is the id to pass as `before_id` for the next page, `null`
+on the last one.
+
+The reads add indexes (`jobs(org_id)`, `jobs(org_id, state)` and three small ones) to an existing
+database at startup. They are additive and the Python server of v2.x ignores them. The `org_locks`
+table that holds the lock row is created empty; locking itself comes with the write endpoints.

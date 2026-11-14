@@ -454,6 +454,10 @@ fn a_python_database_gets_the_operator_audit_table_and_the_python_tables_stay_as
             "detail"
         ]
     );
+    assert_eq!(
+        columns(&path, "org_locks"),
+        ["org_id", "org_created_at", "reason", "locked_at"]
+    );
     // the new table adds nothing to a table Python knows beyond the old migrations
     for (t, was) in python_tables.iter().zip(&before) {
         let now = columns(&path, t);

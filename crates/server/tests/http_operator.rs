@@ -550,3 +550,565 @@ fn overview_is_cached_for_ten_seconds() {
     assert_eq!(first["orgs"], 1);
     assert_eq!(second, first);
 }
+
+// --- read: orgs and their jobs ----------------------------------------------------------------------
+
+const DAY: f64 = 86_400.0;
+
+fn now() -> f64 {
+    printpapi_server::now()
+}
+
+fn sql(db: &Db, q: &str, p: impl rusqlite::Params) {
+    db.with(|c| c.execute(q, p).unwrap());
+}
+
+/// A self-signup the way /signup makes one: org, first user, accepted terms. Returns the org id.
+fn signup(db: &Db, name: &str, email: &str, terms: Option<&str>) -> i64 {
+    db.with(|c| store::signup(c, name, email, "PWHASHSENTINEL", None, terms))
+        .unwrap()
+        .org_id
+}
+
+fn age_org(db: &Db, org: i64, days: f64) {
+    sql(
+        db,
+        "UPDATE orgs SET created_at=? WHERE id=?",
+        rusqlite::params![now() - days * DAY, org],
+    );
+}
+
+/// A job of `org` on its printer (made on first use), created `ago` seconds ago.
+fn job_at(app: &App, org: i64, ago: f64, tweak: impl FnOnce(&mut store::NewJob<'_>)) -> i64 {
+    let existing = app
+        .db
+        .with(|c| {
+            c.query_row(
+                "SELECT id FROM printers WHERE org_id=? LIMIT 1",
+                [org],
+                |r| r.get::<_, i64>(0),
+            )
+        })
+        .ok();
+    let pid = match existing {
+        Some(p) => p,
+        None => register(
+            &app.db,
+            &format!("pc{org}"),
+            &format!("agent-key-{org}"),
+            &[decl("Z", false)],
+            org,
+        )
+        .pid("Z"),
+    };
+    let id = enqueue(&app.db, pid, b"PAYLOADSENTINEL", |j| {
+        j.org_id = Some(org);
+        tweak(j)
+    });
+    sql(
+        &app.db,
+        "UPDATE jobs SET created_at=? WHERE id=?",
+        rusqlite::params![now() - ago, id],
+    );
+    id
+}
+
+fn org_row(v: &Value, id: i64) -> &Value {
+    v["orgs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|o| o["id"] == id)
+        .unwrap_or_else(|| panic!("org {id} not in {v}"))
+}
+
+fn names(v: &Value) -> Vec<String> {
+    v["orgs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|o| o["name"].as_str().unwrap().to_string())
+        .collect()
+}
+
+fn ids_of(v: &Value, key: &str) -> Vec<i64> {
+    v[key]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|o| o["id"].as_i64().unwrap())
+        .collect()
+}
+
+#[test]
+fn org_read_endpoints_need_the_gate_and_are_get_only() {
+    let app = hosted();
+    for t in [
+        "/operator/orgs",
+        "/operator/orgs/1",
+        "/operator/orgs/1/jobs",
+    ] {
+        assert_eq!(app.call("GET", t).socket(CONSOLE).send().status, 401, "{t}");
+        assert_eq!(
+            app.call("GET", t).bearer("t").socket(CONSOLE).send().status,
+            401,
+            "{t}"
+        );
+        assert_eq!(op(&app, "DELETE", t).send().status, 404, "DELETE {t}");
+    }
+    let r = op(&app, "GET", "/operator/orgs").send();
+    assert_eq!(r.status, 200, "{}", r.text());
+    assert_eq!(r.header("cache-control"), Some("no-store"));
+}
+
+#[test]
+fn org_list_has_every_field_with_its_numbers() {
+    let app = hosted();
+    let acme = signup(&app.db, "Acme", "Boss@Acme.test", Some("2026-11"));
+    age_org(&app.db, acme, 30.0);
+    sql(
+        &app.db,
+        "UPDATE terms_acceptances SET accepted_at=? WHERE org_id=?",
+        rusqlite::params![1_700_000_000.0, acme],
+    );
+    sql(
+        &app.db,
+        "UPDATE orgs SET plan='pro', job_quota=100 WHERE id=?",
+        [acme],
+    );
+    let month = store::month_start(now());
+    // one failed job today, one queued job from last month, one done job this month
+    let failed = job_at(&app, acme, 60.0, |_| {});
+    let queued = job_at(&app, acme, 5.0 * DAY, |_| {});
+    let done = job_at(&app, acme, 120.0, |_| {});
+    sql(
+        &app.db,
+        "UPDATE jobs SET state='failed' WHERE id=?",
+        [failed],
+    );
+    sql(&app.db, "UPDATE jobs SET state='done' WHERE id=?", [done]);
+    sql(
+        &app.db,
+        "UPDATE jobs SET created_at=? WHERE id=?",
+        rusqlite::params![month - 10.0, queued],
+    );
+    // two agents: one seen just now, one long ago
+    let a2 = register(&app.db, "fresh", "k2", &[decl("L", true)], acme);
+    let seen = now() - 30.0;
+    sql(
+        &app.db,
+        "UPDATE agents SET last_seen_at=? WHERE id=?",
+        rusqlite::params![seen, a2.computer_id],
+    );
+    sql(
+        &app.db,
+        "UPDATE agents SET last_seen_at=? WHERE org_id=? AND id!=?",
+        rusqlite::params![now() - 3.0 * DAY, acme, a2.computer_id],
+    );
+
+    let (st, v) = app.get_op("/operator/orgs");
+    assert_eq!(st, 200, "{v}");
+    let o = org_row(&v, acme);
+    assert_eq!(o["name"], "Acme");
+    assert_eq!(o["plan"], "pro");
+    assert_eq!(o["job_quota"], 100);
+    assert_eq!(o["jobs_this_month"], 2, "{o}");
+    assert_eq!(o["queued_jobs"], 1, "{o}");
+    assert_eq!(o["failed_today"], 1);
+    assert_eq!(o["agents_total"], 2);
+    assert_eq!(o["agents_online"], 1);
+    assert_eq!(o["printers"], 2);
+    assert!((o["newest_agent_seen_at"].as_f64().unwrap() - seen).abs() < 1.0);
+    assert!(o["last_job_at"].as_f64().unwrap() > now() - 200.0);
+    assert_eq!(o["locked"], false);
+    assert_eq!(o["first_user_email"], "boss@acme.test");
+    assert_eq!(o["terms_version"], "2026-11");
+    assert_eq!(o["terms_accepted_at"], 1_700_000_000.0);
+    assert!(o["created_at"].as_f64().unwrap() < now() - 29.0 * DAY);
+    assert_eq!(o["status"], "active");
+    assert!(v["next_after"].is_null());
+}
+
+#[test]
+fn org_status_is_locked_new_idle_or_active_and_filters() {
+    let app = hosted();
+    let fresh = signup(&app.db, "Fresh", "f@x.test", None);
+    let idle = signup(&app.db, "Idle", "i@x.test", None);
+    let active = signup(&app.db, "Active", "a@x.test", None);
+    let quiet = signup(&app.db, "OldQuiet", "q@x.test", None);
+    let locked = signup(&app.db, "Locked", "l@x.test", None);
+    for o in [store::DEFAULT_ORG, idle, active, quiet, locked] {
+        age_org(&app.db, o, 40.0);
+    }
+    job_at(&app, idle, 20.0 * DAY, |_| {});
+    job_at(&app, active, 2.0 * DAY, |_| {});
+    // a locked org is locked even when it is new and busy
+    age_org(&app.db, locked, 1.0);
+    job_at(&app, locked, 60.0, |_| {});
+    sql(
+        &app.db,
+        "INSERT INTO org_locks(org_id, org_created_at, reason, locked_at) VALUES(?,?,?,?)",
+        rusqlite::params![locked, now() - DAY, "unpaid invoice", now()],
+    );
+    let (st, v) = app.get_op("/operator/orgs");
+    assert_eq!(st, 200, "{v}");
+    assert_eq!(org_row(&v, fresh)["status"], "new");
+    assert_eq!(org_row(&v, idle)["status"], "idle");
+    assert_eq!(org_row(&v, active)["status"], "active");
+    assert_eq!(org_row(&v, quiet)["status"], "idle");
+    assert_eq!(org_row(&v, locked)["status"], "locked");
+    assert_eq!(org_row(&v, locked)["locked"], true);
+    for (s, want) in [
+        ("locked", vec!["Locked"]),
+        ("new", vec!["Fresh"]),
+        ("active", vec!["Active"]),
+    ] {
+        let (st, v) = app.get_op(&format!("/operator/orgs?status={s}"));
+        assert_eq!(st, 200, "{v}");
+        assert_eq!(names(&v), want, "{s}");
+    }
+    let (_, v) = app.get_op("/operator/orgs?status=idle");
+    let got = names(&v);
+    assert!(got.contains(&"Idle".to_string()) && got.contains(&"OldQuiet".to_string()));
+    assert!(!got.contains(&"Active".to_string()));
+    assert_eq!(app.get_op("/operator/orgs?status=bogus").0, 400);
+}
+
+#[test]
+fn org_search_matches_name_or_email_case_insensitively() {
+    let app = hosted();
+    signup(&app.db, "Mueller Druck", "chef@mueller.test", None);
+    signup(&app.db, "Beta", "Anna@Gamma.test", None);
+    signup(&app.db, "Delta 100%", "d@x.test", None);
+    let q = |s: &str| {
+        let (st, v) = app.get_op(&format!("/operator/orgs?q={s}"));
+        assert_eq!(st, 200, "q={s}: {v}");
+        names(&v)
+    };
+    assert_eq!(q("mueller%20dr"), vec!["Mueller Druck"]);
+    assert_eq!(q("BETA"), vec!["Beta"]);
+    assert_eq!(q("anna@gamma"), vec!["Beta"]);
+    assert_eq!(q("CHEF@MUELLER"), vec!["Mueller Druck"]);
+    // % and _ are literal
+    assert_eq!(q("100%25"), vec!["Delta 100%"]);
+    assert_eq!(q("%25"), vec!["Delta 100%"]);
+    assert!(q("_").is_empty());
+    assert!(q("nothing-like-this").is_empty());
+}
+
+#[test]
+fn org_list_pages_by_id() {
+    let app = hosted();
+    for i in 0..5 {
+        signup(&app.db, &format!("O{i}"), &format!("o{i}@x.test"), None);
+    }
+    // 6 orgs in all, the seeded default one included
+    let (st, v) = app.get_op("/operator/orgs?limit=4");
+    assert_eq!(st, 200, "{v}");
+    let first = ids_of(&v, "orgs");
+    assert_eq!(first.len(), 4);
+    assert!(first.windows(2).all(|w| w[0] < w[1]), "ascending by id");
+    let next = v["next_after"].as_i64().unwrap();
+    assert_eq!(next, *first.last().unwrap());
+    let (_, v) = app.get_op(&format!("/operator/orgs?limit=4&after={next}"));
+    let rest = ids_of(&v, "orgs");
+    assert_eq!(rest.len(), 2);
+    assert!(rest[0] > next);
+    assert!(v["next_after"].is_null());
+    // the filter pages too
+    let (_, v) = app.get_op("/operator/orgs?q=x.test&status=new&limit=2");
+    assert_eq!(v["orgs"].as_array().unwrap().len(), 2);
+    assert!(v["next_after"].is_i64());
+    for bad in ["limit=0", "limit=x", "after=x"] {
+        assert_eq!(app.get_op(&format!("/operator/orgs?{bad}")).0, 400, "{bad}");
+    }
+    for i in 0..205 {
+        signup(&app.db, "Bulk", &format!("bulk{i}@b.test"), None);
+    }
+    let (_, v) = app.get_op("/operator/orgs?limit=1000");
+    assert_eq!(v["orgs"].as_array().unwrap().len(), 200);
+    assert!(v["next_after"].is_i64());
+}
+
+#[test]
+fn org_detail_has_usage_users_agents_printers_keys_terms_and_lock() {
+    let app = hosted();
+    let acme = signup(&app.db, "Acme", "boss@acme.test", Some("v1"));
+    sql(
+        &app.db,
+        "INSERT INTO terms_acceptances(org_id, user_id, version, accepted_at) VALUES(?,1,'v2',?)",
+        rusqlite::params![acme, now() + 1.0],
+    );
+    let month = store::month_start(now());
+    let j1 = job_at(&app, acme, 1.0, |_| {});
+    let j2 = job_at(&app, acme, 2.0, |_| {});
+    let j0 = job_at(&app, acme, 3.0, |_| {});
+    sql(&app.db, "UPDATE jobs SET state='failed' WHERE id=?", [j1]);
+    // last month does not count; the first day of this month does
+    sql(
+        &app.db,
+        "UPDATE jobs SET created_at=? WHERE id=?",
+        rusqlite::params![month - 5.0, j0],
+    );
+    sql(
+        &app.db,
+        "UPDATE jobs SET created_at=? WHERE id=?",
+        rusqlite::params![month + 5.0, j2],
+    );
+    add_key(&app.db, "shop", "KEYSECRET-1234567890", acme);
+    sql(
+        &app.db,
+        "UPDATE agents SET last_seen_at=? WHERE org_id=?",
+        rusqlite::params![now() - 3600.0, acme],
+    );
+    let (st, v) = app.get_op(&format!("/operator/orgs/{acme}"));
+    assert_eq!(st, 200, "{v}");
+    assert_eq!(v["name"], "Acme");
+    assert_eq!(v["status"], "new");
+    assert_eq!(v["jobs_this_month"], 2);
+    assert!(v["lock"].is_null());
+    let usage = v["usage_by_day"].as_array().unwrap();
+    assert_eq!(usage[0]["jobs"], 1, "{usage:?}");
+    assert!(usage[0]["date"].as_str().unwrap().ends_with("-01"));
+    let total: i64 = usage.iter().map(|d| d["jobs"].as_i64().unwrap()).sum();
+    let failed: i64 = usage.iter().map(|d| d["failed"].as_i64().unwrap()).sum();
+    assert_eq!((total, failed), (2, 1));
+    // every day of the month so far, none after today
+    assert_eq!(usage.len(), ((now() - month) / DAY).floor() as usize + 1);
+    let u = &v["users"][0];
+    assert_eq!(u["email"], "boss@acme.test");
+    assert!(u["id"].is_i64() && u["created_at"].is_f64());
+    assert_eq!(v["users"].as_array().unwrap().len(), 1);
+    let a = &v["agents"][0];
+    assert_eq!(a["name"], format!("pc{acme}"));
+    assert_eq!(a["online"], false);
+    assert!(a.get("last_seen_at").is_some());
+    let p = &v["printers"][0];
+    assert_eq!(p["name"], "Z");
+    assert_eq!(p["can_pdf"], false);
+    assert_eq!(p["state"], "active");
+    assert_eq!(p["agent_id"], a["id"]);
+    let k = &v["keys"][0];
+    assert_eq!(k["label"], "shop");
+    assert_eq!(k["active"], true);
+    assert!(k["created_at"].is_f64());
+    let terms: Vec<&str> = v["terms"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t["version"].as_str().unwrap())
+        .collect();
+    assert_eq!(terms, vec!["v1", "v2"]);
+    assert!(v["terms"][0]["accepted_at"].is_f64());
+    assert_eq!(v["terms_version"], "v2");
+    // a lock shows up with its reason
+    sql(
+        &app.db,
+        "INSERT INTO org_locks(org_id, org_created_at, reason, locked_at) VALUES(?,?,?,?)",
+        rusqlite::params![acme, 1.0, "unpaid invoice", 1_700_000_500.0],
+    );
+    let (_, v) = app.get_op(&format!("/operator/orgs/{acme}"));
+    assert_eq!(
+        v["lock"],
+        json!({"reason": "unpaid invoice", "locked_at": 1_700_000_500.0})
+    );
+    assert_eq!(v["status"], "locked");
+}
+
+#[test]
+fn org_detail_and_jobs_of_an_unknown_org_are_404() {
+    let app = hosted();
+    // the seeded default org exists, so a 404 below is the org and not the route
+    assert_eq!(app.get_op("/operator/orgs/1").0, 200);
+    assert_eq!(app.get_op("/operator/orgs/1/jobs").0, 200);
+    for t in [
+        "/operator/orgs/999",
+        "/operator/orgs/999/jobs",
+        "/operator/orgs/x",
+        "/operator/orgs/x/jobs",
+    ] {
+        assert_eq!(app.get_op(t).0, 404, "{t}");
+    }
+}
+
+#[test]
+fn org_jobs_are_metadata_newest_first_and_paged() {
+    let app = hosted();
+    let acme = signup(&app.db, "Acme", "boss@acme.test", None);
+    let other = signup(&app.db, "Other", "o@x.test", None);
+    let ids: Vec<i64> = (0..5)
+        .map(|i| {
+            job_at(&app, acme, 100.0 - i as f64, |j| {
+                j.title = Some("TITLESENTINEL".into());
+                j.callback_url = Some("https://cb.example/CALLBACKSENTINEL".into());
+                j.idempotency_key = Some(format!("IDEMSENTINEL{i}"));
+                j.copies = 2;
+            })
+        })
+        .collect();
+    job_at(&app, other, 1.0, |_| {});
+    sql(
+        &app.db,
+        "UPDATE jobs SET state='failed', error='printer on fire', finished_at=5.5, claimed_at=4.5 WHERE id=?",
+        [ids[4]],
+    );
+    let (st, v) = app.get_op(&format!("/operator/orgs/{acme}/jobs?limit=2"));
+    assert_eq!(st, 200, "{v}");
+    assert_eq!(ids_of(&v, "jobs"), vec![ids[4], ids[3]]);
+    assert_eq!(v["next_before_id"], ids[3]);
+    let j = &v["jobs"][0];
+    assert_eq!(j["state"], "failed");
+    assert_eq!(j["error"], "printer on fire");
+    assert_eq!(j["finished_at"], 5.5);
+    assert_eq!(j["claimed_at"], 4.5);
+    assert_eq!(j["type"], "raw_base64");
+    assert_eq!(j["mode"], "raw");
+    assert_eq!(j["copies"], 2);
+    assert_eq!(j["printer_name"], "Z");
+    assert!(j["printer_id"].is_i64() && j["created_at"].is_f64());
+    // exactly these fields: no title, payload, callback or idempotency key
+    let mut keys: Vec<&String> = j.as_object().unwrap().keys().collect();
+    keys.sort();
+    assert_eq!(
+        keys,
+        vec![
+            "claimed_at",
+            "copies",
+            "created_at",
+            "error",
+            "finished_at",
+            "id",
+            "mode",
+            "printer_id",
+            "printer_name",
+            "state",
+            "type"
+        ]
+    );
+    let (_, v) = app.get_op(&format!(
+        "/operator/orgs/{acme}/jobs?limit=2&before_id={}",
+        ids[3]
+    ));
+    assert_eq!(ids_of(&v, "jobs"), vec![ids[2], ids[1]]);
+    let (_, v) = app.get_op(&format!("/operator/orgs/{acme}/jobs?before_id={}", ids[1]));
+    assert_eq!(v["jobs"].as_array().unwrap().len(), 1);
+    assert!(v["next_before_id"].is_null());
+    // only this org's jobs, and bad parameters
+    let (_, v) = app.get_op(&format!("/operator/orgs/{acme}/jobs"));
+    assert_eq!(v["jobs"].as_array().unwrap().len(), 5);
+    for bad in ["limit=0", "limit=x", "before_id=x"] {
+        assert_eq!(
+            app.get_op(&format!("/operator/orgs/{acme}/jobs?{bad}")).0,
+            400,
+            "{bad}"
+        );
+    }
+}
+
+#[test]
+fn org_jobs_limit_is_capped_at_200() {
+    let app = hosted();
+    let acme = signup(&app.db, "Acme", "boss@acme.test", None);
+    for _ in 0..205 {
+        job_at(&app, acme, 1.0, |_| {});
+    }
+    let (st, v) = app.get_op(&format!("/operator/orgs/{acme}/jobs?limit=1000"));
+    assert_eq!(st, 200, "{v}");
+    assert_eq!(v["jobs"].as_array().unwrap().len(), 200);
+    assert!(v["next_before_id"].is_i64());
+}
+
+#[test]
+fn no_operator_read_answer_carries_a_secret_or_content() {
+    let app = hosted();
+    let acme = signup(&app.db, "Acme", "boss@acme.test", Some("v1"));
+    sql(
+        &app.db,
+        "UPDATE orgs SET shopify_secret='SHOPIFYSENTINEL', event_url='https://ev.example/EVENTSENTINEL' WHERE id=?",
+        [acme],
+    );
+    add_key(&app.db, "shop", "KEYSECRET-1234567890", acme);
+    register(
+        &app.db,
+        "pc",
+        "AGENTKEYSECRET-123",
+        &[decl("Z", false)],
+        acme,
+    );
+    sql(
+        &app.db,
+        "UPDATE users SET password_hash='PWHASHSENTINEL' WHERE org_id=?",
+        [acme],
+    );
+    job_at(&app, acme, 10.0, |j| {
+        j.title = Some("TITLESENTINEL".into());
+        j.callback_url = Some("https://cb.example/CALLBACKSENTINEL".into());
+        j.idempotency_key = Some("IDEMSENTINEL".into());
+    });
+    let mut forbidden: Vec<String> = [
+        "SHOPIFYSENTINEL",
+        "EVENTSENTINEL",
+        "KEYSECRET-1234567890",
+        "AGENTKEYSECRET-123",
+        "PWHASHSENTINEL",
+        "TITLESENTINEL",
+        "CALLBACKSENTINEL",
+        "IDEMSENTINEL",
+        "PAYLOADSENTINEL",
+        "password_hash",
+        "key_hash",
+        "api_key_hash",
+        "payload",
+        "callback_url",
+        "idempotency_key",
+        "shopify_secret",
+        "title",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect();
+    forbidden.push(store::hash_key("KEYSECRET-1234567890"));
+    forbidden.push(store::hash_key("AGENTKEYSECRET-123"));
+    for t in [
+        "/operator/orgs".to_string(),
+        "/operator/orgs?q=acme".to_string(),
+        format!("/operator/orgs/{acme}"),
+        format!("/operator/orgs/{acme}/jobs"),
+    ] {
+        let r = op(&app, "GET", &t).send();
+        assert_eq!(r.status, 200, "{t}");
+        let body = r.text();
+        assert!(body.contains("Acme") || t.ends_with("/jobs"), "{t}: {body}");
+        for f in &forbidden {
+            assert!(!body.contains(f.as_str()), "{t} leaks {f}: {body}");
+        }
+    }
+}
+
+#[test]
+fn org_read_queries_use_indexes() {
+    let db = store::connect(":memory:").unwrap();
+    store::init_db(&db).unwrap();
+    for (name, plan) in [
+        ("org list", store::explain_operator_org_list(&db).unwrap()),
+        ("org jobs", store::explain_operator_org_jobs(&db).unwrap()),
+    ] {
+        assert!(!plan.is_empty(), "{name}");
+        for line in &plan {
+            for t in [
+                "jobs",
+                "users",
+                "agents",
+                "printers",
+                "terms_acceptances",
+                "org_locks",
+            ] {
+                assert!(
+                    !line.starts_with(&format!("SCAN {t}")),
+                    "{name} scans {t}: {plan:#?}"
+                );
+            }
+            assert!(!line.contains("TEMP B-TREE"), "{name} sorts: {plan:#?}");
+        }
+    }
+}
