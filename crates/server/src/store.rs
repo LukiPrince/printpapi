@@ -565,15 +565,29 @@ pub fn month_start(now: f64) -> f64 {
 // string-building. Legacy DBs are entirely org_id=1, so org-1 callers see exactly what they saw
 // before.
 
+// The `*_tx` variants run inside a transaction the caller owns (`begin_tx`), so an operator action
+// can make its change and write its audit row under one `BEGIN IMMEDIATE`. The plain functions are
+// `begin` + the `_tx` body + `commit`, nothing else.
+
+/// Open a write transaction (`BEGIN IMMEDIATE`) for a caller that composes several `*_tx` calls.
+/// Dropping it without `commit` rolls back.
+pub fn begin_tx(conn: &Connection) -> Result<Transaction<'_>> {
+    begin(conn)
+}
+
 pub fn create_org(conn: &Connection, name: &str) -> Result<i64> {
     let tx = begin(conn)?;
+    let id = create_org_tx(&tx, name)?;
+    tx.commit()?;
+    Ok(id)
+}
+
+pub fn create_org_tx(tx: &Transaction, name: &str) -> Result<i64> {
     tx.execute(
         "INSERT INTO orgs(name, created_at) VALUES(?,?)",
         params![name, crate::now()],
     )?;
-    let id = tx.last_insert_rowid();
-    tx.commit()?;
-    Ok(id)
+    Ok(tx.last_insert_rowid())
 }
 
 /// Orgs for the root listing. The Shopify webhook secret is reported as a flag, never echoed —
@@ -661,6 +675,42 @@ pub fn set_org_quota(conn: &Connection, org_id: i64, quota: Option<i64>) -> Resu
     )
 }
 
+pub fn set_org_quota_tx(tx: &Transaction, org_id: i64, quota: Option<i64>) -> Result<bool> {
+    let n = tx.execute(
+        "UPDATE orgs SET job_quota=? WHERE id=?",
+        params![quota, org_id],
+    )?;
+    Ok(n == 1)
+}
+
+/// What an operator edit may change on an org. `None` leaves a field alone; `job_quota: Some(None)`
+/// sets unlimited. `plan` carries the catalogue id and the quota it grants, written together.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct OrgUpdate<'a> {
+    pub name: Option<&'a str>,
+    pub job_quota: Option<Option<i64>>,
+    pub plan: Option<(&'a str, Option<i64>)>,
+}
+
+/// Apply every set field of `u` inside the caller's transaction. False if there is no such org.
+/// Validation is the caller's job and happens before this runs, so nothing here rejects half-way.
+/// An explicit `job_quota` is applied after the plan and so wins over the plan's quota.
+pub fn update_org_tx(tx: &Transaction, org_id: i64, u: &OrgUpdate) -> Result<bool> {
+    if !org_exists(tx, org_id)? {
+        return Ok(false);
+    }
+    if let Some(name) = u.name {
+        tx.execute("UPDATE orgs SET name=? WHERE id=?", params![name, org_id])?;
+    }
+    if let Some((plan, quota)) = u.plan {
+        set_org_plan_tx(tx, org_id, plan, quota)?;
+    }
+    if let Some(quota) = u.job_quota {
+        set_org_quota_tx(tx, org_id, quota)?;
+    }
+    Ok(true)
+}
+
 /// Move an org onto a billing plan. The plan id is bookkeeping; its quota is what bites, and
 /// both are written in one UPDATE so they can never disagree. False if no such org.
 pub fn set_org_plan(
@@ -670,11 +720,21 @@ pub fn set_org_plan(
     quota: Option<i64>,
 ) -> Result<bool> {
     let tx = begin(conn)?;
+    let ok = set_org_plan_tx(&tx, org_id, plan, quota)?;
+    tx.commit()?;
+    Ok(ok)
+}
+
+pub fn set_org_plan_tx(
+    tx: &Transaction,
+    org_id: i64,
+    plan: &str,
+    quota: Option<i64>,
+) -> Result<bool> {
     let n = tx.execute(
         "UPDATE orgs SET plan=?, job_quota=? WHERE id=?",
         params![plan, quota, org_id],
     )?;
-    tx.commit()?;
     Ok(n == 1)
 }
 
@@ -726,6 +786,15 @@ pub fn truncate_wal_logged(conn: &Connection, what: &str) -> bool {
 /// key still enrolls there.
 pub fn delete_org(conn: &Connection, org_id: i64) -> Result<bool> {
     let tx = begin(conn)?;
+    let found = delete_org_tx(&tx, org_id)?;
+    if found {
+        tx.commit()?;
+    }
+    Ok(found)
+}
+
+/// `delete_org` inside the caller's transaction; the caller commits (and drops it on `false`).
+pub fn delete_org_tx(tx: &Transaction, org_id: i64) -> Result<bool> {
     if tx
         .query_row("SELECT 1 FROM orgs WHERE id=?", [org_id], |_| Ok(()))
         .optional()?
@@ -754,7 +823,6 @@ pub fn delete_org(conn: &Connection, org_id: i64) -> Result<bool> {
         tx.execute(&format!("DELETE FROM {table} WHERE org_id=?"), [org_id])?;
     }
     tx.execute("DELETE FROM orgs WHERE id=?", [org_id])?;
-    tx.commit()?;
     Ok(true)
 }
 
@@ -999,11 +1067,16 @@ pub fn list_api_keys(conn: &Connection, org_id: Option<i64>) -> Result<Vec<ApiKe
 /// Org-filtered like every other id lookup: another org's key is simply not found.
 pub fn revoke_api_key(conn: &Connection, key_id: i64, org_id: Option<i64>) -> Result<bool> {
     let tx = begin(conn)?;
+    let ok = revoke_api_key_tx(&tx, key_id, org_id)?;
+    tx.commit()?;
+    Ok(ok)
+}
+
+pub fn revoke_api_key_tx(tx: &Transaction, key_id: i64, org_id: Option<i64>) -> Result<bool> {
     let n = tx.execute(
         "UPDATE api_keys SET active=0 WHERE id=:kid AND (:org IS NULL OR org_id = :org)",
         named_params! {":kid": key_id, ":org": org_id},
     )?;
-    tx.commit()?;
     Ok(n == 1)
 }
 
@@ -1052,9 +1125,31 @@ pub fn signup(
     job_quota: Option<i64>,
     terms_version: Option<&str>,
 ) -> Result<Signup> {
+    let tx = begin(conn)?;
+    let out = signup_tx(
+        &tx,
+        org_name,
+        email,
+        password_hash,
+        job_quota,
+        terms_version,
+    )?;
+    tx.commit()?;
+    Ok(out)
+}
+
+/// `signup` inside the caller's transaction. Err(Conflict) leaves the half-made org for the
+/// caller's rollback (drop the transaction without committing).
+pub fn signup_tx(
+    tx: &Transaction,
+    org_name: &str,
+    email: &str,
+    password_hash: &str,
+    job_quota: Option<i64>,
+    terms_version: Option<&str>,
+) -> Result<Signup> {
     let now = crate::now();
     let addr = normalize_email(email);
-    let tx = begin(conn)?;
     tx.execute(
         "INSERT INTO orgs(name, job_quota, created_at) VALUES(?,?,?)",
         params![org_name, job_quota, now],
@@ -1071,7 +1166,6 @@ pub fn signup(
             params![org_id, user_id, version, now],
         )?;
     }
-    tx.commit()?;
     Ok(Signup { org_id, user_id })
 }
 
@@ -1117,15 +1211,26 @@ pub fn create_password_reset(
     ttl_s: f64,
     now: Option<f64>,
 ) -> Result<f64> {
+    let tx = begin(conn)?;
+    let expires_at = create_password_reset_tx(&tx, user_id, token, ttl_s, now)?;
+    tx.commit()?;
+    Ok(expires_at)
+}
+
+pub fn create_password_reset_tx(
+    tx: &Transaction,
+    user_id: i64,
+    token: &str,
+    ttl_s: f64,
+    now: Option<f64>,
+) -> Result<f64> {
     let now = now.unwrap_or_else(crate::now);
     let expires_at = now + ttl_s;
-    let tx = begin(conn)?;
     tx.execute("DELETE FROM password_resets WHERE user_id=?", [user_id])?;
     tx.execute(
         "INSERT INTO password_resets(user_id, token_hash, created_at, expires_at) VALUES(?,?,?,?)",
         params![user_id, hash_key(token), now, expires_at],
     )?;
-    tx.commit()?;
     Ok(expires_at)
 }
 
@@ -2858,6 +2963,63 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    // --- transaction-aware variants: compose with a caller's write, roll back with it ------------
+
+    #[test]
+    fn update_org_tx_applies_all_fields_and_rolls_back_with_the_caller() {
+        let conn = db();
+        let oid = create_org(&conn, "acme").unwrap();
+        let upd = OrgUpdate {
+            name: Some("acme 2"),
+            job_quota: Some(Some(7)),
+            plan: Some(("pro", Some(500))),
+        };
+        let tx = begin_tx(&conn).unwrap();
+        assert!(update_org_tx(&tx, oid, &upd).unwrap());
+        drop(tx); // the caller's later step failed: nothing may stay
+        let o = get_org(&conn, oid).unwrap().unwrap();
+        assert_eq!((o.name.as_str(), o.job_quota, o.plan), ("acme", None, None));
+
+        let tx = begin_tx(&conn).unwrap();
+        assert!(update_org_tx(&tx, oid, &upd).unwrap());
+        tx.commit().unwrap();
+        let o = get_org(&conn, oid).unwrap().unwrap();
+        assert_eq!(o.name, "acme 2");
+        assert_eq!(o.plan.as_deref(), Some("pro"));
+        assert_eq!(o.job_quota, Some(7)); // the explicit quota wins over the plan's
+
+        let tx = begin_tx(&conn).unwrap();
+        assert!(!update_org_tx(&tx, 999_999, &upd).unwrap());
+    }
+
+    #[test]
+    fn delete_org_tx_leaves_the_commit_to_the_caller() {
+        let conn = db();
+        let oid = create_org(&conn, "gone").unwrap();
+        let tx = begin_tx(&conn).unwrap();
+        assert!(delete_org_tx(&tx, oid).unwrap());
+        drop(tx);
+        assert!(org_exists(&conn, oid).unwrap());
+        let tx = begin_tx(&conn).unwrap();
+        assert!(delete_org_tx(&tx, oid).unwrap());
+        tx.commit().unwrap();
+        assert!(!org_exists(&conn, oid).unwrap());
+        let tx = begin_tx(&conn).unwrap();
+        assert!(!delete_org_tx(&tx, oid).unwrap());
+    }
+
+    #[test]
+    fn signup_tx_rolls_back_the_org_when_the_email_is_taken() {
+        let conn = db();
+        signup(&conn, "a", "x@example.com", "h", None, None).unwrap();
+        let before = list_orgs(&conn).unwrap().len();
+        let tx = begin_tx(&conn).unwrap();
+        let r = signup_tx(&tx, "b", "x@example.com", "h", Some(5), None);
+        assert!(matches!(r, Err(StoreError::Conflict)));
+        drop(tx);
+        assert_eq!(list_orgs(&conn).unwrap().len(), before);
     }
 
     // --- multi-tenancy --------------------------------------------------------------------

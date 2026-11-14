@@ -629,6 +629,16 @@ fn py_eq_int(v: &Value, i: i64) -> bool {
 
 /// The id in `<prefix><digits><suffix>` — the regex routes. `\d+` that does not fit an i64 is
 /// not a route (the Python crashed binding it), so it falls through to the 404.
+/// A `job_quota` field: a non-negative integer, or null for unlimited. Shared by the root
+/// `PUT /orgs/{id}` and the operator edit, so both reject the same values with the same text.
+pub(crate) fn parse_job_quota(v: &Value) -> Result<Option<i64>, &'static str> {
+    match v {
+        Value::Null => Ok(None),
+        Value::Number(n) if n.as_i64().is_some_and(|q| q >= 0) => Ok(n.as_i64()),
+        _ => Err("job_quota must be a non-negative integer or null"),
+    }
+}
+
 fn id_of(target: &str, prefix: &str, suffix: &str) -> Option<i64> {
     let d = target.strip_prefix(prefix)?.strip_suffix(suffix)?;
     if d.is_empty() || !d.bytes().all(|b| b.is_ascii_digit()) {
@@ -2377,15 +2387,9 @@ impl Ctx<'_> {
             if p.kind != "root" {
                 return Ok(jerr(403, "job_quota is set by the server operator"));
             }
-            let quota_n = match quota {
-                Value::Null => None,
-                Value::Number(n) if n.as_i64().is_some_and(|q| q >= 0) => n.as_i64(),
-                _ => {
-                    return Ok(jerr(
-                        400,
-                        "job_quota must be a non-negative integer or null",
-                    ));
-                }
+            let quota_n = match parse_job_quota(quota) {
+                Ok(q) => q,
+                Err(msg) => return Ok(jerr(400, msg)),
             };
             if !self.db(|c| store::set_org_quota(c, oid, quota_n))? {
                 return Ok(not_found());
