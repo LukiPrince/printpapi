@@ -12,6 +12,9 @@ use ureq::tls::{RootCerts, TlsConfig};
 use crate::config::HttpSettings;
 
 const UA: &str = "printpapi-agent";
+/// Sent on every request to the server: the claim then carries `job_uid` (docs/api.md). A server
+/// or proxy that does not know the header ignores it; the agent then works as before.
+const FEATURES: (&str, &str) = ("X-Printapi-Features", "job-uid");
 /// ponytail: flat caps so a hostile or broken server cannot make the agent allocate without bound.
 /// The server itself caps request bodies at 32 MB.
 const MAX_JSON_BODY: u64 = 32 * 1024 * 1024;
@@ -213,6 +216,7 @@ impl Client {
                 }
                 r.header("Authorization", format!("Bearer {key}"))
                     .header("User-Agent", UA)
+                    .header(FEATURES.0, FEATURES.1)
                     .call()
             }
             Some(b) => {
@@ -222,6 +226,7 @@ impl Client {
                 }
                 r.header("Authorization", format!("Bearer {key}"))
                     .header("User-Agent", UA)
+                    .header(FEATURES.0, FEATURES.1)
                     .header("Content-Type", "application/json")
                     .send(b.to_string().into_bytes())
             }
@@ -504,6 +509,34 @@ mod tests {
         assert!(req.contains("cf-access-client-secret: s3"));
         assert!(req.contains("authorization: bearer k"));
         assert!(req.contains("user-agent: printpapi-agent"));
+    }
+
+    #[test]
+    fn every_request_asks_for_the_job_identity() {
+        // GET, GET of a payload and POST: the server hands out job_uid only to who asks
+        let (url, rx) = serve(Some(OK_JSON));
+        let c = client(45.0, &[]);
+        c.get(&format!("{url}/agent/jobs"), "k").unwrap();
+        let req = rx.recv().unwrap().to_lowercase();
+        assert!(req.contains("x-printapi-features: job-uid\r\n"), "{req}");
+        let (url, rx) = serve(Some(OK_JSON));
+        c.get_bytes(&format!("{url}/agent/jobs/1/payload"), "k")
+            .unwrap();
+        assert!(
+            rx.recv()
+                .unwrap()
+                .to_lowercase()
+                .contains("x-printapi-features: job-uid\r\n")
+        );
+        let (url, rx) = serve(Some(OK_JSON));
+        c.post(&format!("{url}/agent/results"), "k", &json!({}))
+            .unwrap();
+        assert!(
+            rx.recv()
+                .unwrap()
+                .to_lowercase()
+                .contains("x-printapi-features: job-uid\r\n")
+        );
     }
 
     #[test]

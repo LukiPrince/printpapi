@@ -240,6 +240,12 @@ pub struct ClaimedJob {
     pub mode: String,
     pub copies: i64,
     pub options: Option<Value>,
+    /// Identity of this very job (`job_uid`), only when the agent asked for it with the request
+    /// header `X-Printapi-Features: job-uid`; the two claim routes clear it otherwise, so the body
+    /// of an agent that did not ask stays byte-identical. None also when `created_at` cannot be
+    /// read as a number.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub job_uid: Option<String>,
 }
 
 /// `claimed_job` result: the job an agent already holds.
@@ -501,7 +507,7 @@ CREATE INDEX IF NOT EXISTS jobs_api_key ON jobs(api_key_id, id) WHERE api_key_id
 /// Past its deadline the job is skipped here and failed by the reaper's `expire_jobs` — the skip
 /// is what guarantees it never prints, whatever the reaper's tick is doing.
 /// ponytail: served by `jobs_claim` (agent_id, state, created_at, id), so the ORDER BY needs no sort.
-const CLAIM_SQL: &str = "SELECT id, printer_id, mode, copies, options FROM jobs \
+const CLAIM_SQL: &str = "SELECT id, printer_id, mode, copies, options, created_at FROM jobs \
      WHERE agent_id=?1 AND state='queued' AND (expires_at IS NULL OR expires_at > ?2) \
      ORDER BY created_at, id LIMIT 1";
 
@@ -610,6 +616,18 @@ pub fn init_db(conn: &Connection) -> Result<()> {
 /// sha256 hex of a credential — how every key, session and reset token is stored.
 pub fn hash_key(key: &str) -> String {
     hex(&Sha256::digest(key.as_bytes()))
+}
+
+/// Identity of one job row that a database reset or restore cannot hand to another job: the first
+/// 32 hex chars of sha256("printpapi-job:{id}:{created_at bits as 16 hex}"). `created_at` is
+/// written once by the enqueue and no product code updates it, so a reused id has another uid and
+/// a restored row keeps its own. Derived, not stored: it also covers jobs queued before the update.
+/// The agent's journal keys on it (docs/agent.md); it is not a credential.
+pub fn job_uid(id: i64, created_at: f64) -> String {
+    let digest = Sha256::digest(format!("printpapi-job:{id}:{:016x}", created_at.to_bits()));
+    let mut uid = hex(&digest);
+    uid.truncate(32);
+    uid
 }
 
 fn hex(bytes: &[u8]) -> String {
@@ -1776,13 +1794,22 @@ pub fn claim_job(conn: &Connection, agent_id: i64, now: Option<f64>) -> Result<O
     let now = now.unwrap_or_else(crate::now);
     // Look before taking the write lock: most polls find nothing, and then the only write is the
     // liveness touch, which does not need to wait for the disk (see touch_last_seen).
-    let row: Option<(i64, i64, String, i64, Option<String>)> = conn
+    type Row = (i64, i64, String, i64, Option<String>, Option<f64>);
+    let row: Option<Row> = conn
         .prepare_cached(CLAIM_SQL)?
         .query_row(params![agent_id, now], |r| {
-            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+            // a created_at that is no number (a hand-edited database) only costs the uid, never the claim
+            Ok((
+                r.get(0)?,
+                r.get(1)?,
+                r.get(2)?,
+                r.get(3)?,
+                r.get(4)?,
+                r.get::<_, f64>(5).ok(),
+            ))
         })
         .optional()?;
-    let Some((job_id, printer_id, mode, copies, options)) = row else {
+    let Some((job_id, printer_id, mode, copies, options, created_at)) = row else {
         touch_last_seen(conn, agent_id, now)?; // the touch is the point of an empty poll
         return Ok(None);
     };
@@ -1806,6 +1833,7 @@ pub fn claim_job(conn: &Connection, agent_id: i64, now: Option<f64>) -> Result<O
         mode,
         copies,
         options: parse_json(options),
+        job_uid: created_at.map(|c| job_uid(job_id, c)),
     }))
 }
 
@@ -1856,8 +1884,34 @@ pub fn finish_job(
     ok: bool,
     error: Option<&str>,
 ) -> Result<bool> {
+    finish_job_checked(conn, job_id, agent_id, ok, error, None)
+}
+
+/// `finish_job`, and when the agent names the job it claimed (`job_uid` of the result body) the
+/// row must be that very job: another uid is a miss, nothing changes. None = today's behaviour.
+pub fn finish_job_checked(
+    conn: &Connection,
+    job_id: i64,
+    agent_id: i64,
+    ok: bool,
+    error: Option<&str>,
+    uid: Option<&str>,
+) -> Result<bool> {
     let state = if ok { "done" } else { "failed" };
     let tx = begin(conn)?;
+    if let Some(uid) = uid {
+        let created: Option<f64> = tx
+            .query_row(
+                "SELECT created_at FROM jobs WHERE id=? AND agent_id=?",
+                params![job_id, agent_id],
+                |r| Ok(r.get::<_, f64>(0).ok()),
+            )
+            .optional()?
+            .flatten();
+        if created.is_none_or(|c| job_uid(job_id, c) != uid) {
+            return Ok(false);
+        }
+    }
     let n = tx
         .prepare_cached(
             "UPDATE jobs SET state=?, error=?, finished_at=? \
@@ -1872,6 +1926,64 @@ pub fn finish_job(
         ])?;
     tx.commit()?;
     Ok(n == 1)
+}
+
+/// A result that arrived late, for `POST /agent/results`: the agent proves with `uid` that it
+/// claimed this very job, and the outcome is taken whatever the reaper did meanwhile. One
+/// transaction. Returns the state of the job afterwards, None when this agent has no such job, the
+/// uid differs or the row is gone (nothing changed).
+///
+/// | state now | ok | not ok |
+/// |---|---|---|
+/// | claimed, queued | done | failed + error |
+/// | failed | done | unchanged |
+/// | done, cancelled | unchanged | unchanged |
+///
+/// A requeued job takes the result because the uid says this agent printed it (a second print is
+/// the harm), and `ok=false` only ever comes from a partly printed job. A reaper-failed job
+/// becomes done (the paper is out; `failed` would invite a manual reprint), which re-arms its
+/// webhook: hooks are at-least-once, deduplicate on job_id + state. Cancelled stays: somebody
+/// decided that.
+pub fn finish_job_by_uid(
+    conn: &Connection,
+    job_id: i64,
+    uid: &str,
+    agent_id: i64,
+    ok: bool,
+    error: Option<&str>,
+) -> Result<Option<String>> {
+    let tx = begin(conn)?;
+    let row: Option<(String, Option<f64>)> = tx
+        .query_row(
+            "SELECT state, created_at FROM jobs WHERE id=? AND agent_id=?",
+            params![job_id, agent_id],
+            |r| Ok((r.get(0)?, r.get::<_, f64>(1).ok())),
+        )
+        .optional()?;
+    let Some((state, Some(created))) = row else {
+        return Ok(None);
+    };
+    if job_uid(job_id, created) != uid {
+        return Ok(None);
+    }
+    let new = match (state.as_str(), ok) {
+        ("claimed" | "queued" | "failed", true) => "done",
+        ("claimed" | "queued", false) => "failed",
+        _ => return Ok(Some(state)),
+    };
+    tx.execute(
+        "UPDATE jobs SET state=?, error=?, finished_at=?, hook_attempts=0, hook_delivered_at=NULL \
+         WHERE id=? AND agent_id=?",
+        params![
+            new,
+            if ok { None } else { error },
+            crate::now(),
+            job_id,
+            agent_id
+        ],
+    )?;
+    tx.commit()?;
+    Ok(Some(new.to_string()))
 }
 
 /// Returns how many jobs went back to `queued`. With `enforce_locks` a stale job of a locked org
@@ -2035,21 +2147,29 @@ pub fn pending_webhooks(conn: &Connection, max_attempts: i64) -> Result<Vec<Pend
     Ok(rows.collect::<rusqlite::Result<_>>()?)
 }
 
-pub fn mark_webhook_delivered(conn: &Connection, job_id: i64, now: Option<f64>) -> Result<()> {
+/// `state` is the state that was posted: a delivery in flight for `failed` must not swallow the
+/// `done` that a late result set meanwhile.
+pub fn mark_webhook_delivered(
+    conn: &Connection,
+    job_id: i64,
+    state: &str,
+    now: Option<f64>,
+) -> Result<()> {
     let tx = begin(conn)?;
     tx.execute(
-        "UPDATE jobs SET hook_delivered_at=? WHERE id=?",
-        params![now.unwrap_or_else(crate::now), job_id],
+        "UPDATE jobs SET hook_delivered_at=? WHERE id=? AND state=?",
+        params![now.unwrap_or_else(crate::now), job_id, state],
     )?;
     tx.commit()?;
     Ok(())
 }
 
-pub fn bump_webhook_attempt(conn: &Connection, job_id: i64) -> Result<()> {
+/// Guarded by the posted `state` like `mark_webhook_delivered`.
+pub fn bump_webhook_attempt(conn: &Connection, job_id: i64, state: &str) -> Result<()> {
     let tx = begin(conn)?;
     tx.execute(
-        "UPDATE jobs SET hook_attempts=hook_attempts+1 WHERE id=?",
-        [job_id],
+        "UPDATE jobs SET hook_attempts=hook_attempts+1 WHERE id=? AND state=?",
+        params![job_id, state],
     )?;
     tx.commit()?;
     Ok(())
@@ -4832,8 +4952,237 @@ mod tests {
         claim_job(&conn, r.computer_id, None).unwrap();
         finish_job(&conn, a, r.computer_id, true, None).unwrap();
         assert_eq!(pending_webhooks(&conn, 5).unwrap().len(), 1);
-        mark_webhook_delivered(&conn, a, None).unwrap();
+        mark_webhook_delivered(&conn, a, "done", None).unwrap();
         assert!(pending_webhooks(&conn, 5).unwrap().is_empty());
+    }
+
+    // --- outbox: job identity and late results --------------------------------------------------
+
+    fn job_row(
+        conn: &Connection,
+        jid: i64,
+    ) -> (String, Option<String>, Option<f64>, i64, Option<f64>) {
+        conn.query_row(
+            "SELECT state, error, finished_at, hook_attempts, hook_delivered_at FROM jobs WHERE id=?",
+            [jid],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+        )
+        .unwrap()
+    }
+
+    fn created_at_of(conn: &Connection, jid: i64) -> f64 {
+        q(conn, "SELECT created_at FROM jobs WHERE id=?", [jid])
+    }
+
+    #[test]
+    fn job_uid_is_32_hex_stable_and_differs_for_another_id_or_created_at() {
+        let a = job_uid(7, 1000.5);
+        assert_eq!(a.len(), 32);
+        assert!(
+            a.bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        );
+        assert_eq!(a, job_uid(7, 1000.5));
+        assert_ne!(a, job_uid(8, 1000.5));
+        // a database reset reuses the id; the timestamp is what tells the two jobs apart
+        assert_ne!(a, job_uid(7, 1000.500001));
+        // the documented derivation, so the agent side and the docs can rely on it
+        let want = hex(&Sha256::digest(format!(
+            "printpapi-job:7:{:016x}",
+            1000.5f64.to_bits()
+        )));
+        assert_eq!(a, want[..32]);
+    }
+
+    #[test]
+    fn claim_job_fills_job_uid_from_the_row() {
+        let conn = db();
+        let r = reg(&conn, "w", "k", &[("Z", false)]);
+        let jid = enq(&conn, id_of(&r, "Z"), b"a");
+        let created = created_at_of(&conn, jid);
+        let job = claim_job(&conn, r.computer_id, None).unwrap().unwrap();
+        assert_eq!(job.job_uid, Some(job_uid(jid, created)));
+    }
+
+    #[test]
+    fn claim_job_with_a_created_at_that_is_no_number_still_claims_without_uid() {
+        let conn = db();
+        let r = reg(&conn, "w", "k", &[("Z", false)]);
+        let jid = enq(&conn, id_of(&r, "Z"), b"a");
+        conn.execute(
+            "UPDATE jobs SET created_at='not a number' WHERE id=?",
+            [jid],
+        )
+        .unwrap();
+        let job = claim_job(&conn, r.computer_id, None).unwrap().unwrap();
+        assert_eq!(job.job_id, jid);
+        assert_eq!(job.job_uid, None);
+        assert_eq!(state_of(&conn, jid), "claimed");
+    }
+
+    #[test]
+    fn finish_job_by_uid_table() {
+        // (state the job is in, ok) -> (state after, changed)
+        let cases: &[(&str, bool, &str, bool)] = &[
+            ("claimed", true, "done", true),
+            ("claimed", false, "failed", true),
+            ("queued", true, "done", true),
+            ("queued", false, "failed", true),
+            ("failed", true, "done", true),
+            ("failed", false, "failed", false),
+            ("done", true, "done", false),
+            ("done", false, "done", false),
+            ("cancelled", true, "cancelled", false),
+            ("cancelled", false, "cancelled", false),
+        ];
+        for (from, ok, to, changed) in cases {
+            let conn = db();
+            let r = reg(&conn, "w", "k", &[("Z", false)]);
+            let jid = enq_with(&conn, id_of(&r, "Z"), b"a", |j| {
+                j.callback_url = Some("https://h/a".into())
+            });
+            let uid = job_uid(jid, created_at_of(&conn, jid));
+            conn.execute(
+                "UPDATE jobs SET state=?, error='old', finished_at=5.0, hook_attempts=3, hook_delivered_at=9.0 WHERE id=?",
+                params![from, jid],
+            )
+            .unwrap();
+            let got =
+                finish_job_by_uid(&conn, jid, &uid, r.computer_id, *ok, Some("boom")).unwrap();
+            assert_eq!(got.as_deref(), Some(*to), "{from} ok={ok}");
+            let (state, error, finished, attempts, delivered) = job_row(&conn, jid);
+            assert_eq!(state, *to, "{from} ok={ok}");
+            if *changed {
+                assert_eq!(
+                    error,
+                    if *ok { None } else { Some("boom".into()) },
+                    "{from} ok={ok}"
+                );
+                assert!(finished.unwrap() > 5.0, "{from} ok={ok}");
+                // the hook runs again for the new state
+                assert_eq!((attempts, delivered), (0, None), "{from} ok={ok}");
+            } else {
+                assert_eq!(error.as_deref(), Some("old"), "{from} ok={ok}");
+                assert_eq!(finished, Some(5.0), "{from} ok={ok}");
+                assert_eq!((attempts, delivered), (3, Some(9.0)), "{from} ok={ok}");
+            }
+        }
+    }
+
+    #[test]
+    fn finish_job_by_uid_with_a_wrong_uid_a_foreign_agent_or_an_unknown_id_changes_nothing() {
+        let conn = db();
+        let a = reg(&conn, "a", "ka", &[("Z", false)]);
+        let b = reg(&conn, "b", "kb", &[("Z", false)]);
+        let jid = enq(&conn, id_of(&a, "Z"), b"a");
+        claim_job(&conn, a.computer_id, None).unwrap();
+        let uid = job_uid(jid, created_at_of(&conn, jid));
+        // another job id reusing the number after a reset has another created_at
+        let stale = job_uid(jid, created_at_of(&conn, jid) - 1.0);
+        for (id, u, agent) in [
+            (jid, stale.as_str(), a.computer_id),
+            (jid, uid.as_str(), b.computer_id),
+            (jid + 100, uid.as_str(), a.computer_id),
+            (jid, "", a.computer_id),
+        ] {
+            assert_eq!(
+                finish_job_by_uid(&conn, id, u, agent, true, None).unwrap(),
+                None
+            );
+        }
+        assert_eq!(state_of(&conn, jid), "claimed");
+    }
+
+    #[test]
+    fn a_requeued_job_finished_late_is_not_claimable_again() {
+        let conn = db();
+        let r = reg(&conn, "w", "k", &[("Z", false)]);
+        let jid = enq(&conn, id_of(&r, "Z"), b"a");
+        let uid = claim_job(&conn, r.computer_id, Some(1.0))
+            .unwrap()
+            .unwrap()
+            .job_uid
+            .unwrap();
+        assert_eq!(
+            requeue_stale(&conn, 300.0, 2, Some(1000.0), false).unwrap(),
+            1
+        );
+        assert_eq!(state_of(&conn, jid), "queued");
+        assert_eq!(
+            finish_job_by_uid(&conn, jid, &uid, r.computer_id, true, None)
+                .unwrap()
+                .as_deref(),
+            Some("done")
+        );
+        assert!(claim_job(&conn, r.computer_id, None).unwrap().is_none());
+    }
+
+    #[test]
+    fn a_job_the_reaper_failed_becomes_done_and_its_hook_is_pending_again() {
+        let conn = db();
+        let r = reg(&conn, "w", "k", &[("Z", false)]);
+        let jid = enq_with(&conn, id_of(&r, "Z"), b"a", |j| {
+            j.callback_url = Some("https://h/a".into())
+        });
+        let uid = claim_job(&conn, r.computer_id, Some(1.0))
+            .unwrap()
+            .unwrap()
+            .job_uid
+            .unwrap();
+        conn.execute("UPDATE jobs SET retries=2 WHERE id=?", [jid])
+            .unwrap();
+        requeue_stale(&conn, 300.0, 2, Some(1000.0), false).unwrap();
+        assert_eq!(job_row(&conn, jid).0, "failed");
+        // the failed hook was delivered
+        let hooks = pending_webhooks(&conn, 5).unwrap();
+        assert_eq!(hooks[0].state, "failed");
+        mark_webhook_delivered(&conn, jid, "failed", None).unwrap();
+        assert!(pending_webhooks(&conn, 5).unwrap().is_empty());
+        finish_job_by_uid(&conn, jid, &uid, r.computer_id, true, None).unwrap();
+        let hooks = pending_webhooks(&conn, 5).unwrap();
+        assert_eq!(hooks.len(), 1);
+        assert_eq!((hooks[0].job_id, hooks[0].state.as_str()), (jid, "done"));
+        assert_eq!(hooks[0].error, None);
+    }
+
+    #[test]
+    fn webhook_marks_of_an_old_state_do_not_swallow_the_new_state() {
+        let conn = db();
+        let r = reg(&conn, "w", "k", &[("Z", false)]);
+        let jid = enq_with(&conn, id_of(&r, "Z"), b"a", |j| {
+            j.callback_url = Some("https://h/a".into())
+        });
+        let uid = claim_job(&conn, r.computer_id, None)
+            .unwrap()
+            .unwrap()
+            .job_uid
+            .unwrap();
+        finish_job(&conn, jid, r.computer_id, false, Some("x")).unwrap();
+        // a failed delivery is in flight while the late ok arrives
+        finish_job_by_uid(&conn, jid, &uid, r.computer_id, true, None).unwrap();
+        mark_webhook_delivered(&conn, jid, "failed", None).unwrap();
+        bump_webhook_attempt(&conn, jid, "failed").unwrap();
+        let (state, _, _, attempts, delivered) = job_row(&conn, jid);
+        assert_eq!((state.as_str(), attempts, delivered), ("done", 0, None));
+        assert_eq!(pending_webhooks(&conn, 5).unwrap()[0].state, "done");
+    }
+
+    #[test]
+    fn finish_job_with_a_job_uid_of_another_job_changes_nothing() {
+        let conn = db();
+        let r = reg(&conn, "w", "k", &[("Z", false)]);
+        let jid = enq(&conn, id_of(&r, "Z"), b"a");
+        let uid = claim_job(&conn, r.computer_id, None)
+            .unwrap()
+            .unwrap()
+            .job_uid
+            .unwrap();
+        let wrong = job_uid(jid, 1.0);
+        assert!(!finish_job_checked(&conn, jid, r.computer_id, true, None, Some(&wrong)).unwrap());
+        assert_eq!(state_of(&conn, jid), "claimed");
+        // absent = today's behaviour, the right uid = the same
+        assert!(finish_job_checked(&conn, jid, r.computer_id, true, None, Some(&uid)).unwrap());
+        assert_eq!(state_of(&conn, jid), "done");
     }
 
     #[test]
@@ -4846,7 +5195,7 @@ mod tests {
         claim_job(&conn, r.computer_id, None).unwrap();
         finish_job(&conn, a, r.computer_id, true, None).unwrap();
         for _ in 0..3 {
-            bump_webhook_attempt(&conn, a).unwrap();
+            bump_webhook_attempt(&conn, a, "done").unwrap();
         }
         assert!(pending_webhooks(&conn, 3).unwrap().is_empty()); // attempts >= cap -> given up
         assert_eq!(pending_webhooks(&conn, 4).unwrap()[0].job_id, a);

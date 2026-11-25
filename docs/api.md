@@ -61,9 +61,10 @@ Token comparison is constant-time (`hmac.compare_digest`).
 | `PUT /apikeys/{id}` | manage | Change a key's rights: `{"scope": "agent"}` → `{ok, scope}` |
 | `DELETE /apikeys/{id}` | manage | Revoke a key |
 | `POST /agent/register` | agent (`Agent`) | Declare name + printers → `{computer_id, printer_ids}` |
-| `GET /agent/jobs` | agent | Long-poll for a job (204 on timeout) |
+| `GET /agent/jobs` | agent | Long-poll for a job (204 on timeout); with the request header `X-Printapi-Features: job-uid` the answer also has `job_uid` |
 | `GET /agent/jobs/{id}/payload` | agent | Download the job's bytes |
-| `POST /agent/jobs/{id}/result` | agent | Report `{ok, error?}` |
+| `POST /agent/jobs/{id}/result` | agent | Report `{ok, error?, job_uid?}` |
+| `POST /agent/results` | agent (strict) | A result delivered late, by job id and `job_uid` → `{ok, state}` ([Job lifecycle](#job-lifecycle)) |
 | `POST\|GET\|DELETE /cloudprnt/{key}` | client key (`CloudPrnt`) | [Star CloudPRNT](cloudprnt.md): the printer polls, downloads and confirms here itself |
 
 Request bodies are capped at 32 MB.
@@ -90,7 +91,7 @@ picture of a receipt job.
 | `Look` | `GET /printers`, `/printers/{id}/receipt-profile`, `/labels`, `/labels/{id}`, `/jobs`, `/jobs/{id}`, `/metrics`, `/plans`; every PrintNode `GET` (`/whoami`, `/computers`, `/printers`, `/printjobs`) | yes | no | no | yes (jobs: own only) | yes |
 | `Submit` | `POST /jobs`, `POST /receipts/preview`, `POST /orders`, the Shopify webhook, `DELETE /jobs/{id}`; PrintNode `POST /printjobs`, `DELETE /printjobs/{set}` | yes | no | no | yes (cancel: own only) | no |
 | `Edit` | `POST /labels`, `PUT /labels/{id}`, `DELETE /labels/{id}`, `PUT /printers/{id}/receipt-profile`, `DELETE /printers/{id}/receipt-profile` | yes | no | no | no | no |
-| `Agent` | `POST /agent/register`, `GET /agent/jobs`, `GET /agent/jobs/{id}/payload`, `POST /agent/jobs/{id}/result` | yes | yes | no | no | no |
+| `Agent` | `POST /agent/register`, `GET /agent/jobs`, `GET /agent/jobs/{id}/payload`, `POST /agent/jobs/{id}/result`, `POST /agent/results` | yes | yes | no | no | no |
 | `CloudPrnt` | `POST\|GET\|DELETE /cloudprnt[/{key}]` | yes | no | yes | no | no |
 
 A scope this version does not know (a newer server wrote it) allows nothing, `GET /me` excepted.
@@ -110,7 +111,9 @@ A scope this version does not know (a newer server wrote it) allows nothing, `GE
   expire.
 - **A job already handed out.** If an agent's key loses the agent right while a job is `claimed` by
   that agent, the payload download and the result of exactly that job still work; the next poll is
-  `401`. Otherwise the report would be refused, the job requeued and printed twice. A revoked key
+  `401`. Otherwise the report would be refused, the job requeued and printed twice. A result the
+  agent kept in its [journal](agent.md#the-print-journal) needs the right: `POST /agent/results` is `401` for a
+  narrowed key, and the agent sends it when the right is back. A revoked key
   gets nothing, and a CloudPRNT device has no such exception (no key is bound to a device): take the
   key out of the printer before you narrow or revoke it, or a job it is printing at that moment can
   print again later.
@@ -288,6 +291,10 @@ Set `callback_url` on a job and the server POSTs this JSON once the job reaches 
   `GET /jobs/{id}` as the source of truth.
 - **At-least-once:** a delivery can arrive **more than once** (e.g. the POST succeeded but its ack
   was lost, so it retries). Make your handler idempotent — dedupe on `job_id` + `state`.
+- **A `done` can follow a `failed`.** A job the reaper failed (`retry limit exceeded`, `expired`,
+  `retention`) becomes `done` when its agent delivers the result late (see [Job lifecycle](#job-lifecycle)),
+  and the webhook fires again with `done`. A client that resubmits on `failed` can print twice;
+  wait a while, or check `GET /jobs/{id}` first.
 - The payload is **unsigned** and the URL is fetched server-side (`http(s)` only) — same trust model
   as the `*_uri` content types. Point it at a trusted endpoint.
 
@@ -533,6 +540,33 @@ scrape_configs:
 `queued` → agent claims it (`claimed`) → agent reports → `done` or `failed`.
 If an agent claims a job and never reports (crash, network), the visibility-timeout reaper
 requeues it — after a bounded number of retries the job is marked `failed`.
+
+**Late results.** The agent writes the outcome of a printed job to its
+[journal](agent.md#the-print-journal) before it reports it, and delivers it later when the report
+fails. Two things on the server make that safe:
+
+- `GET /agent/jobs` carries `"job_uid": "<32 hex>"` when the request has the header
+  `X-Printapi-Features: job-uid` (a comma list; the agent sends it on every request). Without the header
+  the answer is exactly what it was. The uid is the first 32 hex digits of
+  `sha256("printpapi-job:{id}:{created_at bits as 16 hex digits}")`: derived, nothing stored, and a job
+  number that a reset database uses again has another one. It is no credential; every call still
+  needs the agent key. The agent may add `job_uid` to the body of `POST /agent/jobs/{id}/result`; a uid that
+  is not the job's gives `404` and changes nothing, an absent one is the old behaviour.
+- `POST /agent/results` `{"job_id": 7, "job_uid": "…", "ok": true, "error": null}` takes a result by id and
+  uid, whatever the job's state is now. Needs the agent right (`401` otherwise); a body that is no
+  JSON object is `400`, as is a `job_id` that is no integer or a `job_uid` that is no string. Every well-formed
+  call is `200` `{"ok": true, "state": "<state of the job now>"}`, or `"state": null` when this
+  agent has no such job or the uid is another one (nothing changed). What it does:
+
+  | state now | `ok: true` | `ok: false` |
+  |---|---|---|
+  | `claimed` (also claimed again), `queued` (the reaper requeued it) | `done` | `failed` with the error |
+  | `failed` (`retry limit exceeded`, `expired`, `retention`) | `done` | unchanged |
+  | `done`, `cancelled` | unchanged | unchanged |
+
+  A job that printed for longer than the reaper's five minutes is therefore finished, not printed
+  again. A job the reaper had failed becomes `done` and its [webhook](#webhooks) fires again with that
+  state. `cancelled` stays: somebody decided that.
 
 A job with `expire_after` whose deadline passes is never handed to an agent (the claim query skips
 it) and is failed with `error: "expired"` by the same reaper — a terminal state, so its webhook

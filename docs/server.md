@@ -214,6 +214,12 @@ SQLite in WAL mode with an atomic claim. A visibility-timeout reaper requeues jo
 went silent and fails them after a bounded number of retries. Reaper errors are logged to
 stderr.
 
+A result may arrive late, after the reaper requeued the job or even failed it (the agent delivers
+what it kept in its journal, [agent.md](agent.md#the-print-journal)). The server takes it by job
+id and `job_uid` at `POST /agent/results`: a job that printed past the visibility timeout ends `done`
+and is not printed again, and one the reaper failed becomes `done`, which fires its webhook once more.
+See [Job lifecycle](api.md#job-lifecycle). Nothing is added to the database.
+
 ### Retention
 
 A job holds its payload (labels, packing slips, addresses) until you say otherwise. With

@@ -107,6 +107,11 @@ cd web && npm run build:app     # after any web/ change; commit crates/server/we
   `.installed-by-setup` as UTF-8 `key=value` lines (`version=`, `brand=`; unknown lines are kept when
   the version is rewritten); and that a new agent runs with the existing unit, `agent.ini`, rights
   and paths, else the schema is raised and the setup is needed.
+- **The print journal** (`crates/agent/src/journal.rs`, docs/agent.md#the-print-journal) never holds the key, a
+  payload, a title or a header value, and its error texts are masked and cut. It only records a job
+  of which at least one copy was handed over (`print_copies`); in any doubt (no identity, an unknown uid, a
+  journal that cannot be read, an acknowledged failure) the agent **prints**: a duplicate is better
+  than a label that is silently missing. Opening never rewrites the file; only compaction does.
 - The agent writes `status.json` (never the key, never a header value) into the status folder
   (`status::status_dir_in`) only when the `.installed-by-setup` marker sits next to it. It is what
   the tray icon reads: it opens no port and takes no commands. Keep secrets out of it, and keep
@@ -125,11 +130,23 @@ cd web && npm run build:app     # after any web/ change; commit crates/server/we
   stages only the changed fields (`patch.json`) and goes through the admin subcommands, so it asks
   for elevation once. "Quit" ends the icon, never the agent.
 - `fn mode(args: &[OsString]) -> Mode` in `crates/setup/src/main.rs` is the one parser of the program's
-  arguments: exactly `--version` prints the version before anything else, any argument `--tray` is the
-  icon, `--section <word>` opens a window section. The updater starts the new program with
+  arguments: exactly `--version` prints the version before anything else, an argument that starts
+  with `--managed-` is a headless installer mode (before the tray lock and the web view check), any
+  argument `--tray` is the icon, `--section <word>` opens a window section. The updater starts the new program with
   `--version` before it swaps anything, so keep that path free of locks, web view and windows.
+- `--managed-install`, `--managed-refresh` and `--managed-uninstall` (`src/managed.rs`) are the headless
+  Windows modes the .msi runs as LocalSystem; other systems print the usage and exit 2. The logic runs
+  against a `Host` trait, so its tests use a fake machine. The key never reaches argv, a log line or an
+  error text; keep its test. As LocalSystem they first replace the environment (Windows Installer hands
+  over the starter's) and work in LocalSystem's own profile folder, written out (`src/winenv.rs`,
+  `staging::private_root`): nothing SYSTEM runs or reads may lie in the starter's profile. The .msi hook is `wix/managed.wxs`, written against the template of
+  tauri-cli 2.12.6 (pinned in ci.yml and release.yml): read the template again before changing the pin.
+  MSI-only Tauri settings live in `tauri.msi.conf.json`, never in `tauri.conf.json`.
 - `web/lib/setup-downloads.json` is the one list of setup files. The downloads page and
   `release.yml` both read it; a variant nobody has run by hand is `"beta": true`.
+  `tools/docs/test_release_assets.py` keeps the list a subset of what `release.yml` builds. The .msi
+  and .rpm are built after the existing installers are uploaded, with `continue-on-error`, and ship
+  in the second artifact `setup-extra-<name>`.
 
 ## Dashboard (`web/`)
 

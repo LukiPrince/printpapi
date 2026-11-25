@@ -84,6 +84,16 @@ jobs:
       # the agent of this build trusts the public half of the committed test seed (Cargo feature
       # update-test-key, never enabled by release.yml), so the smoke test can sign an update
       - run: cargo build --release --locked -p printpapi-server -p printpapi-agent --features printpapi-agent/update-test-key
+        env: # no VCRUNTIME140.dll in the Windows programs (see "no C runtime DLL" below)
+          CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS: -C target-feature=+crt-static
+          CARGO_TARGET_AARCH64_PC_WINDOWS_MSVC_RUSTFLAGS: -C target-feature=+crt-static
+      - name: no C runtime DLL (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          for f in target/release/printpapi-agent.exe target/release/printpapi.exe; do
+            if grep -aqi 'vcruntime140' "$f"; then echo "$f needs VCRUNTIME140.dll"; exit 1; fi
+          done
       # the same agent as version 99.0.0, and the two examples the update steps use, into target-new
       # (built without --locked: the version lives in Cargo.toml and Cargo.lock; the script puts both back)
       - run: python tools/smoke/build_update_fixture.py
@@ -134,12 +144,47 @@ jobs:
       - run: npm run build:setup
         working-directory: web
       - run: cargo build --release --locked -p printpapi-agent
+        env: # linked as in release.yml
+          CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS: -C target-feature=+crt-static
+          CARGO_TARGET_AARCH64_PC_WINDOWS_MSVC_RUSTFLAGS: -C target-feature=+crt-static
       - run: cargo fmt --check
         working-directory: crates/setup
       - run: cargo clippy --locked -- -D warnings
         working-directory: crates/setup
       - run: cargo test --locked
         working-directory: crates/setup
+      # The .msi (Windows only, steps in this job so that no new check name appears): build it twice
+      # (every build gets a new ProductCode, so the second is a real upgrade of the first) and
+      # install, repair, upgrade and remove it for real on this throwaway runner
+      # (tools/smoke/setup_smoke.py --msi). Debug builds: the test is about the installer, not the size.
+      # tauri-cli at exactly the version crates/setup/wix/managed.wxs was written against.
+      - name: tauri-cli for the .msi (Windows)
+        if: runner.os == 'Windows'
+        run: cargo install tauri-cli --version 2.12.6 --locked
+      - name: server for the .msi smoke test (Windows)
+        if: runner.os == 'Windows'
+        run: cargo build --release --locked -p printpapi-server
+      - name: build the .msi twice (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        working-directory: crates/setup
+        env:
+          PRINTPAPI_AGENT_BIN: ${{ github.workspace }}/target/release/printpapi-agent.exe
+        run: |
+          set -eux
+          for n in a b; do
+            rm -f target/debug/bundle/msi/*.msi
+            cargo tauri build --debug --bundles msi --config tauri.msi.conf.json
+            mkdir -p "../../msi-$n"
+            cp target/debug/bundle/msi/*.msi "../../msi-$n/"
+          done
+      - name: smoke test the .msi (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          python tools/smoke/setup_smoke.py \
+            --server target/release/printpapi.exe \
+            --msi "$(ls msi-a/*.msi)" --msi-upgrade "$(ls msi-b/*.msi)"
 
   # The dashboard bundle in crates/server/web is committed (so a plain `cargo build` checkout has
   # a UI without Node). This job proves the source in web/ still builds, and that nobody changed

@@ -24,7 +24,7 @@ impl Staging {
 
     /// A folder with a random name under `root`. A `root` that could not be found is an error:
     /// there is no other place to fall back to that is as private.
-    fn in_root(root: io::Result<PathBuf>) -> io::Result<Staging> {
+    pub(crate) fn in_root(root: io::Result<PathBuf>) -> io::Result<Staging> {
         // `tempfile` takes the umask for the folder (0755 on Linux), so the owner-only mode is
         // asked for; on Windows the folder inherits the ACL of `root`.
         let mut builder = tempfile::Builder::new();
@@ -56,13 +56,34 @@ impl Staging {
 // profile, which is private by ACL; if that fails, the setup fails too. The ceiling: a profile that
 // is shared by policy (a redirected AppData) is as private as that share.
 #[cfg(not(windows))]
-fn private_root() -> io::Result<PathBuf> {
+pub(crate) fn private_root() -> io::Result<PathBuf> {
     Ok(std::env::temp_dir())
 }
 
 #[cfg(windows)]
-fn private_root() -> io::Result<PathBuf> {
-    local_app_data()
+pub(crate) fn private_root() -> io::Result<PathBuf> {
+    let system = crate::winenv::is_local_system()?;
+    let root = root_of(system)?;
+    if system {
+        // a fresh Windows has the profile, but not always this folder in it
+        std::fs::create_dir_all(&root)?;
+    }
+    Ok(root)
+}
+
+/// LocalSystem's folder is written out: what Windows says for it depends on the environment, and
+/// Windows Installer hands a custom action the one of the person who started it (winenv.rs). The agent
+/// that SYSTEM is about to run and the agent.ini with the key must not lie in that person's profile.
+#[cfg(windows)]
+fn root_of(local_system: bool) -> io::Result<PathBuf> {
+    if !local_system {
+        return local_app_data();
+    }
+    Ok(printpapi_agent::install::system_dir()
+        .join("config")
+        .join("systemprofile")
+        .join("AppData")
+        .join("Local"))
 }
 
 /// `%LOCALAPPDATA%` of the user, asked of Windows (`SHGetKnownFolderPath(FOLDERID_LocalAppData)`),
@@ -169,6 +190,17 @@ mod tests {
             staging.dir().parent().unwrap().canonicalize().unwrap(),
             local.canonicalize().unwrap()
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn local_system_works_in_its_own_profile_which_is_written_out() {
+        let root = root_of(true).unwrap();
+        let system = printpapi_agent::install::system_dir();
+        assert_eq!(root, system.join(r"config\systemprofile\AppData\Local"));
+        assert_ne!(root, root_of(false).unwrap());
+        let local = std::path::PathBuf::from(std::env::var_os("LOCALAPPDATA").unwrap());
+        assert!(!root.starts_with(local));
     }
 
     #[test]

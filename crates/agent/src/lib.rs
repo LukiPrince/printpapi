@@ -10,6 +10,7 @@ pub mod config;
 pub mod discover;
 pub mod ini;
 pub mod install;
+pub mod journal;
 pub mod keystore;
 pub mod log;
 pub mod marker;
@@ -34,7 +35,7 @@ use config::{Capabilities, Config, HttpSettings, Printer, parse_printers};
 use keystore::KeyStore;
 use print::{Fns, add_capabilities};
 use proc::{Runner, real_runner};
-use run::{PrinterMap, build_printer_map, poll_forever, register_with_retry};
+use run::{Outbox, PrinterMap, build_printer_map, poll_forever, register_with_retry};
 use status::{Reporter, Status, StatusWriter, unix_now};
 
 pub use print::{PdfFn, RawFn};
@@ -219,6 +220,32 @@ fn setup_data_dir(base_dir: &Path, os: install::Os) -> Option<PathBuf> {
         .then(|| status::status_dir(os))
 }
 
+/// Where the print journal lives (docs/agent.md, Reliability); None keeps results in memory only.
+/// systemd's `StateDirectory=` and `$STATE_DIRECTORY` (a colon-separated list when several are set):
+/// <https://www.freedesktop.org/software/systemd/man/latest/systemd.exec.html>.
+/// 1. An agent that setup installed (the marker): the vetted status folder. If vetting refused it,
+///    nothing: the refusal is logged already, and `$STATE_DIRECTORY` is never looked at here.
+/// 2. A manual run with systemd's `StateDirectory=` (`state_dir`, only passed on Unix): the part
+///    before the first separator, when it is an absolute path.
+/// 3. A manual run: the folder of the executable and agent.ini. Never the temp folder, which every
+///    user can write and a boot wipes. A folder other users may write already lets them replace the
+///    program.
+fn journal_path(
+    base_dir: &Path,
+    marker: bool,
+    data_dir: Option<&Path>,
+    state_dir: Option<std::ffi::OsString>,
+) -> Option<PathBuf> {
+    if marker {
+        return data_dir.map(|d| d.join(journal::FILE_NAME));
+    }
+    state_dir
+        .and_then(|v| std::env::split_paths(&v).next())
+        .filter(|p| p.is_absolute())
+        .or_else(|| Some(base_dir.to_path_buf()))
+        .map(|d| d.join(journal::FILE_NAME))
+}
+
 /// The folder only if the agent may use it: it exists, is no link and belongs to SYSTEM or the
 /// administrators (root, the service user). Setup creates it with its permissions; an agent must
 /// not create one that setup did not, a log line sent to a missing folder would be lost, and a
@@ -385,6 +412,18 @@ pub fn run(base_dir: &Path) -> Result<(), Fatal> {
     if let Some(dir) = &data_dir {
         log::set_log_dir(dir.clone());
     }
+    // before data_dir moves into the status writer
+    let journal_at = journal_path(
+        base_dir,
+        base_dir.join(install::MARKER_NAME).exists(),
+        data_dir.as_deref(),
+        // systemd's StateDirectory= exists on Unix only
+        if cfg!(unix) {
+            std::env::var_os("STATE_DIRECTORY")
+        } else {
+            None
+        },
+    );
     let sleep = |secs: u64| std::thread::sleep(std::time::Duration::from_secs(secs));
     let Prepared {
         cfg,
@@ -429,6 +468,14 @@ pub fn run(base_dir: &Path) -> Result<(), Fatal> {
         },
         registered: &|| report(&|r| r.registered(unix_now())),
         poll: &|base, key, map| {
+            // opened here, where the key is known: it keeps the key out of what the file holds
+            let journal = match &journal_at {
+                Some(path) => journal::Journal::open(path.clone(), key, &log::log_error),
+                None => journal::Journal::memory().with_key(key),
+            };
+            let started = std::time::Instant::now();
+            let mut outbox =
+                Outbox::new(journal, Box::new(move || started.elapsed().as_secs_f64()));
             poll_forever(
                 base,
                 key,
@@ -437,6 +484,7 @@ pub fn run(base_dir: &Path) -> Result<(), Fatal> {
                 &fns,
                 &sleep,
                 &log::log_error,
+                &mut outbox,
                 &mut |outcome| report(&|r| r.polled(outcome, unix_now())),
                 &|| report(&|r| r.claimed(unix_now())),
             )
@@ -458,6 +506,61 @@ pub fn install_panic_hook() {
 mod tests {
     use super::*;
     use std::cell::RefCell;
+
+    #[test]
+    fn the_journal_of_a_setup_install_is_in_the_vetted_status_folder_or_nowhere() {
+        let base = Path::new("agent-folder");
+        let status = Path::new("status-folder");
+        assert_eq!(
+            journal_path(base, true, Some(status), None),
+            Some(status.join(journal::FILE_NAME))
+        );
+        // vetting refused the folder: memory only, and $STATE_DIRECTORY is never looked at
+        let state = tempfile::tempdir().unwrap();
+        assert_eq!(
+            journal_path(base, true, None, Some(state.path().into())),
+            None
+        );
+        assert_eq!(
+            journal_path(base, true, Some(status), Some(state.path().into())),
+            Some(status.join(journal::FILE_NAME))
+        );
+    }
+
+    #[test]
+    fn the_journal_of_a_manual_run_is_in_the_state_directory_else_next_to_the_program() {
+        let base = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let here = base.path().join(journal::FILE_NAME);
+        assert_eq!(
+            journal_path(base.path(), false, None, None),
+            Some(here.clone())
+        );
+        assert_eq!(
+            journal_path(base.path(), false, None, Some(state.path().into())),
+            Some(state.path().join(journal::FILE_NAME))
+        );
+        // systemd joins several folders with the platform's separator: the first one
+        let other = tempfile::tempdir().unwrap();
+        let list = std::env::join_paths([state.path(), other.path()]).unwrap();
+        assert_eq!(
+            journal_path(base.path(), false, None, Some(list)),
+            Some(state.path().join(journal::FILE_NAME))
+        );
+        // a relative or empty value is not a place; the agent's folder is
+        for bad in ["relative/dir", ""] {
+            assert_eq!(
+                journal_path(base.path(), false, None, Some(bad.into())),
+                Some(here.clone()),
+                "{bad:?}"
+            );
+        }
+        // the data dir of a manual run (none) does not matter
+        assert_eq!(
+            journal_path(base.path(), false, Some(Path::new("x")), None),
+            Some(here)
+        );
+    }
 
     #[test]
     fn test_select_backend_by_platform() {

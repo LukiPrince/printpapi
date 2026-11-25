@@ -96,9 +96,12 @@ Prefer to build it yourself? `docker build -t printpapi .`
 
 **Agent**, on the machine with the printers. The easiest way is the setup app: download the
 `printpapi-setup-<platform>` file for your system from the
-[latest release](https://github.com/LukiPrince/printpapi/releases/latest) (`.exe` on Windows, `.dmg`
-on macOS, `.deb` or `.AppImage` on Linux; an AppImage needs `chmod +x` first), open it and follow
-the four steps ([docs](docs/agent.md#setup-app)). It also installs a tray icon with a settings window
+[latest release](https://github.com/LukiPrince/printpapi/releases/latest) (`.exe` or `.msi` on
+Windows, x64 or ARM64; `.dmg` on macOS; `.deb`, `.rpm` or `.AppImage` on Linux; an AppImage needs
+`chmod +x` first), open it and follow the four steps ([docs](docs/agent.md#setup-app)). The `.msi`
+can also install the agent silently on many PCs, one key and one file per PC
+([docs](docs/agent.md#managed-windows-install-msi)); the `.rpm` is for Fedora and openSUSE with a
+desktop. The setup also installs a tray icon with a settings window
 ([docs](docs/agent.md#tray-icon-and-settings)). The agent and the icon can update themselves from a
 signed file, in one click or at night, and go back to the old version when the new one does not
 connect ([docs](docs/agent.md#updates)). Every setup download is Beta until someone has run
@@ -107,7 +110,7 @@ it: use the Python agent there ([docs](docs/agent.md#locked-down-windows)). Or b
 
 1. Download the `printpapi-agent-<platform>` archive from the
    [latest release](https://github.com/LukiPrince/printpapi/releases/latest) and unpack it (Windows
-   x86-64, Linux x86-64/arm64, macOS Apple silicon/Intel). On Windows put `SumatraPDF.exe` next to
+   x86-64/arm64, Linux x86-64/arm64, macOS Apple silicon/Intel). On Windows put `SumatraPDF.exe` next to
    the exe for PDF; Linux and macOS use CUPS (on macOS read the
    [raw-printing note](docs/agent.md#macos)).
 2. Issue the agent a key on the dashboard's **Keys** page (or `POST /apikeys`), then create

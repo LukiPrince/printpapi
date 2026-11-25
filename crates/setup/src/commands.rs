@@ -53,7 +53,7 @@ impl SetupError {
         &self.message
     }
 
-    fn io(what: &str, e: std::io::Error) -> SetupError {
+    pub(crate) fn io(what: &str, e: std::io::Error) -> SetupError {
         SetupError::new("system", format!("{what}: {e}"))
     }
 }
@@ -128,7 +128,7 @@ pub(crate) fn lock<'a>(state: &'a Shared) -> MutexGuard<'a, AppState> {
 
 // ---- machine
 
-fn layout() -> Layout {
+pub(crate) fn layout() -> Layout {
     install::layout(Os::host(), &install::program_files())
 }
 
@@ -136,15 +136,15 @@ fn layout() -> Layout {
 /// and `tasklist` the detection runs.
 /// https://learn.microsoft.com/en-us/windows/win32/procthread/process-creation-flags
 #[cfg(windows)]
-fn no_window(command: &mut std::process::Command) {
+pub(crate) fn no_window(command: &mut std::process::Command) {
     use std::os::windows::process::CommandExt;
     command.creation_flags(0x0800_0000);
 }
 
 #[cfg(not(windows))]
-fn no_window(_: &mut std::process::Command) {}
+pub(crate) fn no_window(_: &mut std::process::Command) {}
 
-fn runner() -> Runner {
+pub(crate) fn runner() -> Runner {
     Rc::new(|cmd: &Cmd| run_command_with(cmd, &no_window))
 }
 
@@ -266,6 +266,7 @@ pub fn build_ini(
         printers: Some(&printers),
         timeout: None,
         headers: None,
+        updates: None,
     };
     Ok(update_ini(None, &update))
 }
@@ -330,10 +331,10 @@ fn read_result(dir: &Path) -> Option<Value> {
 
 /// How an admin subcommand gets started with administrator rights: `elevate::run` in the app, a
 /// fake in the tests (`agent`, then the subcommand and the staging folder).
-type Elevator<'a> = &'a dyn Fn(&Path, &[&OsStr]) -> Result<(), Elevate>;
+pub(crate) type Elevator<'a> = &'a dyn Fn(&Path, &[&OsStr]) -> Result<(), Elevate>;
 
 /// Run one admin subcommand on the staging folder and read what it reports.
-fn run_elevated(
+pub(crate) fn run_elevated(
     elevate: Elevator,
     agent: &Path,
     dir: &Path,
@@ -661,7 +662,7 @@ fn stage_own_tray_with(
         .map_err(|e| SetupError::io("cannot prepare the tray icon", e))
 }
 
-fn stage_own_tray(dir: &Path) -> Result<bool, SetupError> {
+pub(crate) fn stage_own_tray(dir: &Path) -> Result<bool, SetupError> {
     let exe = std::env::current_exe().map_err(|e| SetupError::io("cannot find this program", e))?;
     stage_own_tray_with(
         Os::host(),

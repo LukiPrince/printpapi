@@ -7,7 +7,7 @@ only** — nothing listens on the printer's machine, so NAT/firewalls are no pro
 ## Setup app
 
 The easiest way on Windows, macOS and Linux with a desktop: download `printpapi-setup-<platform>`
-(`.exe` on Windows, `.dmg` on macOS, `.deb` or `.AppImage` on Linux) from the
+(`.exe` or `.msi` on Windows, `.dmg` on macOS, `.deb`, `.rpm` or `.AppImage` on Linux) from the
 [latest release](https://github.com/LukiPrince/printpapi/releases/latest), open it and go through
 four steps (connect to the server with an agent key, pick the printers, test print, done).
 It writes `agent.ini`, installs the agent to `%ProgramFiles%\printpapi-agent\` (Windows) or
@@ -41,7 +41,8 @@ for them once.
   header value. A file that is missing or older than two minutes shows "not running"; an agent that
   has not been in touch with the server for two minutes shows "offline" with the time it has been
   silent. The agent still opens no port and takes no commands.
-  The crash log of an agent the setup installed lives in the same folder.
+  The crash log of an agent the setup installed lives in the same folder, and so does the
+  [print journal](#the-print-journal), `print-journal.jsonl`. A change made in the settings window keeps it.
 - A new key on the same server needs a new device name, because the server ties a name to its
   key. The printers then get new ids and the old device stays in the dashboard; the window warns
   before it does that. When the stored key cannot be read, the same key with the same name is
@@ -67,6 +68,24 @@ for them once.
 - An AppImage starts only once it is executable: run `chmod +x` on the file, or tick *Allow
   executing as program* in its properties.
 - Linux without a desktop or without systemd: use the manual steps below.
+- Windows on ARM64 has its own files: `printpapi-setup-windows-aarch64.exe` and
+  `printpapi-setup-windows-aarch64.msi`. The agent and the setup are built for ARM64; SumatraPDF,
+  which prints the PDFs, stays the x64 build that Windows runs under emulation.
+- The `.msi` installs the setup program for all users, and, with a prepared file, the agent too,
+  without a window: see [Managed Windows install (.msi)](#managed-windows-install-msi).
+- The `.rpm` is for current Fedora and openSUSE releases with a desktop.
+  `sudo dnf install ./printpapi-setup-linux-x86_64.rpm` on Fedora,
+  `sudo zypper install --allow-unsigned-rpm ./printpapi-setup-linux-x86_64.rpm` on openSUSE (the
+  aarch64 file is `printpapi-setup-linux-aarch64.rpm`). The file is not signed. Fedora 45 checks
+  signatures by default ([the change](https://fedoraproject.org/wiki/Changes/Enforcing_signature_checking_by_default)),
+  so a plain `rpm -i` refuses it there; `dnf install ./file.rpm` takes a local file. It is built
+  on Ubuntu 22.04 and needs the `pkexec` command and the WebKitGTK 4.1 and
+  AppIndicator libraries; the package names all of them as requirements, so the installer pulls them in
+  (the package that provides `pkexec` is polkit on Fedora and pkexec on openSUSE). Every file in the downloads is Beta; for the
+  `.rpm`, nobody has installed it on a real desktop yet (SELinux, the tray, the password prompt).
+- **Red Hat, Rocky Linux, AlmaLinux:** not supported today. AlmaLinux 9 has only the older
+  WebKitGTK that the window cannot use, and AlmaLinux 10 has WebKitGTK 4.1 only in the testing part
+  of EPEL. Use the agent archive and the [systemd steps](#run-as-a-service) there.
 - An agent you set up by hand is not taken over: the setup stops and says so, so a job is never
   printed twice.
 
@@ -173,6 +192,151 @@ after two failed nights; a click in the window always tries.
   there; check `update-state.json` in the install folder for the last attempt. An older agent answers
   it with a usage line and does nothing.
 
+## Managed Windows install (.msi)
+
+For a fleet of Windows PCs that a deployment tool sets up (Intune, a script, a startup script).
+`printpapi-setup-windows-x86_64.msi` (`printpapi-setup-windows-aarch64.msi` on ARM64; Beta like every
+setup download) always installs the setup program for all users, to
+`%ProgramFiles%\printpapi Agent Setup\`. It installs the agent as well, silently, only when the
+public property `AGENT_INI` names a prepared `agent.ini`:
+
+```bat
+msiexec /i printpapi-setup-windows-x86_64.msi /qn /norestart /l*v C:\Windows\Temp\printpapi-msi.log AGENT_INI=%SystemRoot%\printpapi-deploy
+```
+
+(`%SystemRoot%` is `C:\Windows`; the command prompt fills it in. A tool that does not takes the path
+spelled out.)
+
+**One key and one `agent.ini` per PC.** The server ties a key to exactly one device, so a file that
+many PCs share cannot work: the first PC registers, every other one is refused with the line "The
+key is already used by another PC: one key per PC". Issue a key for each PC with the rights **Agent
+only** (`POST /apikeys` with `{"label": "<COMPUTERNAME>", "scope": "agent"}`, see
+[API keys](server.md#api-keys)) and write a file for it:
+
+```ini
+[agent]
+server_url = https://print.example.com
+api_key = <the key of this PC>
+printers = Zebra GK420d ; HP LaserJet|pdf
+```
+
+`AGENT_INI` is the path of such a file, or of a folder. In a folder the install takes
+`<COMPUTERNAME>.ini`, the file of the PC it runs on, so one folder can hold the files of all PCs. The
+path must be absolute. A `name` in the file is used as it is; without one, a PC that has the agent
+already keeps its installed name (a renamed PC must not register again under a new name), and a new
+one takes the name of the computer. A `SumatraPDF.exe` next to the file is installed for the PDF
+printers. It has to be **SumatraPDF 3.6.1, 64 bit**, the build that the setup window downloads:
+take `SumatraPDF-3.6.1-64.exe` out of
+[SumatraPDF-3.6.1-64.zip](https://www.sumatrapdfreader.org/dl/rel/3.6.1/SumatraPDF-3.6.1-64.zip)
+and name it `SumatraPDF.exe`. Any other file, a newer version too, fails the whole install
+(`msiexec` 1603; the log line names the SHA-256 that was expected). Without the file the PC has no PDF
+printing from this install: its `|pdf` printers need SumatraPDF from somewhere else, next to
+`printpapi-agent.exe`. There is no pairing code and no key in a property, on the command line or in
+a log.
+
+**Protect the file.** Until the install has read it, the key is in it as plain text, and the
+install trusts what it finds. Make the folder where a standard user cannot make anything,
+`%SystemRoot%\printpapi-deploy` (`C:\Windows`), in a session that runs as administrator, and let only
+SYSTEM and the Administrators have it:
+
+```bat
+md %SystemRoot%\printpapi-deploy
+icacls %SystemRoot%\printpapi-deploy /inheritance:r /grant:r *S-1-5-18:(OI)(CI)F *S-1-5-32-544:(OI)(CI)F
+```
+
+Do not put the folder in `C:\ProgramData`: every user may create folders there, so somebody can make
+`printpapi-deploy` before you, and no `icacls` line makes such a folder safe afterwards.
+`/setowner` and `/reset` leave the folder open to whoever holds a handle on it from before, and with
+`/T` they also walk through a junction that the user put inside it and change the owner and the rights
+of whatever it points to. So a folder that somebody else made is not used and not repaired: the install
+refuses it (below), and you delete it and make it again as administrator. Write the file from the same
+elevated Command Prompt or PowerShell, so that the Administrators own it (files made from an elevated
+Git Bash belong to you, and the install refuses them). The file belongs in a folder of its own, never in
+a drive root such as `C:\`: the install refuses that too.
+
+Best is a local folder per PC: the deployment tool copies the file there, runs `msiexec` and deletes
+the file afterwards. A network share is discouraged: the install reads the file as the computer
+account, so every computer of the domain that may read the share reads every key on it. What the
+install checks, as SYSTEM: the path is not a link, the file is at most 256 KiB, and (for a file on
+this computer) the owner of the file and the owner of the folder that holds it is SYSTEM or the
+Administrators. The owner of the file stops somebody replacing it by a file of their own, the owner
+of the folder stops a folder that somebody else made first. The install does not look at the access
+list, so the place is what protects the file: a folder that standard users cannot make, as above. A
+file on a share is not asked for its owner.
+
+**What it does.** The agent, the tray icon and the scheduled task are installed as the setup app
+does it, and the key is stored encrypted ([Where the key is stored](#where-the-key-is-stored)). The
+file replaces the whole `agent.ini`: printers, headers and `timeout` that someone set later in the
+settings window are replaced too. `updates = off` is written unless the file has an `updates` line:
+the deployment tool owns the versions of a managed PC ([Updates](#updates)). An agent that the setup
+did not install is not touched: the install stops with "An agent that was not installed by the setup is
+already here. Remove it first." so a job is never printed twice. The PC must reach the server while
+it installs (the agent registers first); offline, `msiexec` ends with 1603 and the deployment
+tool tries again. A PC that already has the agent waits up to two minutes for a running print job to
+end before the agent is stopped, so that the job is not printed twice; if it is still printing then,
+the install fails with the line "The agent is printing a job" (1603) and the deployment tool tries
+again. A stopped agent holds nothing up, an agent that is offline only when it is not printing. The
+same wait comes before the agent refresh of an upgrade, and before the removal, which goes on after
+two minutes anyway: removing the `.msi` never fails for a print (the log line then says that the agent
+was removed while printing and that the job may be printed again). The wait comes after the new files
+are unpacked, but it is not the last step: between the last look and the stop the agent still
+registers with the server, normally a second or two and longer on a slow connection. A job that the
+agent takes in that time is cut off and printed again by the server after five minutes.
+
+**Variables.** Windows Installer starts the install as LocalSystem, but with the environment of whoever
+started `msiexec`. The install drops it (and the current folder), takes the machine's and LocalSystem's
+own variables and works in LocalSystem's profile folder, so a proxy for the registration has to be set
+for the machine, not for your user.
+
+**When it fails.** `msiexec` reports 1603. The install writes one line, without the key, to
+`printpapi-managed.log` in the profile folder of the account that ran it: LocalSystem for `msiexec`
+(normally `C:\Windows\System32\config\systemprofile\AppData\Local`; there is no log when that folder
+cannot be made), your own `%LOCALAPPDATA%` when you typed the call yourself (below). A wrong call, such
+as a relative `AGENT_INI`, leaves its usage line there too. The verbose log of `/l*v` shows the
+resolved `AGENT_INI`. A first install that fails after the agent was put in place takes the agent out
+again.
+
+**Upgrade, repair, remove.**
+
+- Running the same `.msi` again is maintenance mode and changes nothing, with or without
+  `AGENT_INI`. A repair (`msiexec /fa`) with another `AGENT_INI` does not replace the configuration
+  either. To change a PC's configuration without a new version, run the setup program from its folder as
+  administrator with `--managed-install <ini or folder>`, or remove the `.msi` and install it again.
+  The setup program has no console window, so a call typed into a prompt returns at once and shows
+  nothing. Wait for it and read the exit code (0 done, 1 failed, 2 wrong call) like this:
+
+  ```bat
+  start /wait "" "%ProgramFiles%\printpapi Agent Setup\printpapi-setup.exe" --managed-install %SystemRoot%\printpapi-deploy
+  echo %ERRORLEVEL%
+  ```
+
+  A failure line goes to `printpapi-managed.log` in the `%LOCALAPPDATA%` of the account you typed it
+  in, not to the LocalSystem profile.
+- A new `.msi` (another product code, the same upgrade code) is a major upgrade. With `AGENT_INI` the
+  agent is installed again from that file. Without it the agent program and the tray program are replaced
+  and every setting stays; a newer installed agent is never replaced by an older one. The x64 and the
+  ARM64 `.msi` are one product: the other architecture is an upgrade.
+- Removing the `.msi` removes the agent that it installed, and only that one. The `.msi` leaves a
+  flag file `.managed-install` next to the setup program to remember that it installed the agent. On a
+  PC where it never did, removing the `.msi` keeps the agent. The other way round: when somebody
+  removes the agent with the window and installs it again by hand, the flag is still there, so
+  removing the `.msi` removes that agent too. Do not mix the two ways on one PC.
+- `--managed-refresh` and `--managed-uninstall` are what upgrade and removal run; they are not for
+  typing. The `.msi` starts them only on a PC where the flag file `.managed-install` exists: on a PC
+  that has the plain `.msi`, removing it never starts the unsigned setup program, so a policy or
+  antivirus that blocks that program cannot make the removal fail.
+- The install folder is fixed: `INSTALLDIR` on the command line or in a dialog is ignored, and the
+  setup program refuses to run as an installer step from any other folder, because it runs as SYSTEM.
+- Every managed install, refresh and removal ends all tray icons and open settings windows of the
+  PC; they come back at the next logon.
+- `AGENT_INI` is deliberately not a secure property: somebody who is not an administrator cannot hand
+  it to an elevated install, and the command line of an administrator still can.
+
+**Costs and limits.** The `.msi` adds a desktop shortcut (Tauri's stock template). It does not install
+WebView2 (Windows 11 has it; the setup says where to get it otherwise). Neither the `.exe` nor the
+`.msi` is code-signed: SmartScreen warns, and Smart App Control and WDAC block both, so there the
+[Python agent](#locked-down-windows) stays the answer.
+
 ## Install
 
 The agent is a single Rust binary, `printpapi-agent`. No Python, no runtime.
@@ -180,7 +344,7 @@ The agent is a single Rust binary, `printpapi-agent`. No Python, no runtime.
 1. Download the archive for the machine from the
    [latest release](https://github.com/LukiPrince/printpapi/releases/latest) and unpack it. Each
    archive holds the binary, `agent.ini.example` and `LICENSE`:
-   - `printpapi-agent-windows-x86_64.zip`
+   - `printpapi-agent-windows-x86_64.zip`, `printpapi-agent-windows-aarch64.zip` (ARM64)
    - `printpapi-agent-linux-x86_64.tar.gz`, `printpapi-agent-linux-aarch64.tar.gz`
    - `printpapi-agent-macos-aarch64.tar.gz` (Apple silicon), `printpapi-agent-macos-x86_64.tar.gz`
      (Intel)
@@ -533,6 +697,21 @@ WantedBy=multi-user.target
 needed. `sudo systemctl enable --now printpapi-agent`. The service user needs no special rights —
 any local user may submit to CUPS.
 
+The agent keeps its [print journal](#the-print-journal) next to the binary. When the service user
+cannot write that folder (the usual case with a root-owned `/opt/printpapi`), undelivered results are
+kept in memory only and a restart loses them. To have them survive, add one line under `[Service]` of
+your own unit file:
+
+```ini
+StateDirectory=printpapi-agent-manual
+```
+
+then `sudo systemctl daemon-reload` and restart the service. systemd makes `/var/lib/printpapi-agent-manual` for the
+service user and the agent uses it through `$STATE_DIRECTORY`. Put the line into the unit file itself,
+not into a drop-in: the setup app uses the same unit name, and a drop-in left behind would apply to its
+unit. Do not use the name `printpapi-agent` (the setup's status folder, which systemd would hand to the
+service user) or `printpapi` (the server's data folder, [migration](migration.md)).
+
 **macOS — launchd** (`/Library/LaunchDaemons/com.printpapi.agent.plist`, root-owned, mode 644):
 
 ```xml
@@ -620,8 +799,70 @@ Switch to the Rust agent once a code-signed build is released.
 
 ## Reliability
 
-- Result reporting retries up to 5 times with exponential backoff, so a network blip after a
-  successful print doesn't make the server requeue (and re-print) the job.
+### The print journal
+
+A result the agent could not deliver must not make the job print a second time. So the agent keeps
+a journal, `print-journal.jsonl`: as soon as at least one copy of a job was handed over to the printer without an error,
+the outcome of the job (done, or the error of a later copy) is written to that file and flushed to
+disk **before** it is reported to the server. Then:
+
+- The report is tried five times (1, 2, 4 and 8 seconds apart). If it still fails, the entry stays
+  and is sent again before every poll, also after the agent was restarted or the machine rebooted.
+  After a failed pass the agent waits 30 seconds, then twice as long each time, at most 10 minutes.
+- If the server hands that same job out again (its reaper requeued it, because the report never
+  arrived), the agent reports the recorded outcome and prints nothing.
+- A job that takes longer than the server's five minutes to print is still finished: the server
+  accepts the result of a job its reaper has requeued or even failed. See
+  [the job lifecycle](api.md#job-lifecycle).
+
+A job is recognised by an identity (`job_uid`) that the server derives from the job's number and creation time, so a
+server whose database was reset or restored from a backup cannot make the agent mistake a new job
+for an old one. In every doubtful case the agent prints.
+
+The journal holds, per job: its number and identity, whether it worked, the error text (masked,
+cut to 500 characters, never the key) and whether the server has confirmed it. Never the
+document, the title, a header value or the key. It is a text file of one JSON object per line,
+at most 1000 jobs and 16 MiB, compacted by the agent itself; delete it, with the agent stopped,
+to make the agent forget. It is only used between a server and an agent of this version: an older
+server hands out no identity, and then the agent works as before, as does the legacy Python agent.
+
+Where it lives: an agent that the setup installed keeps it next to `status.json` in its status folder (see
+[Tray icon and settings](#tray-icon-and-settings)); an agent you started by hand keeps it in the
+folder of the program and `agent.ini`, or under systemd with `StateDirectory=` in that folder. If
+the folder cannot be written the agent says so once in the crash log and keeps the results in
+memory only, which a restart loses. The journal is never put into the temp folder.
+
+**What is not covered** (the job can still print twice, or a label or a result can be missing):
+
+- A crash or power cut while a job is being printed: the whole job prints again.
+- A first copy that failed although paper came out (SumatraPDF stopped after 60 seconds, a socket
+  cut in the middle), when the failure report was lost as well: the job is tried again.
+- A power cut can lose labels that were handed over but still waited in the spooler, the CUPS queue
+  or a printer's buffer. "Printed" means "handed over without an error", for the journal as it
+  always did for `done`.
+- A lost journal: a folder that cannot be written followed by a restart, a full disk followed by a
+  restart, the agent removed and installed again.
+- An old server (it hands out no identity) and the legacy Python agent.
+- Two installations that share one key: each has its own journal.
+- A result that arrives after the server's retention removed the job (the server answers
+  `state: null` and the agent drops it from the pending list; an `ok` result stays in the journal
+  as confirmed) or cleared its callback (no webhook).
+- A failure report that the server accepted but whose reply was lost, followed by setting the job
+  back to `queued` by hand in SQLite before the agent sent it again: the agent reports the
+  recorded failure and prints nothing. Submit a new job.
+- Going back to an agent from before the journal: it does not read the journal and sends no job
+  identity, so a job whose result was still pending can print again. Let the current agent run
+  with the server reachable first (the crash log says "delivered late" for each result), or accept
+  the duplicate.
+- A server database that was reset is told apart from the old one by the job number together with
+  its creation time, so a frozen clock plus a reset can collide.
+
+A job that is set back to `queued` by hand after it printed is answered from the journal; submit a
+new job to print it again. A failure that the server has confirmed to the agent is forgotten, so
+a job that failed and is handed out again prints.
+
+### Other safeguards
+
 - If the agent dies mid-job, the server's reaper requeues the job after the visibility timeout.
 - Crash log: `%LOCALAPPDATA%\print_agent-error.log` (Windows) / `print_agent-error.log` in the
   temp dir (Linux, macOS) - see [Unattended machines](#unattended-machines) for what gets logged.

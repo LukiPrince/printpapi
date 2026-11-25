@@ -1,0 +1,86 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  printpapi — self-hosted PrintNode alternative. Elastic License 2.0 (see LICENSE).
+
+  The managed part of the .msi: with AGENT_INI the agent is installed silently, on a major upgrade
+  without it the agent is refreshed, and removing the .msi removes the agent it installed. The three
+  actions run the setup program's headless modes (crates/setup/src/managed.rs) as LocalSystem.
+  docs/agent.md, "Managed Windows install (.msi)", is the user's text.
+
+  PINNED TO tauri-cli 2.12.6 (release.yml and ci.yml install exactly that version). This fragment
+  uses ids of Tauri's own template, crates/tauri-bundler/src/bundle/windows/msi/main.wxs at tag
+  tauri-cli-v2.12.6: the file "Path" (the setup exe), the directory "INSTALLDIR", the property
+  WIX_UPGRADE_DETECTED (its MajorUpgrade). Look at the template again before changing the pin.
+
+  Only used by the MSI build step of release.yml and ci.yml: cargo tauri build with the bundle msi and the config file tauri.msi.conf.json: the base
+  tauri.conf.json does not know it, so a plain build makes no MSI without this hook.
+-->
+<Wix xmlns="http://schemas.microsoft.com/wix/2006/wi">
+  <Fragment>
+    <!--
+      The install folder is Program Files, whatever the command line, a dialog or the HKCU key of
+      an earlier install says: the exe below runs as LocalSystem and must not sit in a folder that
+      a standard user can write to. Type 51 sets the property INSTALLDIR, which the template also
+      uses as the id of the directory; it runs right after AppSearch (which fills INSTALLDIR from
+      HKCU) and before the costing of the directories. Same effect as WiX's SetDirectory element,
+      https://wixtoolset.org/docs/v3/xsd/wix/setdirectory/, but the place in the sequence is written
+      here. The program checks its own folder again (managed.rs). ProgramFiles64Folder: the .msi is
+      built for x64 and ARM64 only.
+    -->
+    <CustomAction Id="PinInstallDir" Property="INSTALLDIR" Value="[ProgramFiles64Folder]printpapi Agent Setup" />
+
+    <!--
+      The flag file of managed.rs (FLAG there) in that folder, found by AppSearch before anything is
+      installed or removed: it says that this PC's agent was put there by the .msi. Without it the
+      exe has nothing to do on a removal or an upgrade, so it is not started at all: a PC that has
+      the plain .msi can then still be cleaned of it when WDAC or an antivirus blocks the unsigned
+      exe, instead of failing the removal with 1603. The path may hold a property
+      (https://learn.microsoft.com/en-us/windows/win32/msi/anypath). Secure="yes": AppSearch does
+      not run again in the execute sequence when it ran in the UI sequence
+      (https://learn.microsoft.com/en-us/windows/win32/msi/appsearch-action), so in a double-clicked
+      run, which is elevated only for the execute sequence, the value reaches it only as a secure
+      property; Tauri's own search of the same kind (DESKTOPSHORTCUTEXISTS) is secure too. A forged
+      value is harmless: managed.rs checks the flag file itself.
+    -->
+    <Property Id="PRINTPAPI_MANAGED_FLAG" Secure="yes">
+      <DirectorySearch Id="PrintpapiFlagDir" Path="[ProgramFiles64Folder]printpapi Agent Setup" Depth="0">
+        <FileSearch Name=".managed-install" />
+      </DirectorySearch>
+    </Property>
+
+    <!--
+      Deferred, as LocalSystem (Impersonate="no"), run from the installed setup exe (FileKey="Path").
+      The Target is formatted text: [AGENT_INI] is resolved when the script is written
+      (https://learn.microsoft.com/en-us/windows/win32/msi/custom-action-type-34). AGENT_INI is
+      deliberately NOT declared as a secure property: a person who is not an administrator and
+      starts an elevated install cannot hand it over (restricted public properties,
+      https://learn.microsoft.com/en-us/windows/win32/msi/restricted-public-properties); an
+      administrator's own command line still does. The key is never a property: AGENT_INI is a path.
+    -->
+    <CustomAction Id="ManagedInstall" FileKey="Path" ExeCommand="--managed-install &quot;[AGENT_INI]&quot;" Execute="deferred" Impersonate="no" Return="check" />
+    <CustomAction Id="ManagedRefresh" FileKey="Path" ExeCommand="--managed-refresh" Execute="deferred" Impersonate="no" Return="check" />
+    <CustomAction Id="ManagedUninstall" FileKey="Path" ExeCommand="--managed-uninstall" Execute="deferred" Impersonate="no" Return="check" />
+
+    <InstallUISequence>
+      <Custom Action="PinInstallDir" After="AppSearch" />
+    </InstallUISequence>
+    <InstallExecuteSequence>
+      <Custom Action="PinInstallDir" After="AppSearch" />
+      <!-- NOT Installed: never on a repair or a maintenance run, so msiexec with the repair option and AGENT_INI=x
+           cannot replace the configuration -->
+      <Custom Action="ManagedInstall" Before="InstallFinalize">AGENT_INI AND NOT Installed AND NOT REMOVE</Custom>
+      <!-- a major upgrade (new ProductCode, same UpgradeCode) without a new file, on a PC whose agent the .msi installed -->
+      <Custom Action="ManagedRefresh" Before="InstallFinalize">NOT AGENT_INI AND WIX_UPGRADE_DETECTED AND PRINTPAPI_MANAGED_FLAG AND NOT Installed AND NOT REMOVE</Custom>
+      <!-- not when an upgrade removes the old product: the agent stays and is refreshed instead; not
+           without the flag: the .msi never installed an agent here -->
+      <Custom Action="ManagedUninstall" Before="RemoveFiles">REMOVE="ALL" AND NOT UPGRADINGPRODUCTCODE AND PRINTPAPI_MANAGED_FLAG</Custom>
+    </InstallExecuteSequence>
+
+    <!-- The template references only components, so this one pulls the fragment in (componentRefs). -->
+    <DirectoryRef Id="INSTALLDIR">
+      <Component Id="PrintpapiManagedHook" Guid="*" Win64="yes">
+        <RegistryValue Root="HKLM" Key="SOFTWARE\printpapi\Setup" Name="InstallDir" Type="string" Value="[INSTALLDIR]" KeyPath="yes" />
+      </Component>
+    </DirectoryRef>
+  </Fragment>
+</Wix>

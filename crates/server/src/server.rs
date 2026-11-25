@@ -577,6 +577,21 @@ pub struct Req {
     pub socket_peer: String,
 }
 
+/// Request header with which an agent asks for the job identity in the claim (and which it sends
+/// on every request). Its value is a comma list; `GET /agent/jobs` adds `job_uid` only when the
+/// list holds `job-uid`, so the body for every agent that did not ask stays byte-identical.
+pub const FEATURES_HEADER: &str = "x-printapi-features";
+
+/// Does this request ask for `job_uid` in the claim?
+pub fn wants_job_uid(headers: &http::HeaderMap) -> bool {
+    headers
+        .get_all(FEATURES_HEADER)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|v| v.split(','))
+        .any(|f| f.trim().eq_ignore_ascii_case("job-uid"))
+}
+
 impl Req {
     /// A header as text ("" when absent or not valid UTF-8).
     pub fn header(&self, name: &str) -> &str {
@@ -2873,8 +2888,14 @@ impl Ctx<'_> {
             let Some(aid) = self.agent_id()? else {
                 return Ok(unauthorized());
             };
+            let want_uid = wants_job_uid(&self.req.headers);
             return Ok(match self.db(|c| store::claim_job(c, aid, None))? {
-                Some(job) => Resp::json(200, &val(&job)),
+                Some(mut job) => {
+                    if !want_uid {
+                        job.job_uid = None;
+                    }
+                    Resp::json(200, &val(&job))
+                }
                 None => Resp::empty(204),
             });
         }
@@ -2939,6 +2960,7 @@ impl Ctx<'_> {
                 return Ok(Resp::json(200, &json!({ "id": id, "name": name })));
             }
             "/agent/register" => return self.agent_register(),
+            "/agent/results" => return self.agent_results(),
             _ => {}
         }
         if let Some(oid) = id_of(t, "/orgs/", "/users") {
@@ -2958,9 +2980,12 @@ impl Ctx<'_> {
             let body = gate!(self.read_obj());
             let ok = body.get("ok").is_some_and(truthy);
             let error = sql_text(body.get("error"));
+            // an agent that was handed a job_uid names it: another job under this id (a database
+            // reset) is a 404 and stays untouched. Absent (or no string) = the id decides, as ever.
+            let uid = str_field(&body, "job_uid");
             // the gate runs again with the write, in one closure (the key may have changed meanwhile)
             let Some(finished) = self.agent_for_job(jid, |c, aid| {
-                store::finish_job(c, jid, aid, ok, error.as_deref())
+                store::finish_job_checked(c, jid, aid, ok, error.as_deref(), uid)
             })?
             else {
                 return Ok(unauthorized());
@@ -2968,6 +2993,39 @@ impl Ctx<'_> {
             return Ok(if finished { ok_true() } else { not_found() });
         }
         Ok(not_found())
+    }
+
+    /// `POST /agent/results` {job_id, job_uid, ok, error}: a result the agent could not deliver
+    /// earlier (its journal, docs/agent.md). Matched by id and uid, so after a database reset it
+    /// can never finish another job. Strict agent key: a key that lost the agent right is a 401 and
+    /// the agent keeps the result until the right is back. Every well-formed call is a 200 with
+    /// the state of the job now, or null when this agent has no such job.
+    fn agent_results(&self) -> R {
+        // 401 before the body is read, as on the neighbouring routes
+        if self.agent_id()?.is_none() {
+            return Ok(unauthorized());
+        }
+        let body = gate!(self.read_obj());
+        let (Some(job_id), Some(uid)) = (
+            body.get("job_id").and_then(Value::as_i64),
+            str_field(&body, "job_uid"),
+        ) else {
+            return Ok(jerr(400, "job_id and job_uid required"));
+        };
+        let ok = body.get("ok").is_some_and(truthy);
+        let error = sql_text(body.get("error"));
+        // the key is checked again with the write, in one closure
+        let key = self.presented_key();
+        let state = self.db(|c| match store::authenticate_agent(c, key)? {
+            None => Ok(None),
+            Some(aid) => {
+                store::finish_job_by_uid(c, job_id, uid, aid, ok, error.as_deref()).map(Some)
+            }
+        })?;
+        Ok(match state {
+            None => unauthorized(),
+            Some(state) => Resp::json(200, &json!({ "ok": true, "state": state })),
+        })
     }
 
     fn post_apikeys(&self) -> R {
@@ -3427,10 +3485,10 @@ pub fn deliver_webhooks(
         let res = match post(&job.callback_url, &payload) {
             Err(e) => {
                 eprintln!("webhook {} -> {} failed: {e}", job.job_id, job.callback_url);
-                db.with(|c| store::bump_webhook_attempt(c, job.job_id))
+                db.with(|c| store::bump_webhook_attempt(c, job.job_id, &job.state))
             }
             // marked outside the post handling: a mark-time DB error must not look like a POST failure
-            Ok(()) => db.with(|c| store::mark_webhook_delivered(c, job.job_id, None)),
+            Ok(()) => db.with(|c| store::mark_webhook_delivered(c, job.job_id, &job.state, None)),
         };
         if let Err(e) = res {
             return eprintln!("webhook dispatcher error: {e}");

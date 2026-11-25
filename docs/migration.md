@@ -113,7 +113,10 @@ On each machine:
 5. Point the autostart entry at the new executable instead of the Python interpreter. On Windows,
    create the task as in [Run as a service](agent.md#run-as-a-service) with `-Force` added to
    `Register-ScheduledTask`, which replaces the old task (one made with `schtasks /create` also
-   stops after 72 hours). With systemd, set `ExecStart=/opt/printpapi/printpapi-agent` in the unit.
+   stops after 72 hours). With systemd, set `ExecStart=/opt/printpapi/printpapi-agent` in the unit,
+   and see [Run as a service](agent.md#run-as-a-service) for the one line (`StateDirectory=`) that
+   lets the agent keep its [print journal](agent.md#the-print-journal) when `/opt/printpapi` is not
+   writable for the service user.
 6. Start it and check the dashboard's **Devices** page: the computer shows as online under its old
    name.
 

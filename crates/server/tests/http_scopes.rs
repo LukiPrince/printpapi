@@ -779,6 +779,7 @@ fn a_cloudprnt_key_is_no_agent_and_no_client() {
         ("GET", "/agent/jobs", 401),
         ("GET", "/agent/jobs/1/payload", 401),
         ("POST", "/agent/jobs/1/result", 401),
+        ("POST", "/agent/results", 401),
         ("GET", "/computers", 403),
     ] {
         let r = app
@@ -922,6 +923,18 @@ fn an_agent_key_registers_polls_downloads_and_reports_and_nothing_else() {
     );
     assert_eq!(r.status, 200);
     assert_eq!(job_state(&app.db, jid), "done");
+    // a late result of the agent's journal, matched by id and uid
+    let uid = store::job_uid(
+        jid,
+        sql_f64(&app.db, "SELECT created_at FROM jobs WHERE id=?", jid).unwrap(),
+    );
+    let r = app.agent(
+        "POST",
+        "/agent/results",
+        k,
+        Some(json!({"job_id": jid, "job_uid": uid, "ok": true})),
+    );
+    assert_eq!((r.status, r.json()["state"].clone()), (200, json!("done")));
     // the org's computer list, as released setups read it
     let (code, b) = app.get("/computers", Some(k));
     assert_eq!(code, 200);

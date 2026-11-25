@@ -11,6 +11,13 @@ name: release
 # (secret UPDATE_SIGNING_KEY). Without the secret, or for a tag that is not vN.N.N, that step ends with a
 # notice and the release is published as before. The signed file is uploaded last, after the files it
 # names. The job waits for the approval of the environment's required reviewer once that is set.
+#
+# Beta variants (.msi, .rpm; the ARM64 Windows files come with their own matrix rows): they are built
+# AFTER the existing formats have been named and uploaded, with continue-on-error, and travel in a
+# second artifact, setup-extra-<name>. A broken beta variant can never take away a shipping installer:
+# publish merges all artifacts, and uploads only the files that exist. A file is copied into
+# dist-extra only when its check passed (the .msi smoke, the .rpm install check). Their names are
+# in web/lib/setup-downloads.json too; tools/docs/test_release_assets.py keeps both lists in step.
 on:
   push:
     tags: ["v*"]
@@ -23,6 +30,7 @@ jobs:
       matrix:
         include:
           - { os: windows-latest, target: x86_64-pc-windows-msvc, name: windows-x86_64, exe: .exe }
+          - { os: windows-11-arm, target: aarch64-pc-windows-msvc, name: windows-aarch64, exe: .exe }
           - { os: ubuntu-latest, target: x86_64-unknown-linux-gnu, name: linux-x86_64, exe: "" }
           - { os: ubuntu-24.04-arm, target: aarch64-unknown-linux-gnu, name: linux-aarch64, exe: "" }
           - { os: macos-latest, target: aarch64-apple-darwin, name: macos-aarch64, exe: "" }
@@ -33,7 +41,28 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
+      # ring builds C and assembly for this target and wants clang (its BUILDING.md: Windows ARM64
+      # needs the "clang" component); the runner image has LLVM, only its folder is not on PATH.
+      # https://github.com/briansmith/ring/blob/main/BUILDING.md
+      # If the build still fails here, set CC_aarch64_pc_windows_msvc=clang-cl for this row.
+      - name: clang for ring (Windows ARM64)
+        if: matrix.name == 'windows-aarch64'
+        shell: bash
+        run: echo "C:/Program Files/LLVM/bin" >> "$GITHUB_PATH"
       - run: cargo build --release --locked --target ${{ matrix.target }} -p printpapi-agent -p printpapi-server
+        env: # no VCRUNTIME140.dll in the Windows programs (see "no C runtime DLL" below)
+          CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS: -C target-feature=+crt-static
+          CARGO_TARGET_AARCH64_PC_WINDOWS_MSVC_RUSTFLAGS: -C target-feature=+crt-static
+      # A Windows without the Visual C++ runtime cannot start a program that imports VCRUNTIME140.dll, and
+      # a program that SYSTEM starts must not go looking for it in other folders.
+      # https://doc.rust-lang.org/reference/linkage.html#static-and-dynamic-c-runtimes
+      - name: no C runtime DLL (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          for f in target/${{ matrix.target }}/release/printpapi-agent.exe target/${{ matrix.target }}/release/printpapi.exe; do
+            if grep -aqi 'vcruntime140' "$f"; then echo "$f needs VCRUNTIME140.dll"; exit 1; fi
+          done
       - name: package
         shell: bash
         run: |
@@ -73,6 +102,7 @@ jobs:
       matrix:
         include:
           - { os: windows-latest, target: x86_64-pc-windows-msvc, name: windows-x86_64, exe: .exe }
+          - { os: windows-11-arm, target: aarch64-pc-windows-msvc, name: windows-aarch64, exe: .exe }
           - { os: ubuntu-22.04, target: x86_64-unknown-linux-gnu, name: linux-x86_64, exe: "" }
           - { os: ubuntu-22.04-arm, target: aarch64-unknown-linux-gnu, name: linux-aarch64, exe: "" }
           - { os: macos-latest, target: aarch64-apple-darwin, name: macos-aarch64, exe: "" }
@@ -103,8 +133,26 @@ jobs:
         working-directory: web
       - run: npm run build:setup
         working-directory: web
+      # ring builds C and assembly for this target and wants clang (its BUILDING.md: Windows ARM64
+      # needs the "clang" component); the runner image has LLVM, only its folder is not on PATH.
+      # https://github.com/briansmith/ring/blob/main/BUILDING.md
+      # If the build still fails here, set CC_aarch64_pc_windows_msvc=clang-cl for this row.
+      - name: clang for ring (Windows ARM64)
+        if: matrix.name == 'windows-aarch64'
+        shell: bash
+        run: echo "C:/Program Files/LLVM/bin" >> "$GITHUB_PATH"
       - run: cargo build --release --locked --target ${{ matrix.target }} -p printpapi-agent
-      - run: cargo install tauri-cli --version "^2" --locked
+        env: # the agent inside the setup, linked as in the build job
+          CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS: -C target-feature=+crt-static
+          CARGO_TARGET_AARCH64_PC_WINDOWS_MSVC_RUSTFLAGS: -C target-feature=+crt-static
+      - name: no C runtime DLL in the embedded agent (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          f=target/${{ matrix.target }}/release/printpapi-agent.exe
+          if grep -aqi 'vcruntime140' "$f"; then echo "$f needs VCRUNTIME140.dll"; exit 1; fi
+      # Exactly this version: crates/setup/wix/managed.wxs uses ids of the .msi template of this tauri-cli.
+      - run: cargo install tauri-cli --version 2.12.6 --locked
       - name: build the setup (Windows exe)
         if: runner.os == 'Windows'
         working-directory: crates/setup
@@ -170,6 +218,92 @@ jobs:
           name: setup-${{ matrix.name }}
           path: dist/*
           if-no-files-found: error
+
+      # ---- beta variants: everything below may fail without taking anything away ----
+      # Windows: the .msi. Built twice, because Product Id="*" gives every build a new ProductCode,
+      # so the second one is a real major upgrade of the first for the smoke test (the template's
+      # MajorUpgrade allows the same version). The smoke test installs, upgrades and removes for real:
+      # throwaway runners only. Only a smoke-proven .msi (the second build) goes into dist-extra.
+      - name: build the server (the .msi smoke test needs it)
+        id: server
+        if: runner.os == 'Windows'
+        continue-on-error: true
+        run: cargo build --release --locked --target ${{ matrix.target }} -p printpapi-server
+      - name: build the .msi (first)
+        id: msi_a
+        if: runner.os == 'Windows'
+        continue-on-error: true
+        shell: bash
+        working-directory: crates/setup
+        env:
+          PRINTPAPI_AGENT_BIN: ${{ github.workspace }}/target/${{ matrix.target }}/release/printpapi-agent${{ matrix.exe }}
+        run: |
+          set -eux
+          cargo tauri build --target ${{ matrix.target }} --bundles msi --config tauri.msi.conf.json
+          mkdir -p ../../msi-a
+          cp target/${{ matrix.target }}/release/bundle/msi/*.msi ../../msi-a/
+      - name: build the .msi (second, for the upgrade)
+        id: msi_b
+        if: steps.msi_a.outcome == 'success'
+        continue-on-error: true
+        shell: bash
+        working-directory: crates/setup
+        env:
+          PRINTPAPI_AGENT_BIN: ${{ github.workspace }}/target/${{ matrix.target }}/release/printpapi-agent${{ matrix.exe }}
+        run: |
+          set -eux
+          rm -f target/${{ matrix.target }}/release/bundle/msi/*.msi
+          cargo tauri build --target ${{ matrix.target }} --bundles msi --config tauri.msi.conf.json
+          mkdir -p ../../msi-b
+          cp target/${{ matrix.target }}/release/bundle/msi/*.msi ../../msi-b/
+      - name: smoke test the .msi
+        id: msi_smoke
+        if: steps.msi_b.outcome == 'success' && steps.server.outcome == 'success'
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -eux
+          python tools/smoke/setup_smoke.py \
+            --server "target/${{ matrix.target }}/release/printpapi.exe" \
+            --msi "$(ls msi-a/*.msi)" --msi-upgrade "$(ls msi-b/*.msi)"
+      - name: name the .msi
+        if: steps.msi_smoke.outcome == 'success'
+        shell: bash
+        run: |
+          mkdir -p dist-extra
+          cp msi-b/*.msi dist-extra/printpapi-setup-${{ matrix.name }}.msi
+      - name: say what is missing (.msi)
+        if: runner.os == 'Windows' && steps.msi_smoke.outcome != 'success'
+        shell: bash
+        run: echo "::warning::No .msi for ${{ matrix.name }}. server=${{ steps.server.outcome }}, first build=${{ steps.msi_a.outcome }}, second build=${{ steps.msi_b.outcome }}, smoke test=${{ steps.msi_smoke.outcome }}."
+      # Linux: the .rpm, then an install check in Fedora (this and the previous release) and openSUSE
+      # Tumbleweed (tools/packaging/rpm_install_check.sh). Only a checked .rpm goes into dist-extra.
+      - name: build the .rpm
+        id: rpm
+        if: runner.os == 'Linux'
+        continue-on-error: true
+        working-directory: crates/setup
+        env:
+          PRINTPAPI_AGENT_BIN: ${{ github.workspace }}/target/${{ matrix.target }}/release/printpapi-agent
+        run: cargo tauri build --target ${{ matrix.target }} --bundles rpm
+      - name: check the .rpm installs
+        id: rpm_check
+        if: steps.rpm.outcome == 'success'
+        continue-on-error: true
+        run: bash tools/packaging/rpm_install_check.sh crates/setup/target/${{ matrix.target }}/release/bundle/rpm/*.rpm
+      - name: name the .rpm
+        if: steps.rpm_check.outcome == 'success'
+        run: |
+          mkdir -p dist-extra
+          cp crates/setup/target/${{ matrix.target }}/release/bundle/rpm/*.rpm dist-extra/printpapi-setup-${{ matrix.name }}.rpm
+      - name: say what is missing (.rpm)
+        if: runner.os == 'Linux' && steps.rpm_check.outcome != 'success'
+        run: echo "::warning::No .rpm for ${{ matrix.name }}. build=${{ steps.rpm.outcome }}, install check=${{ steps.rpm_check.outcome }}."
+      - uses: actions/upload-artifact@v4
+        with:
+          name: setup-extra-${{ matrix.name }}
+          path: dist-extra/*
+          if-no-files-found: ignore
 
   publish:
     needs: [build, setup]

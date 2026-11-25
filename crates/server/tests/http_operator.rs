@@ -264,6 +264,7 @@ fn routes() -> Vec<(&'static str, &'static str)> {
         ("GET", "/agent/jobs"),
         ("GET", "/agent/jobs/1/payload"),
         ("POST", "/agent/jobs/1/result"),
+        ("POST", "/agent/results"),
         ("POST", "/cloudprnt"),
         ("GET", "/cloudprnt"),
         ("DELETE", "/cloudprnt"),

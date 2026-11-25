@@ -406,6 +406,9 @@ pub struct IniUpdate<'a> {
     pub printers: Option<&'a str>,
     pub timeout: Option<&'a str>,
     pub headers: Option<&'a [(String, Option<String>)]>,
+    /// `notify`, `auto` or `off`: one of those three words, as the setup's managed install writes
+    /// `updates = off`. Nothing else is written here, so it needs no escaping.
+    pub updates: Option<&'a str>,
 }
 
 /// `existing` with the `[agent]` keys of `update` set, as text. Works line by line: a replaced
@@ -422,6 +425,7 @@ pub fn update_ini(existing: Option<&str>, update: &IniUpdate) -> String {
         ("name", update.name),
         ("printers", update.printers),
         ("timeout", update.timeout),
+        ("updates", update.updates),
     ] {
         if let Some(v) = value {
             let v = v.replace(['\r', '\n'], " ").replace('%', "%%");
@@ -754,6 +758,7 @@ pub fn apply_patch(installed: &str, patch: &Patch) -> Result<String, String> {
         printers: patch.printers.as_deref(),
         timeout: timeout.as_deref(),
         headers: Some(&patch.headers),
+        updates: None,
     };
     let mut text = update_ini(Some(installed), &update);
     if let Some(mode) = &patch.updates {
@@ -792,6 +797,35 @@ mod tests {
             "[agent]\nserver_url=https://x\napi_key=k\nprinters=p\n{extra}"
         ))
         .unwrap()
+    }
+
+    #[test]
+    fn update_ini_sets_the_update_mode_and_replaces_a_named_one() {
+        let up = |mode| IniUpdate {
+            server_url: None,
+            api_key: None,
+            name: None,
+            printers: None,
+            timeout: None,
+            headers: None,
+            updates: mode,
+        };
+        let text = update_ini(
+            Some("[agent]\nname = pc\n\n[headers]\nA = b\n"),
+            &up(Some("off")),
+        );
+        assert_eq!(
+            text,
+            "[agent]\nname = pc\nupdates = off\n\n[headers]\nA = b\n"
+        );
+        let text = update_ini(
+            Some("[agent]\nupdates = auto\nname = pc\n"),
+            &up(Some("off")),
+        );
+        assert_eq!(text, "[agent]\nupdates = off\nname = pc\n");
+        // not named: nothing is touched
+        let same = "[agent]\nupdates = auto\n";
+        assert_eq!(update_ini(Some(same), &up(None)), same);
     }
 
     #[test]
@@ -1121,6 +1155,7 @@ mod tests {
                 printers: Some("50% Drucker"),
                 timeout: None,
                 headers: None,
+                updates: None,
             },
         );
         let cfg = Config::from_text(&text).unwrap();
@@ -1140,6 +1175,7 @@ mod tests {
                 printers: Some("c"),
                 timeout: None,
                 headers: None,
+                updates: None,
             },
         );
         assert!(
@@ -1166,6 +1202,7 @@ mod tests {
             printers: Some("p"),
             timeout: None,
             headers: None,
+            updates: None,
         };
         let text = update_ini(Some("[agent]\nnote = 1\n\n[headers]\nA = b\n"), &up);
         let cfg = Config::from_text(&text).unwrap();
@@ -1191,6 +1228,7 @@ mod tests {
                 printers: Some("c"),
                 timeout: None,
                 headers: None,
+                updates: None,
             },
         );
         assert!(text.contains("[headers]\nprinters = keep"));
@@ -1211,6 +1249,7 @@ mod tests {
                 printers: Some("c"),
                 timeout: None,
                 headers: None,
+                updates: None,
             },
         );
         let cfg = Config::from_text(&text).unwrap();
@@ -1228,6 +1267,7 @@ mod tests {
                 printers: None,
                 timeout: Some("30"),
                 headers: None,
+                updates: None,
             },
         );
         let cfg = Config::from_text(&text).unwrap();
@@ -1246,6 +1286,7 @@ mod tests {
                 printers: Some("p"),
                 timeout: None,
                 headers: None,
+                updates: None,
             },
         );
         assert_eq!(
@@ -1589,6 +1630,7 @@ server_url = https://x
                 printers: Some("p"),
                 timeout: Some("45"),
                 headers: Some(&h),
+                updates: None,
             },
         );
         let cfg = Config::from_text(&text).unwrap();
@@ -1616,6 +1658,7 @@ B = c
                 printers: Some("p"),
                 timeout: Some("45"),
                 headers: Some(&h),
+                updates: None,
             },
         );
         let s = Config::from_text(&text).unwrap().http_settings().unwrap();
@@ -1634,6 +1677,7 @@ B = c
                 printers: Some("p"),
                 timeout: Some("45"),
                 headers: Some(&h),
+                updates: None,
             },
         );
         let s = Config::from_text(&text).unwrap().http_settings().unwrap();
@@ -1682,6 +1726,7 @@ B = c
                 printers: None,
                 timeout: None,
                 headers: None,
+                updates: None,
             }
         }
         let new = update_ini(Some(&sealed), &update(Some("new%key")));
