@@ -23,6 +23,8 @@ pub enum ConnectError {
     BadUrl,
     Unreachable(String),
     BadKey,
+    /// The key is fine but is issued for printing, reading or Star printers, not for a computer.
+    NotAgentKey,
 }
 
 impl ConnectError {
@@ -32,6 +34,7 @@ impl ConnectError {
             ConnectError::BadUrl => "bad_url",
             ConnectError::Unreachable(_) => "unreachable",
             ConnectError::BadKey => "bad_key",
+            ConnectError::NotAgentKey => "not_agent_key",
         }
     }
 }
@@ -46,6 +49,9 @@ impl fmt::Display for ConnectError {
             ConnectError::BadKey => {
                 f.write_str("The server does not accept this key. It is wrong or was revoked.")
             }
+            ConnectError::NotAgentKey => f.write_str(
+                "This key may not set up a device. Create one on the Keys page of your dashboard with the rights Agent only or Everything.",
+            ),
         }
     }
 }
@@ -149,6 +155,18 @@ pub fn check_connection(
 ) -> Result<bool, ConnectError> {
     http.get(&format!("{base}/health"), key)
         .map_err(|e| ConnectError::Unreachable(explain(&e)))?;
+    // Before /computers: a CloudPRNT key gets 403 there, which would read as "could not reach the
+    // server". A deny list on purpose: a missing field (old server, full key), a word a later
+    // server invented and any failure (a proxy that lets only some paths through, a wrong key) are
+    // ignored. /computers still reports a wrong key, and POST /agent/register is the authority.
+    if let Ok(Some(me)) = http.get(&format!("{base}/me"), key)
+        && matches!(
+            me.get("scope").and_then(Value::as_str),
+            Some("print" | "read" | "cloudprnt")
+        )
+    {
+        return Err(ConnectError::NotAgentKey);
+    }
     Ok(computers(http, base, key)?
         .iter()
         .any(|c| c["name"].as_str() == Some(name)))
@@ -239,9 +257,11 @@ mod tests {
 
     type Reply = Result<Option<Value>, HttpError>;
 
-    /// `/health` and `/computers` answered with canned replies; every URL asked is recorded.
+    /// `/health`, `/me` and `/computers` answered with canned replies; every URL asked is
+    /// recorded. `/me` answers like a server with a full key unless a test says otherwise.
     struct FakeHttp {
         health: Reply,
+        me: Reply,
         computers: Reply,
         asked: RefCell<Vec<(String, String)>>,
     }
@@ -250,9 +270,14 @@ mod tests {
         fn new(health: Reply, computers: Reply) -> FakeHttp {
             FakeHttp {
                 health,
+                me: Ok(Some(json!({"kind": "key", "org_id": 1}))),
                 computers,
                 asked: RefCell::new(Vec::new()),
             }
+        }
+        fn with_me(mut self, me: Reply) -> FakeHttp {
+            self.me = me;
+            self
         }
         fn with_computers(list: Value) -> FakeHttp {
             FakeHttp::new(
@@ -267,6 +292,8 @@ mod tests {
             self.asked.borrow_mut().push((url.into(), key.into()));
             if url.ends_with("/health") {
                 self.health.clone()
+            } else if url.ends_with("/me") {
+                self.me.clone()
             } else {
                 self.computers.clone()
             }
@@ -358,6 +385,11 @@ mod tests {
     fn error_codes_and_messages_are_plain_words() {
         assert_eq!(ConnectError::BadUrl.code(), "bad_url");
         assert_eq!(ConnectError::BadKey.code(), "bad_key");
+        assert_eq!(ConnectError::NotAgentKey.code(), "not_agent_key");
+        assert_eq!(
+            ConnectError::NotAgentKey.to_string(),
+            "This key may not set up a device. Create one on the Keys page of your dashboard with the rights Agent only or Everything."
+        );
         let e = ConnectError::Unreachable("boom".into());
         assert_eq!(e.code(), "unreachable");
         assert_eq!(e.to_string(), "Could not reach the server: boom");
@@ -387,9 +419,68 @@ mod tests {
         );
         let asked = http.asked.borrow();
         assert_eq!(asked[0], ("https://x/health".to_string(), "k".to_string()));
+        // /me sits between them: a CloudPRNT key gets 403 on /computers, which would read as
+        // "could not reach the server"
+        assert_eq!(asked[1], ("https://x/me".to_string(), "k".to_string()));
         assert_eq!(
-            asked[1],
+            asked[2],
             ("https://x/computers".to_string(), "k".to_string())
+        );
+    }
+
+    fn me_with(scope: Option<&str>) -> Reply {
+        let mut me = json!({"kind": "key", "org_id": 1});
+        if let Some(s) = scope {
+            me["scope"] = json!(s);
+        }
+        Ok(Some(me))
+    }
+
+    #[test]
+    fn a_key_that_may_not_set_up_a_device_is_told_so() {
+        for scope in ["print", "read", "cloudprnt"] {
+            let http = FakeHttp::with_computers(json!([])).with_me(me_with(Some(scope)));
+            assert_eq!(
+                check_connection(&http, "https://x", "k", "pc"),
+                Err(ConnectError::NotAgentKey),
+                "{scope}"
+            );
+            // /computers is never asked: it may be a 403 for this key
+            assert_eq!(http.asked.borrow().len(), 2, "{scope}");
+        }
+    }
+
+    #[test]
+    fn every_other_answer_of_me_is_ignored_and_computers_decides() {
+        // a full key, an agent key, a word a later server invented, no scope (an old server or a
+        // full key), a failing /me (a proxy that lets only some paths through) and no body at all
+        for me in [
+            me_with(Some("full")),
+            me_with(Some("agent")),
+            me_with(Some("hologram")),
+            me_with(None),
+            status(500),
+            status(404),
+            Ok(None),
+            Err(HttpError::Value("expected value at line 1 column 1".into())),
+            Ok(Some(json!({"scope": 5}))),
+        ] {
+            let http =
+                FakeHttp::with_computers(json!([{"id": 1, "name": "pc"}])).with_me(me.clone());
+            assert_eq!(
+                check_connection(&http, "https://x", "k", "pc"),
+                Ok(true),
+                "{me:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_401_on_me_still_ends_as_a_bad_key_through_computers() {
+        let http = FakeHttp::new(Ok(Some(json!({"ok": true}))), status(401)).with_me(status(401));
+        assert_eq!(
+            check_connection(&http, "https://x", "k", "pc"),
+            Err(ConnectError::BadKey)
         );
     }
 

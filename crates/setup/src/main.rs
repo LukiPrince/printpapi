@@ -73,7 +73,6 @@ fn main() -> ExitCode {
             commands::needs_insecure_confirm,
             commands::check_connection,
             commands::list_printers,
-            commands::read_existing,
             commands::sumatra_present,
             commands::download_sumatra,
             commands::test_print,

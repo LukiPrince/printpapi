@@ -306,9 +306,165 @@ impl LoginLimiter {
     }
 }
 
+/// What an issued key may do. `Unknown` is a value this version does not know (a newer server
+/// wrote it): it allows nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Scope {
+    Full,
+    Agent,
+    CloudPrnt,
+    Print,
+    Read,
+    Unknown,
+}
+
+/// One thing a machine key may be allowed to do; `Scope::allows` is the only place that decides.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Right {
+    /// `GET /computers`.
+    Computers,
+    /// Read printers, templates, jobs, metrics and plans, on both API layers.
+    Look,
+    /// Submit and cancel jobs (Bearer API, orders, Shopify, PrintNode).
+    Submit,
+    /// Write label templates (and, later, receipt profiles).
+    Edit,
+    /// Enrol a computer, poll for its jobs, download and report them.
+    Agent,
+    /// Act as a Star CloudPRNT printer.
+    CloudPrnt,
+}
+
+impl Scope {
+    /// The words a manager may issue, exact lower case.
+    pub fn issuable(word: &str) -> Option<Scope> {
+        match Self::parse(word) {
+            Scope::Unknown => None,
+            s => Some(s),
+        }
+    }
+
+    /// A stored value; anything this version does not know is `Unknown`, never an error and never
+    /// a wider scope.
+    pub fn parse(word: &str) -> Scope {
+        match word {
+            "full" => Scope::Full,
+            "agent" => Scope::Agent,
+            "cloudprnt" => Scope::CloudPrnt,
+            "print" => Scope::Print,
+            "read" => Scope::Read,
+            _ => Scope::Unknown,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Scope::Full => "full",
+            Scope::Agent => "agent",
+            Scope::CloudPrnt => "cloudprnt",
+            Scope::Print => "print",
+            Scope::Read => "read",
+            Scope::Unknown => "unknown",
+        }
+    }
+
+    /// For `skip_serializing_if`: a full key is the default and stays out of answers.
+    pub fn is_full(&self) -> bool {
+        *self == Scope::Full
+    }
+
+    /// The rights table. Print keys also see and cancel only their own jobs; that is the server's
+    /// filter, not a right.
+    pub fn allows(self, right: Right) -> bool {
+        match self {
+            Scope::Full => true,
+            Scope::Agent => matches!(right, Right::Computers | Right::Agent),
+            Scope::CloudPrnt => matches!(right, Right::CloudPrnt),
+            Scope::Print => matches!(right, Right::Computers | Right::Look | Right::Submit),
+            Scope::Read => matches!(right, Right::Computers | Right::Look),
+            Scope::Unknown => false,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- key scopes ---------------------------------------------------------------------------
+
+    const RIGHTS: [Right; 6] = [
+        Right::Computers,
+        Right::Look,
+        Right::Submit,
+        Right::Edit,
+        Right::Agent,
+        Right::CloudPrnt,
+    ];
+
+    #[test]
+    fn allows_matches_the_rights_table() {
+        // Literal table, in the order of RIGHTS: Computers, Look, Submit, Edit, Agent, CloudPrnt.
+        let table: [(Scope, [bool; 6]); 6] = [
+            (Scope::Full, [true, true, true, true, true, true]),
+            (Scope::Agent, [true, false, false, false, true, false]),
+            (Scope::CloudPrnt, [false, false, false, false, false, true]),
+            (Scope::Print, [true, true, true, false, false, false]),
+            (Scope::Read, [true, true, false, false, false, false]),
+            (Scope::Unknown, [false, false, false, false, false, false]),
+        ];
+        for (scope, row) in table {
+            for (right, want) in RIGHTS.into_iter().zip(row) {
+                assert_eq!(scope.allows(right), want, "{scope:?} {right:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn parse_and_issuable_know_exactly_five_lower_case_words() {
+        for (word, scope) in [
+            ("full", Scope::Full),
+            ("agent", Scope::Agent),
+            ("cloudprnt", Scope::CloudPrnt),
+            ("print", Scope::Print),
+            ("read", Scope::Read),
+        ] {
+            assert_eq!(Scope::parse(word), scope);
+            assert_eq!(Scope::issuable(word), Some(scope));
+            assert_eq!(scope.as_str(), word);
+        }
+        for word in [
+            "",
+            "admin",
+            "Full",
+            "FULL",
+            " full",
+            "full ",
+            "unknown",
+            "agent,print",
+        ] {
+            assert_eq!(Scope::parse(word), Scope::Unknown, "{word:?}");
+            assert_eq!(Scope::issuable(word), None, "{word:?}");
+        }
+        assert_eq!(Scope::Unknown.as_str(), "unknown");
+    }
+
+    #[test]
+    fn scope_serializes_lower_case_and_only_full_is_full() {
+        assert_eq!(serde_json::to_value(Scope::CloudPrnt).unwrap(), "cloudprnt");
+        assert_eq!(serde_json::to_value(Scope::Print).unwrap(), "print");
+        assert!(Scope::Full.is_full());
+        for s in [
+            Scope::Agent,
+            Scope::CloudPrnt,
+            Scope::Print,
+            Scope::Read,
+            Scope::Unknown,
+        ] {
+            assert!(!s.is_full(), "{s:?}");
+        }
+    }
 
     // Written by Python's hashlib.scrypt (app.auth.hash_password); production DBs hold these.
     const PY_HASH_1: &str =

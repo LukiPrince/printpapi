@@ -2,6 +2,11 @@
 # printpapi — self-hosted PrintNode alternative. Elastic License 2.0 (see LICENSE).
 """CI smoke test of the agent setup: install, autostart, tray icon, a job, restart, uninstall.
 
+On Windows it also runs the steps of "Where the key is stored" in docs/agent.md: the key is sealed,
+the documented Python snippet prints it, a patch keeps it sealed, `unprotect-key` and the opt-out,
+a blob that cannot be read (the agent waits, offline, with a fresh status file), the repair by hand
+and by a connection patch. On every system `read-config` is checked to hand out no key.
+
 Starts the server, installs the agent with `printpapi-agent install` (a `file://` printer, so no
 paper is needed) together with a placeholder tray program, waits until the agent is online, checks
 the status file and the tray autostart, sends a raw job and waits for `job-<id>.prn`, runs
@@ -17,6 +22,7 @@ import argparse
 import base64
 import json
 import os
+import re
 import secrets
 import shutil
 import socket
@@ -163,6 +169,142 @@ def remove_foreign_file(foreign):
         subprocess.run(["sudo", "rmdir", str(INSTALL_DIR)], check=False)
 
 
+def agent_ini_path():
+    return INSTALL_DIR / "agent.ini"
+
+
+def read_installed_ini():
+    return agent_ini_path().read_bytes().decode("utf-8")
+
+
+def write_installed_ini(text):
+    # in place: the rights of the file stay as the install made them
+    agent_ini_path().write_bytes(text.encode("utf-8"))
+
+
+def install_patch(agent, staging, patch):
+    """Change the installed agent with a patch. A staged agent.ini wins over it, so it goes first."""
+    (staging / "agent.ini").unlink(missing_ok=True)
+    (staging / "patch.json").write_text(json.dumps(patch), encoding="utf-8")
+    try:
+        return run_agent(agent, "install", staging)
+    finally:
+        (staging / "patch.json").unlink(missing_ok=True)
+
+
+def read_status():
+    return json.loads(STATUS_FILE.read_text(encoding="utf-8"))
+
+
+def online_after(local_time):
+    """Online means: the status file says online with a contact after `local_time`."""
+    def check():
+        status = read_status()
+        if status.get("state") == "online" and (status.get("last_contact") or 0) > local_time:
+            return status
+    return check
+
+
+def documented_key_snippet():
+    """The Python block of docs/agent.md that reads the stored key, found by its marker comment, so
+    that the text that is documented is the text that runs."""
+    docs = (Path(__file__).resolve().parents[2] / "docs" / "agent.md").read_text(encoding="utf-8")
+    for block in re.findall(r"```python\n(.*?)```", docs, flags=re.S):
+        if "# printpapi: show the stored agent key" in block:
+            return block
+    raise Fail("docs/agent.md has no python block with the marker comment")
+
+
+def check_key_at_rest(agent, base, token, staging, name, key, header_value):
+    """Windows: the key is stored encrypted, survives changes, and the way back and the recovery
+    work (docs/agent.md, "Where the key is stored")."""
+    def computer_id():
+        for c in call(base, token, "GET", "/computers")["computers"]:
+            if c["name"] == name:
+                return c["id"]
+    same_id = computer_id()
+
+    def key_line():
+        return re.search(r"(?m)^api_key *=", read_installed_ini())
+
+    def blob_line():
+        return re.search(r"(?m)^api_key_dpapi *= *([0-9a-f]+)", read_installed_ini())
+
+    # 1. sealed by the install, and the SYSTEM agent reads it
+    if key in read_installed_ini() or key_line() or not blob_line():
+        raise Fail("agent.ini does not hold the key as api_key_dpapi only")
+    blob = blob_line().group(1)
+
+    # 2. the documented snippet prints the key
+    shown = subprocess.run([sys.executable, "-I", "-"], input=documented_key_snippet(),
+                           capture_output=True, text=True, timeout=60)
+    if shown.returncode != 0 or shown.stdout.strip() != key:
+        raise Fail(f"the documented snippet did not print the key: {shown.stderr[-300:]}")
+
+    # 3. a change keeps it sealed, the device the same
+    result = install_patch(agent, staging, {"timeout": 45})
+    wait_for("the agent online after a patch", online_after(result["baseline_local"]), timeout=90)
+    if result.get("key_sealed") is not True or not blob_line() or computer_id() != same_id:
+        raise Fail(f"a patch did not keep the key sealed: {result}")
+
+    # 4. unprotect-key: plain, opted out, and later changes leave it plain
+    done = subprocess.run([str(agent), "unprotect-key"], capture_output=True, text=True,
+                          timeout=120)
+    print(f"--- unprotect-key: exit {done.returncode}\n{done.stdout}{done.stderr}".rstrip(),
+          flush=True)
+    text = read_installed_ini()
+    if (done.returncode != 0 or key in done.stdout + done.stderr or f"api_key = {key}" not in text
+            or not re.search(r"(?m)^seal_key *= *no", text) or blob_line()):
+        raise Fail("unprotect-key did not leave the key as plain text with seal_key = no")
+    result = install_patch(agent, staging, {"timeout": 60})
+    wait_for("the agent online after a patch", online_after(result["baseline_local"]), timeout=90)
+    if result.get("key_sealed") is not False or f"api_key = {key}" not in read_installed_ini():
+        raise Fail(f"a patch sealed a file that opted out: {result}")
+
+    # 5. the opt-out is a line: without it the next change seals again
+    write_installed_ini(re.sub(r"(?m)^seal_key *=.*\r?\n", "", read_installed_ini()))
+    result = install_patch(agent, staging, {"timeout": 45})
+    wait_for("the agent online after a patch", online_after(result["baseline_local"]), timeout=90)
+    if result.get("key_sealed") is not True or not blob_line():
+        raise Fail(f"deleting seal_key did not seal again: {result}")
+
+    # 6. a blob that cannot be read: the agent stays up, offline, with a fresh status file. Every
+    # seal makes a new blob, so the secrets to look for are the one in the file now and the zeros
+    # that replace it.
+    good = read_installed_ini()
+    blob = blob_line().group(1)
+    zeros = "00" * 8
+    write_installed_ini(re.sub(r"(?m)^(api_key_dpapi *= *)[0-9a-f]+", lambda m: m.group(1) + zeros,
+                               good))
+    run_agent(agent, "restart", staging)
+    time.sleep(130)
+    status = read_status()
+    if time.time() - STATUS_FILE.stat().st_mtime > 60:
+        raise Fail("the status file went stale while the key cannot be read")
+    if (status.get("state") != "offline" or status.get("key_unreadable") is not True
+            or not status.get("printers")):
+        raise Fail(f"the status does not show an unreadable key with the printers: {status}")
+    raw = STATUS_FILE.read_text(encoding="utf-8")
+    if any(secret in raw for secret in (key, header_value, blob, zeros)):
+        raise Fail("the status file contains a secret")
+
+    # 7. the old line back, no restart: the agent notices within two minutes
+    put_back = time.time()
+    write_installed_ini(good)
+    wait_for("the agent to read the key again", online_after(put_back), timeout=120)
+    if read_status().get("key_unreadable"):
+        raise Fail("the status still says the key is unreadable")
+
+    # 8. damaged again: entering the same connection repairs it, same device
+    write_installed_ini(re.sub(r"(?m)^(api_key_dpapi *= *)[0-9a-f]+", lambda m: m.group(1) + "00" * 8,
+                               good))
+    result = install_patch(agent, staging, {"server_url": base, "api_key": key, "name": name})
+    wait_for("the agent online after the repair", online_after(result["baseline_local"]),
+             timeout=90)
+    if result.get("key_sealed") is not True or computer_id() != same_id:
+        raise Fail(f"the connection patch did not repair the key: {result}")
+
+
 def agent_cmd(agent, sub, staging):
     cmd = [str(agent), sub, str(staging)]
     return cmd if WIN else ["sudo", *cmd]
@@ -259,6 +401,13 @@ def main():
         wait_for("the status file", STATUS_FILE.is_file)
         check_status_file([key, header_value])
 
+        # every system: read-config hands out the headers and never the key
+        run_agent(agent, "read-config", staging)
+        copy = (staging / "agent.ini").read_text(encoding="utf-8")
+        (staging / "agent.ini").unlink()
+        if header_value not in copy or key in copy:
+            raise Fail("the read-config copy must hold the header value and not the key")
+
         def printer_id():
             for p in call(base, token, "GET", "/printers")["printers"]:
                 if p["name"] == "archive" and p["agent_name"] == name:
@@ -272,6 +421,11 @@ def main():
         wait_for(f"{out.name} to arrive", out.is_file)
         if out.read_bytes() != zpl:
             raise Fail(f"{out.name} has the wrong content")
+
+        if WIN:
+            if result.get("key_sealed") is not True:
+                raise Fail(f"install did not report key_sealed: {result}")
+            check_key_at_rest(agent, base, token, staging, name, key, header_value)
 
         # restart: a new process says so itself. Its status file holds the start time of the
         # process, which the old process cannot have written (a newer last_seen_at on the server

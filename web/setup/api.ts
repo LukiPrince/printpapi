@@ -10,7 +10,8 @@ export type Platform = "windows" | "macos" | "linux";
 export type InstallState = "none" | "managed" | "foreign" | "unsupported";
 export type FoundPrinter = { name: string; per_user: boolean; usable: boolean };
 export type PrinterChoice = { name: string; pdf: boolean; target: string | null; locked: boolean };
-export type Existing = { serverUrl: string; name: string; printers: PrinterChoice[] };
+/** What is known of the connection of an installed agent (from its status file). */
+export type Existing = { serverUrl: string; name: string; printers: PrinterChoice[]; keyUnreadable?: boolean };
 export type SetupError = { code: string; message: string };
 /** What the agent says about itself (its status file, readable without administrator rights). */
 export type AgentStatus = {
@@ -26,6 +27,8 @@ export type AgentStatus = {
   /** The names only: the values are secrets and come with headerValues. */
   headerNames: string[];
   error: string | null;
+  /** The key stored in agent.ini cannot be read on this computer (copied file, damaged value). */
+  keyUnreadable: boolean;
 };
 /** A change of the installed agent.ini: only what is named is touched. A header value of null removes it. */
 export type ConfigPatch = { printers?: PrinterChoice[]; timeout?: number; headers?: [string, string | null][] };
@@ -62,7 +65,6 @@ export const setup = {
   checkConnection: (serverUrl: string, apiKey: string, name: string) =>
     call<boolean>("check_connection", { serverUrl, apiKey, name }),
   listPrinters: () => call<FoundPrinter[]>("list_printers"),
-  readExisting: () => call<Existing>("read_existing"),
   sumatraPresent: () => call<boolean>("sumatra_present"),
   downloadSumatra: () => call<void>("download_sumatra"),
   testPrint: (printer: PrinterChoice) => call<void>("test_print", { printer }),

@@ -207,6 +207,9 @@ pub struct Status {
     pub timeout: f64,
     pub header_names: Vec<String>,
     pub error: Option<String>,
+    /// The key stored in agent.ini cannot be read here: the agent waits instead of ending, and
+    /// the window offers to enter it again.
+    pub key_unreadable: bool,
 }
 
 impl Status {
@@ -249,6 +252,7 @@ impl Status {
             timeout: settings.timeout,
             header_names: settings.headers.into_keys().collect(),
             error: None,
+            key_unreadable: false,
         }
     }
 }
@@ -282,6 +286,7 @@ pub fn render(s: &Status) -> String {
         "timeout": s.timeout,
         "header_names": s.header_names,
         "error": s.error,
+        "key_unreadable": s.key_unreadable,
     })
     .to_string()
 }
@@ -385,6 +390,24 @@ impl Reporter {
         if let Some(w) = &mut self.writer {
             w.update(&self.status, now);
         }
+    }
+
+    /// The key stored in agent.ini cannot be read (`text` says why, without key or blob): offline,
+    /// and the file says so.
+    pub fn key_failed(&mut self, text: &str, now: f64) {
+        self.status.state = "offline";
+        self.status.error = Some(mask_key(text.to_string(), &self.key));
+        self.status.key_unreadable = true;
+        self.flush(now);
+    }
+
+    /// The stored key can be read after all: `status` is made from the opened settings, and `key`
+    /// is what error texts are masked with from now on (the reporter was built before it was
+    /// known, so it held an empty one). The same reporter stays: the heartbeat holds it weakly.
+    pub fn key_opened(&mut self, status: Status, key: String, now: f64) {
+        self.status = status;
+        self.key = key;
+        self.flush(now);
     }
 
     /// The server took the registration.
@@ -922,5 +945,42 @@ printers = p
             .unwrap();
             assert_eq!(Status::from_config(&cfg).server, shown, "{given}");
         }
+    }
+
+    #[test]
+    fn the_unreadable_key_shows_in_the_file_and_the_opened_key_is_masked_afterwards() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = || -> Value {
+            serde_json::from_str(&std::fs::read_to_string(dir.path().join("status.json")).unwrap())
+                .unwrap()
+        };
+        let mut r = Reporter::new(
+            Status::from_config(&config()),
+            Some(StatusWriter::new(dir.path().to_path_buf())),
+            String::new(),
+        );
+        r.key_failed("The key stored in agent.ini cannot be read.", 10.0);
+        let v = file();
+        assert_eq!(v["state"], "offline");
+        assert_eq!(v["key_unreadable"], true);
+        assert_eq!(v["error"], "The key stored in agent.ini cannot be read.");
+        // the key opens: a new status, and from now on the key is masked
+        r.key_opened(Status::from_config(&config()), KEY.to_string(), 20.0);
+        let v = file();
+        assert_eq!(v["key_unreadable"], false);
+        assert_eq!(v["error"], Value::Null);
+        r.register_failed(&format!("refused {KEY}"), 30.0);
+        let v = file();
+        assert_eq!(v["error"], "refused ***");
+        assert!(!v.to_string().contains(KEY));
+    }
+
+    #[test]
+    fn key_unreadable_is_false_by_default_and_the_file_holds_no_secret() {
+        let s = Status::from_config(&config());
+        assert!(!s.key_unreadable);
+        let v: Value = serde_json::from_str(&render(&s)).unwrap();
+        assert_eq!(v["key_unreadable"], false);
+        assert!(!render(&s).contains(KEY));
     }
 }

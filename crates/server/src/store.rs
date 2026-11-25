@@ -141,6 +141,7 @@ pub struct CloudprntDevice {
 pub struct ClientKey {
     pub id: i64,
     pub org_id: i64,
+    pub scope: auth::Scope,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -151,6 +152,9 @@ pub struct ApiKeyInfo {
     /// The raw INTEGER column (1/0), as the Python `dict(row)` reported it — not a JSON bool.
     pub active: i64,
     pub created_at: f64,
+    /// Left out of the JSON for a full key, so "no scope" always means "a full key".
+    #[serde(skip_serializing_if = "auth::Scope::is_full")]
+    pub scope: auth::Scope,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -215,6 +219,8 @@ pub struct NewJob<'a> {
     pub org_id: Option<i64>,
     pub idempotency_key: Option<String>,
     pub expire_after: Option<i64>,
+    /// The issued key that submitted the job (a print key later sees only its own).
+    pub api_key_id: Option<i64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -335,6 +341,7 @@ pub struct PrinterInfo {
 
 // --- functions (port of app/store.py; each one is one transaction) ----------------------------
 
+use crate::auth;
 use crate::pyfmt;
 use rusqlite::{
     OptionalExtension, Row, Transaction, TransactionBehavior, named_params, params,
@@ -386,12 +393,14 @@ CREATE TABLE IF NOT EXISTS jobs(
   copies INTEGER NOT NULL DEFAULT 1, options TEXT,
   callback_url TEXT, hook_attempts INTEGER NOT NULL DEFAULT 0, hook_delivered_at REAL,
   idempotency_key TEXT, expires_at REAL,
+  api_key_id INTEGER,
   retries INTEGER NOT NULL DEFAULT 0, created_at REAL NOT NULL, claimed_at REAL, finished_at REAL);
 -- NULLs are distinct in SQLite, so jobs without a key are unconstrained.
 CREATE UNIQUE INDEX IF NOT EXISTS jobs_idem ON jobs(org_id, idempotency_key);
 CREATE TABLE IF NOT EXISTS api_keys(
   id INTEGER PRIMARY KEY AUTOINCREMENT, org_id INTEGER NOT NULL, label TEXT NOT NULL,
-  key_hash TEXT NOT NULL UNIQUE, active INTEGER NOT NULL DEFAULT 1, created_at REAL NOT NULL);
+  key_hash TEXT NOT NULL UNIQUE, active INTEGER NOT NULL DEFAULT 1, created_at REAL NOT NULL,
+  scope TEXT NOT NULL DEFAULT 'full');
 -- The operator audit log: one row per `/operator/` write, kept for ever (never changed or deleted by
 -- any API, not removed with an org). Ids, numbers and setting values only, no e-mail or name.
 -- `org_created_at` keeps a reused org id apart from its predecessor. A table of its own, so the
@@ -442,6 +451,9 @@ const MIGRATIONS: &[&str] = &[
     "CREATE UNIQUE INDEX IF NOT EXISTS users_email ON users(email)",
     "ALTER TABLE orgs ADD COLUMN job_quota INTEGER",
     "ALTER TABLE orgs ADD COLUMN plan TEXT",
+    // SQLite allows a NOT NULL column when its default is not NULL (lang_altertable, section 4)
+    "ALTER TABLE api_keys ADD COLUMN scope TEXT NOT NULL DEFAULT 'full'",
+    "ALTER TABLE jobs ADD COLUMN api_key_id INTEGER",
 ];
 
 /// Performance indexes the Python server never had. Additive and harmless to it. The columns
@@ -465,6 +477,8 @@ CREATE INDEX IF NOT EXISTS jobs_org_state ON jobs(org_id, state);
 CREATE INDEX IF NOT EXISTS printers_org ON printers(org_id);
 CREATE INDEX IF NOT EXISTS users_org ON users(org_id);
 CREATE INDEX IF NOT EXISTS terms_org ON terms_acceptances(org_id, accepted_at);
+-- the jobs one key submitted (a print key sees only those)
+CREATE INDEX IF NOT EXISTS jobs_api_key ON jobs(api_key_id, id) WHERE api_key_id IS NOT NULL;
 ";
 
 /// The oldest queued job of one agent that has not passed its deadline (`?1` agent, `?2` now).
@@ -553,6 +567,9 @@ pub fn init_db(conn: &Connection) -> Result<()> {
             Err(e) => return Err(e.into()),
         }
     }
+    // Every key and agent lookup selects this column, and the loop above swallows e.g. SQLITE_BUSY:
+    // stop here rather than answer 500 to all of them. (jobs.api_key_id is covered by its index.)
+    conn.prepare("SELECT scope FROM api_keys LIMIT 0")?;
     conn.execute_batch(INDEXES)?;
     let tx = begin(conn)?;
     let has = |sql: &str, id: i64| -> Result<bool> {
@@ -1039,15 +1056,71 @@ pub fn register_cloudprnt(conn: &Connection, org_id: i64, name: &str) -> Result<
 // api_key is a high-entropy token; the sha256 lookup has no practical timing oracle, so an
 // indexed equality match is fine for the authenticate_* functions.
 
-/// The agent holding `api_key` — unless that key is an issued client key that has since been
-/// revoked: revoking a key cuts off every use of it, the agent it enrolled included. (An agent
-/// key that was never issued, from before issued keys were required, has no row to revoke.)
-pub fn authenticate_agent(conn: &Connection, api_key: &str) -> Result<Option<i64>> {
+/// The agent holding `api_key` and the scope of the issued key behind it (`None`: the key was never
+/// issued, a v2 agent key) — unless that key is an issued client key that has since been revoked:
+/// revoking a key cuts off every use of it, the agent it enrolled included.
+fn agent_of_key(conn: &Connection, api_key: &str) -> Result<Option<(i64, Option<auth::Scope>)>> {
     Ok(conn
         .prepare_cached(
-            "SELECT a.id FROM agents a LEFT JOIN api_keys k ON k.key_hash = a.api_key_hash              WHERE a.api_key_hash=? AND (k.id IS NULL OR k.active=1)",
+            "SELECT a.id, k.scope FROM agents a LEFT JOIN api_keys k ON k.key_hash = a.api_key_hash \
+             WHERE a.api_key_hash=? AND (k.id IS NULL OR k.active=1)",
         )?
-        .query_row([hash_key(api_key)], |r| r.get(0))
+        .query_row([hash_key(api_key)], |r| {
+            Ok((
+                r.get(0)?,
+                r.get::<_, Option<String>>(1)?.map(|s| auth::Scope::parse(&s)),
+            ))
+        })
+        .optional()?)
+}
+
+/// The agent holding `api_key`, if the key may act as an agent: a never-issued key, or an active
+/// issued key whose scope allows `Right::Agent`. Everything that hands out new work uses this.
+pub fn authenticate_agent(conn: &Connection, api_key: &str) -> Result<Option<i64>> {
+    Ok(agent_of_key(conn, api_key)?
+        .filter(|(_, scope)| scope.is_none_or(|s| s.allows(auth::Right::Agent)))
+        .map(|(id, _)| id))
+}
+
+/// For payload and result: also the key of an agent that lost its agent right while `job_id` was
+/// handed out to it, and only for that job while it is `claimed`. Refusing the report would
+/// requeue a printed job. A revoked key gets nothing.
+pub fn authenticate_agent_for_job(
+    conn: &Connection,
+    api_key: &str,
+    job_id: i64,
+) -> Result<Option<i64>> {
+    let Some((id, scope)) = agent_of_key(conn, api_key)? else {
+        return Ok(None);
+    };
+    if scope.is_none_or(|s| s.allows(auth::Right::Agent)) {
+        return Ok(Some(id));
+    }
+    let claimed = conn
+        .prepare_cached("SELECT 1 FROM jobs WHERE id=?1 AND agent_id=?2 AND state='claimed'")?
+        .query_row(params![job_id, id], |_| Ok(()))
+        .optional()?
+        .is_some();
+    Ok(claimed.then_some(id))
+}
+
+/// The agent holding this active key (if any computer enrolled with it), for the targeted wake
+/// when the key's rights change or it is revoked. Org-filtered like every key lookup.
+pub fn enrolled_agent(conn: &Connection, key_id: i64, org_id: Option<i64>) -> Result<Option<i64>> {
+    Ok(conn
+        .prepare_cached(
+            "SELECT a.id FROM api_keys k JOIN agents a ON a.api_key_hash = k.key_hash \
+             WHERE k.id=:kid AND k.active=1 AND (:org IS NULL OR k.org_id=:org)",
+        )?
+        .query_row(named_params! {":kid": key_id, ":org": org_id}, |r| r.get(0))
+        .optional()?)
+}
+
+/// The name an agent registered under.
+pub fn agent_name(conn: &Connection, agent_id: i64) -> Result<Option<String>> {
+    Ok(conn
+        .prepare_cached("SELECT name FROM agents WHERE id=?")?
+        .query_row([agent_id], |r| r.get(0))
         .optional()?)
 }
 
@@ -1063,15 +1136,54 @@ pub fn key_revoked(conn: &Connection, key: &str) -> Result<bool> {
         .is_some())
 }
 
+/// Issues a full key (every key before scopes existed).
 pub fn add_api_key(conn: &Connection, label: &str, key: &str, org_id: i64) -> Result<i64> {
+    add_api_key_scoped(conn, label, key, org_id, auth::Scope::Full)
+}
+
+pub fn add_api_key_scoped(
+    conn: &Connection,
+    label: &str,
+    key: &str,
+    org_id: i64,
+    scope: auth::Scope,
+) -> Result<i64> {
     let tx = begin(conn)?;
-    tx.execute(
-        "INSERT INTO api_keys(org_id, label, key_hash, active, created_at) VALUES(?,?,?,1,?)",
-        params![org_id, label, hash_key(key), crate::now()],
-    )?;
-    let id = tx.last_insert_rowid();
+    let id = add_api_key_scoped_tx(&tx, label, key, org_id, scope)?;
     tx.commit()?;
     Ok(id)
+}
+
+/// The insert inside the caller's transaction (pairing issues a key together with other rows).
+pub fn add_api_key_scoped_tx(
+    tx: &Transaction,
+    label: &str,
+    key: &str,
+    org_id: i64,
+    scope: auth::Scope,
+) -> Result<i64> {
+    tx.execute(
+        "INSERT INTO api_keys(org_id, label, key_hash, active, created_at, scope) \
+         VALUES(?,?,?,1,?,?)",
+        params![org_id, label, hash_key(key), crate::now(), scope.as_str()],
+    )?;
+    Ok(tx.last_insert_rowid())
+}
+
+/// Change the rights of an active key. False for an unknown, revoked or foreign key.
+pub fn set_api_key_scope(
+    conn: &Connection,
+    key_id: i64,
+    org_id: Option<i64>,
+    scope: auth::Scope,
+) -> Result<bool> {
+    let tx = begin(conn)?;
+    let n = tx.execute(
+        "UPDATE api_keys SET scope=:s WHERE id=:kid AND active=1 AND (:org IS NULL OR org_id=:org)",
+        named_params! {":s": scope.as_str(), ":kid": key_id, ":org": org_id},
+    )?;
+    tx.commit()?;
+    Ok(n == 1)
 }
 
 /// Resolve a client key to its id and org — the org every request with it is confined to.
@@ -1081,11 +1193,13 @@ pub fn authenticate_client(conn: &Connection, key: &str) -> Result<Option<Client
         return Ok(None);
     }
     Ok(conn
-        .prepare_cached("SELECT id, org_id FROM api_keys WHERE key_hash=? AND active=1")?
+        .prepare_cached("SELECT id, org_id, scope FROM api_keys WHERE key_hash=? AND active=1")?
         .query_row([hash_key(key)], |r| {
             Ok(ClientKey {
                 id: r.get(0)?,
                 org_id: r.get(1)?,
+                // an unknown word is a scope that allows nothing, never "no key"
+                scope: auth::Scope::parse(&r.get::<_, String>(2)?),
             })
         })
         .optional()?)
@@ -1093,7 +1207,7 @@ pub fn authenticate_client(conn: &Connection, key: &str) -> Result<Option<Client
 
 pub fn list_api_keys(conn: &Connection, org_id: Option<i64>) -> Result<Vec<ApiKeyInfo>> {
     let mut stmt = conn.prepare(
-        "SELECT id, org_id, label, active, created_at FROM api_keys \
+        "SELECT id, org_id, label, active, created_at, scope FROM api_keys \
          WHERE (:org IS NULL OR org_id = :org) ORDER BY id",
     )?;
     let rows = stmt.query_map(named_params! {":org": org_id}, |r| {
@@ -1103,6 +1217,7 @@ pub fn list_api_keys(conn: &Connection, org_id: Option<i64>) -> Result<Vec<ApiKe
             label: r.get(2)?,
             active: r.get(3)?,
             created_at: r.get(4)?,
+            scope: auth::Scope::parse(&r.get::<_, String>(5)?),
         })
     })?;
     Ok(rows.collect::<rusqlite::Result<_>>()?)
@@ -1129,7 +1244,8 @@ pub fn revoke_api_key_tx(tx: &Transaction, key_id: i64, org_id: Option<i64>) -> 
 // login carried in the same `Authorization: Bearer` header the API keys use. Sessions are stored
 // hashed (like every other credential here) and expire — logout deletes the row, the reaper
 // purges the rest. Machine keys stay in api_keys: what may manage an org is decided by *which*
-// table the presented credential resolves in, not by a role column.
+// table the presented credential resolves in, not by a role column. What a machine key may do
+// beyond that is its `scope` (`auth::Scope`); sessions have no scopes.
 
 /// Python `str.strip().lower()`: its whitespace set also holds U+001C..U+001F.
 pub fn normalize_email(value: &str) -> String {
@@ -1594,8 +1710,8 @@ pub fn enqueue_job_with(
         .map(|o| pyfmt::dumps(&Value::Object(o.clone())));
     tx.prepare_cached(
         "INSERT INTO jobs(org_id, user_id, printer_id, agent_id, type, mode, state, payload, \
-         title, copies, options, callback_url, idempotency_key, expires_at, created_at) \
-         VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+         title, copies, options, callback_url, idempotency_key, expires_at, api_key_id, \
+         created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
     )?
     .execute(params![
         org_id,
@@ -1612,6 +1728,7 @@ pub fn enqueue_job_with(
         job.callback_url,
         job.idempotency_key,
         job.expire_after.map(|s| now + s as f64),
+        job.api_key_id,
         now
     ])?;
     let job_id = tx.last_insert_rowid();
@@ -1969,6 +2086,30 @@ pub fn recent_jobs(
     sql.push_str(" ORDER BY j.id DESC LIMIT ?2");
     let mut stmt = conn.prepare(&sql)?;
     let rows = stmt.query_map(params_from_iter(params), job_row)?;
+    Ok(rows.collect::<rusqlite::Result<_>>()?)
+}
+
+/// The ids of the jobs one key submitted, newest first. `ids` restricts to a set (the PrintNode
+/// layer addresses jobs by id set); `Some(&[])` is an empty answer without a query.
+pub fn key_job_ids(
+    conn: &Connection,
+    key_id: i64,
+    limit: i64,
+    ids: Option<&[i64]>,
+) -> Result<Vec<i64>> {
+    let mut sql = String::from("SELECT id FROM jobs WHERE api_key_id=?1");
+    let mut params: Vec<rusqlite::types::Value> = vec![key_id.into(), limit.into()];
+    if let Some(ids) = ids {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let marks: Vec<String> = (0..ids.len()).map(|n| format!("?{}", n + 3)).collect();
+        sql.push_str(&format!(" AND id IN ({})", marks.join(",")));
+        params.extend(ids.iter().map(|&i| rusqlite::types::Value::from(i)));
+    }
+    sql.push_str(" ORDER BY id DESC LIMIT ?2");
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(params_from_iter(params), |r| r.get(0))?;
     Ok(rows.collect::<rusqlite::Result<_>>()?)
 }
 
@@ -2912,6 +3053,7 @@ pub struct OperatorKey {
     pub label: String,
     pub active: bool,
     pub created_at: f64,
+    pub scope: auth::Scope,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -2967,7 +3109,7 @@ pub fn operator_org_parts(conn: &Connection, org_id: i64) -> Result<OrgParts> {
         })?
         .collect::<rusqlite::Result<_>>()?;
     let mut st = conn.prepare_cached(
-        "SELECT id, label, active, created_at FROM api_keys WHERE org_id = ? ORDER BY id",
+        "SELECT id, label, active, created_at, scope FROM api_keys WHERE org_id = ? ORDER BY id",
     )?;
     let keys = st
         .query_map([org_id], |r| {
@@ -2976,6 +3118,7 @@ pub fn operator_org_parts(conn: &Connection, org_id: i64) -> Result<OrgParts> {
                 label: r.get(1)?,
                 active: r.get(2)?,
                 created_at: r.get(3)?,
+                scope: auth::Scope::parse(&r.get::<_, String>(4)?),
             })
         })?
         .collect::<rusqlite::Result<_>>()?;
@@ -3596,6 +3739,7 @@ mod tests {
             org_id: None,
             idempotency_key: None,
             expire_after: None,
+            api_key_id: None,
         };
         f(&mut j);
         enqueue_job(conn, &j)
@@ -4049,6 +4193,290 @@ mod tests {
         assert!(!revoke_api_key(&conn, 9999, None).unwrap());
     }
 
+    // --- key scopes ---------------------------------------------------------------------------
+
+    fn scoped_agent(conn: &Connection, key: &str, scope: auth::Scope) -> (Registration, i64) {
+        let kid = add_api_key_scoped(conn, "k", key, DEFAULT_ORG, scope).unwrap();
+        (reg(conn, "pc", key, &[("Z", false)]), kid)
+    }
+
+    #[test]
+    fn a_key_inserted_the_way_python_does_is_full() {
+        let conn = db();
+        conn.execute(
+            "INSERT INTO api_keys(org_id, label, key_hash, active, created_at) VALUES(1,'py',?,1,0)",
+            [hash_key("py-key")],
+        )
+        .unwrap();
+        assert_eq!(
+            authenticate_client(&conn, "py-key").unwrap().unwrap().scope,
+            auth::Scope::Full
+        );
+        let kid = add_api_key(&conn, "n8n", "k2", DEFAULT_ORG).unwrap();
+        let row = authenticate_client(&conn, "k2").unwrap().unwrap();
+        assert_eq!((row.id, row.scope), (kid, auth::Scope::Full));
+    }
+
+    #[test]
+    fn add_api_key_scoped_round_trips_through_authenticate_and_list() {
+        let conn = db();
+        let kid = add_api_key_scoped(&conn, "shop", "ks", DEFAULT_ORG, auth::Scope::Print).unwrap();
+        let row = authenticate_client(&conn, "ks").unwrap().unwrap();
+        assert_eq!((row.id, row.scope), (kid, auth::Scope::Print));
+        let keys = list_api_keys(&conn, None).unwrap();
+        assert_eq!(keys[0].scope, auth::Scope::Print);
+    }
+
+    #[test]
+    fn a_garbage_stored_scope_authenticates_as_unknown_and_is_no_agent() {
+        let conn = db();
+        let (r, kid) = scoped_agent(&conn, "kg", auth::Scope::Agent);
+        conn.execute("UPDATE api_keys SET scope='superuser' WHERE id=?", [kid])
+            .unwrap();
+        let row = authenticate_client(&conn, "kg").unwrap().unwrap();
+        assert_eq!(row.scope, auth::Scope::Unknown);
+        assert_eq!(authenticate_agent(&conn, "kg").unwrap(), None);
+        assert_ne!(r.computer_id, 0);
+    }
+
+    #[test]
+    fn authenticate_agent_follows_the_scope_of_an_issued_key() {
+        let conn = db();
+        for (i, (scope, ok)) in [
+            (auth::Scope::Full, true),
+            (auth::Scope::Agent, true),
+            (auth::Scope::Print, false),
+            (auth::Scope::Read, false),
+            (auth::Scope::CloudPrnt, false),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let key = format!("key{i}");
+            let kid = add_api_key_scoped(&conn, "k", &key, DEFAULT_ORG, scope).unwrap();
+            let r = reg(&conn, &format!("pc{i}"), &key, &[("Z", false)]);
+            assert_eq!(
+                authenticate_agent(&conn, &key).unwrap(),
+                ok.then_some(r.computer_id),
+                "{scope:?}"
+            );
+            revoke_api_key(&conn, kid, None).unwrap();
+            assert_eq!(
+                authenticate_agent(&conn, &key).unwrap(),
+                None,
+                "revoked {scope:?}"
+            );
+        }
+        // a key nobody issued (a v2 agent key) keeps working
+        let r = reg(&conn, "old", "never-issued", &[("Y", false)]);
+        assert_eq!(
+            authenticate_agent(&conn, "never-issued").unwrap(),
+            Some(r.computer_id)
+        );
+    }
+
+    #[test]
+    fn authenticate_agent_for_job_lets_a_narrowed_key_finish_only_its_claimed_job() {
+        let conn = db();
+        let (r, kid) = scoped_agent(&conn, "kn", auth::Scope::Full);
+        let other = reg(&conn, "other", "kother", &[("O", false)]);
+        let claimed = enq(&conn, id_of(&r, "Z"), b"a");
+        let queued = enq(&conn, id_of(&r, "Z"), b"b");
+        let foreign = enq(&conn, id_of(&other, "O"), b"c");
+        claim_job(&conn, r.computer_id, None).unwrap();
+        claim_job(&conn, other.computer_id, None).unwrap();
+        assert_eq!(state_of(&conn, claimed), "claimed");
+        assert_eq!(state_of(&conn, queued), "queued");
+        // a full key: as before, any job id
+        for jid in [claimed, queued, foreign, 9999] {
+            assert_eq!(
+                authenticate_agent_for_job(&conn, "kn", jid).unwrap(),
+                Some(r.computer_id)
+            );
+        }
+        assert!(set_api_key_scope(&conn, kid, None, auth::Scope::Print).unwrap());
+        assert_eq!(authenticate_agent(&conn, "kn").unwrap(), None);
+        assert_eq!(
+            authenticate_agent_for_job(&conn, "kn", claimed).unwrap(),
+            Some(r.computer_id)
+        );
+        for jid in [queued, foreign, 9999] {
+            assert_eq!(
+                authenticate_agent_for_job(&conn, "kn", jid).unwrap(),
+                None,
+                "{jid}"
+            );
+        }
+        // once done it is no longer open
+        assert!(finish_job(&conn, claimed, r.computer_id, true, None).unwrap());
+        assert_eq!(
+            authenticate_agent_for_job(&conn, "kn", claimed).unwrap(),
+            None
+        );
+        // a revoked key gets nothing, not even for a job that is claimed at that moment
+        let again = enq(&conn, id_of(&r, "Z"), b"d");
+        assert_eq!(
+            claim_job(&conn, r.computer_id, None)
+                .unwrap()
+                .unwrap()
+                .job_id,
+            queued
+        );
+        assert_eq!(
+            claim_job(&conn, r.computer_id, None)
+                .unwrap()
+                .unwrap()
+                .job_id,
+            again
+        );
+        assert_eq!(state_of(&conn, again), "claimed");
+        assert_eq!(
+            authenticate_agent_for_job(&conn, "kn", again).unwrap(),
+            Some(r.computer_id)
+        );
+        revoke_api_key(&conn, kid, None).unwrap();
+        for jid in [claimed, queued, again, foreign] {
+            assert_eq!(authenticate_agent_for_job(&conn, "kn", jid).unwrap(), None);
+        }
+    }
+
+    #[test]
+    fn a_narrowed_key_without_an_agents_row_gains_nothing_for_a_job() {
+        let conn = db();
+        let r = reg(&conn, "pc", "kagent", &[("Z", false)]);
+        let jid = enq(&conn, id_of(&r, "Z"), b"a");
+        claim_job(&conn, r.computer_id, None).unwrap();
+        add_api_key_scoped(&conn, "p", "kprint", DEFAULT_ORG, auth::Scope::Print).unwrap();
+        assert_eq!(
+            authenticate_agent_for_job(&conn, "kprint", jid).unwrap(),
+            None
+        );
+        assert_eq!(authenticate_agent_for_job(&conn, "", jid).unwrap(), None);
+    }
+
+    #[test]
+    fn set_api_key_scope_is_org_filtered_and_refuses_revoked_and_unknown_keys() {
+        let conn = db();
+        let other = create_org(&conn, "acme").unwrap();
+        let kid = add_api_key(&conn, "k", "k1", DEFAULT_ORG).unwrap();
+        assert!(!set_api_key_scope(&conn, kid, Some(other), auth::Scope::Read).unwrap());
+        assert_eq!(
+            authenticate_client(&conn, "k1").unwrap().unwrap().scope,
+            auth::Scope::Full
+        );
+        assert!(set_api_key_scope(&conn, kid, Some(DEFAULT_ORG), auth::Scope::Read).unwrap());
+        assert_eq!(
+            authenticate_client(&conn, "k1").unwrap().unwrap().scope,
+            auth::Scope::Read
+        );
+        assert!(set_api_key_scope(&conn, kid, None, auth::Scope::Agent).unwrap());
+        assert!(!set_api_key_scope(&conn, 9999, None, auth::Scope::Agent).unwrap());
+        revoke_api_key(&conn, kid, None).unwrap();
+        assert!(!set_api_key_scope(&conn, kid, None, auth::Scope::Full).unwrap());
+    }
+
+    #[test]
+    fn enrolled_agent_finds_the_agent_of_an_active_key() {
+        let conn = db();
+        let other = create_org(&conn, "acme").unwrap();
+        let (r, kid) = scoped_agent(&conn, "ke", auth::Scope::Agent);
+        let lonely = add_api_key(&conn, "l", "klonely", DEFAULT_ORG).unwrap();
+        assert_eq!(
+            enrolled_agent(&conn, kid, Some(DEFAULT_ORG)).unwrap(),
+            Some(r.computer_id)
+        );
+        assert_eq!(
+            enrolled_agent(&conn, kid, None).unwrap(),
+            Some(r.computer_id)
+        );
+        assert_eq!(enrolled_agent(&conn, kid, Some(other)).unwrap(), None);
+        assert_eq!(enrolled_agent(&conn, lonely, None).unwrap(), None);
+        assert_eq!(enrolled_agent(&conn, 9999, None).unwrap(), None);
+        revoke_api_key(&conn, kid, None).unwrap();
+        assert_eq!(enrolled_agent(&conn, kid, None).unwrap(), None);
+    }
+
+    #[test]
+    fn key_job_ids_lists_one_keys_jobs_newest_first() {
+        let conn = db();
+        let r = reg(&conn, "pc", "ka", &[("Z", false)]);
+        let k1 = add_api_key(&conn, "a", "k1", DEFAULT_ORG).unwrap();
+        let k2 = add_api_key(&conn, "b", "k2", DEFAULT_ORG).unwrap();
+        let mk = |key: Option<i64>| enq_with(&conn, id_of(&r, "Z"), b"x", |j| j.api_key_id = key);
+        let a1 = mk(Some(k1));
+        let b1 = mk(Some(k2));
+        let none = mk(None);
+        let a2 = mk(Some(k1));
+        let a3 = mk(Some(k1));
+        assert_eq!(key_job_ids(&conn, k1, 10, None).unwrap(), [a3, a2, a1]);
+        assert_eq!(key_job_ids(&conn, k2, 10, None).unwrap(), [b1]);
+        assert_eq!(key_job_ids(&conn, k1, 2, None).unwrap(), [a3, a2]);
+        assert_eq!(
+            key_job_ids(&conn, k1, 10, Some(&[a1, b1, none, 9999])).unwrap(),
+            [a1]
+        );
+        assert!(key_job_ids(&conn, k1, 10, Some(&[])).unwrap().is_empty());
+        assert!(key_job_ids(&conn, 9999, 10, None).unwrap().is_empty());
+        let p = plan(
+            &conn,
+            "SELECT id FROM jobs WHERE api_key_id=?1 ORDER BY id DESC LIMIT ?2",
+            params![k1, 10],
+        );
+        assert!(p.contains("jobs_api_key"), "{p}");
+    }
+
+    #[test]
+    fn init_db_stops_when_the_scope_column_is_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ro.sqlite3");
+        let path = path.to_str().unwrap();
+        let conn = connect(path).unwrap();
+        init_db(&conn).unwrap();
+        conn.execute_batch(
+            "DROP INDEX jobs_api_key;
+             ALTER TABLE api_keys DROP COLUMN scope;
+             ALTER TABLE jobs DROP COLUMN api_key_id;
+             PRAGMA query_only=ON;",
+        )
+        .unwrap();
+        // the migrations are swallowed (READONLY); the check must not be
+        let err = init_db(&conn).unwrap_err();
+        assert!(
+            format!("{err:?}").contains("no such column: scope"),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn list_api_keys_json_of_a_full_key_is_the_old_five_fields() {
+        let conn = db();
+        add_api_key(&conn, "n8n", "k1", DEFAULT_ORG).unwrap();
+        add_api_key_scoped(&conn, "shop", "k2", DEFAULT_ORG, auth::Scope::Print).unwrap();
+        let keys = list_api_keys(&conn, None).unwrap();
+        let full = serde_json::to_value(&keys[0]).unwrap();
+        let names: Vec<_> = full.as_object().unwrap().keys().cloned().collect();
+        assert_eq!(names, ["id", "org_id", "label", "active", "created_at"]);
+        let print = serde_json::to_value(&keys[1]).unwrap();
+        let names: Vec<_> = print.as_object().unwrap().keys().cloned().collect();
+        assert_eq!(
+            names,
+            ["id", "org_id", "label", "active", "created_at", "scope"]
+        );
+        assert_eq!(print["scope"], "print");
+    }
+
+    #[test]
+    fn operator_org_parts_carry_the_scope_of_each_key() {
+        let conn = db();
+        add_api_key(&conn, "a", "k1", DEFAULT_ORG).unwrap();
+        add_api_key_scoped(&conn, "b", "k2", DEFAULT_ORG, auth::Scope::CloudPrnt).unwrap();
+        let keys = operator_org_parts(&conn, DEFAULT_ORG).unwrap().keys;
+        assert_eq!(
+            keys.iter().map(|k| k.scope).collect::<Vec<_>>(),
+            [auth::Scope::Full, auth::Scope::CloudPrnt]
+        );
+    }
+
     #[test]
     fn recent_jobs_newest_first_with_printer_name_and_limit() {
         let conn = db();
@@ -4390,7 +4818,8 @@ mod tests {
             authenticate_client(&conn, "k-acme").unwrap(),
             Some(ClientKey {
                 id: kid,
-                org_id: oid
+                org_id: oid,
+                scope: auth::Scope::Full
             })
         );
         assert!(authenticate_client(&conn, "nope").unwrap().is_none());
@@ -4534,7 +4963,11 @@ mod tests {
         );
         assert_eq!(
             authenticate_client(&conn, "legacy-key").unwrap(),
-            Some(ClientKey { id: kid, org_id: 1 })
+            Some(ClientKey {
+                id: kid,
+                org_id: 1,
+                scope: auth::Scope::Full
+            })
         );
         assert_eq!(
             get_job(&conn, jid, Some(1)).unwrap().unwrap().state,

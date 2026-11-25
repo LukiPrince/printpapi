@@ -159,7 +159,7 @@ The row above plus:
 | `users` | `id`, `email`, `created_at` |
 | `agents` | `id`, `name`, `last_seen_at`, `online` |
 | `printers` | `id`, `name`, `can_pdf`, `state`, `agent_id` |
-| `keys` | `id`, `label`, `active`, `created_at`: the key itself is never shown |
+| `keys` | `id`, `label`, `active`, `created_at`, `scope` (always there, `full` included): the key itself is never shown |
 | `terms` | the acceptance history, oldest first: `version`, `accepted_at` |
 | `lock` | `null`, or `{reason, locked_at}` while the org is locked |
 | `support` | `null`, or the active support grant `{id, reason, granted_at, expires_at, reads}` (see [Support access](#support-access)) |

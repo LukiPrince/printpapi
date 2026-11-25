@@ -17,8 +17,9 @@ export function ConnectionSection({ status, onChange }: { status: AgentStatus | 
       <CardHeader>
         <CardTitle>Connection</CardTitle>
         <CardDescription>
-          Another server: the device is created there under the same name. A new key on the same
-          server needs a new device name.
+          {status?.keyUnreadable
+            ? "The key stored on this computer cannot be read. Enter the key this device already uses; its name and printers stay."
+            : "Another server: the device is created there under the same name. A new key on the same server needs a new device name."}
         </CardDescription>
       </CardHeader>
       <CardContent className="space-y-3">

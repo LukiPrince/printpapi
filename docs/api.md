@@ -8,7 +8,8 @@ All endpoints speak JSON over HTTP. Authentication is a bearer token:
 - *client* — the bootstrap `PRINTAPI_TOKEN`, any active issued key (see
   [API keys](server.md#api-keys)), **or** a session token from `POST /login`. An issued key and a
   session only ever see their own org; the bootstrap token spans all of them — see
-  [Multi-tenancy](#multi-tenancy).
+  [Multi-tenancy](#multi-tenancy). What an issued key may do depends on its scope, see
+  [Key rights](#key-rights); the table below names the right each route needs.
 - *manage* — root **or** a session (an account login): the org's keys, users and settings. A
   machine key is deliberately excluded, so a leaked integration key cannot issue itself a
   successor — see [Accounts and login](#accounts-and-login).
@@ -23,22 +24,22 @@ Token comparison is constant-time (`hmac.compare_digest`).
 |---|---|---|
 | `GET /` | none | Web dashboard (static bundle embedded in the binary; data fetched with the token) |
 | `GET /health` | none | Liveness check, plus whether this server offers `signup` and `password_reset` |
-| `GET /metrics` | client | Prometheus text: job counts by state, agent/printer liveness |
-| `POST /jobs` | client | Submit a job → `{job_id}` |
-| `GET\|POST /labels`, `GET\|PUT\|DELETE /labels/{id}` | client | [Label templates](labels.md): where the content sits on a label; jobs of type `label_*` render through them |
-| `POST /orders` | client | Render an order as a packing slip and print it → `{job_id}` ([e-commerce](ecommerce.md)) |
-| `POST /integrations/shopify/orders` | HMAC | Shopify order webhook (key in the URL, signature in the header) |
-| `GET /jobs` | client | Recent job history. With [retention](server.md#retention) set, old jobs lose payload and title (`title` is `null`), and rows from before the current month disappear after at least 7 days |
-| `GET /jobs/{id}` | client | One job's state: `queued` \| `claimed` \| `done` \| `failed` \| `cancelled` |
-| `DELETE /jobs/{id}` | client | Cancel a still-`queued` job (`409` once claimed, `404` if unknown) |
-| `GET /printers` | client | Registered printers + online/offline + capabilities |
-| `GET /computers` | client | Registered agents + online/offline + printer count |
+| `GET /metrics` | client (`Look`) | Prometheus text: job counts by state, agent/printer liveness |
+| `POST /jobs` | client (`Submit`) | Submit a job → `{job_id}` |
+| `GET\|POST /labels`, `GET\|PUT\|DELETE /labels/{id}` | client (`Look` to read, `Edit` to write) | [Label templates](labels.md): where the content sits on a label; jobs of type `label_*` render through them |
+| `POST /orders` | client (`Submit`) | Render an order as a packing slip and print it → `{job_id}` ([e-commerce](ecommerce.md)) |
+| `POST /integrations/shopify/orders` | HMAC + key (`Submit`) | Shopify order webhook (key in the URL, signature in the header) |
+| `GET /jobs` | client (`Look`) | Recent job history. With [retention](server.md#retention) set, old jobs lose payload and title (`title` is `null`), and rows from before the current month disappear after at least 7 days |
+| `GET /jobs/{id}` | client (`Look`) | One job's state: `queued` \| `claimed` \| `done` \| `failed` \| `cancelled` |
+| `DELETE /jobs/{id}` | client (`Submit`) | Cancel a still-`queued` job (`409` once claimed, `404` if unknown) |
+| `GET /printers` | client (`Look`) | Registered printers + online/offline + capabilities |
+| `GET /computers` | client (`Computers`) | Registered agents + online/offline + printer count |
 | `POST /login` | none | E-mail + password → `{token, expires_at, org_id, user_id}` |
 | `POST /signup` | none | Self-serve org + first account + session (`403` unless the operator opened it) |
 | `POST /password/reset` | none | Mail a one-shot reset token — always `{"ok": true}` |
 | `POST /password/reset/confirm` | none | `{token, password}` → sets it and logs every browser out |
 | `POST /logout` | session | End this session server-side |
-| `GET /me` | any | `{kind: root\|session\|key, org_id}` (+ `email`, `user_id` for a session) |
+| `GET /me` | any | `{kind: root\|session\|key, org_id}` (+ `email`, `user_id` for a session, `scope` for a key that is not `full`) |
 | `PUT /me/password` | session | `{current, new}` — changes it and logs every browser out |
 | `POST /users` | manage | Add a user to the caller's own org → `{id, email, org_id}` |
 | `GET /users` | manage | Users of the caller's org (root: all orgs) |
@@ -49,17 +50,18 @@ Token comparison is constant-time (`hmac.compare_digest`).
 | `GET /orgs/{id}` | manage | One org's settings + `plan`, `job_quota` and `jobs_this_month` |
 | `PUT /orgs/{id}` | manage | Set/clear `event_url`, `shopify_secret`; `job_quota` and `plan` are root-only |
 | `DELETE /orgs/{id}` | root | Remove an org and everything in it (never the default org) |
-| `GET /plans` | any | The [billing](billing.md) plan catalogue + the caller's current plan |
+| `GET /plans` | client (`Look`) | The [billing](billing.md) plan catalogue + the caller's current plan |
 | `POST /billing/webhook` | HMAC | The payment provider's callback: this org is on that plan now |
-| `POST /apikeys` | manage | Issue a client key → `{id, label, org_id, key}` (key shown once) |
+| `POST /apikeys` | manage | Issue a client key, optionally with a `scope` → `{id, label, org_id, key}` (+ `scope` unless `full`; key shown once) |
 | `GET /support-access` | manage | The [support access](#support-access) grants of the caller's org (root: `?org=`) |
-| `GET /apikeys` | manage | List keys with their org (never the secret) |
+| `GET /apikeys` | manage | List keys with their org and, unless `full`, their `scope` (never the secret) |
+| `PUT /apikeys/{id}` | manage | Change a key's rights: `{"scope": "agent"}` → `{ok, scope}` |
 | `DELETE /apikeys/{id}` | manage | Revoke a key |
-| `POST /agent/register` | agent | Declare name + printers → `{computer_id, printer_ids}` |
+| `POST /agent/register` | agent (`Agent`) | Declare name + printers → `{computer_id, printer_ids}` |
 | `GET /agent/jobs` | agent | Long-poll for a job (204 on timeout) |
 | `GET /agent/jobs/{id}/payload` | agent | Download the job's bytes |
 | `POST /agent/jobs/{id}/result` | agent | Report `{ok, error?}` |
-| `POST\|GET\|DELETE /cloudprnt/{key}` | client key | [Star CloudPRNT](cloudprnt.md): the printer polls, downloads and confirms here itself |
+| `POST\|GET\|DELETE /cloudprnt/{key}` | client key (`CloudPrnt`) | [Star CloudPRNT](cloudprnt.md): the printer polls, downloads and confirms here itself |
 
 Request bodies are capped at 32 MB.
 
@@ -67,6 +69,95 @@ An `Authorization: Basic` header instead of `Bearer` switches the same server to
 **[PrintNode-compatible shapes](printnode-compat.md)** (`/whoami`, `/printjobs`, and PrintNode's
 JSON for `/printers` and `/computers`), so an existing client can be pointed here unchanged. Same
 keys, same orgs; everything below describes the `Bearer` API.
+
+## Key rights
+
+Every issued key has one **scope**: `full` (the default, and what every key issued before rights
+existed is), `agent`, `cloudprnt`, `print` or `read`. The scope narrows what a **machine key** may
+call. It does not touch the bootstrap token, browser sessions or agent keys that were never issued
+(self-chosen v2 keys). Managing keys, users, the org and the support log (`/apikeys`, `/users`,
+`/orgs`, `/support-access`, including `event_url` and `shopify_secret`) stays with root and sessions:
+every key, a full one included, still gets `401` there.
+
+| Right | Routes | full | agent | cloudprnt | print | read |
+|---|---|---|---|---|---|---|
+| (none) | `GET /me` | yes | yes | yes | yes | yes |
+| `Computers` | `GET /computers` | yes | yes | no | yes | yes |
+| `Look` | `GET /printers`, `/labels`, `/labels/{id}`, `/jobs`, `/jobs/{id}`, `/metrics`, `/plans`; every PrintNode `GET` (`/whoami`, `/computers`, `/printers`, `/printjobs`) | yes | no | no | yes (jobs: own only) | yes |
+| `Submit` | `POST /jobs`, `POST /orders`, the Shopify webhook, `DELETE /jobs/{id}`; PrintNode `POST /printjobs`, `DELETE /printjobs/{set}` | yes | no | no | yes (cancel: own only) | no |
+| `Edit` | `POST /labels`, `PUT /labels/{id}`, `DELETE /labels/{id}` | yes | no | no | no | no |
+| `Agent` | `POST /agent/register`, `GET /agent/jobs`, `GET /agent/jobs/{id}/payload`, `POST /agent/jobs/{id}/result` | yes | yes | no | no | no |
+| `CloudPrnt` | `POST\|GET\|DELETE /cloudprnt[/{key}]` | yes | no | yes | no | no |
+
+A scope this version does not know (a newer server wrote it) allows nothing, `GET /me` excepted.
+
+- **Issuing and changing.** `POST /apikeys` takes an optional `scope`; absent or `null` is `full`,
+  anything but one of the five words is `400` `scope must be one of: full, agent, cloudprnt, print,
+  read` and issues nothing. The answer carries `"scope"` only when it is not `full`, so "no scope"
+  always means "a full key", also against an older server. `GET /apikeys` and `GET /me` do the same.
+  `PUT /apikeys/{id}` with `{"scope": "agent"}` changes it later (root or a session) and answers
+  `{"ok": true, "scope": "agent"}`; a missing or invalid scope is `400`, an unknown, revoked or
+  foreign key `404`. A manager may set any scope, a wider one too: they can issue full keys anyway,
+  and it is the undo for a wrong narrowing.
+- **When a change counts.** Every request that arrives after the change is judged by the new scope.
+  A request already accepted (body read, payload being fetched) may still queue its job, exactly as
+  with revoking a key. Narrowing the key of a computer ends its waiting long-poll with `401` at once
+  and wakes only that computer. Jobs queued for it wait until the right is back, or until they
+  expire.
+- **A job already handed out.** If an agent's key loses the agent right while a job is `claimed` by
+  that agent, the payload download and the result of exactly that job still work; the next poll is
+  `401`. Otherwise the report would be refused, the job requeued and printed twice. A revoked key
+  gets nothing, and a CloudPRNT device has no such exception (no key is bound to a device): take the
+  key out of the printer before you narrow or revoke it, or a job it is printing at that moment can
+  print again later.
+- **Own jobs.** A `print` key sees and cancels only the jobs submitted with that key, on both API
+  layers, orders and Shopify jobs included. Another key's job reads exactly like a missing one:
+  `404` on `/jobs/{id}`, absent from `GET /jobs` and the PrintNode lists, not counted by the
+  PrintNode delete. `full` and `read` keys see the whole org. `/metrics` and `/whoami` show
+  org-wide counts to a print key; only job rows are restricted. Jobs submitted before this version
+  have no key and no print key sees them.
+- **Idempotency.** A resubmit with the same `idempotency_key` still returns the org's original
+  `job_id`, even if another key made that job; a print key then gets `404` when it asks for it.
+  The key space is the whole org's, so a print key can take an idempotency key before the
+  integration that will use it, and that integration's job is then answered with the print key's
+  job and not printed. The one key the server builds itself is refused: a print key may not send an
+  `idempotency_key` that starts with `shopify-` (`400`). A shop plugin's own keys (WooCommerce
+  uses `woo-<order>-<status>`) cannot be told apart from any other caller's, so give every
+  integration its own unguessable or prefixed keys, and keep the key of a print key out of reach.
+- **Replacing a key.** A new print key does not see the jobs submitted with the one it replaces.
+  Change the rights of the old key instead if you need them.
+- **Why `agent` and `cloudprnt` are two rights.** A CloudPRNT device is identified only by the MAC
+  address the caller sends, no key is bound to it. With one shared right a computer's key could read,
+  swallow and confirm the jobs of every Star printer of the org. Split, a computer's key cannot act as
+  a Star printer, and a key from a printer's URL (which lands in access logs) cannot enrol a computer.
+  One `cloudprnt` key still reaches **all** Star printers of its org, and so does a `full` key.
+- **Reserved names.** An `agent` key cannot register a computer whose name starts with
+  `cloudprnt-`: `401` `names starting with cloudprnt- are reserved for Star printers`. A full key,
+  root and a never-issued key may, as before. Narrowing does not undo such a name: `PUT /apikeys/{id}`
+  refuses (`400`) to give a key the rights `agent` alone while the computer enrolled with it is
+  named `cloudprnt-...`, because that computer would share the Star printer's queue and its next
+  registration would be refused. `full`, `print`, `read` and `cloudprnt` are fine.
+
+What a key without the right gets:
+
+| Surface | Unknown or revoked key | Known key, right missing |
+|---|---|---|
+| Bearer API | `401 {"error": "unauthorized"}` | `403 {"error": "this key's rights (read) do not allow this"}` |
+| PrintNode layer (Basic) | `401 {"code": "Unauthorized", ...}` | `403 {"code": "Forbidden", "message": ...}` |
+| Shopify webhook | `401` | `403`, before the signature is checked |
+| CloudPRNT | `401` | `403`, and nothing is enrolled |
+| `POST /agent/register` | `401` | `401` with a message naming the rights needed |
+| other `/agent/*` | `401` | `401` |
+| `/apikeys`, `/users`, `/orgs`, `/support-access` | `401` | `401` (no key may) |
+
+On the Bearer routes and on PrintNode `POST /printjobs` the right is checked before the body is
+parsed: a refused key with a broken JSON body gets `403`. CloudPRNT and `POST /agent/register`
+parse the body first (broken JSON is `400` there), and the Shopify webhook has read the body but
+checks the right before the signature. `/agent/*` stays `401` because the setup app reads
+`403` there as "a proxy in front of the server refused", and `401` as "check the key or the name".
+The dashboard signs a browser out on any `401` outside the management paths, which is why a missing
+right is `403` elsewhere.
+
 
 ## Submitting a job
 
@@ -229,7 +320,8 @@ curl -s -X POST localhost:3460/orgs -H 'Authorization: Bearer <PRINTAPI_TOKEN>' 
 
 # 2. root issues that org a key (one per agent / per integration)
 curl -s -X POST localhost:3460/apikeys -H 'Authorization: Bearer <PRINTAPI_TOKEN>' \
-     -d '{"label":"acme-agent","org_id":2}'     # -> {"id":1,"label":"acme-agent","org_id":2,"key":"…"}
+     -d '{"label":"acme-agent","org_id":2,"scope":"agent"}'
+     # -> {"id":1,"label":"acme-agent","org_id":2,"key":"…","scope":"agent"}
 
 # 3. the agent puts that key in agent.ini and registers — it lands in org 2, and so do its
 #    printers and every job printed on them.
@@ -249,15 +341,18 @@ Rules:
   already holds (machines enrolled under v2 keep working), and except with
   `PRINTAPI_OPEN_ENROLLMENT=1`, which restores the v2 rule (any key enrolls into org `1`). Agent
   names are unique *per org*, not globally; an agent key is still bound to its name on first
-  contact. Revoking an issued key also stops the agent that enrolled with it.
+  contact. Revoking an issued key also stops the agent that enrolled with it. A key whose rights
+  lack `Agent` (`print`, `read`, `cloudprnt`) is `401` here, with a message saying which rights are
+  needed, also with open enrollment on; an `agent` key cannot take a name that starts with
+  `cloudprnt-` (see [Key rights](#key-rights)).
 - `org_id` is optional on `POST /apikeys` and defaults to `1`. An unknown org → `400`.
 
 **Existing installs need no migration** — everything already lives in org `1`, root behaves as
 before, and every issued key resolves to org `1`.
 
 Deliberately out of scope for now (`# ponytail:` in the code): billing, quotas, and org deletion.
-An agent key doubles as its org's client key; issue one per machine to keep a lost machine's
-blast radius to that machine.
+A *full* key that an agent holds doubles as its org's client key; issue an `agent` key per machine
+to keep a lost machine's blast radius to that machine.
 
 ## Accounts and login
 
@@ -284,9 +379,9 @@ curl -s -X POST localhost:3460/users   -H 'Authorization: Bearer sess_…' \
 What holds:
 
 - **Three kinds of credential, one header.** Root manages every org; a session manages its own
-  org; a machine key prints and reads and nothing more (`401` on `/apikeys`, `/users`,
-  `PUT /orgs/{id}`). Which table the credential resolves in *is* the permission — there is no role
-  column and no roles.
+  org; a machine key has rights (its [scope](#key-rights)) but never manages (`401` on
+  `/apikeys`, `/users`, `PUT /orgs/{id}`). Which table the credential resolves in decides who
+  manages; a session has no scope, and there is no role column and no roles.
 - **Sessions expire** after 30 days and can be ended early (`POST /logout`, or the reaper once
   expired). Tokens are stored sha256-hashed, like every other credential here.
 - **Passwords** are `scrypt` hashes (stdlib, salted per user), minimum 8 characters. Changing a

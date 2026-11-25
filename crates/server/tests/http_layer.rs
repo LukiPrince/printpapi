@@ -322,6 +322,7 @@ fn enqueue(state: &AppState) -> store::Enqueued {
                 org_id: Some(1),
                 idempotency_key: None,
                 expire_after: None,
+                api_key_id: None,
             },
         )
         .unwrap()
@@ -414,6 +415,40 @@ fn long_poll_is_woken_by_an_enqueue_during_the_wait() {
         serde_json::from_slice::<Value>(&r.body).unwrap()["job_id"],
         e.job_id
     );
+}
+
+#[test]
+fn a_key_narrowed_while_its_agent_waits_claims_nothing() {
+    let (state, addr, aid) = poll_state(3.0, 10.0);
+    let kid = state
+        .db
+        .with(|c| store::add_api_key(c, "pc", "agent-key", 1))
+        .unwrap();
+    let poll = std::thread::spawn(move || get(addr, "/agent/jobs", AGENT));
+    let t0 = Instant::now();
+    while state.waker.tracked() == 0 && t0.elapsed() < Duration::from_secs(2) {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    // PUT /apikeys/{id}: the new scope has no agent right, a job is queued, the agent is woken
+    state
+        .db
+        .with(|c| store::set_api_key_scope(c, kid, None, printpapi_server::auth::Scope::Read))
+        .unwrap();
+    let job = enqueue(&state);
+    state.waker.wake(aid);
+    let r = poll.join().unwrap();
+    assert_eq!(r.status(), "HTTP/1.1 401 Unauthorized");
+    assert!(
+        t0.elapsed() < Duration::from_secs(2),
+        "answered on the wake-up, not the timeout"
+    );
+    let st: String = state.db.with(|c| {
+        c.query_row("SELECT state FROM jobs WHERE id=?", [job.job_id], |r| {
+            r.get(0)
+        })
+        .unwrap()
+    });
+    assert_eq!(st, "queued", "the narrowed agent did not claim it");
 }
 
 #[test]

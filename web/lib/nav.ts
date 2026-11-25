@@ -50,7 +50,7 @@ export const NAV: NavItem[] = [
     label: "API Keys",
     eyebrow: "Access",
     icon: KeyRound,
-    help: "Per-client API keys — one per integration. The key is shown once, so copy it then. Revoking cuts access instantly. Needs an account login or the bootstrap PRINTAPI_TOKEN.",
+    help: "Per-client API keys, one per integration or device, each with its own rights. The key is shown once, so copy it then. Revoking cuts access instantly. Needs an account login or the bootstrap PRINTAPI_TOKEN.",
   },
   {
     href: "/users",

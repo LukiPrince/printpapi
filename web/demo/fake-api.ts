@@ -3,6 +3,7 @@
 // and the browser glue (fetch patch, storage) lives in store.ts. Error texts are copied from
 // crates/server/src/server.rs so the dashboard shows what the real server says.
 import type { ApiKey, Computer, Job, LabelTemplate, Me, Org, OrgUser, Printer, ServerInfo } from "../lib/api";
+import { KEY_SCOPES, type KeyScope } from "../lib/key-scopes.ts";
 import { BASE_COUNTS } from "./seed.ts";
 import type { DemoState } from "./seed.ts";
 import { advance, cancel, enqueue, mode, SEED_LAST_JOB } from "./sim.ts";
@@ -118,11 +119,35 @@ function hex32(): string {
   return out;
 }
 
+const SCOPE_WORDS = "scope must be one of: full, agent, cloudprnt, print, read";
+
+/** The `scope` of a key request: one of the five words, `undefined` when absent or null. */
+function scopeOf(body: Record<string, unknown> | null): KeyScope | undefined | "bad" {
+  const v = body?.scope;
+  if (v === undefined || v === null) return undefined;
+  return KEY_SCOPES.some((s) => s.value === v) ? (v as KeyScope) : "bad";
+}
+
 function issueKey(c: Ctx): FakeResponse {
-  const label = String(obj(c.body)?.label ?? "").trim() || "unnamed key";
+  const body = obj(c.body);
+  const label = String(body?.label ?? "").trim() || "unnamed key";
+  const scope = scopeOf(body);
+  if (scope === "bad") return err(400, SCOPE_WORDS);
   const key: ApiKey = { id: c.s.next.key++, label, active: 1, created_at: c.now };
+  // a full key carries no scope, like the server's answers
+  if (scope && scope !== "full") key.scope = scope;
   c.s.keys.unshift(key);
-  return ok({ id: key.id, label, org_id: 1, key: "pp_demo_" + hex32() });
+  return ok({ id: key.id, label, org_id: 1, key: "pp_demo_" + hex32(), ...(key.scope ? { scope: key.scope } : {}) });
+}
+
+function setKeyScope(c: Ctx): FakeResponse {
+  const scope = scopeOf(obj(c.body));
+  if (scope === undefined || scope === "bad") return err(400, SCOPE_WORDS);
+  const k = c.s.keys.find((x) => x.id === c.id);
+  if (!k || !k.active) return notFound();
+  if (scope === "full") delete k.scope;
+  else k.scope = scope;
+  return ok({ ok: true, scope });
 }
 
 function revokeKey(c: Ctx): FakeResponse {
@@ -363,6 +388,7 @@ const ROUTES: Route[] = [
   { method: "GET", re: /^\/metrics$/, run: (c) => metrics(c.s) },
   { method: "GET", re: /^\/apikeys$/, run: (c) => ok({ keys: c.s.keys }) },
   { method: "POST", re: /^\/apikeys$/, run: issueKey },
+  { method: "PUT", re: /^\/apikeys\/\d+$/, run: setKeyScope },
   { method: "DELETE", re: /^\/apikeys\/\d+$/, run: revokeKey },
   { method: "GET", re: /^\/users$/, run: (c) => ok({ users: c.s.users }) },
   { method: "POST", re: /^\/users$/, run: createUser },

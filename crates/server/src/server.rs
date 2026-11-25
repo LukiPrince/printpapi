@@ -557,6 +557,7 @@ impl Resp {
 
 // --- routing ------------------------------------------------------------------------------------
 
+use crate::auth::Right;
 use crate::pyfmt::{as_sql_int, py_str, repr, repr_str, truthy};
 use crate::store::{self, StoreError};
 use crate::{auth, billing, cloudprnt, dispatch, label, orders, packing_slip, printnode, web};
@@ -600,6 +601,32 @@ fn unauthorized() -> Resp {
 
 fn not_found() -> Resp {
     jerr(404, "not found")
+}
+
+/// 403 for a known key whose scope lacks the right. Every machine surface but `/agent/*` (which
+/// stays 401, see the docs) answers with this text.
+fn scope_denied(scope: auth::Scope) -> Resp {
+    jerr(403, scope_denied_text(scope))
+}
+
+/// The answer for a `scope` that is none of the five words.
+const SCOPE_WORDS: &str = "scope must be one of: full, agent, cloudprnt, print, read";
+
+/// The `scope` of a key request: one of the five words. Absent or null is `full` when
+/// `default_full` (issuing), and no scope at all otherwise (changing: it must be given). `Err` for
+/// a value that is not one of the words.
+fn issued_scope(body: &Obj, default_full: bool) -> Gate<Option<auth::Scope>> {
+    match body.get("scope") {
+        None | Some(Value::Null) => Ok(default_full.then_some(auth::Scope::Full)),
+        Some(Value::String(s)) => auth::Scope::issuable(s)
+            .map(Some)
+            .ok_or_else(|| jerr(400, SCOPE_WORDS)),
+        Some(_) => Err(jerr(400, SCOPE_WORDS)),
+    }
+}
+
+fn scope_denied_text(scope: auth::Scope) -> String {
+    format!("this key's rights ({}) do not allow this", scope.as_str())
 }
 
 fn bad_json() -> Resp {
@@ -825,18 +852,54 @@ const PN_COLLECTIONS: [&str; 4] = ["/whoami", "/computers", "/printers", "/print
 ///
 /// kind `root`: the bootstrap token — no org filter, may act in and manage every org.
 /// kind `session`: a browser login — one org, and may manage it (keys, users, org settings).
-/// kind `key`: a machine credential — one org, print and read only. A leaked integration key must
-/// not be able to issue itself a successor.
-/// Which table the credential resolves in *is* the permission — no role column.
+/// kind `key`: a machine credential — one org, and only what its scope allows (`auth::Scope`; a
+/// full key prints and reads). It never manages keys, users or the org: a leaked integration key
+/// must not be able to issue itself a successor.
+/// Which table the credential resolves in decides who may manage; the scope of a key decides what
+/// else it may do.
 struct Principal {
     kind: &'static str,
     org_id: Option<i64>,
     user_id: Option<i64>,
     email: Option<String>,
     manage: bool,
+    /// Root and sessions are `Full`.
+    scope: auth::Scope,
+    /// The issued key behind a `key` principal.
+    key_id: Option<i64>,
 }
 
 impl Principal {
+    fn root() -> Self {
+        Principal {
+            kind: "root",
+            org_id: None,
+            user_id: None,
+            email: None,
+            manage: true,
+            scope: auth::Scope::Full,
+            key_id: None,
+        }
+    }
+
+    /// An issued client key (Bearer, PrintNode Basic, Shopify webhook).
+    fn key(row: store::ClientKey) -> Self {
+        Principal {
+            kind: "key",
+            org_id: Some(row.org_id),
+            user_id: None,
+            email: None,
+            manage: false,
+            scope: row.scope,
+            key_id: Some(row.id),
+        }
+    }
+
+    /// The key whose jobs this caller is confined to: only a print key is.
+    fn own_jobs(&self) -> Option<i64> {
+        self.key_id.filter(|_| self.scope == auth::Scope::Print)
+    }
+
     /// True if this principal may not touch `org_id` (root may touch every one).
     fn foreign_org(&self, org_id: i64) -> bool {
         self.org_id.is_some_and(|o| o != org_id)
@@ -865,6 +928,30 @@ enum Labeled<'a> {
 }
 
 /// The job types whose payload the server fetches itself (`label_uri` has its own path).
+/// What the Shopify webhook prefixes the order id with to build its idempotency key.
+const SHOPIFY_IDEM_PREFIX: &str = "shopify-";
+
+/// The idempotency key a client sent. The key space is the org's (a resubmit returns the original
+/// job whoever made it), so a key that is meant to contain a leak, one that sees only its own jobs,
+/// must not be able to take the key the webhook will build for an order: the order would then
+/// never print, and Shopify would be told it did. Keys of other integrations (a shop plugin builds
+/// its own) cannot be told apart from the caller's own and stay open, see docs/api.md.
+fn client_idempotency_key(
+    p: &Principal,
+    key: Option<String>,
+) -> Result<Option<String>, dispatch::DispatchError> {
+    if p.own_jobs().is_some()
+        && key
+            .as_deref()
+            .is_some_and(|k| k.starts_with(SHOPIFY_IDEM_PREFIX))
+    {
+        return Err(dispatch::DispatchError::Invalid(format!(
+            "idempotency_key may not start with {SHOPIFY_IDEM_PREFIX}: the Shopify webhook uses that prefix"
+        )));
+    }
+    Ok(key)
+}
+
 fn fetches_payload(type_v: &Value) -> bool {
     matches!(
         type_v.as_str(),
@@ -932,7 +1019,12 @@ fn enrollment_org(
         return Ok(Err("agent key revoked"));
     }
     if let Some(row) = store::authenticate_client(c, key)? {
-        return Ok(Ok(row.org_id));
+        // return, do not fall through: the next branch takes anything with open enrollment
+        return Ok(if row.scope.allows(Right::Agent) {
+            Ok(row.org_id)
+        } else {
+            Err("this key may not enroll agents: issue one with the rights \"agent\" or \"full\"")
+        });
     }
     if open || (!key.is_empty() && store::authenticate_agent(c, key)?.is_some()) {
         return Ok(Ok(store::DEFAULT_ORG));
@@ -1017,13 +1109,7 @@ impl Ctx<'_> {
     fn principal(&self) -> Result<Option<Principal>, StoreError> {
         let key = self.presented_key();
         if self.admin_ok() {
-            return Ok(Some(Principal {
-                kind: "root",
-                org_id: None,
-                user_id: None,
-                email: None,
-                manage: true,
-            }));
+            return Ok(Some(Principal::root()));
         }
         if key.starts_with("sess_") {
             // never looked up as a machine key
@@ -1034,21 +1120,50 @@ impl Ctx<'_> {
                 user_id: Some(s.user_id),
                 email: s.email,
                 manage: true,
+                scope: auth::Scope::Full,
+                key_id: None,
             }));
         }
         let row = self.db(|c| store::authenticate_client(c, key))?;
-        Ok(row.map(|r| Principal {
-            kind: "key",
-            org_id: Some(r.org_id),
-            user_id: None,
-            email: None,
-            manage: false,
-        }))
+        Ok(row.map(Principal::key))
     }
 
-    /// The print/read gate: Err(401) or the org to filter by (None = root, no filter).
-    fn client_org(&self) -> Result<Gate<Option<i64>>, StoreError> {
-        Ok(self.principal()?.map(|p| p.org_id).ok_or_else(unauthorized))
+    /// The gate of a machine route: 401 without a credential, 403 when the key's scope lacks
+    /// `right`. Root and sessions are `Full`.
+    fn client(&self, right: Right) -> Result<Gate<Principal>, StoreError> {
+        Ok(match self.principal()? {
+            None => Err(unauthorized()),
+            Some(p) if !p.scope.allows(right) => Err(scope_denied(p.scope)),
+            Some(p) => Ok(p),
+        })
+    }
+
+    /// The job rows `p` may see, newest first. A print key sees only its own: both lookups run in
+    /// one `db` closure.
+    fn jobs_for(
+        &self,
+        p: &Principal,
+        limit: i64,
+        ids: Option<&[i64]>,
+    ) -> Result<Vec<store::JobRow>, StoreError> {
+        self.db(|c| match p.own_jobs() {
+            None => store::recent_jobs(c, limit, p.org_id, ids),
+            Some(k) => {
+                let mine = store::key_job_ids(c, k, limit, ids)?;
+                store::recent_jobs(c, limit, p.org_id, Some(&mine))
+            }
+        })
+    }
+
+    /// May `p` see and cancel job `job_id`? Everyone but a print key may (the org filter of the
+    /// store applies). `api_key_id` never changes after the insert, so check-then-act is safe.
+    fn owns(&self, p: &Principal, job_id: i64) -> Result<bool, StoreError> {
+        let Some(k) = p.own_jobs() else {
+            return Ok(true);
+        };
+        Ok(!self
+            .db(|c| store::key_job_ids(c, k, 1, Some(&[job_id])))?
+            .is_empty())
     }
 
     /// The gate for key/user/org administration: root or a browser session, never a machine key.
@@ -1110,6 +1225,27 @@ impl Ctx<'_> {
             return Ok(None);
         }
         self.db(|c| store::authenticate_agent(c, key))
+    }
+
+    /// For `/agent/jobs/{id}/payload` and `/result`: runs `f` for the agent behind the presented key
+    /// in the same `db` closure that authenticates it, so the key cannot change in between. A key
+    /// that lost the agent right still passes for a job its agent has `claimed` (refusing the report
+    /// of a printed job would requeue and reprint it). `None` = 401.
+    fn agent_for_job<T>(
+        &self,
+        job_id: i64,
+        f: impl FnOnce(&rusqlite::Connection, i64) -> Result<T, StoreError>,
+    ) -> Result<Option<T>, StoreError> {
+        let key = self.presented_key();
+        if key.is_empty() {
+            return Ok(None);
+        }
+        self.db(
+            |c| match store::authenticate_agent_for_job(c, key, job_id)? {
+                None => Ok(None),
+                Some(aid) => f(c, aid).map(Some),
+            },
+        )
     }
 
     // --- bodies ---------------------------------------------------------------------------------
@@ -1327,12 +1463,8 @@ impl Ctx<'_> {
 
     /// The POST /jobs core: validate, fetch the payload, enqueue. The PrintNode compat layer
     /// submits through here too, so there is one validation path.
-    fn submit_job(
-        &self,
-        body: &Obj,
-        org: Option<i64>,
-        user_id: Option<i64>,
-    ) -> Result<store::Enqueued, SubmitErr> {
+    fn submit_job(&self, body: &Obj, p: &Principal) -> Result<store::Enqueued, SubmitErr> {
+        let org = p.org_id;
         let null = Value::Null;
         let type_v = body.get("type").unwrap_or(&null);
         let mut mode = dispatch::agent_mode(type_v);
@@ -1347,7 +1479,7 @@ impl Ctx<'_> {
         } else {
             None
         };
-        let idempotency_key = dispatch::parse_idempotency_key(body)?;
+        let idempotency_key = client_idempotency_key(p, dispatch::parse_idempotency_key(body)?)?;
         let expire_after = dispatch::parse_expire_after(body)?;
         // the key stays marked until the job is queued, so a second request cannot fetch meanwhile
         let mut _held = Held::default();
@@ -1385,7 +1517,7 @@ impl Ctx<'_> {
             type_: type_v.as_str().unwrap_or(""),
             mode,
             payload: &data,
-            user_id: user_id.unwrap_or(store::DEFAULT_USER),
+            user_id: p.user_id.unwrap_or(store::DEFAULT_USER),
             title: sql_text(body.get("title")),
             copies,
             callback_url,
@@ -1393,6 +1525,7 @@ impl Ctx<'_> {
             org_id: org,
             idempotency_key,
             expire_after,
+            api_key_id: p.key_id,
         };
         self.enqueue(&job)
     }
@@ -1561,7 +1694,7 @@ impl Ctx<'_> {
     }
 
     fn post_labels(&self) -> R {
-        let org = gate!(self.client_org()?);
+        let org = gate!(self.client(Right::Edit)?).org_id;
         let spec = gate!(self.label_spec());
         match self.db(|c| store::create_label_template(c, org, &spec)) {
             Ok(t) => Ok(Resp::json(200, &t.to_json())),
@@ -1571,7 +1704,7 @@ impl Ctx<'_> {
     }
 
     fn put_label(&self, id: i64) -> R {
-        let org = gate!(self.client_org()?);
+        let org = gate!(self.client(Right::Edit)?).org_id;
         let spec = gate!(self.label_spec());
         match self.db(|c| store::update_label_template(c, id, org, &spec)) {
             Ok(Some(t)) => Ok(Resp::json(200, &t.to_json())),
@@ -1582,11 +1715,9 @@ impl Ctx<'_> {
     }
 
     fn post_jobs(&self) -> R {
-        let Some(p) = self.principal()? else {
-            return Ok(unauthorized());
-        };
+        let p = gate!(self.client(Right::Submit)?);
         let body = gate!(self.read_obj());
-        match self.submit_job(&body, p.org_id, p.user_id) {
+        match self.submit_job(&body, &p) {
             Ok(e) => Ok(Resp::json(200, &json!({ "job_id": e.job_id }))),
             Err(SubmitErr::Fetch(m)) => Ok(jerr(502, format!("downstream: {m}"))),
             Err(SubmitErr::Quota(m)) => Ok(jerr(402, m)),
@@ -1606,11 +1737,11 @@ impl Ctx<'_> {
         payload: &Value,
         fmt: &Value,
         opts: &Obj,
-        org: Option<i64>,
+        p: &Principal,
         idem: Option<String>,
         shop: Option<&str>,
-        user_id: Option<i64>,
     ) -> R {
+        let org = p.org_id;
         let prep = (|| {
             let order = orders::normalize_order(payload, fmt).map_err(|e| e.to_string())?;
             let copies = dispatch::parse_copies(opts).map_err(|e| e.to_string())?;
@@ -1618,7 +1749,11 @@ impl Ctx<'_> {
             let expire_after = dispatch::parse_expire_after(opts).map_err(|e| e.to_string())?;
             let idem = match idem {
                 Some(i) => Some(i),
-                None => dispatch::parse_idempotency_key(opts).map_err(|e| e.to_string())?,
+                None => client_idempotency_key(
+                    p,
+                    dispatch::parse_idempotency_key(opts).map_err(|e| e.to_string())?,
+                )
+                .map_err(|e| e.to_string())?,
             };
             Ok::<_, String>((order, copies, callback_url, expire_after, idem))
         })();
@@ -1654,7 +1789,7 @@ impl Ctx<'_> {
             type_: "order",
             mode: "pdf",
             payload: &pdf,
-            user_id: user_id.unwrap_or(store::DEFAULT_USER),
+            user_id: p.user_id.unwrap_or(store::DEFAULT_USER),
             title: Some(title),
             copies,
             callback_url,
@@ -1662,6 +1797,7 @@ impl Ctx<'_> {
             org_id: org,
             idempotency_key: idem,
             expire_after,
+            api_key_id: p.key_id,
         };
         match self.enqueue(&job) {
             Ok(e) => Ok(Resp::json(200, &json!({ "job_id": e.job_id }))),
@@ -1678,19 +1814,16 @@ impl Ctx<'_> {
     }
 
     fn post_orders(&self) -> R {
-        let Some(p) = self.principal()? else {
-            return Ok(unauthorized());
-        };
+        let p = gate!(self.client(Right::Submit)?);
         let body = gate!(self.read_obj());
         let null = Value::Null;
         self.enqueue_order(
             body.get("order").unwrap_or(&null),
             body.get("format").unwrap_or(&null),
             &body,
-            p.org_id,
+            &p,
             None,
             None,
-            p.user_id,
         )
     }
 
@@ -1708,6 +1841,11 @@ impl Ctx<'_> {
         let Some(row) = self.db(|c| store::authenticate_client(c, key))? else {
             return Ok(unauthorized());
         };
+        // before the signature: a key that may not submit learns nothing about the secret
+        if !row.scope.allows(Right::Submit) {
+            return Ok(scope_denied(row.scope));
+        }
+        let p = Principal::key(row);
         let org = row.org_id;
         let secret = self
             .db(|c| store::get_org(c, org))?
@@ -1751,10 +1889,9 @@ impl Ctx<'_> {
             &payload,
             &json!("shopify"),
             &opts,
-            Some(org),
-            sid.map(|s| format!("shopify-{s}")),
+            &p,
+            sid.map(|s| format!("{SHOPIFY_IDEM_PREFIX}{s}")),
             shop,
-            None,
         )
     }
 
@@ -1817,16 +1954,21 @@ impl Ctx<'_> {
         Resp::json(code, &json!({ "code": name, "message": message.as_ref() }))
     }
 
-    /// Same credentials as the Bearer API — any issued client key, or the root token. The inner
-    /// Option is the org (None = root).
-    fn pn_org(&self) -> Result<Option<Option<i64>>, StoreError> {
+    /// Same credentials as the Bearer API — any issued client key, or the root token — and the same
+    /// rights table. The answer is the principal, or the response to send: 401 for an unknown key,
+    /// 403 `Forbidden` for a key whose scope lacks `right`.
+    fn pn_client(&self, right: Right) -> Result<Result<Principal, Resp>, StoreError> {
         let key = printnode::basic_key(self.req.header("authorization"));
         if !key.is_empty() && auth::ct_eq(&key, &self.cfg().token) {
-            return Ok(Some(None));
+            return Ok(Ok(Principal::root()));
         }
-        Ok(self
-            .db(|c| store::authenticate_client(c, &key))?
-            .map(|r| Some(r.org_id)))
+        Ok(match self.db(|c| store::authenticate_client(c, &key))? {
+            None => Err(self.pn_error(401, "Unauthorized", "invalid API key")),
+            Some(r) if !r.scope.allows(right) => {
+                Err(self.pn_error(403, "Forbidden", scope_denied_text(r.scope)))
+            }
+            Some(r) => Ok(Principal::key(r)),
+        })
     }
 
     fn pn_printers(
@@ -1854,18 +1996,18 @@ impl Ctx<'_> {
 
     fn pn_jobs(
         &self,
-        org: Option<i64>,
+        p: &Principal,
         ids: Option<&[i64]>,
     ) -> Result<Vec<store::JobRow>, StoreError> {
         if let Some(ids) = ids.filter(|i| !i.is_empty()) {
-            return self.db(|c| store::recent_jobs(c, ids.len() as i64, org, Some(ids)));
+            return self.jobs_for(p, ids.len() as i64, Some(ids));
         }
         // `?limit=` is how their clients page the job list; silently capping every caller at our
         // own default would be a surprising truncation. Junk falls back to the default.
         let q = query_params(self.target());
         let limit = printnode::py_int(qfirst(&q, "limit").unwrap_or("50"))
             .map_or(50, |n| n.clamp(1, 500) as i64);
-        self.db(|c| store::recent_jobs(c, limit, org, None))
+        self.jobs_for(p, limit, None)
     }
 
     /// PrintNode-shaped GETs. None if the path is not part of the compat surface.
@@ -1883,9 +2025,11 @@ impl Ctx<'_> {
         {
             return Ok(None); // e.g. /printers/1/states — not a route of theirs
         }
-        let Some(org) = self.pn_org()? else {
-            return Ok(Some(self.pn_error(401, "Unauthorized", "invalid API key")));
+        let p = match self.pn_client(Right::Look)? {
+            Ok(p) => p,
+            Err(r) => return Ok(Some(r)),
         };
+        let org = p.org_id;
         let ids = match m.as_ref().map(|m| printnode::parse_set(m.set)).transpose() {
             Ok(ids) => ids,
             Err(e) => return Ok(Some(self.pn_error(400, "BadRequest", e.0))),
@@ -1923,7 +2067,7 @@ impl Ctx<'_> {
             Value::Array(self.pn_printers(org, by_printer, by_agent)?)
         } else if sub == "/states" {
             Value::Array(
-                self.pn_jobs(org, ids.as_deref())?
+                self.pn_jobs(&p, ids.as_deref())?
                     .iter()
                     .map(printnode::printjob_states)
                     .collect(),
@@ -1942,7 +2086,7 @@ impl Ctx<'_> {
                     .collect()
             };
             Value::Array(
-                self.pn_jobs(org, ids.as_deref())?
+                self.pn_jobs(&p, ids.as_deref())?
                     .iter()
                     .map(|j| printnode::printjob(j, pmap.get(&j.printer_id)))
                     .collect(),
@@ -1955,8 +2099,9 @@ impl Ctx<'_> {
         if self.req.path() != "/printjobs" {
             return Ok(None);
         }
-        let Some(org) = self.pn_org()? else {
-            return Ok(Some(self.pn_error(401, "Unauthorized", "invalid API key")));
+        let p = match self.pn_client(Right::Submit)? {
+            Ok(p) => p,
+            Err(r) => return Ok(Some(r)),
         };
         let Some(body) = self.parse_body() else {
             return Ok(Some(self.pn_error(
@@ -1969,7 +2114,7 @@ impl Ctx<'_> {
             Ok(m) => m,
             Err(e) => return Ok(Some(self.pn_error(400, "BadRequest", e.0))),
         };
-        Ok(Some(match self.submit_job(&map, org, None) {
+        Ok(Some(match self.submit_job(&map, &p) {
             // they answer a create with the bare print job id
             Ok(e) => Resp::json(201, &json!(e.job_id)),
             Err(SubmitErr::Fetch(m)) => self.pn_error(502, "DownstreamError", m),
@@ -1990,8 +2135,9 @@ impl Ctx<'_> {
         else {
             return Ok(None);
         };
-        let Some(org) = self.pn_org()? else {
-            return Ok(Some(self.pn_error(401, "Unauthorized", "invalid API key")));
+        let p = match self.pn_client(Right::Submit)? {
+            Ok(p) => p,
+            Err(r) => return Ok(Some(r)),
         };
         let ids = match printnode::parse_set(m.set) {
             Ok(ids) => ids,
@@ -1999,7 +2145,11 @@ impl Ctx<'_> {
         };
         let mut n = 0;
         for id in ids {
-            if self.db(|c| store::cancel_job(c, id, org))? == store::CancelOutcome::Cancelled {
+            // a print key cancels only its own jobs: another one's is not counted
+            if self.owns(&p, id)?
+                && self.db(|c| store::cancel_job(c, id, p.org_id))?
+                    == store::CancelOutcome::Cancelled
+            {
                 n += 1;
             }
         }
@@ -2028,6 +2178,11 @@ impl Ctx<'_> {
         let Some(row) = self.db(|c| store::authenticate_client(c, &key))? else {
             return Ok(Err(unauthorized()));
         };
+        // before the MAC check, so nothing is enrolled: a device is identified by its MAC alone, and
+        // a computer's key must not be able to act as a Star printer
+        if !row.scope.allows(Right::CloudPrnt) {
+            return Ok(Err(scope_denied(row.scope)));
+        }
         if printnode::py_trim(mac).is_empty() {
             return Ok(Err(jerr(400, "mac required")));
         }
@@ -2193,7 +2348,7 @@ impl Ctx<'_> {
                 return Ok(Resp::json(200, &h));
             }
             "/metrics" => {
-                let org = gate!(self.client_org()?);
+                let org = gate!(self.client(Right::Look)?).org_id;
                 let m = self.db(|c| store::metrics(c, self.cfg().online_window_s, None, org))?;
                 return Ok(Resp {
                     status: 200,
@@ -2205,12 +2360,12 @@ impl Ctx<'_> {
                 });
             }
             "/jobs" => {
-                let org = gate!(self.client_org()?);
-                let jobs = self.db(|c| store::recent_jobs(c, 50, org, None))?;
+                let p = gate!(self.client(Right::Look)?);
+                let jobs = self.jobs_for(&p, 50, None)?;
                 return Ok(Resp::json(200, &json!({ "jobs": val(&jobs) })));
             }
             "/labels" => {
-                let org = gate!(self.client_org()?);
+                let org = gate!(self.client(Right::Look)?).org_id;
                 let all = self.db(|c| store::list_label_templates(c, org))?;
                 let templates: Vec<Value> = all.iter().map(store::LabelTemplate::to_json).collect();
                 return Ok(Resp::json(200, &json!({ "templates": templates })));
@@ -2218,28 +2373,31 @@ impl Ctx<'_> {
             _ => {}
         }
         if let Some(id) = id_of(t, "/labels/", "") {
-            let org = gate!(self.client_org()?);
+            let org = gate!(self.client(Right::Look)?).org_id;
             return Ok(match self.db(|c| store::get_label_template(c, id, org))? {
                 Some(l) => Resp::json(200, &l.to_json()),
                 None => not_found(),
             });
         }
         if let Some(id) = id_of(t, "/jobs/", "") {
-            let org = gate!(self.client_org()?);
-            return Ok(match self.db(|c| store::get_job(c, id, org))? {
+            let p = gate!(self.client(Right::Look)?);
+            if !self.owns(&p, id)? {
+                return Ok(not_found());
+            }
+            return Ok(match self.db(|c| store::get_job(c, id, p.org_id))? {
                 Some(j) => Resp::json(200, &val(&j)),
                 None => not_found(),
             });
         }
         match t {
             "/printers" => {
-                let org = gate!(self.client_org()?);
+                let org = gate!(self.client(Right::Look)?).org_id;
                 let v =
                     self.db(|c| store::list_printers(c, self.cfg().online_window_s, None, org))?;
                 return Ok(Resp::json(200, &json!({ "printers": val(&v) })));
             }
             "/computers" => {
-                let org = gate!(self.client_org()?);
+                let org = gate!(self.client(Right::Computers)?).org_id;
                 let v =
                     self.db(|c| store::list_agents(c, self.cfg().online_window_s, None, org))?;
                 return Ok(Resp::json(200, &json!({ "computers": val(&v) })));
@@ -2249,6 +2407,9 @@ impl Ctx<'_> {
                     return Ok(unauthorized());
                 };
                 let mut me = json!({ "kind": p.kind, "org_id": p.org_id });
+                if !p.scope.is_full() {
+                    me["scope"] = json!(p.scope.as_str());
+                }
                 if p.kind == "session" {
                     me["email"] = json!(p.email);
                     me["user_id"] = json!(p.user_id);
@@ -2258,9 +2419,7 @@ impl Ctx<'_> {
             "/plans" => {
                 // The catalogue, with each checkout link already pointed at the caller's own org so
                 // the provider hands that id back in its webhook. [] = billing not configured.
-                let Some(p) = self.principal()? else {
-                    return Ok(unauthorized());
-                };
+                let p = gate!(self.client(Right::Look)?);
                 let org = match p.org_id {
                     Some(o) => self.db(|c| store::get_org(c, o))?,
                     None => None,
@@ -2322,10 +2481,13 @@ impl Ctx<'_> {
             ));
         }
         if let Some(jid) = id_of(t, "/agent/jobs/", "/payload") {
-            let Some(aid) = self.agent_id()? else {
+            // authentication and download in one closure: a key narrowed meanwhile cannot slip in
+            let Some(payload) =
+                self.agent_for_job(jid, |c, aid| store::get_payload(c, jid, aid))?
+            else {
                 return Ok(unauthorized());
             };
-            return Ok(match self.db(|c| store::get_payload(c, jid, aid))? {
+            return Ok(match payload {
                 None => not_found(),
                 Some(data) => Resp {
                     status: 200,
@@ -2416,19 +2578,21 @@ impl Ctx<'_> {
             return self.create_user(oid, &body);
         }
         if let Some(jid) = id_of(t, "/agent/jobs/", "/result") {
-            let Some(aid) = self.agent_id()? else {
+            // 401 before the body is read, as before
+            if self.agent_for_job(jid, |_, _| Ok(()))?.is_none() {
                 return Ok(unauthorized());
-            };
+            }
             let body = gate!(self.read_obj());
             let ok = body.get("ok").is_some_and(truthy);
             let error = sql_text(body.get("error"));
-            return Ok(
-                if self.db(|c| store::finish_job(c, jid, aid, ok, error.as_deref()))? {
-                    ok_true()
-                } else {
-                    not_found()
-                },
-            );
+            // the gate runs again with the write, in one closure (the key may have changed meanwhile)
+            let Some(finished) = self.agent_for_job(jid, |c, aid| {
+                store::finish_job(c, jid, aid, ok, error.as_deref())
+            })?
+            else {
+                return Ok(unauthorized());
+            };
+            return Ok(if finished { ok_true() } else { not_found() });
         }
         Ok(not_found())
     }
@@ -2449,6 +2613,11 @@ impl Ctx<'_> {
             .filter(|l| !l.is_empty())
             .unwrap_or("client")
             .to_string();
+        // after the label, before the org: a bad scope issues nothing
+        let scope = match issued_scope(&body, true) {
+            Ok(Some(s)) => s,
+            Ok(None) | Err(_) => return Ok(jerr(400, SCOPE_WORDS)),
+        };
         // The org id is echoed exactly as the caller wrote it (a string "2" stays "2"); the DB
         // gets the integer SQLite would compare it as.
         let org_v = match body.get("org_id").filter(|v| truthy(v)) {
@@ -2463,10 +2632,57 @@ impl Ctx<'_> {
             _ => return Ok(jerr(400, "unknown org")),
         };
         let key = auth::token_urlsafe(32);
-        let kid = self.db(|c| store::add_api_key(c, &label, &key, org_id))?;
+        let kid = self.db(|c| store::add_api_key_scoped(c, &label, &key, org_id, scope))?;
+        let mut out = json!({ "id": kid, "label": label, "org_id": org_v, "key": key });
+        // only when it is not full, so "no scope" always means "a full key" (also against older servers)
+        if !scope.is_full() {
+            out["scope"] = json!(scope.as_str());
+        }
+        Ok(Resp::json(200, &out))
+    }
+
+    /// `PUT /apikeys/{id}`: change the rights of an active key, so a machine that is already set up
+    /// can be narrowed without enrolling it again. Wakes only the agent enrolled with the key, so
+    /// its waiting long-poll ends with 401 at once.
+    fn put_apikey(&self, id: i64) -> R {
+        let p = gate!(self.manager()?);
+        let body = gate!(self.read_obj());
+        let Some(scope) = gate!(issued_scope(&body, false)) else {
+            return Ok(jerr(400, SCOPE_WORDS));
+        };
+        let agent = self.db(|c| -> Result<_, StoreError> {
+            let enrolled = store::enrolled_agent(c, id, p.org_id)?;
+            // register_cloudprnt finds a Star printer by (org, name): a computer under such a name
+            // that may act as an agent but not as a Star printer would hold the printer's queue,
+            // and its next registration would be refused. Only registering checks the name, so the
+            // narrowing has to.
+            if scope.allows(Right::Agent) && !scope.allows(Right::CloudPrnt) {
+                let named = match enrolled {
+                    Some(a) => store::agent_name(c, a)?,
+                    None => None,
+                };
+                if named.is_some_and(|n| n.starts_with(cloudprnt::NAME_PREFIX)) {
+                    return Ok(Err(
+                        "this key's computer is named cloudprnt-..., a name reserved for Star printers: keep the rights \"full\" or enrol the computer under another name",
+                    ));
+                }
+            }
+            if !store::set_api_key_scope(c, id, p.org_id, scope)? {
+                return Ok(Ok(None));
+            }
+            Ok(Ok(Some(enrolled)))
+        })?;
+        let agent = match agent {
+            Err(m) => return Ok(jerr(400, m)),
+            Ok(None) => return Ok(not_found()),
+            Ok(Some(a)) => a,
+        };
+        if let Some(agent) = agent.filter(|_| !scope.allows(Right::Agent)) {
+            self.s.waker.wake(agent);
+        }
         Ok(Resp::json(
             200,
-            &json!({ "id": kid, "label": label, "org_id": org_v, "key": key }),
+            &json!({ "ok": true, "scope": scope.as_str() }),
         ))
     }
 
@@ -2479,8 +2695,9 @@ impl Ctx<'_> {
         // (the v2 rule): otherwise whoever can reach /agent/register could plant agents and
         // printers in the default org. A revoked key enrolls nothing — and polls nothing either
         // (store::authenticate_agent).
-        // ponytail: the agent key doubles as its org's client key; issue one key per agent to
-        // keep the blast radius of a lost machine to that machine.
+        // ponytail: a full agent key doubles as its org's client key (a key with the rights
+        // "agent" does not); issue one "agent" key per computer to keep the blast radius of a lost
+        // machine to that machine.
         let (root, open) = (self.admin_ok(), self.cfg().open_enrollment);
         // Checked here so a refused key answers 401 before any body validation, and again below
         // in the same lock hold as the registration, so a revocation in between cannot slip by.
@@ -2528,6 +2745,15 @@ impl Ctx<'_> {
             Ok(
                 match enrollment_org(c, key, root, open, self.operator_cred)? {
                     Err(m) => Err(m),
+                    // register_cloudprnt finds a device by (org, name): a computer under such a
+                    // name would share the Star printer's queue
+                    Ok(_)
+                        if name.starts_with(cloudprnt::NAME_PREFIX)
+                            && store::authenticate_client(c, key)?
+                                .is_some_and(|k| !k.scope.allows(Right::CloudPrnt)) =>
+                    {
+                        Err("names starting with cloudprnt- are reserved for Star printers")
+                    }
                     Ok(org) => Ok(store::register_agent(c, name, key, &printers, org)),
                 },
             )
@@ -2569,6 +2795,9 @@ impl Ctx<'_> {
         }
         if let Some(id) = id_of(t, "/labels/", "") {
             return self.put_label(id);
+        }
+        if let Some(id) = id_of(t, "/apikeys/", "") {
+            return self.put_apikey(id);
         }
         Ok(not_found())
     }
@@ -2667,10 +2896,15 @@ impl Ctx<'_> {
         }
         if let Some(id) = id_of(t, "/apikeys/", "") {
             let p = gate!(self.manager()?);
-            let revoked = self.db(|c| store::revoke_api_key(c, id, p.org_id))?;
-            if revoked {
-                // a long-poll of an agent enrolled with this key re-checks it and ends with 401
-                self.s.waker.wake_all();
+            // The enrolled agent is read before the revoke (it needs an active key), so a repeated
+            // DELETE wakes nobody.
+            let (revoked, agent) = self.db(|c| -> Result<_, StoreError> {
+                let agent = store::enrolled_agent(c, id, p.org_id)?;
+                Ok((store::revoke_api_key(c, id, p.org_id)?, agent))
+            })?;
+            if let Some(agent) = agent.filter(|_| revoked) {
+                // its long-poll re-checks the key and ends with 401
+                self.s.waker.wake(agent);
             }
             return Ok(if revoked { ok_true() } else { not_found() });
         }
@@ -2704,7 +2938,7 @@ impl Ctx<'_> {
             });
         }
         if let Some(id) = id_of(t, "/labels/", "") {
-            let org = gate!(self.client_org()?);
+            let org = gate!(self.client(Right::Edit)?).org_id;
             return Ok(if self.db(|c| store::delete_label_template(c, id, org))? {
                 ok_true()
             } else {
@@ -2712,8 +2946,12 @@ impl Ctx<'_> {
             });
         }
         if let Some(jid) = id_of(t, "/jobs/", "") {
-            let org = gate!(self.client_org()?);
-            return Ok(match self.db(|c| store::cancel_job(c, jid, org))? {
+            let p = gate!(self.client(Right::Submit)?);
+            // not yours reads like a missing job, before any other answer (no 409 oracle)
+            if !self.owns(&p, jid)? {
+                return Ok(not_found());
+            }
+            return Ok(match self.db(|c| store::cancel_job(c, jid, p.org_id))? {
                 store::CancelOutcome::Cancelled => {
                     Resp::json(200, &json!({ "ok": true, "state": "cancelled" }))
                 }

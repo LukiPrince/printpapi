@@ -33,7 +33,9 @@ Details worth knowing:
   [retention](server.md#retention) on, at least `max(N, 7)` days after the job finished. The **Print packing slip** entry in the order's *Actions* box
   sends without a key — a reprint is meant to print again.
 - The API key lives in `wp_options` in plaintext (as WordPress plugin settings do). Issue a key
-  for the shop alone, and revoke that one key if the site is ever compromised.
+  for the shop alone with the rights **Print only** (`"scope": "print"`): the plugin needs
+  nothing but `POST /orders` and `GET /printers`, and that key sees only the jobs it made. Revoke
+  it if the site is ever compromised.
 
 ## Shopify
 
@@ -62,8 +64,10 @@ one. No Partner account, no OAuth, no review.
 **Why the key is in the URL:** Shopify cannot send an `Authorization` header, so the URL says
 *which org* to print for, and Shopify's `X-Shopify-Hmac-Sha256` signature proves the request is
 genuine. The key alone cannot print here — a request with a valid key and a bad signature is
-`401`. Treat the URL as a secret anyway (it lands in Shopify's webhook log), and use a client key
-issued for this one purpose so revoking it costs nothing else.
+`401`. Treat the URL as a secret anyway (it lands in Shopify's webhook log), and use a key issued for
+this one purpose with the rights **Print only**, so revoking it costs nothing else. A key that may
+not submit (Agent only, CloudPRNT only, Read only) is `403`, before the signature is checked; the
+order then does not appear in the history, and Shopify retries for 48 h.
 
 Redelivered webhooks (Shopify retries for 48 h) are deduped on the order id, so the same order
 never prints twice.

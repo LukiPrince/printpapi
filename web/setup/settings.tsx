@@ -64,7 +64,12 @@ function useStatus() {
 
 /** What the setup flow is told about the agent that is there now. */
 function known(status: AgentStatus | null): Existing {
-  return { serverUrl: status?.server ?? "", name: status?.name ?? "", printers: status?.printers ?? [] };
+  return {
+    serverUrl: status?.server ?? "",
+    name: status?.name ?? "",
+    printers: status?.printers ?? [],
+    keyUnreadable: status?.keyUnreadable ?? false,
+  };
 }
 
 type Flow = { kind: "printers" | "connection"; existing: Existing };

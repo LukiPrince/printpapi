@@ -10,6 +10,7 @@ pub mod config;
 pub mod discover;
 pub mod ini;
 pub mod install;
+pub mod keystore;
 pub mod log;
 pub mod print;
 pub mod proc;
@@ -27,7 +28,8 @@ use std::sync::{Arc, Mutex};
 use serde_json::Value;
 
 use client::Client;
-use config::{Capabilities, Config, Printer, parse_printers};
+use config::{Capabilities, Config, HttpSettings, Printer, parse_printers};
+use keystore::KeyStore;
 use print::{Fns, add_capabilities};
 use proc::{Runner, real_runner};
 use run::{PrinterMap, build_printer_map, poll_forever, register_with_retry};
@@ -39,6 +41,8 @@ pub type CapsFn = Box<dyn Fn(&str) -> Option<Capabilities>>;
 
 /// Print to stdout, ignoring a closed or missing stdout (a background run has none).
 pub fn out_line(msg: &str) {
+    #[cfg(test)]
+    OUT_LINES.with(|l| l.borrow_mut().push(msg.to_string()));
     let _ = writeln!(std::io::stdout(), "{msg}");
 }
 
@@ -53,6 +57,8 @@ pub fn err_line(msg: &str) {
 thread_local! {
     /// What `err_line` printed on this thread, so tests can check the console output.
     pub static ERR_LINES: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
+    /// What `out_line` printed on this thread.
+    pub static OUT_LINES: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
 /// Which printing backend a machine uses.
@@ -244,19 +250,65 @@ fn sleep_ticking(secs: u64, sleep: &dyn Fn(u64), tick: &dyn Fn()) {
     }
 }
 
-/// The agent: load `<base_dir>/agent.ini`, register, poll forever. Only returns on failure.
-pub fn run(base_dir: &Path) -> Result<(), Fatal> {
-    let os = install::Os::host();
-    let data_dir = vetted_dir(
-        setup_data_dir(base_dir, os),
-        &|dir| status::usable_status_dir(dir, os),
-        &log::log_error,
-    );
-    if let Some(dir) = &data_dir {
-        log::set_log_dir(dir.clone());
+/// What `run` has once agent.ini is read and its key is known.
+struct Prepared {
+    cfg: Config,
+    settings: HttpSettings,
+    reporter: Arc<Mutex<Reporter>>,
+}
+
+/// One read of agent.ini for the agent: the settings, and, when a stored key could not be opened,
+/// the text that says so (the config then holds no key). `Err` is a file that cannot be used; its
+/// text has no quoted line and so no key.
+fn read_config(
+    base_dir: &Path,
+    store: Option<&KeyStore>,
+) -> Result<(Config, HttpSettings, Option<String>), String> {
+    let text = Config::load_text(base_dir)?;
+    let (text, key_text) = match keystore::open(&text, store) {
+        Ok(Some(opened)) => (opened, None),
+        Ok(None) => (text, None),
+        Err(why) => (text, Some(why)),
+    };
+    let cfg = Config::from_text(&text)
+        .map_err(|_| "agent.ini cannot be read (a line that is not valid)".to_string())?;
+    let settings = cfg.http_settings()?;
+    Ok((cfg, settings, key_text))
+}
+
+/// What `start` needs from agent.ini, checked while the agent waits for a key: leaving the wait
+/// with one of these missing would end the process, or send an empty key for ever. The texts name
+/// a setting and quote no value.
+fn startable(cfg: &Config) -> Result<(), String> {
+    cfg.require("server_url")?;
+    cfg.get("name")?;
+    if cfg.require("api_key")?.is_empty() {
+        return Err("agent.ini [agent]: the key \"api_key\" is empty".to_string());
     }
-    let cfg = Config::load(base_dir).map_err(Fatal::Exit)?;
-    let settings = cfg.http_settings().map_err(Fatal::Exit)?;
+    parse_printers(&cfg.require("printers")?)
+        .map_err(|_| "agent.ini [agent]: printers cannot be read".to_string())?;
+    Ok(())
+}
+
+/// agent.ini, the stored key and the status reporter, before anything needs the key: no HTTP
+/// client and no journal exists until this returns.
+///
+/// A stored key that cannot be read (agent.ini copied from another Windows installation, a
+/// damaged blob) does not end a setup-installed agent: it says so in the status file, writes the
+/// text to the log once, and looks again every minute, so the tray keeps its name, server and
+/// printers for the repair, a hand edit works without a restart, and a transient DPAPI failure
+/// heals. Without a status folder (an agent set up by hand, with a console or an own service
+/// manager) it ends with the text at once. A bad file at the first read ends it as before. The
+/// agent never writes agent.ini.
+fn prepare(
+    base_dir: &Path,
+    data_dir: Option<PathBuf>,
+    store: Option<&KeyStore>,
+    sleep: &dyn Fn(u64),
+    log: &dyn Fn(&str),
+) -> Result<Prepared, Fatal> {
+    // the first read: the text of agent.ini can be read, but the key in it perhaps not
+    let (cfg, settings, key_text) = read_config(base_dir, store).map_err(Fatal::Exit)?;
     status::process_started_at();
     let has_status_file = data_dir.is_some();
     let reporter = Arc::new(Mutex::new(Reporter::new(
@@ -276,6 +328,72 @@ pub fn run(base_dir: &Path) -> Result<(), Fatal> {
     {
         log::log_error(&format!("no status heartbeat: {e}"));
     }
+    let Some(mut text) = key_text else {
+        return Ok(Prepared {
+            cfg,
+            settings,
+            reporter,
+        });
+    };
+    if !has_status_file {
+        return Err(Fatal::Exit(text));
+    }
+    let mut logged: Option<String> = None;
+    loop {
+        report(&|r| r.key_failed(&text, unix_now()));
+        if logged.as_deref() != Some(text.as_str()) {
+            log(&text);
+            logged = Some(text.clone());
+        }
+        sleep_ticking(60, sleep, &|| report(&|r| r.tick(unix_now())));
+        match read_config(base_dir, store) {
+            // only a file the agent can start with ends the wait: a half-saved hand edit (the blob
+            // line gone, an empty `api_key =`) must not end the process or register with no key
+            Ok((cfg, settings, None)) if startable(&cfg).is_ok() => {
+                let key = cfg.get("api_key").ok().flatten().unwrap_or_default();
+                report(&|r| r.key_opened(Status::from_config(&cfg), key.clone(), unix_now()));
+                log("the stored key can be read again");
+                return Ok(Prepared {
+                    cfg,
+                    settings,
+                    reporter,
+                });
+            }
+            // still unreadable, a half-saved hand edit, a bad header: the next text, and on
+            Ok((_, _, Some(next))) | Err(next) => text = next,
+            Ok((cfg, _, None)) => text = startable(&cfg).unwrap_err(),
+        }
+    }
+}
+
+/// The agent: load `<base_dir>/agent.ini`, register, poll forever. Only returns on failure.
+pub fn run(base_dir: &Path) -> Result<(), Fatal> {
+    let os = install::Os::host();
+    let data_dir = vetted_dir(
+        setup_data_dir(base_dir, os),
+        &|dir| status::usable_status_dir(dir, os),
+        &log::log_error,
+    );
+    if let Some(dir) = &data_dir {
+        log::set_log_dir(dir.clone());
+    }
+    let sleep = |secs: u64| std::thread::sleep(std::time::Duration::from_secs(secs));
+    let Prepared {
+        cfg,
+        settings,
+        reporter,
+    } = prepare(
+        base_dir,
+        data_dir,
+        keystore::host().as_ref(),
+        &sleep,
+        &log::log_error,
+    )?;
+    let report = |f: &dyn Fn(&mut Reporter)| {
+        f(&mut reporter
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner))
+    };
     let http = Client::new(&settings);
     let sumatra = sumatra_program(base_dir);
     let runner = real_runner();
@@ -283,7 +401,6 @@ pub fn run(base_dir: &Path) -> Result<(), Fatal> {
     let caps = select_caps_collector(platform, Rc::clone(&runner));
     let (raw, pdf) = select_backend(platform, &sumatra, runner);
     let fns = Fns::native(raw, pdf);
-    let sleep = |secs: u64| std::thread::sleep(std::time::Duration::from_secs(secs));
     let wait = |secs: u64| sleep_ticking(secs, &sleep, &|| report(&|r| r.tick(unix_now())));
     let hooks = Hooks {
         caps: &*caps,
@@ -659,5 +776,276 @@ printers=p
         )
         .unwrap();
         assert!(matches!(run(dir.path()), Err(Fatal::Exit(m)) if m.contains("must be >= 30")));
+    }
+
+    // ---- the stored key at start ----
+
+    fn xor(b: &[u8]) -> std::io::Result<Vec<u8>> {
+        Ok(b.iter().map(|x| x ^ 0x5a).collect())
+    }
+    fn refuse(_: &[u8]) -> std::io::Result<Vec<u8>> {
+        Err(std::io::Error::other("refused"))
+    }
+    const STORE: keystore::KeyStore = keystore::KeyStore {
+        protect: xor,
+        unprotect: xor,
+    };
+    /// A store that wrote the blob but cannot read it any more (another installation).
+    const OTHER_PC: keystore::KeyStore = keystore::KeyStore {
+        protect: xor,
+        unprotect: refuse,
+    };
+    const KEY: &str = "SECRET-KEY-123";
+    const PLAIN: &str = "[agent]\nserver_url = https://x\napi_key = SECRET-KEY-123\nname = pc\nprinters = Büro|pdf\n";
+
+    struct Start {
+        base: tempfile::TempDir,
+        status: tempfile::TempDir,
+    }
+
+    impl Start {
+        fn new(ini: &str) -> Start {
+            let s = Start {
+                base: tempfile::tempdir().unwrap(),
+                status: tempfile::tempdir().unwrap(),
+            };
+            s.write(ini);
+            s
+        }
+        fn write(&self, ini: &str) {
+            std::fs::write(self.base.path().join("agent.ini"), ini).unwrap();
+        }
+        fn status(&self) -> Value {
+            let text = std::fs::read_to_string(self.status.path().join("status.json")).unwrap();
+            serde_json::from_str(&text).unwrap()
+        }
+        fn prepare(
+            &self,
+            store: &keystore::KeyStore,
+            sleep: &dyn Fn(u64),
+            log: &dyn Fn(&str),
+        ) -> Result<Prepared, Fatal> {
+            prepare(
+                self.base.path(),
+                Some(self.status.path().to_path_buf()),
+                Some(store),
+                sleep,
+                log,
+            )
+        }
+    }
+
+    fn sealed() -> String {
+        keystore::seal(PLAIN, Some(&STORE)).unwrap().unwrap()
+    }
+
+    #[test]
+    fn prepare_waits_while_the_stored_key_cannot_be_read_and_heals_itself() {
+        let start = Start::new(&sealed());
+        let sleeps = RefCell::new(Vec::new());
+        let logs = RefCell::new(Vec::new());
+        let sleep = |secs: u64| {
+            sleeps.borrow_mut().push(secs);
+            let n = sleeps.borrow().len();
+            if n == 1 {
+                // what the tray and the window see while the agent waits
+                let v = start.status();
+                assert_eq!(v["state"], "offline");
+                assert_eq!(v["key_unreadable"], true);
+                assert_eq!(v["error"], keystore::UNREADABLE);
+                assert_eq!(v["name"], "pc");
+                assert_eq!(v["printers"][0]["name"], "Büro");
+                assert!(!v.to_string().contains(KEY));
+            }
+            if n == 4 {
+                // the administrator puts the key in by hand
+                start.write(PLAIN);
+            }
+        };
+        let log = |m: &str| logs.borrow_mut().push(m.to_string());
+        let prepared = start.prepare(&OTHER_PC, &sleep, &log).unwrap();
+        // 60 s per try, in steps the status file stays young through
+        assert_eq!(*sleeps.borrow(), vec![30; 4]);
+        assert_eq!(prepared.cfg.require("api_key").unwrap(), KEY);
+        let v = start.status();
+        assert_eq!(v["key_unreadable"], false);
+        assert_eq!(v["error"], Value::Null);
+        // one line for the text, one for the repair
+        assert_eq!(
+            *logs.borrow(),
+            vec![
+                keystore::UNREADABLE.to_string(),
+                "the stored key can be read again".to_string()
+            ]
+        );
+        assert!(prepared.settings.headers.is_empty());
+    }
+
+    #[test]
+    fn prepare_keeps_waiting_through_a_half_saved_file_and_logs_each_text_once() {
+        let start = Start::new(&sealed());
+        let sleeps = RefCell::new(0u32);
+        let logs = RefCell::new(Vec::new());
+        let sleep = |_| {
+            *sleeps.borrow_mut() += 1;
+            match *sleeps.borrow() {
+                // a hand edit that is not finished: a key twice, the secret on a line of its own
+                4 => start.write("[agent]\napi_key = SECRET-KEY-123\napi_key = SECRET-KEY-123\n"),
+                // a header the agent would refuse
+                6 => start.write(&format!("{PLAIN}[headers]\nauthorization = x\n")),
+                8 => start.write(PLAIN),
+                _ => {}
+            }
+        };
+        let log = |m: &str| logs.borrow_mut().push(m.to_string());
+        start.prepare(&OTHER_PC, &sleep, &log).unwrap();
+        let logs = logs.borrow();
+        assert_eq!(logs.len(), 4, "{logs:?}");
+        assert_eq!(logs[0], keystore::UNREADABLE);
+        assert!(
+            logs[1].contains("invalid") && logs[2].contains("[headers]"),
+            "{logs:?}"
+        );
+        assert_eq!(logs[3], "the stored key can be read again");
+        assert!(logs.iter().all(|l| !l.contains(KEY)), "{logs:?}");
+        // it waited through every try
+        assert_eq!(*sleeps.borrow(), 8);
+    }
+
+    #[test]
+    fn prepare_keeps_waiting_while_a_half_saved_file_has_no_usable_key() {
+        let start = Start::new(&sealed());
+        let sleeps = RefCell::new(0u32);
+        let logs = RefCell::new(Vec::new());
+        let sleep = |_| {
+            *sleeps.borrow_mut() += 1;
+            let n = *sleeps.borrow();
+            match n {
+                // the blob line is gone, the key is not typed yet
+                4 => start.write(&PLAIN.replace("api_key = SECRET-KEY-123\n", "")),
+                // an empty key, saved before the paste
+                6 => start.write(&PLAIN.replace("SECRET-KEY-123", "")),
+                // no server yet
+                8 => start.write(&PLAIN.replace("server_url = https://x\n", "")),
+                // a name that start would refuse
+                10 => start.write(&PLAIN.replace("name = pc", "name = 50%")),
+                12 => start.write(PLAIN),
+                _ => {}
+            }
+            if matches!(n, 5 | 7 | 9 | 11) {
+                // the agent is still waiting, and says so
+                let v = start.status();
+                assert_eq!(v["key_unreadable"], true, "try {n}");
+                assert_eq!(v["state"], "offline", "try {n}");
+                assert_eq!(v["name"], "pc", "try {n}");
+            }
+        };
+        let log = |m: &str| logs.borrow_mut().push(m.to_string());
+        let prepared = start.prepare(&OTHER_PC, &sleep, &log).unwrap();
+        assert_eq!(*sleeps.borrow(), 12);
+        assert_eq!(prepared.cfg.require("api_key").unwrap(), KEY);
+        let logs = logs.borrow();
+        assert_eq!(logs.len(), 6, "{logs:?}");
+        assert_eq!(logs[0], keystore::UNREADABLE);
+        assert!(logs[1].contains("api_key"), "{logs:?}");
+        assert!(
+            logs[2].contains("api_key") && logs[2].contains("empty"),
+            "{logs:?}"
+        );
+        assert!(logs[3].contains("server_url"), "{logs:?}");
+        assert!(logs[4].contains("name"), "{logs:?}");
+        assert_eq!(logs[5], "the stored key can be read again");
+        assert_eq!(start.status()["key_unreadable"], false);
+    }
+
+    #[test]
+    fn prepare_without_a_status_folder_ends_at_once_with_the_text() {
+        let start = Start::new(&sealed());
+        let sleep = |_| panic!("no waiting without a status folder");
+        let e = prepare(
+            start.base.path(),
+            None,
+            Some(&OTHER_PC),
+            &sleep,
+            &|_: &str| {},
+        )
+        .err()
+        .unwrap();
+        assert_eq!(e, Fatal::Exit(keystore::UNREADABLE.to_string()));
+        // and a system that has no store at all
+        let e = prepare(start.base.path(), None, None, &sleep, &|_: &str| {})
+            .err()
+            .unwrap();
+        assert_eq!(e, Fatal::Exit(keystore::NOT_ON_THIS_SYSTEM.to_string()));
+    }
+
+    #[test]
+    fn a_bad_agent_ini_at_the_first_read_still_ends_the_agent() {
+        let sleep = |_| panic!("no waiting for a bad file");
+        for (ini, needle) in [
+            ("[agent]\napi_key = a\napi_key = b\n", "invalid"),
+            ("[other]\nx = 1\n", "missing or invalid"),
+            (
+                "[agent]\nserver_url = https://x\napi_key = k\nprinters = p\ntimeout = 5\n",
+                "timeout",
+            ),
+        ] {
+            let start = Start::new(ini);
+            let e = start.prepare(&STORE, &sleep, &|_: &str| {}).err().unwrap();
+            let Fatal::Exit(text) = e else {
+                panic!("{ini}")
+            };
+            assert!(text.contains(needle), "{text}");
+        }
+        // a file that is not there at all
+        let start = Start::new(PLAIN);
+        std::fs::remove_file(start.base.path().join("agent.ini")).unwrap();
+        assert!(matches!(
+            start.prepare(&STORE, &sleep, &|_: &str| {}).err(),
+            Some(Fatal::Exit(_))
+        ));
+    }
+
+    #[test]
+    fn prepare_opens_a_readable_key_and_a_plain_one_without_waiting() {
+        let sleep = |_| panic!("nothing to wait for");
+        for ini in [sealed(), PLAIN.to_string()] {
+            let start = Start::new(&ini);
+            let prepared = start.prepare(&STORE, &sleep, &|_: &str| {}).unwrap();
+            assert_eq!(prepared.cfg.require("api_key").unwrap(), KEY);
+            // the masking key is the real one from the first moment
+            let mut r = prepared.reporter.lock().unwrap();
+            r.register_failed(&format!("401 for {KEY}"), 1.0);
+            drop(r);
+            let v = start.status();
+            assert!(!v.to_string().contains(KEY), "{v}");
+            assert_eq!(v["key_unreadable"], false);
+        }
+        // a plain key next to a blob that nobody can read is no reason to wait either
+        let start = Start::new(
+            &sealed().replace("api_key_dpapi", "api_key = SECRET-KEY-123\napi_key_dpapi"),
+        );
+        let prepared = start.prepare(&OTHER_PC, &sleep, &|_: &str| {}).unwrap();
+        assert_eq!(prepared.cfg.require("api_key").unwrap(), KEY);
+    }
+
+    #[test]
+    fn once_the_key_is_readable_it_is_masked_in_error_texts() {
+        let start = Start::new(&sealed());
+        let sleeps = RefCell::new(0u32);
+        let sleep = |_| {
+            *sleeps.borrow_mut() += 1;
+            if *sleeps.borrow() == 2 {
+                start.write(PLAIN);
+            }
+        };
+        let prepared = start.prepare(&OTHER_PC, &sleep, &|_: &str| {}).unwrap();
+        prepared
+            .reporter
+            .lock()
+            .unwrap()
+            .register_failed(&format!("the server said no to {KEY}"), 5.0);
+        let v = start.status();
+        assert_eq!(v["error"], "the server said no to ***");
     }
 }

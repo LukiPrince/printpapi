@@ -58,6 +58,7 @@ fn job(conn: &Connection, printer: i64, mode: &str, payload: &[u8], title: Optio
             org_id: None,
             idempotency_key: None,
             expire_after: None,
+            api_key_id: None,
         },
     )
     .unwrap()

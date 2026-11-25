@@ -5,8 +5,10 @@ can print** — n8n, Zapier, Make, Power Automate, a cron job, your backend. No 
 
 Two things first:
 
-1. **A client API key** — dashboard → *API keys* → *New key* (or `POST /apikeys` with the
-   bootstrap token). Never put `PRINTAPI_TOKEN` itself into an automation tool; it is root.
+1. **A client API key** — dashboard → *API keys* → *New key* with the rights **Print only** (or
+   `POST /apikeys` with the bootstrap token and `"scope": "print"`). It submits jobs and reads the
+   printers, and sees only the jobs it made. Never put `PRINTAPI_TOKEN` itself into an automation
+   tool; it is root.
 2. **The `printer_id`** — dashboard → *Devices*, or `GET /printers`. It is stable.
 
 Your automation tool must be able to reach the server: a self-hosted n8n on the same LAN can use

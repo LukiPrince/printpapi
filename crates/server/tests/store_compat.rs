@@ -42,6 +42,7 @@ fn opening_a_python_database_applies_the_migrations_and_the_new_indexes_cleanly(
         "agents_org",
         "jobs_idem",
         "users_email",
+        "jobs_api_key",
     ] {
         assert!(
             indexes.iter().any(|i| i == wanted),
@@ -57,12 +58,65 @@ fn opening_a_python_database_applies_the_migrations_and_the_new_indexes_cleanly(
 }
 
 #[test]
+fn a_python_database_gets_key_scopes_and_every_old_key_and_job_reads_as_before() {
+    let (dir, db) = open();
+    db.with(|c| {
+        // every key Python wrote is full; its jobs belong to no key
+        let scopes: Vec<String> = c
+            .prepare("SELECT scope FROM api_keys")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert!(
+            !scopes.is_empty() && scopes.iter().all(|s| s == "full"),
+            "{scopes:?}"
+        );
+        let keyed: i64 = c
+            .query_row(
+                "SELECT COUNT(*) FROM jobs WHERE api_key_id IS NOT NULL",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(keyed, 0);
+        let jobs: i64 = c
+            .query_row("SELECT COUNT(*) FROM jobs", [], |r| r.get(0))
+            .unwrap();
+        assert!(jobs > 0);
+        assert!(
+            list_api_keys(c, None)
+                .unwrap()
+                .iter()
+                .all(|k| k.scope == printpapi_server::auth::Scope::Full)
+        );
+    });
+    // the second start changes nothing
+    drop(db);
+    let db = Db::open(dir.path().join("python_v2.sqlite3").to_str().unwrap()).unwrap();
+    let cols: i64 = db.with(|c| {
+        c.query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('api_keys') WHERE name='scope'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap()
+    });
+    assert_eq!(cols, 1);
+}
+
+#[test]
 fn credentials_written_by_python_authenticate() {
     let (_dir, db) = open();
     db.with(|c| {
         assert_eq!(
             authenticate_client(c, "pk_known_test_key").unwrap(),
-            Some(ClientKey { id: 1, org_id: ORG })
+            Some(ClientKey {
+                id: 1,
+                org_id: ORG,
+                scope: printpapi_server::auth::Scope::Full
+            })
         );
         assert_eq!(authenticate_client(c, "pk_other").unwrap(), None);
         assert_eq!(authenticate_agent(c, "agent-key-1").unwrap(), Some(1));
@@ -210,6 +264,7 @@ fn enqueue_and_idempotency_work_against_python_rows() {
             org_id: Some(ORG),
             idempotency_key: key.map(Into::into),
             expire_after: None,
+            api_key_id: None,
         };
         // the Python job holding "order-100" is found, even though it is still queued
         let again = enqueue_job(c, &job(Some("order-100"))).unwrap();
@@ -360,6 +415,7 @@ fn write_a_database_for_python_to_read() {
             org_id: None,
             idempotency_key: Some("rust-order-1".into()),
             expire_after: Some(3600),
+            api_key_id: None,
         };
         enqueue_job(c, &job).unwrap();
         let dev = register_cloudprnt(c, DEFAULT_ORG, "cloudprnt-mac1").unwrap();

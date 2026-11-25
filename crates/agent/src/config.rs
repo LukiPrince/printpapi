@@ -71,6 +71,13 @@ impl Config {
     /// the "missing or invalid" text; a malformed file gives a text without the parser's quotes:
     /// they carry the offending line, and that can be the `api_key` line.
     pub fn load(base_dir: &Path) -> Result<Config, String> {
+        let text = Config::load_text(base_dir)?;
+        Config::from_text(&text)
+    }
+
+    /// The text of `<base_dir>/agent.ini`, with the checks and messages of [`Config::load`] up
+    /// to the parse: the agent opens a stored key in this text before it is parsed for good.
+    pub fn load_text(base_dir: &Path) -> Result<String, String> {
         let ini_path = base_dir.join("agent.ini");
         let missing = || {
             format!(
@@ -89,7 +96,25 @@ impl Config {
         if !ini.has_section("agent") {
             return Err(missing());
         }
-        Ok(Config { ini })
+        Ok(text)
+    }
+
+    /// The raw value of `key` in `[agent]` itself, without the `[DEFAULT]` fallback.
+    pub(crate) fn own_raw(&self, key: &str) -> Option<&str> {
+        self.ini
+            .section("agent")?
+            .iter()
+            .find(|(k, _)| k == key)
+            .map(|(_, v)| v.as_str())
+    }
+
+    /// The raw value of `key` in `[DEFAULT]`.
+    pub(crate) fn default_raw(&self, key: &str) -> Option<&str> {
+        self.ini
+            .defaults()
+            .iter()
+            .find(|(k, _)| k == key)
+            .map(|(_, v)| v.as_str())
     }
 
     pub fn from_text(text: &str) -> Result<Config, String> {
@@ -389,7 +414,6 @@ pub struct IniUpdate<'a> {
 /// stays as it is unless `update` names it. `%` is doubled because `[agent]` reads through
 /// `BasicInterpolation`; line breaks in a value become blanks so one value never becomes two lines.
 pub fn update_ini(existing: Option<&str>, update: &IniUpdate) -> String {
-    const SECTIONS: [&str; 2] = ["agent", "headers"];
     // Per section: (lower-cased key, the new line or None to remove the key).
     let mut wanted: [Vec<(String, Option<String>)>; 2] = [Vec::new(), Vec::new()];
     for (key, value) in [
@@ -404,6 +428,10 @@ pub fn update_ini(existing: Option<&str>, update: &IniUpdate) -> String {
             wanted[0].push((key.to_string(), Some(format!("{key} = {v}"))));
         }
     }
+    // a new plain key replaces a stored (sealed) one
+    if update.api_key.is_some() {
+        wanted[0].push(("api_key_dpapi".to_string(), None));
+    }
     for (name, value) in update.headers.unwrap_or_default() {
         let name = name.replace(['\r', '\n'], " ");
         let line = value
@@ -411,6 +439,20 @@ pub fn update_ini(existing: Option<&str>, update: &IniUpdate) -> String {
             .map(|v| format!("{name} = {}", v.replace(['\r', '\n'], " ")));
         wanted[1].push((name.trim().to_lowercase(), line));
     }
+    rewrite(existing, wanted)
+}
+
+const SECTIONS: [&str; 2] = ["agent", "headers"];
+
+/// The line-by-line rewrite behind [`update_ini`]: per section (`[agent]`, `[headers]`) the
+/// lower-cased keys to change and, for each, the new text or `None` to remove the key. A `Some`
+/// text is any text for that place (it may be several lines), so the keystore swaps `api_key` for
+/// its note plus `api_key_dpapi` and back. When `api_key_dpapi` is named, the keystore's note line
+/// goes with it.
+pub(crate) fn rewrite(
+    existing: Option<&str>,
+    wanted: [Vec<(String, Option<String>)>; 2],
+) -> String {
     let new_section = |i: usize, lines: Vec<String>| -> Vec<String> {
         let mut out = vec![format!("[{}]", SECTIONS[i])];
         out.extend(lines);
@@ -444,7 +486,11 @@ pub fn update_ini(existing: Option<&str>, update: &IniUpdate) -> String {
     let is_comment = |line: &str| line.trim().starts_with([';', '#']);
     let is_skippable = |line: &str| line.trim().is_empty() || is_comment(line);
 
-    let lines: Vec<&str> = existing.lines().collect();
+    let drop_note = wanted[0].iter().any(|(k, _)| k == "api_key_dpapi");
+    let lines: Vec<&str> = existing
+        .lines()
+        .filter(|l| !(drop_note && l.trim() == crate::keystore::NOTE))
+        .collect();
     let mut out: Vec<String> = Vec::new();
     let mut done: [Vec<String>; 2] = [Vec::new(), Vec::new()];
     // Index in `out` just after the last content line of each section, where new keys go.
@@ -496,7 +542,10 @@ pub fn update_ini(existing: Option<&str>, update: &IniUpdate) -> String {
         let run = &lines[i..=last];
         if let Some((k, new)) = wanted[s].iter().find(|(k, _)| *k == key) {
             if let Some(new) = new {
-                out.push(new.clone());
+                // the place keeps its indentation: lines that are indented like the key must not
+                // become continuation lines of a replacement that starts further left
+                let lead: String = line.chars().take_while(|c| c.is_whitespace()).collect();
+                out.extend(new.lines().map(|l| format!("{lead}{l}")));
             }
             done[s].push(k.clone());
             // comments between the dropped lines survive
@@ -1117,6 +1166,42 @@ mod tests {
     }
 
     #[test]
+    fn update_ini_in_a_hand_indented_section_keeps_the_neighbours_apart() {
+        let old = "[agent]\n  server_url = https://x\n  api_key = k\n  name = pc\n  printers = a\n  timeout = 90\n";
+        let text = update_ini(
+            Some(old),
+            &IniUpdate {
+                server_url: None,
+                api_key: Some("k2"),
+                name: None,
+                printers: Some("c"),
+                timeout: None,
+                headers: None,
+            },
+        );
+        let cfg = Config::from_text(&text).unwrap();
+        assert_eq!(cfg.get("printers").unwrap().as_deref(), Some("c"));
+        assert_eq!(cfg.get("api_key").unwrap().as_deref(), Some("k2"));
+        assert_eq!(cfg.get("name").unwrap().as_deref(), Some("pc"));
+        assert_eq!(cfg.get("timeout").unwrap().as_deref(), Some("90"));
+        // a key that is added goes in at the end and is a line of its own
+        let text = update_ini(
+            Some(&old.replace("  timeout = 90\n", "")),
+            &IniUpdate {
+                server_url: None,
+                api_key: None,
+                name: None,
+                printers: None,
+                timeout: Some("30"),
+                headers: None,
+            },
+        );
+        let cfg = Config::from_text(&text).unwrap();
+        assert_eq!(cfg.get("timeout").unwrap().as_deref(), Some("30"));
+        assert_eq!(cfg.get("printers").unwrap().as_deref(), Some("a"));
+    }
+
+    #[test]
     fn update_ini_keeps_a_value_on_one_line() {
         let text = update_ini(
             None,
@@ -1452,5 +1537,92 @@ B = c
         let s = Config::from_text(&text).unwrap().http_settings().unwrap();
         assert_eq!(s.timeout, 45.0);
         assert_eq!(s.headers.get("x-token").map(String::as_str), Some("a%b"));
+    }
+
+    #[test]
+    fn rewrite_removes_an_agent_key_and_leaves_the_rest() {
+        let old = "; top\n[agent]\nserver_url = https://x\napi_key = k\nprinters = a ;\n  b\n; between\nname = pc\n\n[headers]\nX-A = b\n  more\n";
+        let wanted = [vec![("api_key".to_string(), None)], Vec::new()];
+        let text = rewrite(Some(old), wanted);
+        assert_eq!(
+            text,
+            "; top\n[agent]\nserver_url = https://x\nprinters = a ;\n  b\n; between\nname = pc\n\n[headers]\nX-A = b\n  more\n"
+        );
+    }
+
+    #[test]
+    fn rewrite_puts_any_text_in_the_place_of_a_key() {
+        let old = "[agent]\nserver_url = https://x\napi_key = k\nprinters = p\n";
+        let wanted = [
+            vec![
+                ("api_key".to_string(), Some("; note\nother = 1".to_string())),
+                ("seal_key".to_string(), None),
+            ],
+            Vec::new(),
+        ];
+        assert_eq!(
+            rewrite(Some(old), wanted),
+            "[agent]\nserver_url = https://x\n; note\nother = 1\nprinters = p\n"
+        );
+    }
+
+    #[test]
+    fn update_ini_with_a_new_key_drops_the_sealed_one_and_its_note() {
+        let sealed = format!(
+            "[agent]\nserver_url = https://x\n{}\napi_key_dpapi = 00ff\nseal_key = no\nprinters = p\n",
+            crate::keystore::NOTE
+        );
+        fn update(key: Option<&str>) -> IniUpdate<'_> {
+            IniUpdate {
+                server_url: None,
+                api_key: key,
+                name: Some("pc"),
+                printers: None,
+                timeout: None,
+                headers: None,
+            }
+        }
+        let new = update_ini(Some(&sealed), &update(Some("new%key")));
+        assert!(
+            !new.contains("api_key_dpapi") && !new.contains("encrypted"),
+            "{new}"
+        );
+        assert!(new.contains("api_key = new%%key"), "{new}");
+        assert!(new.contains("seal_key = no"), "{new}");
+        // without a new key the sealed line stays, note included
+        let same = update_ini(Some(&sealed), &update(None));
+        assert!(same.contains("api_key_dpapi = 00ff") && same.contains(crate::keystore::NOTE));
+        assert!(same.contains("name = pc"), "{same}");
+    }
+
+    #[test]
+    fn load_text_gives_the_same_errors_as_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let both = |dir: &Path| {
+            (
+                Config::load(dir).map(|_| ()),
+                Config::load_text(dir).map(|_| ()),
+            )
+        };
+        let (a, b) = both(dir.path());
+        assert_eq!(a, b);
+        assert!(a.unwrap_err().contains("missing or invalid"));
+        std::fs::write(dir.path().join("agent.ini"), "[other]\nx = 1\n").unwrap();
+        let (a, b) = both(dir.path());
+        assert_eq!(a, b);
+        std::fs::write(
+            dir.path().join("agent.ini"),
+            "[agent]\napi_key = k\napi_key = j\n",
+        )
+        .unwrap();
+        let (a, b) = both(dir.path());
+        assert_eq!(a, b);
+        assert!(a.unwrap_err().contains("invalid"));
+        let ok = "\u{feff}[agent]\nserver_url = https://x\napi_key = k\nprinters = p\n";
+        std::fs::write(dir.path().join("agent.ini"), ok).unwrap();
+        assert_eq!(
+            Config::load_text(dir.path()).unwrap(),
+            "[agent]\nserver_url = https://x\napi_key = k\nprinters = p\n"
+        );
     }
 }
