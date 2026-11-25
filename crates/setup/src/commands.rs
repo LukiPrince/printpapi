@@ -21,6 +21,7 @@ use printpapi_agent::config::{
 };
 use printpapi_agent::discover::discover;
 use printpapi_agent::install::{self, Installed, Layout, Os};
+use printpapi_agent::pair::{self, PairError, Pairing};
 use printpapi_agent::proc::{Cmd, Runner, run_command_with};
 use printpapi_agent::{Platform, setup};
 use serde::{Deserialize, Serialize};
@@ -64,6 +65,12 @@ impl From<setup::ConnectError> for SetupError {
     }
 }
 
+impl From<PairError> for SetupError {
+    fn from(e: PairError) -> SetupError {
+        SetupError::new(e.code(), e.to_string())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct FoundPrinter {
     name: String,
@@ -83,9 +90,23 @@ pub struct PrinterChoice {
 #[serde(rename_all = "camelCase")]
 pub struct ApplyRequest {
     server_url: Option<String>,
+    /// `None` with a `server_url`: the connection was made by a pairing code, and the key is in
+    /// this process (`AppState::paired`), never in the window.
     api_key: Option<String>,
     name: Option<String>,
+    /// The pairing the window confirmed (`PairedView::pair_id`), when it names a connection by its
+    /// address only: what the person saw is then what is installed, whatever was paired since.
+    #[serde(default)]
+    pair_id: Option<u64>,
     printers: Vec<PrinterChoice>,
+    /// Set by `fill_paired`: the key came from a pairing.
+    #[serde(skip)]
+    paired: bool,
+    /// Set by `fill_paired`: the window sent a key (the person typed the address), so the headers
+    /// of the installed agent carry over, as documented. A pairing never asks for them: the agent keeps
+    /// them only when the server is the same one.
+    #[serde(skip)]
+    keep_headers: bool,
 }
 
 /// What the steps share. Nothing in here is printed, logged or sent to the window.
@@ -100,6 +121,13 @@ struct Conn {
 pub struct AppState {
     staging: Option<Staging>,
     conn: Option<Conn>,
+    /// The link this window was started with (`printpapi://pair?...`), until the window takes it.
+    link: Option<Pairing>,
+    /// The connection a pairing code made: it holds the key, which stays here until the install.
+    paired: Option<Conn>,
+    /// Counts the pairings of this window; `paired` is the one with the number `paired_id`.
+    pair_seq: u64,
+    paired_id: u64,
 }
 
 impl AppState {
@@ -113,11 +141,68 @@ impl AppState {
         }
     }
 
+    /// A window started by a link (or told of one by the system).
+    pub fn with_link(link: Option<Pairing>) -> AppState {
+        AppState {
+            link,
+            ..AppState::default()
+        }
+    }
+
+    /// The pending link, once: the window asks, and it is gone.
+    pub fn take_link(&mut self) -> Option<PairingView> {
+        self.link.take().map(PairingView::from)
+    }
+
+    /// A link that arrived while the window runs (macOS opens the running program).
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    pub fn set_link(&mut self, link: Pairing) {
+        self.link = Some(link);
+    }
+
     /// Delete the working folder now (the window closes without dropping managed state).
     pub fn clear(&mut self) {
         self.staging = None;
         self.conn = None;
+        self.link = None;
+        self.paired = None;
     }
+}
+
+/// What the window is told of a link or a typed code. The key is never part of it.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PairingView {
+    server_url: Option<String>,
+    code: String,
+}
+
+impl From<Pairing> for PairingView {
+    fn from(p: Pairing) -> PairingView {
+        PairingView {
+            server_url: p.server,
+            code: p.code,
+        }
+    }
+}
+
+/// What a redeemed code says, for the second confirmation. No key.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PairedView {
+    name: String,
+    org: String,
+    /// The creator's address, spelled out where it is not plain ASCII (`pair::shown_address`).
+    created_by: Option<String>,
+    /// `created_by` is not a bare e-mail address (`pair::is_plain_address`): punctuation around it or
+    /// characters spelled out above. The window says so.
+    created_by_escaped: bool,
+    replaces: bool,
+    /// Which pairing this is; the install must name it again (`ApplyRequest::pair_id`).
+    pair_id: u64,
+    /// The address the code was spent at, as this program used it. The window shows this one and
+    /// sends it back, so what the person confirmed is what the install uses.
+    server_url: String,
 }
 
 pub(crate) type Shared<'a> = State<'a, Mutex<AppState>>;
@@ -400,6 +485,131 @@ pub fn check_connection(
     Ok(exists)
 }
 
+/// The link this window was started with, once. Polled by the window (no event permission needed).
+#[tauri::command(async)]
+pub fn take_link(state: Shared) -> Option<PairingView> {
+    lock(&state).take_link()
+}
+
+/// What a pasted link or code says. No network: nothing is contacted before the person clicks.
+#[tauri::command(async)]
+pub fn read_pairing(text: String) -> Option<PairingView> {
+    pair::parse(&text).map(PairingView::from)
+}
+
+/// Spend a pairing code. The address is checked and reached first (`setup::reach`), so a server
+/// that cannot serve the setup shows up with the code unspent. The key stays in this process: the
+/// window gets the account, the creator and the device, to confirm before anything changes.
+#[tauri::command(async)]
+pub fn pair(
+    state: Shared,
+    server_url: String,
+    code: String,
+    name: String,
+    insecure_ok: bool,
+) -> Result<PairedView, SetupError> {
+    let settings = HttpSettings::default();
+    let client = Client::new(&settings);
+    let (mut view, conn) = pair_with(&client, settings, &server_url, &code, &name, insecure_ok)?;
+    let mut guard = lock(&state);
+    guard.conn = None;
+    guard.paired = Some(conn);
+    guard.pair_seq += 1;
+    guard.paired_id = guard.pair_seq;
+    view.pair_id = guard.paired_id;
+    Ok(view)
+}
+
+/// The creator's address as the window shows it, and whether anything in it was spelled out.
+fn shown_creator(created_by: Option<&str>) -> (Option<String>, bool) {
+    (
+        created_by.map(pair::shown_address),
+        created_by.is_some_and(|a| !pair::is_plain_address(a)),
+    )
+}
+
+/// `pair` without the state: the address is checked, plain http outside the private network is
+/// refused unless the person agreed (before any call: the code and the key would cross it
+/// readable), the server is reached, and only then the code is spent.
+fn pair_with(
+    http: &dyn printpapi_agent::client::Http,
+    settings: HttpSettings,
+    server_url: &str,
+    code: &str,
+    name: &str,
+    insecure_ok: bool,
+) -> Result<(PairedView, Conn), SetupError> {
+    let server_url = pair::valid_server(server_url).ok_or(PairError::BadUrl)?;
+    if setup::needs_insecure_confirm(&server_url) && !insecure_ok {
+        return Err(SetupError::new(
+            "insecure",
+            "This address is not encrypted. The code and the key would travel readable over the network. Confirm that you want to use it.",
+        ));
+    }
+    let code = pair::parse(code).ok_or(PairError::BadCode)?.code;
+    let got = setup::pair_checked(http, &server_url, &code, name.trim())?;
+    let (created_by, created_by_escaped) = shown_creator(got.created_by.as_deref());
+    let view = PairedView {
+        name: got.name.clone(),
+        org: got.org,
+        created_by,
+        created_by_escaped,
+        replaces: got.replaces,
+        pair_id: 0,
+        server_url: server_url.clone(),
+    };
+    let conn = Conn {
+        server_url,
+        api_key: got.key,
+        name: got.name,
+        settings,
+    };
+    Ok((view, conn))
+}
+
+/// The refusal when the window names a connection this process does not hold.
+fn no_connection() -> SetupError {
+    SetupError::new(
+        "system",
+        "There is no connection to install with. Go back to the first step.",
+    )
+}
+
+/// A connection named by its address only is the pairing the window confirmed last: another code
+/// may have been spent since (a second window state, a step that was left and entered again), and
+/// the card the person said yes to is not the one whose key would be installed.
+fn check_confirmed(request: &ApplyRequest, paired_id: u64) -> Result<(), SetupError> {
+    let by_address = request.server_url.is_some() && request.api_key.is_none();
+    if by_address && request.pair_id != Some(paired_id) {
+        return Err(no_connection());
+    }
+    Ok(())
+}
+
+/// A connection the window names by its address only is the one a pairing made: the key, the
+/// server and the name come from this process. Anything else with no key is an error. A key the
+/// window sent means the person typed the address, and the installed headers carry over.
+fn fill_paired(request: &mut ApplyRequest, paired: Option<&Conn>) -> Result<(), SetupError> {
+    if request.server_url.is_none() || request.api_key.is_some() {
+        request.keep_headers = request.api_key.is_some();
+        return Ok(());
+    }
+    let none = no_connection;
+    let asked = request
+        .server_url
+        .as_deref()
+        .and_then(|u| setup::normalize_server_url(u).ok());
+    let p = paired
+        .filter(|p| asked.as_deref() == Some(p.server_url.as_str()))
+        .ok_or_else(none)?;
+    request.server_url = Some(p.server_url.clone());
+    request.api_key = Some(p.api_key.clone());
+    request.name = Some(p.name.clone());
+    request.paired = true;
+    request.keep_headers = false;
+    Ok(())
+}
+
 #[tauri::command(async)]
 pub fn list_printers() -> Vec<FoundPrinter> {
     discover(Platform::host(), &runner())
@@ -608,7 +818,17 @@ fn apply_in(
     let ran = run_elevated(elevate, agent, dir, "install");
     // the file holds the key: gone whatever happened
     let _ = std::fs::remove_file(&ini);
-    let baseline = ran?["baseline_last_seen"]
+    let ran = ran?;
+    // A paired install is proven by the status file of this computer, never by the server's
+    // `last_seen_at`: on a replacement PC the old agent keeps polling and would make an agent that
+    // never started look online.
+    if request.paired {
+        return Ok(Applied {
+            baseline: local_baseline(&ran)?,
+            conn: None,
+        });
+    }
+    let baseline = ran["baseline_last_seen"]
         .as_f64()
         .ok_or_else(|| SetupError::new("system", "The agent did not report a start time."))?;
 
@@ -709,13 +929,19 @@ fn window_elevator() -> impl Fn(&Path, &[&OsStr]) -> Result<(), Elevate> {
 }
 
 #[tauri::command(async)]
-pub fn apply(state: Shared, request: ApplyRequest) -> Result<f64, SetupError> {
+pub fn apply(state: Shared, mut request: ApplyRequest) -> Result<f64, SetupError> {
     // an installed agent that is newer than this program is not put back by accident
     crate::updates::older_guard(false)?;
+    {
+        let guard = lock(&state);
+        check_confirmed(&request, guard.paired_id)?;
+        fill_paired(&mut request, guard.paired.as_ref())?;
+    }
     let (agent, dir) = staged(&state)?;
     let tray_staged = stage_own_tray(&dir)?;
     let elevate = window_elevator();
     let merged = merges_into_installed(request.server_url.is_some(), layout().marker.is_file());
+    let paired = request.paired;
     let applied = if merged {
         // the window has no key to ask the server with: its wait reads the status file
         apply_over_installed_in(&elevate, &agent, &dir, &request).map(|baseline| Applied {
@@ -733,7 +959,7 @@ pub fn apply(state: Shared, request: ApplyRequest) -> Result<f64, SetupError> {
     );
     let applied = applied?;
     let mut guard = lock(&state);
-    if merged {
+    if merged || paired {
         guard.conn = None;
     }
     if let Some(conn) = applied.conn {
@@ -830,6 +1056,10 @@ pub struct PatchRequest {
     /// Go back to this older program on purpose (see `updates::older_guard`).
     #[serde(default, rename = "goBack")]
     go_back: bool,
+    /// Set with a connection the person typed: the installed headers carry over. Never from the
+    /// window's own JSON.
+    #[serde(skip)]
+    keep_headers: bool,
 }
 
 /// What the agent reads at start, with nothing else in it: a patch is tried on this before the
@@ -861,6 +1091,9 @@ pub fn patch_json(req: &PatchRequest) -> Result<String, SetupError> {
     }
     if let Some(u) = &req.updates {
         obj.insert("updates".into(), Value::String(u.clone()));
+    }
+    if req.keep_headers {
+        obj.insert("keep_headers".into(), Value::Bool(true));
     }
     let text = Value::Object(obj).to_string();
     let change = |m: String| SetupError::new("change", m);
@@ -915,6 +1148,7 @@ fn apply_over_installed_in(
         headers: None,
         updates: None,
         go_back: false,
+        keep_headers: request.keep_headers,
     };
     apply_patch_in(elevate, agent, dir, &patch)
 }
@@ -1378,7 +1612,10 @@ mod tests {
             server_url: conn.map(|c| c.0.into()),
             api_key: conn.map(|c| c.1.into()),
             name: conn.map(|c| c.2.into()),
+            pair_id: None,
             printers,
+            paired: false,
+            keep_headers: false,
         }
     }
 
@@ -1558,6 +1795,7 @@ mod tests {
             }),
             updates: None,
             go_back: false,
+            keep_headers: false,
         }
     }
 
@@ -1952,5 +2190,410 @@ mod tests {
         let e = fetch_sumatra(tmp.path(), Path::new("sys"), &run, &serve(ZIP), &PINS).unwrap_err();
         assert!(e.message.contains("tar failed"));
         assert!(names_in(tmp.path()).is_empty());
+    }
+    // ---- pairing
+
+    fn paired_conn() -> Conn {
+        Conn {
+            server_url: "https://print.example.com".into(),
+            api_key: KEY.into(),
+            name: "warehouse-pc".into(),
+            settings: HttpSettings::default(),
+        }
+    }
+
+    fn by_address(url: &str) -> ApplyRequest {
+        ApplyRequest {
+            server_url: Some(url.into()),
+            api_key: None,
+            name: Some("typed in the window".into()),
+            pair_id: None,
+            printers: vec![choice("A", false, None)],
+            paired: false,
+            keep_headers: false,
+        }
+    }
+
+    /// Every call a command makes, and nothing else: no network, no mock of the server's logic.
+    struct Recorder {
+        urls: std::cell::RefCell<Vec<String>>,
+        /// `/computers` answers 401 and the pairing endpoint gives this key.
+        paired_key: Option<&'static str>,
+    }
+
+    impl printpapi_agent::client::Http for Recorder {
+        fn get(
+            &self,
+            url: &str,
+            _: &str,
+        ) -> Result<Option<Value>, printpapi_agent::client::HttpError> {
+            self.urls.borrow_mut().push(format!("GET {url}"));
+            if url.ends_with("/computers") {
+                Err(printpapi_agent::client::HttpError::Os(
+                    "server returned 401".into(),
+                ))
+            } else {
+                Ok(Some(json!({"ok": true})))
+            }
+        }
+        fn get_bytes(
+            &self,
+            _: &str,
+            _: &str,
+        ) -> Result<Option<Vec<u8>>, printpapi_agent::client::HttpError> {
+            unreachable!("no download here")
+        }
+        fn post(
+            &self,
+            url: &str,
+            _: &str,
+            _: &Value,
+        ) -> Result<Option<Value>, printpapi_agent::client::HttpError> {
+            self.urls.borrow_mut().push(format!("POST {url}"));
+            Ok(self.paired_key.map(|k| {
+                json!({"key": k, "name": "warehouse-pc", "org": "Acme", "created_by": null,
+                       "replaces": false})
+            }))
+        }
+    }
+
+    #[test]
+    fn plain_http_is_refused_before_any_call_unless_the_person_agreed() {
+        let http = Recorder {
+            urls: Default::default(),
+            paired_key: Some("k".repeat(30).leak()),
+        };
+        let server = "http://print.example.com";
+        let e = pair_with(
+            &http,
+            HttpSettings::default(),
+            server,
+            "7K3M-Q2ZD-9XHT",
+            "pc",
+            false,
+        )
+        .err()
+        .expect("refused");
+        assert_eq!(e.code, "insecure");
+        assert!(
+            http.urls.borrow().is_empty(),
+            "nothing was contacted: {:?}",
+            http.urls
+        );
+        // agreed: reach, then the spend, in that order, on exactly that address
+        let (view, conn) = pair_with(
+            &http,
+            HttpSettings::default(),
+            server,
+            "7K3M-Q2ZD-9XHT",
+            "pc",
+            true,
+        )
+        .ok()
+        .expect("paired");
+        assert_eq!(
+            *http.urls.borrow(),
+            [
+                "GET http://print.example.com/health",
+                "GET http://print.example.com/computers",
+                "POST http://print.example.com/agent/pair",
+            ]
+        );
+        assert_eq!(view.server_url, "http://print.example.com");
+        assert_eq!(conn.server_url, view.server_url);
+        // https needs no agreement; an address with a user name never gets that far
+        let https = Recorder {
+            urls: Default::default(),
+            paired_key: Some("k".repeat(30).leak()),
+        };
+        assert!(
+            pair_with(
+                &https,
+                HttpSettings::default(),
+                "https://print.example.com/",
+                "7K3M-Q2ZD-9XHT",
+                "pc",
+                false
+            )
+            .is_ok()
+        );
+        let bad = Recorder {
+            urls: Default::default(),
+            paired_key: None,
+        };
+        let e = pair_with(
+            &bad,
+            HttpSettings::default(),
+            "https://user@print.example.com",
+            "7K3M-Q2ZD-9XHT",
+            "pc",
+            true,
+        )
+        .err()
+        .expect("refused");
+        assert_eq!(e.code, "bad_url");
+        assert!(bad.urls.borrow().is_empty());
+    }
+
+    #[test]
+    fn a_link_is_taken_once_and_clear_drops_link_and_paired_connection() {
+        let link = pair::parse(
+            "printpapi://pair?server=https%3A%2F%2Fprint.example.com&code=7K3M-Q2ZD-9XHT",
+        );
+        let mut s = AppState::with_link(link);
+        assert_eq!(
+            s.take_link(),
+            Some(PairingView {
+                server_url: Some("https://print.example.com".into()),
+                code: "7K3M-Q2ZD-9XHT".into()
+            })
+        );
+        assert_eq!(s.take_link(), None, "once");
+        s.set_link(pair::parse("7K3M-Q2ZD-9XHT").unwrap());
+        s.paired = Some(paired_conn());
+        s.conn = Some(paired_conn());
+        s.clear();
+        assert!(s.take_link().is_none() && s.paired.is_none() && s.conn.is_none());
+    }
+
+    #[test]
+    fn the_window_shows_a_code_or_link_without_any_network() {
+        let v = read_pairing("  7k3m q2zd 9xht ".into()).unwrap();
+        assert_eq!((v.server_url, v.code.as_str()), (None, "7K3M-Q2ZD-9XHT"));
+        let v = read_pairing(
+            "printpapi://pair?server=http%3A%2F%2F192.168.1.5%3A3460&code=7K3M-Q2ZD-9XHT".into(),
+        )
+        .unwrap();
+        assert_eq!(v.server_url.as_deref(), Some("http://192.168.1.5:3460"));
+        assert!(
+            read_pairing(
+                "printpapi://pair?server=https%3A%2F%2Fa@b.example&code=7K3M-Q2ZD-9XHT".into()
+            )
+            .is_none()
+        );
+        assert!(read_pairing("hello".into()).is_none());
+    }
+
+    #[test]
+    fn the_install_takes_only_the_pairing_the_window_confirmed() {
+        let mut s = AppState::default();
+        s.paired = Some(paired_conn());
+        s.pair_seq = 2;
+        s.paired_id = 2;
+        let named = |id: Option<u64>| {
+            let mut r = by_address("https://print.example.com");
+            r.pair_id = id;
+            r
+        };
+        // the card the person said yes to is the one that was paired last
+        check_confirmed(&named(Some(2)), s.paired_id).unwrap();
+        // the card of an earlier pairing (the step was left and entered again), or none at all
+        for id in [Some(1), Some(3), None] {
+            let e = check_confirmed(&named(id), s.paired_id).unwrap_err();
+            assert_eq!(e.code, "system", "{id:?}");
+        }
+        // a key the person typed has nothing to confirm
+        let mut typed = by_address("https://y");
+        typed.api_key = Some("TYPED".into());
+        check_confirmed(&typed, s.paired_id).unwrap();
+        // a change of printers names no connection
+        check_confirmed(&request(None, vec![choice("A", false, None)]), 0).unwrap();
+    }
+
+    #[test]
+    fn the_confirmation_spells_out_an_address_that_is_not_plain_ascii() {
+        let https = Recorder {
+            urls: Default::default(),
+            paired_key: Some("k".repeat(30).leak()),
+        };
+        let (view, _) = pair_with(
+            &https,
+            HttpSettings::default(),
+            "https://print.example.com",
+            "7K3M-Q2ZD-9XHT",
+            "pc",
+            false,
+        )
+        .ok()
+        .expect("paired");
+        assert!(!view.created_by_escaped && view.created_by.is_none());
+        assert_eq!(shown_creator(None), (None, false));
+        assert_eq!(
+            shown_creator(Some("boss@acme.example")),
+            (Some("boss@acme.example".into()), false)
+        );
+        assert_eq!(
+            shown_creator(Some("boss@\u{430}cme.example")),
+            (Some("boss@\\u{430}cme.example".into()), true)
+        );
+        assert_eq!(
+            shown_creator(Some("boss@acme.example\u{1cbb}")),
+            (Some("boss@acme.example\\u{1cbb}".into()), true)
+        );
+        // the same letters with plain ASCII punctuation around them are not a bare address either
+        for odd in [
+            "<boss@acme.example>",
+            "boss@acme.example.",
+            "\"boss@acme.example\"",
+            "boss@acme.example,",
+            "mailto:boss@acme.example",
+            "boss@acme.example (owner)",
+        ] {
+            assert_eq!(shown_creator(Some(odd)), (Some(odd.into()), true), "{odd}");
+        }
+        let json = serde_json::to_value(&view).unwrap();
+        assert!(json.get("createdByEscaped").is_some() && json.get("pairId").is_some());
+        assert!(json.get("apiKey").is_none() && json.get("key").is_none());
+    }
+
+    #[test]
+    fn fill_paired_takes_key_server_and_name_only_for_the_same_address() {
+        let mut r = by_address("https://print.example.com/");
+        fill_paired(&mut r, Some(&paired_conn())).unwrap();
+        assert_eq!(r.server_url.as_deref(), Some("https://print.example.com"));
+        assert_eq!(r.api_key.as_deref(), Some(KEY));
+        assert_eq!(
+            r.name.as_deref(),
+            Some("warehouse-pc"),
+            "the server's name, not the window's"
+        );
+        assert!(
+            r.paired && !r.keep_headers,
+            "a pairing never asks to keep headers"
+        );
+        // another address, or nothing paired: an error, and nothing is filled
+        for (url, conn) in [
+            ("https://other.example.org", Some(paired_conn())),
+            ("https://print.example.com", None),
+        ] {
+            let mut r = by_address(url);
+            let e = fill_paired(&mut r, conn.as_ref()).unwrap_err();
+            assert_eq!(e.code, "system");
+            assert_eq!(
+                e.message,
+                "There is no connection to install with. Go back to the first step."
+            );
+            assert!(r.api_key.is_none() && !r.paired);
+        }
+    }
+
+    #[test]
+    fn a_typed_key_keeps_the_headers_a_pairing_does_not_and_a_change_of_printers_has_no_connection()
+    {
+        let mut typed = by_address("https://y");
+        typed.api_key = Some("TYPED".into());
+        fill_paired(&mut typed, Some(&paired_conn())).unwrap();
+        assert!(typed.keep_headers && !typed.paired);
+        let mut paired = by_address("https://print.example.com");
+        fill_paired(&mut paired, Some(&paired_conn())).unwrap();
+        assert!(!paired.keep_headers);
+        let mut no_connection = request(None, vec![choice("A", false, None)]);
+        fill_paired(&mut no_connection, None).unwrap();
+        assert!(!no_connection.keep_headers);
+
+        // the flag reaches the patch the install merges, and only for the typed key
+        for (req, want) in [(typed, true), (paired, false)] {
+            let tmp = tempfile::tempdir().unwrap();
+            let seen = Cell::new(None);
+            let elevate = |_: &Path, args: &[&OsStr]| {
+                let dir = staging_dir_of(args);
+                let text = std::fs::read_to_string(dir.join("patch.json")).unwrap();
+                seen.set(Some(parse_patch(&text).unwrap().keep_headers));
+                write_result(&dir, json!({"ok": true, "baseline_local": 5.0}));
+                Ok(())
+            };
+            apply_over_installed_in(&elevate, Path::new("agent"), tmp.path(), &req).unwrap();
+            assert_eq!(seen.get(), Some(want));
+        }
+        // and build_ini of a first install has no installed file to keep anything of
+        let ini = build_ini(Some(("https://x", KEY, "pc")), &[choice("A", false, None)]).unwrap();
+        assert!(!ini.contains("[headers]"));
+    }
+
+    #[test]
+    fn a_paired_install_waits_on_the_status_file_and_keeps_no_connection() {
+        let tmp = tempfile::tempdir().unwrap();
+        let elevate = |_: &Path, args: &[&OsStr]| {
+            let dir = staging_dir_of(args);
+            // the server's last_seen_at would come from the old agent on another computer
+            write_result(
+                &dir,
+                json!({"ok": true, "baseline_local": 42.0, "baseline_last_seen": 7.0}),
+            );
+            Ok(())
+        };
+        let mut req = by_address("https://print.example.com");
+        fill_paired(&mut req, Some(&paired_conn())).unwrap();
+        let applied = apply_in(&elevate, Path::new("agent"), tmp.path(), &req).unwrap();
+        assert_eq!(applied.baseline, 42.0);
+        assert!(
+            applied.conn.is_none(),
+            "wait_online then reads the status file"
+        );
+        // a typed key keeps today's proof
+        let applied = apply_in(
+            &elevate,
+            Path::new("agent"),
+            tmp.path(),
+            &request(
+                Some(("https://y", "TYPED", "pc")),
+                vec![choice("A", false, None)],
+            ),
+        )
+        .unwrap();
+        assert_eq!(applied.baseline, 7.0);
+        assert!(applied.conn.is_some());
+    }
+
+    #[test]
+    fn the_paired_key_is_in_no_argument_no_error_and_no_result() {
+        let tmp = tempfile::tempdir().unwrap();
+        let args_seen = std::cell::RefCell::new(String::new());
+        let elevate = |_: &Path, args: &[&OsStr]| {
+            *args_seen.borrow_mut() = args
+                .iter()
+                .map(|a| a.to_string_lossy())
+                .collect::<Vec<_>>()
+                .join(" ");
+            let dir = staging_dir_of(args);
+            // the key reaches the agent as a file in the private folder, and only there
+            let ini = std::fs::read_to_string(dir.join("agent.ini")).unwrap();
+            assert!(ini.contains(KEY));
+            write_result(&dir, json!({"ok": true, "baseline_local": 1.0}));
+            Ok(())
+        };
+        let mut req = by_address("https://print.example.com");
+        fill_paired(&mut req, Some(&paired_conn())).unwrap();
+        apply_in(&elevate, Path::new("agent"), tmp.path(), &req).unwrap();
+        assert!(!args_seen.borrow().contains(KEY));
+        assert_eq!(
+            names_in(tmp.path()),
+            ["result.json"],
+            "the file with the key is gone"
+        );
+        assert!(
+            !std::fs::read_to_string(tmp.path().join("result.json"))
+                .unwrap()
+                .contains(KEY)
+        );
+        // no error the pairing can make holds a key, and the texts are the documented ones
+        for e in [
+            PairError::BadUrl,
+            PairError::BadCode,
+            PairError::NameTaken,
+            PairError::BadName,
+            PairError::Throttled,
+            PairError::OldServer,
+            PairError::Proxy,
+            PairError::Unreachable("connection failed".into()),
+            PairError::BadReply,
+        ] {
+            let s: SetupError = e.clone().into();
+            assert_eq!(
+                (s.code.as_str(), s.message.as_str()),
+                (e.code(), e.to_string().as_str())
+            );
+            assert!(!s.message.contains(KEY));
+        }
     }
 }

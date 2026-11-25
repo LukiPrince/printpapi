@@ -1,6 +1,6 @@
 // printpapi — self-hosted PrintNode alternative. Elastic License 2.0 (see LICENSE).
 // The setup window's rules, free of React and of Tauri so they can be tested.
-import type { AgentStatus, ConfigPatch, FoundPrinter, Platform, PrinterChoice, SetupError, UpdateInfo, UpdateMode } from "./api";
+import type { AgentStatus, ConfigPatch, FoundPrinter, PairedView, PairingView, Platform, PrinterChoice, SetupError, UpdateInfo, UpdateMode } from "./api";
 
 /** `printers` in agent.ini is `name[=target][|pdf]` joined by `;`, so these cannot appear in a name. */
 const NAME_FORBIDDEN = /[;=|]/;
@@ -46,12 +46,145 @@ export function canTest(p: PrinterChoice, platform: Platform, sumatraPresent: bo
   return !(p.pdf && platform === "windows" && !sumatraPresent);
 }
 
-/** The text for a failed command. A proxy refusal gets the way around it, the rest speak for themselves. */
-export function errorText(e: SetupError): string {
+/**
+ * The text for a failed command. A proxy refusal gets the way around it, the rest speak for
+ * themselves. With a pairing and an installed agent the way around is the command line, which
+ * sends the headers of the installed agent (the window never holds their values).
+ */
+export function errorText(e: SetupError, context: { pairing?: boolean; installed?: boolean } = {}): string {
   if (e.code === "proxy") {
+    if (context.pairing && context.installed) {
+      return "A proxy in front of the server refused this. Run printpapi-agent pair on this computer; it sends the headers of the installed agent.";
+    }
     return "A proxy in front of the server refused this. Set up the agent by hand with [headers], see docs/agent.md.";
   }
   return e.message;
+}
+
+/**
+ * What the pairing field shows for what the shell read. A link names its server, so the Server
+ * address field is hidden; a bare code needs the address typed. `null`: not a link or code.
+ */
+export function pairingFields(view: PairingView | null): { code: string; server: string | null; askServer: boolean } | null {
+  if (view === null) return null;
+  return { code: view.code, server: view.serverUrl, askServer: view.serverUrl === null };
+}
+
+/**
+ * What the Server address field starts with: what the person typed before, else the installed
+ * agent's address. The connection a pairing made names the server of a link, so it never seeds a
+ * field: coming back to the step and typing another code must not inherit that address.
+ */
+export function startServer(
+  initial: { serverUrl: string; paired?: unknown } | null,
+  replacing: { serverUrl: string } | null,
+): string {
+  if (initial && !initial.paired) return initial.serverUrl;
+  return replacing?.serverUrl ?? "";
+}
+
+/** What the second confirmation shows, from what the server said about the code. */
+export type PairingSummary = {
+  account: string;
+  createdBy: string;
+  /** Set when the address is not a bare e-mail address (punctuation around it, characters outside plain ASCII): it can look like another one. */
+  createdByWarning: string | null;
+  device: string;
+  /** Set when the code takes an existing device over. */
+  takeover: string | null;
+  /** Set when this computer is connected to something else now and would leave it. */
+  leaving: string | null;
+};
+
+/**
+ * The lines of the confirmation after a code was redeemed and before anything changes. `replacing`
+ * is the connection of the installed agent, when there is one: leaving it is a warning, unless this
+ * is the same device on the same server (a Reconnect of this very computer).
+ */
+export function pairingResult(
+  paired: PairedView,
+  replacing: { serverUrl: string; name: string } | null,
+): PairingSummary {
+  // An agent that has not run for two minutes has no status file: its server and name read as "".
+  // Nothing may be said about what is not known.
+  const installed = installedConnection(replacing);
+  const reconnectOfThis =
+    paired.replaces &&
+    (replacing === null ||
+      installed === null ||
+      (paired.name === installed.name && sameOrigin(installed.serverUrl, paired.serverUrl)));
+  return {
+    account: paired.org,
+    createdBy: paired.createdBy ?? "the server administrator",
+    createdByWarning: paired.createdByEscaped
+      ? "This is not a plain e-mail address. It has punctuation around it or characters outside plain ASCII (those are spelled out as \\u{...}), so it can imitate another address. Continue only if it is the address you expect."
+      : null,
+    device: paired.name,
+    takeover: paired.replaces
+      ? `This takes over the device ${paired.name}. If it runs on another computer, that one stops printing when this one starts.`
+      : null,
+    leaving: leavingText(paired, installed, replacing !== null, reconnectOfThis),
+  };
+}
+
+function leavingText(
+  paired: PairedView,
+  installed: { serverUrl: string; name: string } | null,
+  agentIsInstalled: boolean,
+  reconnectOfThis: boolean,
+): string | null {
+  if (!agentIsInstalled || reconnectOfThis) return null;
+  if (installed !== null) {
+    return `This computer leaves ${installed.serverUrl}, device ${installed.name}. Its printers get new IDs, and the old device stays in that dashboard.`;
+  }
+  // an agent is installed but nothing is known of its connection: a Reconnect of it says nothing
+  // more, a new device cannot keep the printer IDs of whatever it was
+  return paired.replaces
+    ? null
+    : "This computer leaves the connection it has now. Its printers get new IDs, and the old device stays in that dashboard.";
+}
+
+/** The connection of an installed agent, or null when its server or its name is not known. */
+export function installedConnection(
+  replacing: { serverUrl: string; name: string } | null,
+): { serverUrl: string; name: string } | null {
+  if (replacing === null || replacing.serverUrl.trim() === "" || replacing.name.trim() === "") return null;
+  return replacing;
+}
+
+/**
+ * The same server the way the agent compares them (`setup::same_origin`): scheme, host in lower
+ * case and port, with the default port of the scheme, whatever the path. Anything unreadable is not
+ * the same.
+ */
+export function sameOrigin(a: string, b: string): boolean {
+  try {
+    const [x, y] = [new URL(a.trim()), new URL(b.trim())];
+    return (x.protocol === "http:" || x.protocol === "https:") && x.origin === y.origin;
+  } catch {
+    return false;
+  }
+}
+
+/** What the pairing form holds: the field's text, what the shell read from it, and the typed address. */
+export type PairForm = { text: string; view: PairingView | null; fromLink: boolean; typedServer: string };
+
+/**
+ * A link arrives. It carries its own server in `view`; the field the person types an address
+ * into is not touched, so a bare code typed afterwards never inherits the address of a link.
+ */
+export function formFromLink(form: PairForm, link: PairingView): PairForm {
+  return { ...form, text: link.code, view: link, fromLink: true };
+}
+
+/** The text is edited: what was read from the old text is gone until the new text is read. */
+export function formEdited(form: PairForm, text: string): PairForm {
+  return { ...form, text, view: null, fromLink: false };
+}
+
+/** The address Connect would use: the link's own, else the typed one. */
+export function formServer(form: PairForm): string {
+  return (pairingFields(form.view)?.server ?? form.typedServer).trim();
 }
 
 /**

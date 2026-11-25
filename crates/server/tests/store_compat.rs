@@ -631,6 +631,64 @@ fn a_python_database_gets_the_label_templates_table_at_startup() {
 }
 
 #[test]
+fn a_python_database_gets_the_pairing_table_and_its_printers_stay_queueable() {
+    let (dir, db) = open();
+    let cols = |db: &Db| -> Vec<String> {
+        db.with(|c| {
+            let mut st = c
+                .prepare("SELECT name FROM pragma_table_info('pairing_codes')")
+                .unwrap();
+            st.query_map([], |r| r.get(0))
+                .unwrap()
+                .map(Result::unwrap)
+                .collect()
+        })
+    };
+    assert_eq!(cols(&db).len(), 15);
+    // a code and a fetched key work on the Python org, and the Python printers (state 'active' since
+    // the first schema) still take jobs
+    db.with(|c| {
+        create_pairing(c, ORG, None, None, "7K3M-Q2ZD-9XHT", None).unwrap();
+        let got = redeem_pairing(c, "7K3M-Q2ZD-9XHT", "new-pc", "paired-key", None).unwrap();
+        assert!(matches!(
+            got,
+            Redeem::Paired {
+                replaces: false,
+                ..
+            }
+        ));
+        let reg = register_agent(c, "new-pc", "paired-key", &[], ORG).unwrap();
+        assert!(reg.printer_ids.is_empty());
+        let zebra = list_printers(c, 60.0, None, Some(ORG)).unwrap()[0].id;
+        let pid = json!(zebra);
+        let job = NewJob {
+            printer_id: &pid,
+            type_: "raw_base64",
+            mode: "raw",
+            payload: b"x",
+            user_id: DEFAULT_USER,
+            title: None,
+            copies: 1,
+            callback_url: None,
+            options: None,
+            org_id: Some(ORG),
+            idempotency_key: None,
+            expire_after: None,
+            api_key_id: None,
+        };
+        assert!(enqueue_job(c, &job).unwrap().created);
+    });
+    // a second start leaves the table and its rows alone
+    drop(db);
+    let db = Db::open(dir.path().join("python_v2.sqlite3").to_str().unwrap()).unwrap();
+    assert_eq!(cols(&db).len(), 15);
+    assert_eq!(
+        db.with(|c| list_pairings(c, Some(ORG), None)).unwrap()[0].state,
+        "connected"
+    );
+}
+
+#[test]
 fn a_python_database_gets_the_operator_audit_table_and_the_python_tables_stay_as_they_were() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("python_v2.sqlite3");

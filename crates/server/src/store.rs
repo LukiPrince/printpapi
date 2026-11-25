@@ -11,7 +11,7 @@
 //! Multi-tenancy: `org_id: Option<i64>` — `None` is root (no filter), `Some(id)` confines the
 //! query to that org, written as `(:org IS NULL OR x.org_id = :org)` exactly like the Python.
 use rusqlite::Connection;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex};
@@ -115,7 +115,7 @@ pub struct OrgSummary {
 }
 
 /// One printer as an agent declares it in `POST /agent/register` (already validated).
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PrinterDecl {
     pub name: String,
     /// Python truthiness of the declared `can_pdf`.
@@ -392,6 +392,15 @@ CREATE TABLE IF NOT EXISTS label_templates(
 CREATE TABLE IF NOT EXISTS terms_acceptances(
   id INTEGER PRIMARY KEY, org_id INTEGER NOT NULL, user_id INTEGER NOT NULL,
   version TEXT NOT NULL, accepted_at REAL NOT NULL);
+-- One-time codes that let a device fetch its own agent key; the code is stored hashed, like every
+-- credential. `agent_id` set: the key fetched with the code may take over that device, at its first
+-- poll. `printers` is what the new key declared meanwhile (JSON). Life of a row: docs/api.md,
+-- section Pairing a device. Additive: the Python server does not know the table and ignores it.
+CREATE TABLE IF NOT EXISTS pairing_codes(
+  id INTEGER PRIMARY KEY AUTOINCREMENT, org_id INTEGER NOT NULL, code_hash TEXT NOT NULL UNIQUE,
+  created_by TEXT, agent_id INTEGER, created_at REAL NOT NULL, expires_at REAL NOT NULL,
+  used_at REAL, key_id INTEGER, device_name TEXT,
+  registered_at REAL, printers TEXT, taken_over_at REAL, old_key_hash TEXT, old_jobs TEXT);
 CREATE TABLE IF NOT EXISTS jobs(
   id INTEGER PRIMARY KEY AUTOINCREMENT, org_id INTEGER NOT NULL, user_id INTEGER NOT NULL,
   printer_id INTEGER NOT NULL, agent_id INTEGER NOT NULL, type TEXT NOT NULL, mode TEXT NOT NULL,
@@ -914,6 +923,7 @@ pub fn delete_org_tx(tx: &Transaction, org_id: i64) -> Result<bool> {
         "terms_acceptances",
         "org_locks",
         "support_grants",
+        "pairing_codes",
     ] {
         tx.execute(&format!("DELETE FROM {table} WHERE org_id=?"), [org_id])?;
     }
@@ -952,7 +962,25 @@ pub fn register_agent(
     printers: &[PrinterDecl],
     org_id: i64,
 ) -> Result<Registration> {
-    let now = crate::now();
+    register_agent_at(conn, name, api_key, printers, org_id, crate::now())
+}
+
+/// `register_agent` at a given time (the pairing rules look at the clock).
+///
+/// A key that is not the device's own but holds a right to take it over (a pairing code made with
+/// Reconnect, see `pending_takeover_right`) registers *without* touching the device: key hash,
+/// `last_seen_at` and the existing printers stay as the running agent left them, so a rollback of
+/// an install that fails later leaves that agent working. New printers are inserted as `pending`
+/// (no job can be queued for them) and the declared list waits in the pairing row until the first
+/// poll of the new key (`take_over_if_due`). Registering again with the same key gives the same.
+pub fn register_agent_at(
+    conn: &Connection,
+    name: &str,
+    api_key: &str,
+    printers: &[PrinterDecl],
+    org_id: i64,
+    now: f64,
+) -> Result<Registration> {
     let key_hash = hash_key(api_key);
     let tx = begin(conn)?;
     let existing: Option<(i64, String)> = tx
@@ -965,10 +993,23 @@ pub fn register_agent(
     let agent_id = match existing {
         Some((id, stored)) => {
             if !bool::from(stored.as_bytes().ct_eq(key_hash.as_bytes())) {
-                return Err(StoreError::Auth(format!(
-                    "agent name already registered with a different key: {}",
-                    pyfmt::repr_str(name)
-                )));
+                let Some(pairing) = pending_takeover_right(&tx, &key_hash, org_id, id, now)? else {
+                    return Err(StoreError::Auth(format!(
+                        "agent name already registered with a different key: {}",
+                        pyfmt::repr_str(name)
+                    )));
+                };
+                let ids = declare_pending_printers(&tx, org_id, id, printers, now)?;
+                tx.execute(
+                    "UPDATE pairing_codes SET registered_at=COALESCE(registered_at, ?), printers=? \
+                     WHERE id=?",
+                    params![now, printers_json(printers)?, pairing],
+                )?;
+                tx.commit()?;
+                return Ok(Registration {
+                    computer_id: id,
+                    printer_ids: ids,
+                });
             }
             tx.execute(
                 "UPDATE agents SET last_seen_at=? WHERE id=?",
@@ -977,6 +1018,15 @@ pub fn register_agent(
             id
         }
         None => {
+            // a key made to reconnect one device would otherwise enrol a second one under the
+            // name the new machine happens to carry, while the dashboard calls the first connected
+            if reconnect_key_waiting(&tx, &key_hash)? {
+                return Err(StoreError::Auth(
+                    "this key reconnects an existing device and registers only under that \
+                     device's name"
+                        .to_string(),
+                ));
+            }
             tx.execute(
                 "INSERT INTO agents(org_id, name, api_key_hash, last_seen_at, created_at) \
                  VALUES(?,?,?,?,?)",
@@ -985,23 +1035,61 @@ pub fn register_agent(
             tx.last_insert_rowid()
         }
     };
+    let printer_ids = upsert_printers(&tx, org_id, agent_id, printers, now)?;
+    tx.commit()?;
+    Ok(Registration {
+        computer_id: agent_id,
+        printer_ids,
+    })
+}
+
+/// Whether `key_hash` is a key a Reconnect code handed out whose takeover has not happened yet.
+fn reconnect_key_waiting(tx: &Transaction, key_hash: &str) -> Result<bool> {
+    Ok(tx
+        .query_row(
+            "SELECT 1 FROM pairing_codes p JOIN api_keys k ON k.id = p.key_id \
+             WHERE k.key_hash=? AND p.agent_id IS NOT NULL AND p.taken_over_at IS NULL",
+            [key_hash],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some())
+}
+
+fn capabilities_text(p: &PrinterDecl) -> Option<String> {
+    match &p.capabilities {
+        Some(c) if pyfmt::truthy(c) => Some(pyfmt::dumps(c)),
+        _ => None,
+    }
+}
+
+fn printer_named(tx: &Transaction, agent_id: i64, name: &str) -> Result<Option<i64>> {
+    Ok(tx
+        .query_row(
+            "SELECT id FROM printers WHERE agent_id=? AND name=?",
+            params![agent_id, name],
+            |r| r.get(0),
+        )
+        .optional()?)
+}
+
+/// What an agent declares becomes its printers: new ones are inserted, known ones take the
+/// declared flags, all of them are `active`. Printer name -> id, in declaration order. Shared by
+/// the ordinary registration and the swap of a takeover.
+fn upsert_printers(
+    tx: &Transaction,
+    org_id: i64,
+    agent_id: i64,
+    printers: &[PrinterDecl],
+    now: f64,
+) -> Result<Map<String, Value>> {
     let mut printer_ids = Map::new();
     for p in printers {
-        let caps: Option<String> = match &p.capabilities {
-            Some(c) if pyfmt::truthy(c) => Some(pyfmt::dumps(c)),
-            _ => None,
-        };
-        let found: Option<i64> = tx
-            .query_row(
-                "SELECT id FROM printers WHERE agent_id=? AND name=?",
-                params![agent_id, p.name],
-                |r| r.get(0),
-            )
-            .optional()?;
-        let pid = match found {
+        let caps = capabilities_text(p);
+        let pid = match printer_named(tx, agent_id, &p.name)? {
             Some(pid) => {
                 tx.execute(
-                    "UPDATE printers SET can_pdf=?, capabilities=? WHERE id=?",
+                    "UPDATE printers SET can_pdf=?, capabilities=?, state='active' WHERE id=?",
                     params![p.can_pdf, caps, pid],
                 )?;
                 pid
@@ -1017,11 +1105,36 @@ pub fn register_agent(
         };
         printer_ids.insert(p.name.clone(), Value::from(pid));
     }
-    tx.commit()?;
-    Ok(Registration {
-        computer_id: agent_id,
-        printer_ids,
-    })
+    Ok(printer_ids)
+}
+
+/// The registration of a key that will take the device over later: printers the device does not
+/// have yet are inserted as `pending`, the others keep every flag. The old agent still prints and
+/// has no `can_pdf` check of its own (agent `print.rs`), so a flag flipped early could send a PDF
+/// to a label printer. Printer name -> id.
+fn declare_pending_printers(
+    tx: &Transaction,
+    org_id: i64,
+    agent_id: i64,
+    printers: &[PrinterDecl],
+    now: f64,
+) -> Result<Map<String, Value>> {
+    let mut printer_ids = Map::new();
+    for p in printers {
+        let pid = match printer_named(tx, agent_id, &p.name)? {
+            Some(pid) => pid,
+            None => {
+                tx.execute(
+                    "INSERT INTO printers(org_id, agent_id, name, can_pdf, state, capabilities, \
+                     created_at) VALUES(?,?,?,0,'pending',NULL,?)",
+                    params![org_id, agent_id, p.name, now],
+                )?;
+                tx.last_insert_rowid()
+            }
+        };
+        printer_ids.insert(p.name.clone(), Value::from(pid));
+    }
+    Ok(printer_ids)
 }
 
 /// Enrol (or re-touch) a printer that polls us itself with the Star CloudPRNT protocol.
@@ -1087,6 +1200,656 @@ pub fn register_cloudprnt(conn: &Connection, org_id: i64, name: &str) -> Result<
     })
 }
 
+// --- pairing: one-time codes that hand a device its own agent key ----------------------------
+// Life of a row (docs/api.md, "Pairing a device"): open -> fetched (the key was redeemed) ->
+// registered (the key declared its printers, reconnect rows only) -> connected (it polled and took
+// the device over). Every query below follows from that table.
+
+/// A code works this long.
+pub const PAIRING_TTL_S: f64 = 1800.0;
+/// A fetched key must register within this, or the purge revokes it.
+pub const PAIRING_GRACE_S: f64 = 86_400.0;
+/// Unused, unexpired codes per org.
+pub const PAIRING_MAX_OPEN: i64 = 20;
+/// How long after a takeover the old key's finished job is still accepted: the reaper's timeout
+/// (`http::reaper`), so a job the old machine printed is recorded before the server would requeue it.
+pub const LATE_RESULT_S: f64 = 300.0;
+
+/// Key hash of a Star printer's pseudo-agent (`register_cloudprnt`): no key has this preimage.
+const CLOUDPRNT_KEY_PREFIX: &str = "cloudprnt:";
+
+fn printers_json(printers: &[PrinterDecl]) -> Result<String> {
+    serde_json::to_string(printers).map_err(|e| StoreError::Invalid(e.to_string()))
+}
+
+/// The hash of a code as typed: the dashless, upper-case form (`None`: not a code at all).
+fn pairing_hash(code: &str) -> Option<String> {
+    auth::normalize_pairing_code(code).map(|c| hash_key(&c))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum CreatePairing {
+    Created {
+        id: i64,
+        expires_at: f64,
+    },
+    /// The org already has `PAIRING_MAX_OPEN` unused codes.
+    TooMany,
+    /// No such device in this org.
+    UnknownDevice,
+    /// A Star printer connects by itself, there is nothing to pair.
+    Cloudprnt,
+    /// What the person who redeems must see before anything changes cannot be shown safely, or the
+    /// device cannot be taken over by a code: the sentence says which and what to do. Refused here,
+    /// with the manager at the screen, and not only when the code is spent.
+    Unshowable(&'static str),
+}
+
+/// The creator's address has a character that cannot be shown safely (`auth::shown_text_ok`).
+pub const PAIRING_ADDRESS_UNSHOWABLE: &str = "the address of the person who makes the code has characters that cannot be shown safely: ask an account with a plain address to make it";
+/// The stored name of the device is too long or holds a control or hidden character
+/// (`auth::name_text_ok`): the new key must register under that very name, so it cannot be cleaned.
+pub const PAIRING_DEVICE_UNSHOWABLE: &str = "the device name has characters that cannot be shown safely, so a code cannot take it over: connect the computer again with Connect device, under another name";
+/// A stored name the agent would trim (or an empty one): see `name_survives_trim`.
+pub const PAIRING_DEVICE_BLANK: &str = "the device name is empty or has a space at its start or end, which the agent would not keep, so a code cannot take it over: connect the computer again with Connect device, under another name";
+
+/// `register_cloudprnt` finds a Star printer by (org, name), and the key a code hands out may not
+/// register such a name.
+pub const PAIRING_DEVICE_RESERVED: &str = "the device name starts with cloudprnt-, which is reserved for Star printers, so a code cannot take it over: connect the computer with the key it already uses (an address and a key), or with a new key under another name";
+
+/// Whether a stored device name reads back the same after the agent trims it: the agent writes the
+/// name into its file and reads it back trimmed, and a reconnect key registers only under the stored
+/// name. `POST /agent/register` keeps whatever name it was sent, so an old row can be empty or have
+/// outer white space.
+fn name_survives_trim(name: &str) -> bool {
+    !name.is_empty() && crate::printnode::py_trim(name) == name
+}
+
+/// A new code for `org_id`; with `agent_id` the key fetched with it may take that device over
+/// (Reconnect). `created_by` is the creator's e-mail as it is now (null for root): a copy, so a
+/// deleted user is never shown as somebody else. `code` is stored as a hash. One transaction.
+pub fn create_pairing(
+    conn: &Connection,
+    org_id: i64,
+    agent_id: Option<i64>,
+    created_by: Option<&str>,
+    code: &str,
+    now: Option<f64>,
+) -> Result<CreatePairing> {
+    let now = now.unwrap_or_else(crate::now);
+    let hash =
+        pairing_hash(code).ok_or_else(|| StoreError::Invalid("not a pairing code".to_string()))?;
+    let tx = begin(conn)?;
+    if !created_by.is_none_or(|e| auth::shown_text_ok(e, 200)) {
+        return Ok(CreatePairing::Unshowable(PAIRING_ADDRESS_UNSHOWABLE));
+    }
+    if let Some(agent) = agent_id {
+        let known: Option<(String, String)> = tx
+            .query_row(
+                "SELECT api_key_hash, name FROM agents WHERE id=? AND org_id=?",
+                params![agent, org_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        match known {
+            None => return Ok(CreatePairing::UnknownDevice),
+            Some((h, _)) if h.starts_with(CLOUDPRNT_KEY_PREFIX) => {
+                return Ok(CreatePairing::Cloudprnt);
+            }
+            Some((_, n)) if n.starts_with(crate::cloudprnt::NAME_PREFIX) => {
+                return Ok(CreatePairing::Unshowable(PAIRING_DEVICE_RESERVED));
+            }
+            Some((_, n)) if !auth::name_text_ok(&n, 200) => {
+                return Ok(CreatePairing::Unshowable(PAIRING_DEVICE_UNSHOWABLE));
+            }
+            Some((_, n)) if !name_survives_trim(&n) => {
+                return Ok(CreatePairing::Unshowable(PAIRING_DEVICE_BLANK));
+            }
+            Some(_) => {}
+        }
+        // a newer code replaces the unused ones of the same device
+        tx.execute(
+            "DELETE FROM pairing_codes WHERE agent_id=? AND used_at IS NULL",
+            [agent],
+        )?;
+    }
+    let open: i64 = tx.query_row(
+        "SELECT COUNT(*) FROM pairing_codes WHERE org_id=? AND used_at IS NULL AND expires_at > ?",
+        params![org_id, now],
+        |r| r.get(0),
+    )?;
+    if open >= PAIRING_MAX_OPEN {
+        return Ok(CreatePairing::TooMany);
+    }
+    let expires_at = now + PAIRING_TTL_S;
+    tx.execute(
+        "INSERT INTO pairing_codes(org_id, code_hash, created_by, agent_id, created_at, expires_at) \
+         VALUES(?,?,?,?,?,?)",
+        params![org_id, hash, created_by, agent_id, now, expires_at],
+    )?;
+    let id = tx.last_insert_rowid();
+    tx.commit()?;
+    Ok(CreatePairing::Created { id, expires_at })
+}
+
+/// The active key a device still holds besides the agent-only key a pairing hands out.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct OldKey {
+    pub id: i64,
+    pub label: String,
+}
+
+/// One row of `GET /pairing`. Never a hash, never `created_by`.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct PairingInfo {
+    pub id: i64,
+    pub org_id: i64,
+    pub computer_id: Option<i64>,
+    pub computer_name: Option<String>,
+    pub created_at: f64,
+    pub expires_at: f64,
+    pub used_at: Option<f64>,
+    pub device_name: Option<String>,
+    pub key_id: Option<i64>,
+    /// `open`, `expired`, `fetched`, `registered`, `connected` or `revoked`.
+    pub state: &'static str,
+    pub old_key: Option<OldKey>,
+}
+
+/// `old_key`: the active key that is not agent-only and is the one the device uses now (before a
+/// takeover) or used before it (after one). Joined only for a reconnect row.
+const PAIRING_SELECT: &str = "SELECT p.id, p.org_id, p.agent_id, a.name, p.created_at, p.expires_at, \
+       p.used_at, p.device_name, p.key_id, p.registered_at IS NOT NULL, p.taken_over_at IS NOT NULL, \
+       k.active, EXISTS(SELECT 1 FROM agents h WHERE h.api_key_hash = k.key_hash \
+         AND (p.agent_id IS NULL OR h.id = p.agent_id)), o.id, o.label \
+    FROM pairing_codes p \
+    LEFT JOIN agents a ON a.id = p.agent_id \
+    LEFT JOIN api_keys k ON k.id = p.key_id \
+    LEFT JOIN api_keys o ON o.active=1 AND o.scope != 'agent' AND o.org_id = p.org_id \
+         AND p.agent_id IS NOT NULL AND o.key_hash = COALESCE(p.old_key_hash, a.api_key_hash) \
+    WHERE (:org IS NULL OR p.org_id = :org) AND (:id IS NULL OR p.id = :id) \
+    ORDER BY p.id DESC LIMIT 100";
+
+fn pairing_info(r: &Row, now: f64) -> rusqlite::Result<PairingInfo> {
+    let agent_id: Option<i64> = r.get(2)?;
+    let (used_at, expires_at): (Option<f64>, f64) = (r.get(6)?, r.get(5)?);
+    let (registered, taken): (bool, bool) = (r.get(9)?, r.get(10)?);
+    let key_active: Option<bool> = r.get(11)?;
+    let held: bool = r.get(12)?;
+    let old_id: Option<i64> = r.get(13)?;
+    let state = match (used_at, key_active) {
+        (None, _) if expires_at > now => "open",
+        (None, _) => "expired",
+        // the takeover happened: the device is connected, whatever became of the key since (a
+        // second Reconnect revokes the agent-only first one, and the old full key must stay offered)
+        (Some(_), _) if taken => "connected",
+        // a revoked key does nothing
+        (Some(_), Some(false) | None) => "revoked",
+        (Some(_), Some(true)) if held => "connected",
+        (Some(_), Some(true)) if registered => "registered",
+        (Some(_), Some(true)) => "fetched",
+    };
+    Ok(PairingInfo {
+        id: r.get(0)?,
+        org_id: r.get(1)?,
+        computer_id: agent_id,
+        computer_name: r.get(3)?,
+        created_at: r.get(4)?,
+        expires_at,
+        used_at,
+        device_name: r.get(7)?,
+        key_id: r.get(8)?,
+        state,
+        old_key: match old_id {
+            Some(id) => Some(OldKey {
+                id,
+                label: r.get(14)?,
+            }),
+            None => None,
+        },
+    })
+}
+
+/// The codes of `org` (root: all), newest first, at most 100.
+pub fn list_pairings(
+    conn: &Connection,
+    org: Option<i64>,
+    now: Option<f64>,
+) -> Result<Vec<PairingInfo>> {
+    let now = now.unwrap_or_else(crate::now);
+    let mut st = conn.prepare_cached(PAIRING_SELECT)?;
+    let rows = st
+        .query_map(named_params! {":org": org, ":id": None::<i64>}, |r| {
+            pairing_info(r, now)
+        })?
+        .collect::<rusqlite::Result<_>>()?;
+    Ok(rows)
+}
+
+/// One row, in `org` unless root.
+pub fn get_pairing(
+    conn: &Connection,
+    id: i64,
+    org: Option<i64>,
+    now: Option<f64>,
+) -> Result<Option<PairingInfo>> {
+    let now = now.unwrap_or_else(crate::now);
+    Ok(conn
+        .prepare_cached(PAIRING_SELECT)?
+        .query_row(named_params! {":org": org, ":id": id}, |r| {
+            pairing_info(r, now)
+        })
+        .optional()?)
+}
+
+/// Delete an unused code of `org` (root: any). False for an unknown, foreign or used one.
+pub fn cancel_pairing(conn: &Connection, id: i64, org: Option<i64>) -> Result<bool> {
+    let tx = begin(conn)?;
+    let n = tx.execute(
+        "DELETE FROM pairing_codes WHERE id=:id AND used_at IS NULL AND (:org IS NULL OR org_id=:org)",
+        named_params! {":id": id, ":org": org},
+    )?;
+    tx.commit()?;
+    Ok(n == 1)
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum Redeem {
+    Paired {
+        /// The device name: the one sent, or the stored one for a reconnect code.
+        name: String,
+        /// The name of the org the code belongs to.
+        org: String,
+        created_by: Option<String>,
+        replaces: bool,
+    },
+    /// Unknown, expired, used or cancelled: one answer for all, nothing to tell a guesser.
+    BadCode,
+    /// A new device wants a name the org already has. The code stays usable.
+    NameTaken,
+    /// The device name or the creator's address cannot be shown safely, or the device cannot be
+    /// taken over by a code (the `PAIRING_*` sentences): the person who redeems must see them before
+    /// anything changes, so the code is not spent. The account name is never a reason: it is cleaned.
+    Unshowable(&'static str),
+}
+
+/// Spend `code`: insert `key` as an agent-only key labelled `Device <name>` in the code's org.
+/// One `BEGIN IMMEDIATE`, so a code is spent once. The lookup is an equality match on the hash of
+/// a 60-bit random value (the rule above `authenticate_agent`). `created_by` is nulled here: it is
+/// shown to the person who redeems, once.
+pub fn redeem_pairing(
+    conn: &Connection,
+    code: &str,
+    name: &str,
+    key: &str,
+    now: Option<f64>,
+) -> Result<Redeem> {
+    let now = now.unwrap_or_else(crate::now);
+    let Some(hash) = pairing_hash(code) else {
+        return Ok(Redeem::BadCode);
+    };
+    let tx = begin(conn)?;
+    let row: Option<(i64, i64, Option<String>, Option<i64>)> = tx
+        .query_row(
+            "SELECT id, org_id, created_by, agent_id FROM pairing_codes \
+             WHERE code_hash=? AND used_at IS NULL AND expires_at > ?",
+            params![hash, now],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        )
+        .optional()?;
+    let Some((id, org_id, created_by, agent_id)) = row else {
+        return Ok(Redeem::BadCode);
+    };
+    let (name, replaces) = match agent_id {
+        Some(agent) => {
+            let stored: Option<String> = tx
+                .query_row(
+                    "SELECT name FROM agents WHERE id=? AND org_id=?",
+                    params![agent, org_id],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            match stored {
+                Some(n) => (n, true),
+                None => return Ok(Redeem::BadCode),
+            }
+        }
+        None => {
+            let taken = tx
+                .query_row(
+                    "SELECT 1 FROM agents WHERE org_id=? AND name=?",
+                    params![org_id, name],
+                    |_| Ok(()),
+                )
+                .optional()?
+                .is_some();
+            if taken {
+                return Ok(Redeem::NameTaken);
+            }
+            (name.to_string(), false)
+        }
+    };
+    let org: String = tx
+        .query_row("SELECT name FROM orgs WHERE id=?", [org_id], |r| r.get(0))
+        .optional()?
+        .ok_or(StoreError::Conflict)?;
+    // free text the account cannot change (only the operator can): what is shown is the cleaned,
+    // cut form (the name an agent registers under is another matter and stays as stored)
+    let org = auth::clean_name(&org, 200);
+    let org = if org.trim().is_empty() {
+        "(no name)".to_string()
+    } else {
+        org
+    };
+    if replaces && name.starts_with(crate::cloudprnt::NAME_PREFIX) {
+        return Ok(Redeem::Unshowable(PAIRING_DEVICE_RESERVED));
+    }
+    if !auth::name_text_ok(&name, 200) {
+        return Ok(Redeem::Unshowable(PAIRING_DEVICE_UNSHOWABLE));
+    }
+    if replaces && !name_survives_trim(&name) {
+        return Ok(Redeem::Unshowable(PAIRING_DEVICE_BLANK));
+    }
+    if !created_by
+        .as_deref()
+        .is_none_or(|e| auth::shown_text_ok(e, 200))
+    {
+        return Ok(Redeem::Unshowable(PAIRING_ADDRESS_UNSHOWABLE));
+    }
+    let key_id = add_api_key_scoped_tx(
+        &tx,
+        &format!("Device {name}"),
+        key,
+        org_id,
+        auth::Scope::Agent,
+    )?;
+    tx.execute(
+        "UPDATE pairing_codes SET used_at=?, key_id=?, device_name=?, created_by=NULL WHERE id=?",
+        params![now, key_id, name, id],
+    )?;
+    tx.commit()?;
+    Ok(Redeem::Paired {
+        name,
+        org,
+        created_by,
+        replaces,
+    })
+}
+
+/// The pairing row that lets `key_hash` take over device `agent_id` (of `org_id`) when it
+/// registers: the key is active, fetched in the last 24 hours or already registered, not spent on
+/// a takeover yet, and no agent holds it. `None` for every other key. The id of the row.
+fn pending_takeover_right(
+    conn: &Connection,
+    key_hash: &str,
+    org_id: i64,
+    agent_id: i64,
+    now: f64,
+) -> Result<Option<i64>> {
+    let row: Option<(i64, String)> = conn
+        .prepare_cached(
+            "SELECT p.id, k.scope FROM pairing_codes p JOIN api_keys k ON k.id = p.key_id \
+             WHERE k.key_hash=:hash AND k.active=1 AND p.org_id=:org AND p.agent_id=:agent \
+               AND p.taken_over_at IS NULL \
+               AND (p.registered_at IS NOT NULL OR p.used_at > :now - :grace) \
+               AND NOT EXISTS (SELECT 1 FROM agents b WHERE b.api_key_hash=:hash)",
+        )?
+        .query_row(
+            named_params! {":hash": key_hash, ":org": org_id, ":agent": agent_id,
+            ":now": now, ":grace": PAIRING_GRACE_S},
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?;
+    // a key narrowed meanwhile (PUT /apikeys) may not act as an agent: not even to register
+    Ok(row
+        .filter(|(_, scope)| auth::Scope::parse(scope).allows(auth::Right::Agent))
+        .map(|(id, _)| id))
+}
+
+/// The row of a registered reconnect key that has not taken its device over yet.
+struct Takeover {
+    id: i64,
+    key_id: i64,
+    agent_id: i64,
+    org_id: i64,
+    printers: Option<String>,
+    old_hash: String,
+}
+
+fn find_takeover(conn: &Connection, key_hash: &str) -> Result<Option<Takeover>> {
+    let row: Option<(Takeover, String)> = conn
+        .prepare_cached(
+            "SELECT p.id, p.agent_id, p.org_id, p.printers, a.api_key_hash, k.scope, k.id \
+             FROM api_keys k JOIN pairing_codes p ON p.key_id = k.id \
+             JOIN agents a ON a.id = p.agent_id AND a.org_id = p.org_id \
+             WHERE k.key_hash=? AND k.active=1 AND p.registered_at IS NOT NULL \
+               AND p.taken_over_at IS NULL AND a.api_key_hash NOT LIKE 'cloudprnt:%' \
+               AND NOT EXISTS (SELECT 1 FROM agents b WHERE b.api_key_hash = k.key_hash)",
+        )?
+        .query_row([key_hash], |r| {
+            Ok((
+                Takeover {
+                    id: r.get(0)?,
+                    key_id: r.get(6)?,
+                    agent_id: r.get(1)?,
+                    org_id: r.get(2)?,
+                    printers: r.get(3)?,
+                    old_hash: r.get(4)?,
+                },
+                r.get(5)?,
+            ))
+        })
+        .optional()?;
+    Ok(row
+        .filter(|(_, scope)| auth::Scope::parse(scope).allows(auth::Right::Agent))
+        .map(|(t, _)| t))
+}
+
+/// The first poll of a registered reconnect key: the key becomes the device's key. Computer and
+/// printer ids stay, the declared printer flags apply now, the old key stops being the device's:
+/// an agent-only old key is revoked, any other stays active (it may serve integrations; the
+/// pairing list offers its revocation). Jobs the device holds as `claimed` get `claimed_at=now`, so
+/// the reaper leaves them for exactly as long as a late result of the old machine is accepted.
+/// Reads first and writes only on a hit. Returns the device's id on a swap, `None` otherwise
+/// (also a key narrowed to a scope without the agent right: it takes nothing over).
+pub fn take_over_if_due(conn: &Connection, key: &str, now: Option<f64>) -> Result<Option<i64>> {
+    let now = now.unwrap_or_else(crate::now);
+    let hash = hash_key(key);
+    if find_takeover(conn, &hash)?.is_none() {
+        return Ok(None);
+    }
+    let tx = begin(conn)?;
+    // again under the write lock: a second poll of the same key may have swapped meanwhile
+    let Some(t) = find_takeover(&tx, &hash)? else {
+        return Ok(None);
+    };
+    tx.execute(
+        "UPDATE api_keys SET active=0 WHERE key_hash=? AND scope='agent' AND active=1",
+        [&t.old_hash],
+    )?;
+    tx.execute(
+        "UPDATE agents SET api_key_hash=?, last_seen_at=? WHERE id=?",
+        params![hash, now, t.agent_id],
+    )?;
+    let declared: Vec<PrinterDecl> = t
+        .printers
+        .as_deref()
+        .and_then(|j| serde_json::from_str(j).ok())
+        .unwrap_or_default();
+    upsert_printers(&tx, t.org_id, t.agent_id, &declared, now)?;
+    // the jobs the device holds right now were handed to the key it gives up: only for these may
+    // that key report a late result (a later swap moves `claimed_at`, so time cannot tell whose a
+    // job is any more)
+    let held: Vec<i64> = {
+        let mut st = tx.prepare("SELECT id FROM jobs WHERE agent_id=? AND state='claimed'")?;
+        st.query_map([t.agent_id], |r| r.get(0))?
+            .collect::<rusqlite::Result<_>>()?
+    };
+    tx.execute(
+        "UPDATE pairing_codes SET taken_over_at=?, old_key_hash=?, printers=NULL, old_jobs=? \
+         WHERE id=?",
+        params![
+            now,
+            t.old_hash,
+            serde_json::to_string(&held).unwrap_or_default(),
+            t.id
+        ],
+    )?;
+    // older codes of this device that never swapped lose: their keys end, the rows go. Newer ones
+    // are left alone, so the manager's latest code keeps working.
+    let older: Vec<(i64, Option<i64>)> = {
+        let mut st = tx.prepare(
+            "SELECT id, key_id FROM pairing_codes \
+             WHERE agent_id=? AND id<? AND taken_over_at IS NULL",
+        )?;
+        st.query_map(params![t.agent_id, t.id], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<rusqlite::Result<_>>()?
+    };
+    for (id, key_id) in older {
+        if let Some(key_id) = key_id {
+            revoke_unless_held(&tx, key_id)?;
+        }
+        tx.execute("DELETE FROM pairing_codes WHERE id=?", [id])?;
+    }
+    // a pending printer the declaration did not name has no job and no future, unless a newer
+    // registered code of this device still waits to swap and may have declared it
+    drop_orphan_pending_printers(&tx, Some(t.key_id))?;
+    tx.execute(
+        "UPDATE jobs SET claimed_at=? WHERE agent_id=? AND state='claimed'",
+        params![now, t.agent_id],
+    )?;
+    tx.commit()?;
+    Ok(Some(t.agent_id))
+}
+
+/// Delete the `pending` printers of a device that has no takeover left to wait for (an active key,
+/// registered, not swapped yet): nothing can be queued for them and nobody could remove them.
+/// With `key_id` only the devices that key's pairing rows belong to are looked at.
+fn drop_orphan_pending_printers(tx: &Transaction, key_id: Option<i64>) -> Result<()> {
+    tx.execute(DROP_ORPHAN_PENDING_SQL, named_params! {":kid": key_id})?;
+    Ok(())
+}
+
+/// The devices that still wait for a takeover are one uncorrelated set, read once: a check per
+/// pending printer would scan every pairing row for each of them, under the one database lock.
+const DROP_ORPHAN_PENDING_SQL: &str = "DELETE FROM printers WHERE state='pending' \
+       AND (:kid IS NULL OR agent_id IN (SELECT agent_id FROM pairing_codes WHERE key_id=:kid)) \
+       AND agent_id NOT IN (SELECT p.agent_id FROM pairing_codes p JOIN api_keys k ON k.id = p.key_id \
+                             WHERE p.agent_id IS NOT NULL AND k.active=1 \
+                               AND p.registered_at IS NOT NULL AND p.taken_over_at IS NULL)";
+
+/// The query plan of the pending-printer clean-up (for the test that keeps it uncorrelated).
+pub fn explain_drop_orphan_pending_printers(conn: &Connection) -> Result<Vec<String>> {
+    explain(
+        conn,
+        DROP_ORPHAN_PENDING_SQL,
+        named_params! {":kid": None::<i64>},
+    )
+}
+
+/// Revoke key `key_id` unless an agent holds it (a device's own key is not ours to cut here).
+fn revoke_unless_held(tx: &Transaction, key_id: i64) -> Result<()> {
+    tx.execute(
+        "UPDATE api_keys SET active=0 WHERE id=? AND active=1 \
+         AND NOT EXISTS (SELECT 1 FROM agents a WHERE a.api_key_hash = api_keys.key_hash)",
+        [key_id],
+    )?;
+    Ok(())
+}
+
+/// What `authenticate_poll` found: the agent behind the key, and whether this poll just took the
+/// device over (the old machine's waiting poll must be woken to learn its key is gone).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Polled {
+    pub agent_id: i64,
+    pub swapped: bool,
+}
+
+/// The first authentication of a poll: `authenticate_agent`, and only when that finds nothing the
+/// takeover of a registered reconnect key. A working agent's poll costs no extra read.
+pub fn authenticate_poll(conn: &Connection, key: &str, now: Option<f64>) -> Result<Option<Polled>> {
+    if let Some(agent_id) = authenticate_agent(conn, key)? {
+        return Ok(Some(Polled {
+            agent_id,
+            swapped: false,
+        }));
+    }
+    if let Some(agent_id) = take_over_if_due(conn, key, now)? {
+        return Ok(Some(Polled {
+            agent_id,
+            swapped: true,
+        }));
+    }
+    // two polls of one new key: the one that lost the race finds the swap done
+    Ok(authenticate_agent(conn, key)?.map(|agent_id| Polled {
+        agent_id,
+        swapped: false,
+    }))
+}
+
+/// Whether `key` is the key a device gave up for another less than `LATE_RESULT_S` ago: the
+/// gate in front of the result routes, before the body is read.
+pub fn late_result_open(conn: &Connection, key: &str, now: Option<f64>) -> Result<bool> {
+    let now = now.unwrap_or_else(crate::now);
+    Ok(conn
+        .prepare_cached(
+            "SELECT 1 FROM pairing_codes WHERE old_key_hash=? AND taken_over_at > ? LIMIT 1",
+        )?
+        .query_row(params![hash_key(key), now - LATE_RESULT_S], |_| Ok(()))
+        .optional()?
+        .is_some())
+}
+
+/// The device that gave `key` up in the last `LATE_RESULT_S` seconds, when `job_id` is a job the device
+/// held at that swap and it is still `claimed` (the ids are kept in the pairing row: a later swap
+/// moves `claimed_at`, so the clock cannot tell the first key's jobs from the second's). Whether the key is still active does not matter (an agent-only old key was revoked
+/// at the swap). The caller accepts only `ok: true`:
+/// a late failure may only mean the old agent could no longer fetch the payload.
+pub fn late_result_agent(
+    conn: &Connection,
+    key: &str,
+    job_id: i64,
+    now: Option<f64>,
+) -> Result<Option<i64>> {
+    let now = now.unwrap_or_else(crate::now);
+    Ok(conn
+        .prepare_cached(
+            "SELECT p.agent_id FROM pairing_codes p JOIN jobs j ON j.agent_id = p.agent_id \
+             WHERE p.old_key_hash=? AND p.taken_over_at > ? AND j.id=? AND j.state='claimed' \
+               AND EXISTS (SELECT 1 FROM json_each(p.old_jobs) WHERE value = j.id)",
+        )?
+        .query_row(params![hash_key(key), now - LATE_RESULT_S, job_id], |r| {
+            r.get(0)
+        })
+        .optional()?)
+}
+
+/// The reaper's part: keys that were fetched and never registered within 24 hours end (a key somebody
+/// widened meanwhile is not ours to cut), rows that are done with go, and so do the pending printers
+/// of a takeover that ended. A registered reconnect key waits as long as it takes (the device may be
+/// restarted days later); it ends by its first poll, its revocation or a newer code's swap.
+pub fn purge_pairings(conn: &Connection, now: Option<f64>) -> Result<()> {
+    let cut = now.unwrap_or_else(crate::now) - PAIRING_GRACE_S;
+    let tx = begin(conn)?;
+    tx.execute(
+        "UPDATE api_keys SET active=0 WHERE active=1 \
+         AND id IN (SELECT key_id FROM pairing_codes \
+                     WHERE used_at<=:cut AND registered_at IS NULL AND taken_over_at IS NULL) \
+         AND scope='agent' \
+         AND NOT EXISTS (SELECT 1 FROM agents a WHERE a.api_key_hash=api_keys.key_hash)",
+        named_params! {":cut": cut},
+    )?;
+    tx.execute(
+        "DELETE FROM pairing_codes WHERE COALESCE(taken_over_at, used_at, expires_at)<=:cut \
+         AND NOT (registered_at IS NOT NULL AND taken_over_at IS NULL \
+                  AND EXISTS (SELECT 1 FROM api_keys k WHERE k.id=key_id AND k.active=1))",
+        named_params! {":cut": cut},
+    )?;
+    drop_orphan_pending_printers(&tx, None)?;
+    tx.commit()?;
+    Ok(())
+}
+
 // api_key is a high-entropy token; the sha256 lookup has no practical timing oracle, so an
 // indexed equality match is fine for the authenticate_* functions.
 
@@ -1147,6 +1910,14 @@ pub fn enrolled_agent(conn: &Connection, key_id: i64, org_id: Option<i64>) -> Re
              WHERE k.id=:kid AND k.active=1 AND (:org IS NULL OR k.org_id=:org)",
         )?
         .query_row(named_params! {":kid": key_id, ":org": org_id}, |r| r.get(0))
+        .optional()?)
+}
+
+/// The org a device belongs to (root's way of finding the org of a device it names).
+pub fn agent_org(conn: &Connection, agent_id: i64) -> Result<Option<i64>> {
+    Ok(conn
+        .prepare_cached("SELECT org_id FROM agents WHERE id=?")?
+        .query_row([agent_id], |r| r.get(0))
         .optional()?)
 }
 
@@ -1270,6 +2041,9 @@ pub fn revoke_api_key_tx(tx: &Transaction, key_id: i64, org_id: Option<i64>) -> 
         "UPDATE api_keys SET active=0 WHERE id=:kid AND (:org IS NULL OR org_id = :org)",
         named_params! {":kid": key_id, ":org": org_id},
     )?;
+    if n == 1 {
+        drop_orphan_pending_printers(tx, Some(key_id))?;
+    }
     Ok(n == 1)
 }
 
@@ -1716,9 +2490,12 @@ pub fn enqueue_receipt_job(
     // A foreign printer is simply unknown — same error as a nonexistent one, no leak.
     let printer: Option<(i64, i64)> = tx
         .prepare_cached(
-            "SELECT org_id, agent_id FROM printers WHERE id=:pid AND (:org IS NULL OR org_id = :org)",
+            "SELECT org_id, agent_id FROM printers \
+             WHERE id=:pid AND state='active' AND (:org IS NULL OR org_id = :org)",
         )?
-        .query_row(named_params! {":pid": pid, ":org": job.org_id}, |r| Ok((r.get(0)?, r.get(1)?)))
+        .query_row(named_params! {":pid": pid, ":org": job.org_id}, |r| {
+            Ok((r.get(0)?, r.get(1)?))
+        })
         .optional()?;
     let Some((org_id, agent_id)) = printer else {
         return Err(unknown());
@@ -2294,7 +3071,7 @@ pub fn metrics(
         }
     }
     m.printers_total = conn.query_row(
-        "SELECT COUNT(*) FROM printers WHERE (:org IS NULL OR org_id = :org)",
+        "SELECT COUNT(*) FROM printers WHERE state='active' AND (:org IS NULL OR org_id = :org)",
         named_params! {":org": org_id},
         |r| r.get(0),
     )?;
@@ -2311,7 +3088,7 @@ pub fn list_agents(
     let now = now.unwrap_or_else(crate::now);
     let mut stmt = conn.prepare(
         "SELECT a.id, a.name, a.last_seen_at, a.created_at, \
-         (SELECT COUNT(*) FROM printers p WHERE p.agent_id = a.id) AS printers \
+         (SELECT COUNT(*) FROM printers p WHERE p.agent_id = a.id AND p.state='active') AS printers \
          FROM agents a WHERE (:org IS NULL OR a.org_id = :org) ORDER BY a.id",
     )?;
     let rows = stmt.query_map(named_params! {":org": org_id}, |r| {
@@ -2396,7 +3173,7 @@ pub fn list_printers(
         "SELECT p.id, p.name, p.agent_id, p.can_pdf, p.capabilities, p.created_at, \
          a.name AS agent_name, a.last_seen_at \
          FROM printers p JOIN agents a ON a.id = p.agent_id \
-         WHERE (:org IS NULL OR p.org_id = :org) ORDER BY p.id",
+         WHERE p.state='active' AND (:org IS NULL OR p.org_id = :org) ORDER BY p.id",
     )?;
     let rows = stmt.query_map(named_params! {":org": org_id}, |r| {
         let seen: Option<f64> = r.get(7)?;
@@ -3186,7 +3963,7 @@ SELECT * FROM (
          AND a.last_seen_at >= :online_since) AS agents_online,
       (SELECT COUNT(*) FROM agents a WHERE a.org_id = o.id) AS agents_total,
       (SELECT MAX(a.last_seen_at) FROM agents a WHERE a.org_id = o.id) AS newest_agent_seen_at,
-      (SELECT COUNT(*) FROM printers p WHERE p.org_id = o.id) AS printers,
+      (SELECT COUNT(*) FROM printers p WHERE p.org_id = o.id AND p.state = 'active') AS printers,
       EXISTS(SELECT 1 FROM org_locks l WHERE l.org_id = o.id
          AND l.org_created_at = o.created_at) AS locked,
       (SELECT u.email FROM users u WHERE u.org_id = o.id AND u.email IS NOT NULL

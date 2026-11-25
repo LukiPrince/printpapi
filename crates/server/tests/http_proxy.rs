@@ -80,3 +80,47 @@ fn a_peer_that_is_not_trusted_cannot_choose_its_address() {
     assert_eq!(signup(addr, 1, &["1.1.1.1"]), 200);
     assert_eq!(signup(addr, 2, &["2.2.2.2"]), 429);
 }
+
+/// POST /agent/pair with a wrong (but well-formed) code and the given `X-Forwarded-For` lines.
+fn pair(addr: SocketAddr, xff: &[&str]) -> u16 {
+    let body = r#"{"code":"ZZZZ-ZZZZ-ZZZZ","name":"warehouse-pc"}"#;
+    let extra: String = xff
+        .iter()
+        .map(|v| format!("X-Forwarded-For: {v}\r\n"))
+        .collect();
+    let mut s = TcpStream::connect(addr).unwrap();
+    s.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    write!(
+        s,
+        "POST /agent/pair HTTP/1.1\r\nHost: t\r\n{extra}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    )
+    .unwrap();
+    let mut out = String::new();
+    s.read_to_string(&mut out).unwrap();
+    out.split_whitespace().nth(1).unwrap().parse().unwrap()
+}
+
+#[test]
+fn behind_a_trusted_proxy_each_forwarded_client_has_its_own_pairing_slots() {
+    let addr = server("127.0.0.1");
+    assert_eq!(pair(addr, &["1.1.1.1"]), 401);
+    assert_eq!(pair(addr, &["1.1.1.1"]), 429);
+    assert_eq!(pair(addr, &["2.2.2.2"]), 401);
+    // a header the client wrote further left buys nothing
+    assert_eq!(pair(addr, &["9.9.9.9, 1.1.1.1"]), 429);
+    // and the pairing slots are not the signup slots of the same address
+    assert_eq!(signup(addr, 1, &["1.1.1.1"]), 200);
+}
+
+#[test]
+fn without_a_trusted_proxy_a_spoofed_header_does_not_escape_the_pairing_throttle() {
+    let addr = server("");
+    assert_eq!(pair(addr, &["1.1.1.1"]), 401);
+    assert_eq!(pair(addr, &["2.2.2.2"]), 429);
+    assert_eq!(pair(addr, &[]), 429);
+    // a peer that is not the trusted one cannot choose its address either
+    let addr = server("10.0.0.1");
+    assert_eq!(pair(addr, &["1.1.1.1"]), 401);
+    assert_eq!(pair(addr, &["2.2.2.2"]), 429);
+}

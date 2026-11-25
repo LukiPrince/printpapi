@@ -44,6 +44,39 @@ export type Job = {
   finished_at: number | null;
 };
 
+/** The life of a pairing code (docs/api.md, "Pairing a device"). */
+export type PairingState = "open" | "expired" | "fetched" | "registered" | "connected" | "revoked";
+
+/** The active key that is not agent-only and belongs to the device a code reconnects. */
+export type OldKey = { id: number; label: string };
+
+/** One row of GET /pairing. Never the code itself, a hash or who made it. */
+export type PairingInfo = {
+  id: number;
+  org_id: number;
+  computer_id: number | null;
+  computer_name: string | null;
+  created_at: number;
+  expires_at: number;
+  used_at: number | null;
+  device_name: string | null;
+  key_id: number | null;
+  state: PairingState;
+  old_key: OldKey | null;
+};
+
+/** What POST /pairing gives, once: the code is shown now and never again. */
+export type NewPairing = {
+  id: number;
+  code: string;
+  expires_at: number;
+  /** PUBLIC_URL of the server, or null. */
+  server_url: string | null;
+  computer_id: number | null;
+  computer_name: string | null;
+  old_key: OldKey | null;
+};
+
 export type ApiKey = {
   id: number;
   label: string;
@@ -187,6 +220,7 @@ async function request(path: string, init: RequestInit = {}, token = getToken())
       !path.startsWith("/apikeys") &&
       !path.startsWith("/users") &&
       !path.startsWith("/orgs") &&
+      !path.startsWith("/pairing") &&
       !path.startsWith("/support-access")
     ) {
       window.dispatchEvent(new CustomEvent(UNAUTHORIZED_EVENT));
@@ -339,6 +373,17 @@ export const listJobs = () => getJSON<{ jobs: Job[] }>("/jobs").then((r) => r.jo
 
 export const listApiKeys = () =>
   getJSON<{ keys: ApiKey[] }>("/apikeys").then((r) => r.keys ?? []);
+
+/** A code for a new device, or for Reconnect on `computerId`. Root or an account login only. */
+export const createPairing = (computerId?: number) =>
+  request("/pairing", jsonBody(computerId === undefined ? {} : { computer_id: computerId })).then(
+    (r) => r.json() as Promise<NewPairing>,
+  );
+
+export const listPairings = () =>
+  getJSON<{ codes: PairingInfo[] }>("/pairing").then((r) => r.codes ?? []);
+
+export const cancelPairing = (id: number) => request(`/pairing/${id}`, { method: "DELETE" });
 
 export const createJob = (job: NewJob) =>
   request("/jobs", jsonBody(job)).then((r) => r.json() as Promise<{ job_id: number }>);

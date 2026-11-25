@@ -403,6 +403,20 @@ fn open_settings(section: Option<&str>) {
     }
 }
 
+/// macOS: a `printpapi://` link reached the icon. The window is a process of its own, and the link
+/// is its only argument, as on the other systems.
+#[cfg(target_os = "macos")]
+pub fn open_with_link(link: &str) {
+    if let Ok(exe) = std::env::current_exe() {
+        let _ = std::process::Command::new(exe)
+            .arg(link)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn();
+    }
+}
+
 /// Start the installed program as the icon, for the user of this icon. Not waited for.
 fn start_replacement() -> std::io::Result<()> {
     let cmd = crate::settings::tray_start_cmd(

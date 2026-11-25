@@ -1,7 +1,7 @@
 // printpapi — self-hosted PrintNode alternative. Elastic License 2.0 (see LICENSE).
 import test from "node:test";
 import assert from "node:assert/strict";
-import { DEFAULT_RAW_PORT, addNetworkPrinter, canLeavePrinters, canSwitchOn, canTest, connectMayHelp, errorText, fromFound, lastJobText, logLocation, keepsOldName, needsNewName, needsSumatra, patchFor, pathParts, returnsToConnect, statusWord, timeoutProblem, MODES, NEEDS_CONNECTED, UPDATE_URL_TEXT, autoLine, goBackNote, goBackPatch, installedIsNewer, isNewer, modePatch, modeStillOff, olderCardShown, ownIsNewer, updateAvailable, updateErrorText, updateLine } from "./model.ts";
+import { DEFAULT_RAW_PORT, addNetworkPrinter, startServer, canLeavePrinters, canSwitchOn, canTest, connectMayHelp, errorText, pairingFields, pairingResult, formEdited, formFromLink, formServer, sameOrigin, fromFound, lastJobText, logLocation, keepsOldName, needsNewName, needsSumatra, patchFor, pathParts, returnsToConnect, statusWord, timeoutProblem, MODES, NEEDS_CONNECTED, UPDATE_URL_TEXT, autoLine, goBackNote, goBackPatch, installedIsNewer, isNewer, modePatch, modeStillOff, olderCardShown, ownIsNewer, updateAvailable, updateErrorText, updateLine } from "./model.ts";
 import type { FoundPrinter, PrinterChoice, UpdateInfo } from "./api.ts";
 
 const choice = (over: Partial<PrinterChoice> = {}): PrinterChoice => ({
@@ -371,4 +371,164 @@ test("the failures of an update have their own sentences", () => {
   assert.equal(e("unreachable", "The update server could not be reached: refused"), "The update server could not be reached: refused");
   assert.equal(e("rolled_back", "Version 3.8.0 did not connect, so 3.7.0 was put back. It is running again."), "Version 3.8.0 did not connect, so 3.7.0 was put back. It is running again.");
   assert.equal(e("proxy"), errorText({ code: "proxy", message: "x" }));
+});
+
+// --- pairing ---------------------------------------------------------------------------------
+
+test("a link names its server and hides the address field, a bare code asks for it", () => {
+  assert.equal(pairingFields(null), null);
+  assert.deepEqual(pairingFields({ serverUrl: "https://print.example.com", code: "7K3M-Q2ZD-9XHT" }), {
+    code: "7K3M-Q2ZD-9XHT",
+    server: "https://print.example.com",
+    askServer: false,
+  });
+  assert.deepEqual(pairingFields({ serverUrl: null, code: "7K3M-Q2ZD-9XHT" }), {
+    code: "7K3M-Q2ZD-9XHT",
+    server: null,
+    askServer: true,
+  });
+});
+
+const paired = { name: "warehouse-pc", org: "Acme", createdBy: "boss@acme.example", createdByEscaped: false, replaces: false, pairId: 1, serverUrl: "https://print.example.com" };
+
+test("the server field starts from what the person typed or from the installed agent, never from a spent pairing", () => {
+  const typed = { serverUrl: "https://typed.example", paired: undefined };
+  const spent = { serverUrl: "https://evil.example", paired };
+  const installed = { serverUrl: "https://own.example" };
+  assert.equal(startServer(null, null), "");
+  assert.equal(startServer(null, installed), "https://own.example");
+  assert.equal(startServer(typed, installed), "https://typed.example");
+  // the connection a pairing made names the server of a link: it is not typed into any field again
+  assert.equal(startServer(spent, null), "");
+  assert.equal(startServer(spent, installed), "https://own.example");
+});
+
+test("an address that is not a plain e-mail address carries a warning the person reads before Continue", () => {
+  assert.equal(pairingResult(paired, null).createdByWarning, null);
+  const w = pairingResult({ ...paired, createdBy: "boss@\\u{430}cme.example", createdByEscaped: true }, null);
+  assert.equal(w.createdBy, "boss@\\u{430}cme.example");
+  assert.match(w.createdByWarning ?? "", /not a plain e-mail address/);
+  assert.match(w.createdByWarning ?? "", /address you expect/);
+});
+
+test("a new device is confirmed with account, creator and device, and warns about nothing on a fresh computer", () => {
+  assert.deepEqual(pairingResult(paired, null), {
+    account: "Acme",
+    createdBy: "boss@acme.example",
+    createdByWarning: null,
+    device: "warehouse-pc",
+    takeover: null,
+    leaving: null,
+  });
+});
+
+test("root's code has no creator: the server administrator is named", () => {
+  assert.equal(pairingResult({ ...paired, createdBy: null }, null).createdBy, "the server administrator");
+});
+
+test("a code that takes a device over says what stops printing", () => {
+  const r = pairingResult({ ...paired, replaces: true }, null);
+  assert.equal(
+    r.takeover,
+    "This takes over the device warehouse-pc. If it runs on another computer, that one stops printing when this one starts.",
+  );
+  assert.equal(r.leaving, null);
+});
+
+test("leaving the connection of an installed agent is a warning, a reconnect of this very device is not", () => {
+  const installed = { serverUrl: "https://print.example.com", name: "warehouse-pc" };
+  // another server
+  assert.equal(
+    pairingResult({ ...paired, serverUrl: "https://other.example.org" }, installed).leaving,
+    "This computer leaves https://print.example.com, device warehouse-pc. Its printers get new IDs, and the old device stays in that dashboard.",
+  );
+  // the same server but a new device
+  assert.notEqual(pairingResult(paired, installed).leaving, null);
+  // a reconnect of another device on the same server
+  assert.notEqual(pairingResult({ ...paired, name: "other", replaces: true }, installed).leaving, null);
+  // the installed name on the installed server, as a reconnect: nothing is left behind
+  const same = pairingResult({ ...paired, replaces: true, serverUrl: "HTTPS://Print.Example.com/" }, installed);
+  assert.equal(same.leaving, null);
+  assert.notEqual(same.takeover, null);
+  // the installed name but a code for a new device (no takeover): a new device is made
+  assert.notEqual(pairingResult(paired, installed).leaving, null);
+});
+
+test("a proxy that refuses a pairing from a computer with an agent points at the command line", () => {
+  const proxy = { code: "proxy", message: "A proxy refused." };
+  assert.equal(
+    errorText(proxy, { pairing: true, installed: true }),
+    "A proxy in front of the server refused this. Run printpapi-agent pair on this computer; it sends the headers of the installed agent.",
+  );
+  const byHand = "A proxy in front of the server refused this. Set up the agent by hand with [headers], see docs/agent.md.";
+  assert.equal(errorText(proxy), byHand);
+  assert.equal(errorText(proxy, { pairing: true }), byHand);
+  assert.equal(errorText(proxy, { installed: true }), byHand);
+  assert.equal(errorText({ code: "bad_code", message: "wrong" }, { pairing: true, installed: true }), "wrong");
+});
+
+test("an agent that is not running has no server and no name: nothing is claimed about them", () => {
+  // tray::load_status finds no status file after two minutes: server "" and name ""
+  const unknown = { serverUrl: "", name: "" };
+  const fresh = pairingResult(paired, unknown);
+  assert.equal(fresh.takeover, null);
+  assert.ok(fresh.leaving !== null);
+  assert.equal(
+    fresh.leaving,
+    "This computer leaves the connection it has now. Its printers get new IDs, and the old device stays in that dashboard.",
+  );
+  // a Reconnect of this very device: nothing is left behind and nothing false is said about it
+  const reconnect = pairingResult({ ...paired, replaces: true }, unknown);
+  assert.equal(reconnect.leaving, null);
+  assert.ok(reconnect.takeover !== null);
+  // half known is unknown: no blank where the name or the server should stand
+  for (const half of [
+    { serverUrl: "https://a.example", name: "" },
+    { serverUrl: "", name: "pc" },
+  ]) {
+    assert.equal(pairingResult(paired, half).leaving, fresh.leaving);
+  }
+});
+
+test("the same server is the same origin whatever the spelling", () => {
+  assert.equal(sameOrigin("https://print.example.com:443", "https://print.example.com"), true);
+  assert.equal(sameOrigin("http://print.example.com:80/", "http://PRINT.example.com"), true);
+  assert.equal(sameOrigin("https://print.example.com/sub/path", "https://print.example.com"), true);
+  assert.equal(sameOrigin("https://print.example.com", "http://print.example.com"), false);
+  assert.equal(sameOrigin("https://print.example.com:8443", "https://print.example.com"), false);
+  assert.equal(sameOrigin("https://print.example.com", "https://other.example.com"), false);
+  assert.equal(sameOrigin("", "https://print.example.com"), false);
+  assert.equal(sameOrigin("not a url", "not a url"), false);
+});
+
+test("an installed https://print.example.com:443 is not left when the code is for https://print.example.com", () => {
+  const installed = { serverUrl: "https://print.example.com:443", name: "warehouse-pc" };
+  assert.equal(pairingResult({ ...paired, replaces: true }, installed).leaving, null);
+});
+
+const link = { serverUrl: "https://evil.example", code: "AAAA-AAAA-AAAA" };
+const empty = { text: "", view: null, fromLink: false, typedServer: "" };
+
+test("a bare code typed after a hostile link does not inherit the link's server", () => {
+  const afterLink = formFromLink(empty, link);
+  assert.equal(formServer(afterLink), "https://evil.example");
+  assert.equal(afterLink.fromLink, true);
+  // the person replaces the code with their own: the address field is what it was, not the link's
+  const typed = formEdited(afterLink, "7K3M-Q2ZD-9XHT");
+  assert.equal(typed.fromLink, false);
+  assert.equal(typed.view, null, "nothing is sent for a text that has not been read");
+  assert.equal(formServer({ ...typed, view: { serverUrl: null, code: "7K3M-Q2ZD-9XHT" } }), "");
+  // an installed agent's address is what the field starts with, and it is still that
+  const installed = formFromLink({ ...empty, typedServer: "https://print.example.com" }, link);
+  assert.equal(
+    formServer({ ...formEdited(installed, "7K3M-Q2ZD-9XHT"), view: { serverUrl: null, code: "7K3M-Q2ZD-9XHT" } }),
+    "https://print.example.com",
+  );
+});
+
+test("a second link replaces the first with its own server", () => {
+  const first = formFromLink(empty, link);
+  const second = formFromLink(first, { serverUrl: "https://print.example.com", code: "BBBB-BBBB-BBBB" });
+  assert.equal(formServer(second), "https://print.example.com");
+  assert.equal(second.text, "BBBB-BBBB-BBBB");
 });

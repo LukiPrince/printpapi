@@ -749,6 +749,12 @@ fn bad_json() -> Resp {
     jerr(400, "bad json")
 }
 
+/// A reply that carries a secret or a log: no cache may keep it.
+fn no_store(mut r: Resp) -> Resp {
+    r.headers.push(("Cache-Control", "no-store".into()));
+    r
+}
+
 fn ok_true() -> Resp {
     Resp::json(200, &json!({ "ok": true }))
 }
@@ -1375,6 +1381,41 @@ impl Ctx<'_> {
                 Some(aid) => f(c, aid).map(Some),
             },
         )
+    }
+
+    /// `agent_for_job` for a result: besides the agent behind the key, the device that gave this
+    /// key up for another within `store::LATE_RESULT_S` may report a job it claimed before, and
+    /// only as done (`ok`): a late failure may just mean the old agent could no longer fetch the
+    /// payload, and the reaper should requeue the job. Gate and write run in one closure.
+    fn agent_for_result<T>(
+        &self,
+        job_id: i64,
+        ok: bool,
+        f: impl FnOnce(&rusqlite::Connection, i64) -> Result<T, StoreError>,
+    ) -> Result<Option<T>, StoreError> {
+        let key = self.presented_key();
+        if key.is_empty() {
+            return Ok(None);
+        }
+        self.db(|c| {
+            let aid = match store::authenticate_agent_for_job(c, key, job_id)? {
+                None if ok => store::late_result_agent(c, key, job_id, None)?,
+                found => found,
+            };
+            match aid {
+                None => Ok(None),
+                Some(aid) => f(c, aid).map(Some),
+            }
+        })
+    }
+
+    /// May the presented key still report as the key its device just gave up?
+    fn late_result_open(&self) -> Result<bool, StoreError> {
+        let key = self.presented_key();
+        if key.is_empty() {
+            return Ok(false);
+        }
+        self.db(|c| store::late_result_open(c, key, None))
     }
 
     // --- bodies ---------------------------------------------------------------------------------
@@ -2831,6 +2872,11 @@ impl Ctx<'_> {
                 let keys = self.db(|c| store::list_api_keys(c, p.org_id))?;
                 return Ok(Resp::json(200, &json!({ "keys": val(&keys) })));
             }
+            "/pairing" => {
+                let p = gate!(self.manager()?);
+                let codes = self.db(|c| store::list_pairings(c, p.org_id, None))?;
+                return Ok(no_store(Resp::json(200, &json!({ "codes": val(&codes) }))));
+            }
             "/users" => {
                 let p = gate!(self.manager()?);
                 let users = self.db(|c| store::list_users(c, p.org_id))?;
@@ -2885,9 +2931,20 @@ impl Ctx<'_> {
         }
         if t == "/agent/jobs" {
             // The real route is the async long-poll in `http`; this is its single non-waiting claim.
-            let Some(aid) = self.agent_id()? else {
+            let key = self.presented_key();
+            let polled = if key.is_empty() {
+                None
+            } else {
+                self.db(|c| store::authenticate_poll(c, key, None))?
+            };
+            let Some(polled) = polled else {
                 return Ok(unauthorized());
             };
+            let aid = polled.agent_id;
+            if polled.swapped {
+                // the old machine's waiting poll re-checks its key and ends with 401
+                self.s.waker.wake(aid);
+            }
             let want_uid = wants_job_uid(&self.req.headers);
             return Ok(match self.db(|c| store::claim_job(c, aid, None))? {
                 Some(mut job) => {
@@ -2947,6 +3004,7 @@ impl Ctx<'_> {
                 return self.create_user(org_id, &body);
             }
             "/apikeys" => return self.post_apikeys(),
+            "/pairing" => return self.post_pairing(),
             "/orgs" => {
                 gate!(self.admin());
                 let body = gate!(self.read_obj());
@@ -2960,6 +3018,7 @@ impl Ctx<'_> {
                 return Ok(Resp::json(200, &json!({ "id": id, "name": name })));
             }
             "/agent/register" => return self.agent_register(),
+            "/agent/pair" => return self.agent_pair(),
             "/agent/results" => return self.agent_results(),
             _ => {}
         }
@@ -2973,8 +3032,9 @@ impl Ctx<'_> {
             return self.create_user(oid, &body);
         }
         if let Some(jid) = id_of(t, "/agent/jobs/", "/result") {
-            // 401 before the body is read, as before
-            if self.agent_for_job(jid, |_, _| Ok(()))?.is_none() {
+            // 401 before the body is read, as before. The key a device gave up for another a few
+            // minutes ago may still report (below), so it gets as far as the body.
+            if self.agent_for_job(jid, |_, _| Ok(()))?.is_none() && !self.late_result_open()? {
                 return Ok(unauthorized());
             }
             let body = gate!(self.read_obj());
@@ -2984,7 +3044,7 @@ impl Ctx<'_> {
             // reset) is a 404 and stays untouched. Absent (or no string) = the id decides, as ever.
             let uid = str_field(&body, "job_uid");
             // the gate runs again with the write, in one closure (the key may have changed meanwhile)
-            let Some(finished) = self.agent_for_job(jid, |c, aid| {
+            let Some(finished) = self.agent_for_result(jid, ok, |c, aid| {
                 store::finish_job_checked(c, jid, aid, ok, error.as_deref(), uid)
             })?
             else {
@@ -3001,8 +3061,9 @@ impl Ctx<'_> {
     /// the agent keeps the result until the right is back. Every well-formed call is a 200 with
     /// the state of the job now, or null when this agent has no such job.
     fn agent_results(&self) -> R {
-        // 401 before the body is read, as on the neighbouring routes
-        if self.agent_id()?.is_none() {
+        // 401 before the body is read, as on the neighbouring routes (a key a device just gave up
+        // for another may report, see `agent_for_result`)
+        if self.agent_id()?.is_none() && !self.late_result_open()? {
             return Ok(unauthorized());
         }
         let body = gate!(self.read_obj());
@@ -3016,15 +3077,43 @@ impl Ctx<'_> {
         let error = sql_text(body.get("error"));
         // the key is checked again with the write, in one closure
         let key = self.presented_key();
-        let state = self.db(|c| match store::authenticate_agent(c, key)? {
-            None => Ok(None),
-            Some(aid) => {
-                store::finish_job_by_uid(c, job_id, uid, aid, ok, error.as_deref()).map(Some)
+        let state = self.db(|c| {
+            let aid = match store::authenticate_agent(c, key)? {
+                None if ok => store::late_result_agent(c, key, job_id, None)?,
+                found => found,
+            };
+            match aid {
+                None => Ok(None),
+                Some(aid) => {
+                    store::finish_job_by_uid(c, job_id, uid, aid, ok, error.as_deref()).map(Some)
+                }
             }
         })?;
         Ok(match state {
             None => unauthorized(),
             Some(state) => Resp::json(200, &json!({ "ok": true, "state": state })),
+        })
+    }
+
+    /// The org a new key or pairing code goes to: `org_id` of the body, else the caller's own, for
+    /// root the default org. A session may only name its own; an unknown org is refused. The id is
+    /// returned as the caller wrote it (a string "2" stays "2"), the DB gets the integer SQLite
+    /// would compare it as.
+    fn new_row_org(
+        &self,
+        p: &Principal,
+        body: &Obj,
+    ) -> Result<Result<(i64, Value), &'static str>, StoreError> {
+        let org_v = match body.get("org_id").filter(|v| truthy(v)) {
+            Some(v) => v.clone(),
+            None => json!(p.org_id.unwrap_or(store::DEFAULT_ORG)),
+        };
+        if p.org_id.is_some_and(|o| !py_eq_int(&org_v, o)) {
+            return Ok(Err("org_id not allowed"));
+        }
+        Ok(match as_sql_int(&org_v) {
+            Some(o) if self.db(|c| store::org_exists(c, o))? => Ok((o, org_v)),
+            _ => Err("unknown org"),
         })
     }
 
@@ -3049,18 +3138,9 @@ impl Ctx<'_> {
             Ok(Some(s)) => s,
             Ok(None) | Err(_) => return Ok(jerr(400, SCOPE_WORDS)),
         };
-        // The org id is echoed exactly as the caller wrote it (a string "2" stays "2"); the DB
-        // gets the integer SQLite would compare it as.
-        let org_v = match body.get("org_id").filter(|v| truthy(v)) {
-            Some(v) => v.clone(),
-            None => json!(p.org_id.unwrap_or(store::DEFAULT_ORG)),
-        };
-        if p.org_id.is_some_and(|o| !py_eq_int(&org_v, o)) {
-            return Ok(jerr(400, "org_id not allowed"));
-        }
-        let org_id = match as_sql_int(&org_v) {
-            Some(o) if self.db(|c| store::org_exists(c, o))? => o,
-            _ => return Ok(jerr(400, "unknown org")),
+        let (org_id, org_v) = match self.new_row_org(&p, &body)? {
+            Ok(o) => o,
+            Err(m) => return Ok(jerr(400, m)),
         };
         let key = auth::token_urlsafe(32);
         let kid = self.db(|c| store::add_api_key_scoped(c, &label, &key, org_id, scope))?;
@@ -3070,6 +3150,118 @@ impl Ctx<'_> {
             out["scope"] = json!(scope.as_str());
         }
         Ok(Resp::json(200, &out))
+    }
+
+    /// `POST /pairing` {computer_id?, org_id?}: a one-time code for a new device, or with
+    /// `computer_id` for Reconnect (the key fetched with it may take that device over at its first
+    /// poll). Root or a session, never a machine key (a leaked key must not issue itself a
+    /// successor). The code is shown once; only its hash is stored.
+    fn post_pairing(&self) -> R {
+        let p = gate!(self.manager()?);
+        let body = gate!(self.read_obj());
+        let device = match body.get("computer_id") {
+            None | Some(Value::Null) => None,
+            Some(Value::Number(n)) if n.as_i64().is_some() => n.as_i64(),
+            Some(_) => return Ok(jerr(400, "computer_id must be a number")),
+        };
+        let org_id = match (device, p.org_id) {
+            // root names a device: its org decides (an org_id beside it must agree)
+            (Some(d), None) => {
+                let Some(org) = self.db(|c| store::agent_org(c, d))? else {
+                    return Ok(not_found());
+                };
+                match body.get("org_id").filter(|v| truthy(v)) {
+                    Some(v) if !py_eq_int(v, org) => return Ok(not_found()),
+                    _ => org,
+                }
+            }
+            _ => match self.new_row_org(&p, &body)? {
+                Ok((o, _)) => o,
+                Err(m) => return Ok(jerr(400, m)),
+            },
+        };
+        let code = auth::new_pairing_code();
+        let made =
+            self.db(|c| store::create_pairing(c, org_id, device, p.email.as_deref(), &code, None))?;
+        let id = match made {
+            store::CreatePairing::Created { id, .. } => id,
+            store::CreatePairing::TooMany => {
+                return Ok(jerr(429, "too many open pairing codes"));
+            }
+            store::CreatePairing::UnknownDevice => return Ok(not_found()),
+            store::CreatePairing::Unshowable(why) => return Ok(jerr(400, why)),
+            store::CreatePairing::Cloudprnt => {
+                return Ok(jerr(
+                    400,
+                    "this printer connects by itself (CloudPRNT), there is nothing to pair",
+                ));
+            }
+        };
+        let Some(info) = self.db(|c| store::get_pairing(c, id, Some(org_id), None))? else {
+            return Ok(not_found());
+        };
+        // PUBLIC_URL or nothing: never what the request says about its own host
+        let public_url = &self.cfg().public_url;
+        Ok(no_store(Resp::json(
+            200,
+            &json!({
+                "id": info.id, "code": code, "expires_at": info.expires_at,
+                "server_url": (!public_url.is_empty()).then_some(public_url),
+                "computer_id": info.computer_id, "computer_name": info.computer_name,
+                "old_key": info.old_key,
+            }),
+        )))
+    }
+
+    /// `POST /agent/pair` {code, name}: spend a pairing code for a new agent-only key. No
+    /// credential (the code is one), throttled per client address in its own `pair:` namespace. A
+    /// malformed request costs no slot; a wrong code does; a taken name keeps its slot too, so a
+    /// valid code cannot be used to reset the counter. Never logged with its body.
+    fn agent_pair(&self) -> R {
+        let body = gate!(self.read_obj());
+        let slot = format!("pair:{}", signup_key(&self.req.peer_ip));
+        if !self.s.limiter.allow(&slot, None) {
+            return Ok(jerr(429, "too many pairing attempts, try again later"));
+        }
+        let Some(code) = str_field(&body, "code").and_then(auth::normalize_pairing_code) else {
+            return Ok(jerr(400, "code required"));
+        };
+        let name = str_field(&body, "name")
+            .map(|n| printnode::py_trim(n).to_string())
+            .filter(|n| !n.is_empty() && auth::name_text_ok(n, 200));
+        let Some(name) = name else {
+            return Ok(jerr(400, "name required"));
+        };
+        // register_cloudprnt finds a device by (org, name); no slot, the code stays unspent
+        if name.starts_with(cloudprnt::NAME_PREFIX) {
+            return Ok(jerr(
+                400,
+                "names starting with cloudprnt- are reserved for Star printers",
+            ));
+        }
+        if !self.s.limiter.try_take(&slot, None) {
+            return Ok(jerr(429, "too many pairing attempts, try again later"));
+        }
+        let key = auth::token_urlsafe(32);
+        let got = self.db(|c| store::redeem_pairing(c, &code, &name, &key, None))?;
+        Ok(match got {
+            store::Redeem::BadCode => jerr(401, "pairing code is wrong, expired or already used"),
+            store::Redeem::NameTaken => jerr(409, "a device with this name already exists"),
+            store::Redeem::Unshowable(why) => jerr(400, why),
+            store::Redeem::Paired {
+                name,
+                org,
+                created_by,
+                replaces,
+            } => {
+                self.s.limiter.succeed(&slot);
+                no_store(Resp::json(
+                    200,
+                    &json!({ "key": key, "name": name, "org": org,
+                             "created_by": created_by, "replaces": replaces }),
+                ))
+            }
+        })
     }
 
     /// `PUT /apikeys/{id}`: change the rights of an active key, so a machine that is already set up
@@ -3328,6 +3520,14 @@ impl Ctx<'_> {
         if let Some(key) = cloudprnt_route(self.req.path()) {
             return self.cloudprnt_confirm(key);
         }
+        if let Some(id) = id_of(t, "/pairing/", "") {
+            let p = gate!(self.manager()?);
+            return Ok(if self.db(|c| store::cancel_pairing(c, id, p.org_id))? {
+                ok_true()
+            } else {
+                not_found()
+            });
+        }
         if let Some(id) = id_of(t, "/apikeys/", "") {
             let p = gate!(self.manager()?);
             // The enrolled agent is read before the revoke (it needs an active key), so a repeated
@@ -3584,6 +3784,7 @@ pub fn reaper_pass(state: &AppState, timeout_s: f64, max_retries: i64) {
         }
         state.db.with(|c| store::purge_expired_sessions(c, None))?;
         state.db.with(|c| store::purge_expired_resets(c, None))?;
+        state.db.with(|c| store::purge_pairings(c, None))?;
         retention_pass(state, crate::now());
         Ok(())
     };

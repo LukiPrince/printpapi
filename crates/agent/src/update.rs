@@ -566,7 +566,13 @@ pub struct Lock(#[allow(dead_code)] std::fs::File);
 /// there is no lock file (an installation made before this release; the first install from this
 /// release on creates it). `install`, `uninstall`, `restart`, `unprotect-key` take it this way.
 pub fn lock_if_exists(env: &Env) -> Result<Option<Lock>, ApplyError> {
-    let path = lock_path(&env.layout);
+    lock_in_dir(&env.layout.dir, env.sleep)
+}
+
+/// `lock_if_exists` for the installation in `dir` (`printpapi-agent pair` runs from the install
+/// folder and has no `Env`).
+pub fn lock_in_dir(dir: &Path, sleep: &dyn Fn(u64)) -> Result<Option<Lock>, ApplyError> {
+    let path = dir.join(DIR_NAME).join(LOCK_NAME);
     match std::fs::symlink_metadata(&path) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(system("cannot look at the update lock", e)),
@@ -578,7 +584,7 @@ pub fn lock_if_exists(env: &Env) -> Result<Option<Lock>, ApplyError> {
         }
         Ok(_) => {}
     }
-    hold(env, &path).map(Some)
+    hold(sleep, &path).map(Some)
 }
 
 /// `lock_if_exists`, but the lock has to be there: an update of an installation without one asks
@@ -587,7 +593,7 @@ fn lock_required(env: &Env) -> Result<Lock, ApplyError> {
     lock_if_exists(env)?.ok_or_else(|| ApplyError::System(NO_LOCK.into()))
 }
 
-fn hold(env: &Env, path: &Path) -> Result<Lock, ApplyError> {
+fn hold(sleep: &dyn Fn(u64), path: &Path) -> Result<Lock, ApplyError> {
     use std::fs::TryLockError;
     let file = std::fs::OpenOptions::new()
         .read(true)
@@ -599,7 +605,7 @@ fn hold(env: &Env, path: &Path) -> Result<Lock, ApplyError> {
             Ok(()) => return Ok(Lock(file)),
             Err(TryLockError::WouldBlock) => {
                 if i + 1 < LOCK_TRIES {
-                    (env.sleep)(1);
+                    sleep(1);
                 }
             }
             Err(TryLockError::Error(e)) => return Err(system("cannot take the update lock", e)),

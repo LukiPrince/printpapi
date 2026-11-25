@@ -306,6 +306,99 @@ impl LoginLimiter {
     }
 }
 
+/// The alphabet of a pairing code: Crockford base32, no I, L, O or U, so a dictated code survives.
+const PAIRING_ALPHABET: &[u8; 32] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";
+
+/// A one-time pairing code, `XXXX-XXXX-XXXX`: 12 symbols of 5 random bits each (60 bits).
+pub fn new_pairing_code() -> String {
+    let raw = random_bytes(12);
+    let mut out = String::with_capacity(14);
+    for (i, b) in raw.iter().enumerate() {
+        if i > 0 && i % 4 == 0 {
+            out.push('-');
+        }
+        out.push(PAIRING_ALPHABET[usize::from(b & 31)] as char);
+    }
+    out
+}
+
+/// What a person typed, read as a pairing code: whitespace and dashes dropped, upper-cased, `O`
+/// read as `0` and `I`/`L` as `1` (Crockford's own rule). `Some` only for exactly 12 symbols of the
+/// alphabet; the dashless form is what gets hashed. The agent crate repeats these rules in
+/// `pair::parse` (the crates share no library): keep both in step.
+pub fn normalize_pairing_code(s: &str) -> Option<String> {
+    let mut out = String::with_capacity(12);
+    for c in s.chars() {
+        if c.is_ascii_whitespace() || c == '-' {
+            continue;
+        }
+        let c = match c.to_ascii_uppercase() {
+            'O' => '0',
+            'I' | 'L' => '1',
+            c => c,
+        };
+        if !c.is_ascii() || !PAIRING_ALPHABET.contains(&(c as u8)) || out.len() == 12 {
+            return None;
+        }
+        out.push(c);
+    }
+    (out.len() == 12).then_some(out)
+}
+
+/// Characters that show nothing or change the order of what is shown around them: soft hyphen,
+/// grapheme joiner, Arabic letter mark, Hangul fillers, variation selectors, zero-width and
+/// direction marks, bidi embeddings, isolates and overrides, invisible operators, the BOM,
+/// interlinear annotation and tag characters, and the spaces that only look like a space.
+fn is_hidden_format(c: char) -> bool {
+    // the Unicode Default_Ignorable_Code_Point set (UAX #44, DerivedCoreProperties.txt), the
+    // characters made to show nothing, plus the blank braille cell and every space that is not the
+    // plain one (a no-break or ideographic space reads like the plain one)
+    matches!(c,
+        '\u{ad}' | '\u{34f}' | '\u{61c}' | '\u{115f}'..='\u{1160}' | '\u{17b4}'..='\u{17b5}'
+        | '\u{180b}'..='\u{180f}' | '\u{200b}'..='\u{200f}' | '\u{202a}'..='\u{202e}'
+        | '\u{2060}'..='\u{206f}' | '\u{2800}' | '\u{3164}' | '\u{fe00}'..='\u{fe0f}'
+        | '\u{feff}' | '\u{ffa0}' | '\u{fff0}'..='\u{fffb}' | '\u{1bca0}'..='\u{1bca3}'
+        | '\u{1d173}'..='\u{1d17a}' | '\u{e0000}'..='\u{e0fff}')
+        || (c.is_whitespace() && c != ' ')
+}
+
+/// Whether `s` may be shown to a person as an account name, a device name or an e-mail address
+/// before they confirm a pairing: at most `max` characters, no control character and no hidden
+/// format character. `boss@acme.example` plus a zero-width space is another address that reads
+/// like the first. The agent crate repeats the rule in `pair::redeem` (the crates share no
+/// library): keep both in step.
+pub fn shown_text_ok(s: &str, max: usize) -> bool {
+    s.chars().count() <= max && !s.chars().any(|c| c.is_control() || is_hidden_format(c))
+}
+
+/// The format characters a name may keep although they show nothing by themselves: the emoji
+/// presentation selector, the joiners of joined emoji and of Persian and Indic scripts, and the
+/// no-break space. Phones add the first by themselves (`☕` becomes `☕\u{fe0f}`).
+fn is_benign_format(c: char) -> bool {
+    matches!(c, '\u{fe0f}' | '\u{200c}' | '\u{200d}' | '\u{a0}')
+}
+
+/// Whether `s` may stand for a device name: at most `max` characters, no control character and no
+/// hidden format character beyond the few a name can need (`is_benign_format`). Free text such as
+/// an account name is not refused but cleaned (`clean_name`). The agent crate repeats the rule in
+/// `pair::text_ok`: keep both in step.
+pub fn name_text_ok(s: &str, max: usize) -> bool {
+    s.chars().count() <= max
+        && !s
+            .chars()
+            .any(|c| c.is_control() || (is_hidden_format(c) && !is_benign_format(c)))
+}
+
+/// `s` without control and hidden format characters (but for the benign ones), cut to `max`
+/// characters. For what the confirmation of a pairing shows of free text the manager typed: an
+/// account whose name the account itself cannot change must still be connectable.
+pub fn clean_name(s: &str, max: usize) -> String {
+    s.chars()
+        .filter(|&c| !c.is_control() && (!is_hidden_format(c) || is_benign_format(c)))
+        .take(max)
+        .collect()
+}
+
 /// What an issued key may do. `Unknown` is a value this version does not know (a newer server
 /// wrote it): it allows nothing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
@@ -402,6 +495,130 @@ mod tests {
         Right::Agent,
         Right::CloudPrnt,
     ];
+
+    #[test]
+    fn shown_text_refuses_what_a_person_cannot_see_or_what_reorders_what_they_see() {
+        assert!(shown_text_ok("Acme GmbH", 200));
+        assert!(shown_text_ok("boss@acme.example", 200));
+        assert!(
+            shown_text_ok("Müller & Söhne", 200),
+            "ordinary non-ASCII text is fine"
+        );
+        assert!(shown_text_ok("", 200));
+        assert!(!shown_text_ok(&"a".repeat(201), 200));
+        for bad in [
+            "boss@acme.example\u{200b}",
+            "boss\u{200d}@acme.example",
+            "a\u{202e}b",
+            "a\u{2066}b",
+            "a\u{feff}",
+            "a\u{ad}b",
+            "a\u{61c}",
+            "a\u{e0041}",
+            "a\nb",
+            "a\u{85}b",
+            // other characters that show nothing: variation selectors, the grapheme joiner, the
+            // Hangul fillers, a blank braille cell, spaces that are not the plain one
+            "boss@acme.example\u{fe0f}",
+            "boss@acme.example\u{fe00}",
+            "boss@acme.example\u{34f}",
+            "boss@acme.example\u{115f}",
+            "boss@acme.example\u{3164}",
+            "boss@acme.example\u{ffa0}",
+            "boss@acme.example\u{2800}",
+            "boss@acme.example\u{a0}",
+            "boss@acme.example\u{3000}",
+            "boss@acme.example\u{17b4}",
+            "boss@acme.example\u{e0100}",
+        ] {
+            assert!(!shown_text_ok(bad, 200), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn a_name_may_hold_what_phones_and_scripts_put_in_it_but_not_what_reorders_the_text() {
+        // emoji presentation, joined emoji, Persian and Indic joiners, a no-break space
+        for good in [
+            "Café ☕\u{fe0f}",
+            "👨\u{200d}👩\u{200d}👧",
+            "می\u{200c}خواهم",
+            "Büro\u{a0}2",
+            "Acme GmbH",
+        ] {
+            assert!(name_text_ok(good, 200), "{good:?}");
+            assert_eq!(clean_name(good, 200), good, "{good:?}");
+        }
+        // a person cannot see these, or they reorder what stands around them
+        for bad in [
+            "a\u{202e}b",
+            "a\u{200b}",
+            "a\u{2066}b",
+            "a\nb",
+            "a\u{3000}b",
+            "a\u{feff}",
+        ] {
+            assert!(!name_text_ok(bad, 200), "{bad:?}");
+        }
+        assert!(!name_text_ok(&"a".repeat(201), 200));
+        // an account name is cleaned for the confirmation and never refused
+        assert_eq!(clean_name("Ac\u{202e}me\u{200b}\n GmbH", 200), "Acme GmbH");
+        assert_eq!(clean_name(&"é".repeat(300), 200).chars().count(), 200);
+        assert_eq!(clean_name("\u{200b}", 200), "");
+    }
+
+    #[test]
+    fn a_pairing_code_has_twelve_symbols_of_the_alphabet_in_three_groups() {
+        let codes: Vec<String> = (0..50).map(|_| new_pairing_code()).collect();
+        for c in &codes {
+            let groups: Vec<&str> = c.split('-').collect();
+            assert_eq!(groups.len(), 3, "{c}");
+            assert!(groups.iter().all(|g| g.len() == 4), "{c}");
+            assert!(
+                c.chars()
+                    .filter(|c| *c != '-')
+                    .all(|c| PAIRING_ALPHABET.contains(&(c as u8))),
+                "{c}"
+            );
+            // what the server hands out is what it accepts
+            assert_eq!(normalize_pairing_code(c).unwrap(), c.replace('-', ""));
+        }
+        assert_ne!(codes[0], codes[1]);
+    }
+
+    #[test]
+    fn normalize_reads_what_a_person_types() {
+        let want = Some("7K3MQ2ZD9XHT".to_string());
+        for typed in [
+            "7K3M-Q2ZD-9XHT",
+            "7k3m-q2zd-9xht",
+            "7k3m q2zd 9xht",
+            " 7K3MQ2ZD9XHT\n",
+            "7K3M-Q2ZD-9XHT-",
+        ] {
+            assert_eq!(normalize_pairing_code(typed), want, "{typed:?}");
+        }
+        // O is 0, I and L are 1
+        assert_eq!(
+            normalize_pairing_code("OIL0-OIL0-OIL0"),
+            Some("011001100110".to_string())
+        );
+    }
+
+    #[test]
+    fn normalize_refuses_wrong_length_foreign_symbols_and_non_ascii() {
+        for bad in [
+            "",
+            "7K3M-Q2ZD-9XH",
+            "7K3M-Q2ZD-9XHTT",
+            "7K3M-Q2ZD-9XHU",
+            "7K3M-Q2ZD-9XH!",
+            "7K3M-Q2ZD-9XH\u{FF37}",
+            "7K3M-Q2ZD-9XH\u{e9}",
+            "7K3M\0Q2ZD9XHT",
+        ] {
+            assert_eq!(normalize_pairing_code(bad), None, "{bad:?}");
+        }
+    }
 
     #[test]
     fn allows_matches_the_rights_table() {

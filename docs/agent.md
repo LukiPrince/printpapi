@@ -9,7 +9,9 @@ only** — nothing listens on the printer's machine, so NAT/firewalls are no pro
 The easiest way on Windows, macOS and Linux with a desktop: download `printpapi-setup-<platform>`
 (`.exe` or `.msi` on Windows, `.dmg` on macOS, `.deb`, `.rpm` or `.AppImage` on Linux) from the
 [latest release](https://github.com/LukiPrince/printpapi/releases/latest), open it and go through
-four steps (connect to the server with an agent key, pick the printers, test print, done).
+four steps (connect to the server with a pairing link or an agent key, pick the printers, test
+print, done). The way in is [a link or a code](#connect-with-a-link-or-a-code) from the dashboard:
+no key to copy.
 It writes `agent.ini`, installs the agent to `%ProgramFiles%\printpapi-agent\` (Windows) or
 `/opt/printpapi-agent/` (macOS, Linux) and starts it with the machine: a scheduled task
 `printpapi-agent` on Windows, a launchd daemon `com.printpapi.agent` on macOS, a systemd unit
@@ -18,6 +20,53 @@ the user are not the ones of a printpapi server on the same machine (`/opt/print
 `printpapi`, see the [migration guide](migration.md)), so the two do not touch each other. Open the
 setup again to change the printers or remove the agent; the removal deletes only what the setup
 installed, and the folder only when nothing else is in it.
+
+### Connect with a link or a code
+
+On the **Devices** page of your dashboard click **Connect device**. The dialog shows a link
+(`printpapi://pair?server=...&code=...`), the code with the address, and the command for a
+terminal. Paste the link (or the code) into the first step of the setup. The window says which
+server it connects to and does nothing until you click **Connect**; then it shows the account, the
+person who made the code and the device name, and asks a second time before the printers step.
+An address with a character outside printable ASCII is spelled out there (`boss@\u{430}cme.example`)
+with a warning, because such a character can look like another letter.
+Until that point nothing has changed on this computer or for any device. The key the server hands
+out is an *Agent only* key (see [Key rights](api.md#key-rights)); it stays inside the setup program
+and goes to the agent only through the private working folder, never through a command line, a log
+or the window.
+
+- **Reconnect** on a device section makes a code for that device. The new key takes over its name
+  and printer ids when the new agent starts, so a replacement PC or a re-install keeps the
+  integrations that use fixed printer ids. The old agent keeps working until then. A job the old
+  machine is printing at that moment is recorded when it finishes, for five minutes, so the new one
+  does not print it again ([details](api.md#pairing-a-device)). If the old key is not an
+  *Agent only* key, it keeps working for the API: the dashboard lists it with **Revoke old key**.
+- A code works once and for 30 minutes. A key that was fetched and never used is revoked after
+  24 hours; the Devices page shows a fetched key with **Revoke** (the server cannot say who
+  fetched it, only that and when). More than ten wrong codes from one address in 15 minutes block
+  that address for 15 minutes.
+- **Opening the link.** The setup registers `printpapi://` for all users: on Windows in
+  `HKLM\Software\Classes\printpapi`, on Linux with the application menu entry (`MimeType` and
+  `%u`; GNOME and KDE need the package `desktop-file-utils` for `update-desktop-database`), on
+  macOS in the app. The button **Open on this
+  computer** in the dashboard needs that and the browser asks first. This is best effort: if the
+  registration fails the install still works, and pasting the link into the window is the main
+  path. A link opens the window with its fields filled in and a warning that a link asked for it;
+  nothing is contacted before you click. **The code stands in the window's command line** while it
+  runs, because that is how Windows and Linux hand a link over: another user of the same machine
+  could read it and use it first. It works once, for 30 minutes, and gives an *Agent only* key that
+  the dashboard shows and can revoke. The agent key is never in a command line.
+- **Headers belong to their server.** `[headers]` in `agent.ini` can hold the secret of an access
+  proxy, so a new connection to **another server** (another scheme, host or port) removes the
+  installed headers unless the change names them, and the call to the new server goes out without
+  them. A pairing to the **same** server keeps them, and so do a typed address and key (the second way in),
+  as before. If a proxy in front of the server needs headers, use
+  [`printpapi-agent pair`](#pair-from-the-terminal): for the same server it sends the installed
+  headers, for another server it needs `--keep-headers`, which sends them to that server and keeps
+  them in `agent.ini`.
+- The window needs the whole server: besides `/agent/*` it reads `/health` and `/computers`. A
+  server that publishes only `/agent/*` fails the check in step 1, with the code still unspent. Use
+  [the terminal way](#pair-from-the-terminal) there.
 
 ### Tray icon and settings
 
@@ -43,10 +92,12 @@ for them once.
   silent. The agent still opens no port and takes no commands.
   The crash log of an agent the setup installed lives in the same folder, and so does the
   [print journal](#the-print-journal), `print-journal.jsonl`. A change made in the settings window keeps it.
-- A new key on the same server needs a new device name, because the server ties a name to its
-  key. The printers then get new ids and the old device stays in the dashboard; the window warns
-  before it does that. When the stored key cannot be read, the same key with the same name is
-  accepted ([When the key cannot be read](#when-the-key-cannot-be-read)).
+- Connection: another server creates the device there. **The same server:** create a code with
+  **Reconnect** on this device in the dashboard and enter it; the device keeps its name and its
+  printers. A new key typed by hand on the same server needs a new device name, because the server
+  ties a name to its key; the printers then get new ids, the old device stays in the dashboard, and
+  the window warns before it does that. When the stored key cannot be read, the pairing form is the
+  way back ([When the key cannot be read](#when-the-key-cannot-be-read)).
 - On Linux the icon needs the library `libayatana-appindicator3` (`libayatana-appindicator3.so.1`;
   `libappindicator3` works too). On Debian and Ubuntu it is the package `libayatana-appindicator3-1`
   ([packages.debian.org](https://packages.debian.org/sid/libs/libayatana-appindicator3-1)).
@@ -427,7 +478,82 @@ expire. A computer named `cloudprnt-...` (reserved for Star printers) can only b
 right set that is not Agent only. See [Key rights](api.md#key-rights).
 
 When exposing the server to agents outside your LAN, publishing only `/agent/*` (behind TLS) is
-still the smallest surface.
+still the smallest surface. `POST /agent/pair` is one of them, so [a pairing from the
+terminal](#pair-from-the-terminal) works through it; the setup window also needs `/health` and
+`/computers`.
+
+### Pair from the terminal
+
+For a machine without a screen, a Python agent or a locked-down Windows, the same code works
+without the window. `printpapi-agent pair` is part of the agent (an agent as new as the server;
+an older one just starts and ignores the word). Run it in the agent's folder, with administrator
+rights or `sudo` where that folder is not yours (the setup's install: `/opt/printpapi-agent`,
+`C:\Program Files\printpapi-agent`):
+
+```bash
+sudo ./printpapi-agent pair              # Linux, macOS
+```
+```powershell
+.\printpapi-agent.exe pair                # Windows, from an administrator prompt
+```
+
+```text
+usage: printpapi-agent pair [--server URL] [--name NAME] [--printers LIST] [--keep-headers] [--yes] [--insecure]
+```
+
+It asks for the code or link on the prompt (never as an argument: an argument stands in the process
+list and the shell history; a code or link on the command line is refused). It then shows the
+account, the person who made the code and the device, and asks `Continue? [y/N]`; `--yes` skips the
+question. A bare code uses `--server`, else the `server_url` of the existing `agent.ini`, else asks.
+`--name` is the device name (the existing one, else the computer's name); a Reconnect code ignores it.
+`--printers` writes the `printers` line (the grammar of [Printer syntax](#printer-syntax)). Plain
+`http` outside the private network needs `--insecure`.
+
+- **The file is prepared before the code is spent**: if the new `agent.ini` cannot be made (no
+  rights; the message then says to run it as administrator or with `sudo`), nothing is used up. If
+  `agent.ini` changes while the command waits for the code (the settings window saved something),
+  it stops before the code is spent and asks you to run it again, so that change is not overwritten. After the question the file is replaced in one step, keeping its
+  owner and rights (Windows: `ReplaceFileW`, which keeps the access list), comments, timeout and
+  printers. A failing replace or an answer of no leaves the old file as it was; the key then ends by
+  itself within 24 hours, or at once on the Keys page.
+- **Headers** are sent and kept only when the server is the one already in `agent.ini`; for another
+  server they are neither sent nor kept, and the command prints which it dropped. `--keep-headers`
+  overrides that.
+- It registers the key with **no printers** right away: that binds the key (or marks a Reconnect
+  takeover as pending) without touching a printer or the running agent. If that call fails the
+  command says so; then start the agent within 24 hours, or the unused key is revoked.
+- On an install made by the setup (the marker file is there) the key is stored sealed as setup does
+  ([Where the key is stored](#where-the-key-is-stored)), unless `seal_key = no`. An `agent.ini` that
+  is a link is refused. The command takes the update lock when the installation has one.
+- The output holds neither key nor code. The last line names the command that restarts the agent on
+  this system: `systemctl restart printpapi-agent`, `schtasks /end` and `/run`, or
+  `launchctl kickstart -k`. With no `printers` line it also names the printers found on this computer.
+
+Without the agent's help, with `curl` (Linux, macOS; the Python agent too):
+
+```bash
+umask 077
+curl -sS https://print.example.com/agent/pair -H 'Content-Type: application/json' -o pairing.json -d @- <<'EOF'
+{"code":"7K3M-Q2ZD-9XHT","name":"warehouse-pi"}
+EOF
+```
+
+and PowerShell (an administrator prompt; the file is readable for SYSTEM and Administrators only):
+
+```powershell
+$out = Join-Path $PWD 'pairing.json'
+New-Item $out -ItemType File | Out-Null
+icacls $out /inheritance:r /grant:r '*S-1-5-18:F' '*S-1-5-32-544:F'
+$body = @{ code = (Read-Host 'Pairing code'); name = 'warehouse-pc' } | ConvertTo-Json
+Invoke-RestMethod https://print.example.com/agent/pair -Method Post -UseBasicParsing `
+  -ContentType 'application/json; charset=utf-8' -Body $body -OutFile $out
+```
+
+`-OutFile` keeps the access list of the file that exists. Copy the `key` from `pairing.json` into the
+`api_key` line of `agent.ini`, delete `pairing.json`, and start the agent **within 24 hours**, or
+the key is revoked. For a Reconnect code the reply says `"replaces": true` and the name of the
+device; use that name in `agent.ini`: the server refuses that key under any other name. `Invoke-RestMethod` does not work in PowerShell's
+ConstrainedLanguage mode (WDAC): use the `pair` command or the Python agent's own machine.
 
 ### Where the key is stored
 
@@ -539,14 +665,18 @@ minute. So a short DPAPI failure heals by itself, and a key you put in by hand w
 minute without a restart. `status.json` says so with `key_unreadable`. An agent set up by hand
 ends at once with the text on its console.
 
-1. Settings, Connection: enter the server and the key again. The name, the server and the printers
-   are filled in from the status file; the timeout and the headers stay. The window lets you keep
-   the old name, because it is the same key.
+1. Create a code with **Reconnect** on this device in the dashboard, then Settings, Connection:
+   enter it. The device keeps its name and printer ids, the printers are filled in from the status
+   file and the timeout stays. Or enter the server and the key again: the window lets you keep the
+   old name, because it is the same key. A pairing to the same server keeps the headers, to another
+   server it removes them (see above); a typed address and key keep them.
 2. By hand: as an administrator add `api_key = ...` to `agent.ini`. This is the way for an agent
    with `[headers]` (an access proxy), because the window's connection check sends no headers. If
    the stored key keeps failing on that PC, add `seal_key = no` too, or the next change in
    Settings encrypts it again.
-3. If the key is lost, create a new key on the **Keys** page and use a new device name; the printers then get new ids.
+3. Only when a code is out of the question, create a new key on the **Keys** page and use a **new**
+   device name: the old device stays in the dashboard and the printers get new ids. Reconnect (1)
+   keeps both.
 
 ### Printer syntax
 

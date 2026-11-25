@@ -1861,6 +1861,44 @@ mod tests {
         ob.flush(net, "http://x", "k", log);
     }
 
+    /// A key that has a right to take its device over but has not yet (pairing, Reconnect) is
+    /// refused on `/agent/results`. The poll that makes it the device's key must still go out, or
+    /// a machine with a journal entry would never take over.
+    #[test]
+    fn a_refused_flush_does_not_stop_the_poll_that_takes_a_device_over() {
+        let net = Net::new(Some(claim_of(9, UID, 1)));
+        net.answer(|url, _| {
+            if url.ends_with("/agent/results") {
+                refuse(401)
+            } else {
+                healthy(url, &Value::Null)
+            }
+        });
+        let clock = at_zero();
+        let mut ob = pending_outbox(&clock, &[5]);
+        let (fns, printed) = printer(0);
+        let got = step(&net, &fns, &mut ob);
+        assert!(got.is_ok());
+        assert_eq!(
+            printed.get(),
+            1,
+            "the poll was made and the job it returned was printed"
+        );
+        assert!(
+            net.urls().iter().any(|u| u.ends_with("/agent/results")),
+            "the flush was tried first"
+        );
+        assert_eq!(
+            ob.journal()
+                .pending()
+                .iter()
+                .filter(|e| e.job_id == 5)
+                .count(),
+            1,
+            "the old entry waits"
+        );
+    }
+
     #[test]
     fn flush_never_uses_the_old_route_and_delivers_oldest_first() {
         let net = Net::new(None);

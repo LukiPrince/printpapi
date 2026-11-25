@@ -17,6 +17,7 @@ export function loadState(raw: string | null, now: number): DemoState {
     s.trimmed ??= { done: 0, failed: 0, cancelled: 0, since_seed: 0 }; // states stored before trimmed existed
     if (!Array.isArray(s.labels)) s.labels = seedLabels(now); // states stored before label templates existed
     s.receipt_profiles ??= {}; // states stored before receipts existed
+    s.pairings ??= []; // states stored before pairing existed
     (s.next as Record<string, unknown>).label ??= Math.max(0, ...(s.labels as { id: number }[]).map((l) => l.id)) + 1;
     return s as unknown as DemoState;
   } catch {

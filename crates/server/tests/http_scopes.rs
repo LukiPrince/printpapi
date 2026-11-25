@@ -301,6 +301,9 @@ fn every_client_route_follows_the_rights_table() {
         ("PUT", "/orgs/1"),
         ("GET", "/support-access"),
         ("GET", "/jobs/1/preview"),
+        ("GET", "/pairing"),
+        ("POST", "/pairing"),
+        ("DELETE", "/pairing/1"),
     ] {
         for (word, key) in &keys {
             let r = app
@@ -1082,6 +1085,40 @@ fn a_narrowed_key_without_an_agent_gains_nothing_for_a_claimed_job() {
             .status,
         401
     );
+}
+
+#[test]
+fn the_pair_route_ignores_a_key_that_rides_along() {
+    let app = App::new();
+    let keys = six_keys(&app);
+    let wrong = json!({"code": "7K3M-Q2ZD-9XHT", "name": "pc"});
+    let mut bodies = Vec::new();
+    for (word, key) in &keys {
+        let r = app
+            .call("POST", "/agent/pair")
+            .bearer(key)
+            .json(&wrong)
+            .send();
+        assert_eq!(r.status, 401, "{word}");
+        bodies.push(r.text());
+    }
+    let bare = app.call("POST", "/agent/pair").json(&wrong).send();
+    assert_eq!((bare.status, bare.text()), (401, bodies[0].clone()));
+    assert!(
+        bodies.iter().all(|b| *b == bodies[0]),
+        "no key changes the answer"
+    );
+    // a real code is spent by whoever brings it, whatever key they send
+    for (i, (word, key)) in keys.iter().enumerate() {
+        let (st, made) = app.post("/pairing", Some("t"), json!({}));
+        assert_eq!(st, 200);
+        let r = app
+            .call("POST", "/agent/pair")
+            .bearer(key)
+            .json(&json!({"code": made["code"], "name": format!("pc-{i}")}))
+            .send();
+        assert_eq!(r.status, 200, "{word}: {}", r.text());
+    }
 }
 
 // --- waking the long-poll of exactly one agent ---------------------------------------------------

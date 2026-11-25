@@ -147,6 +147,36 @@ def tray_registered():
     return TRAY_AUTOSTART.is_file()
 
 
+SCHEME_KEY = r"HKLM\Software\Classes\printpapi\shell\open\command"
+SCHEME_MIME = "x-scheme-handler/printpapi"
+
+
+def scheme_registered():
+    """Does a printpapi:// link open the tray program? Windows asks the registry. Linux reads the
+    menu entry's MimeType line and, where xdg-mime exists, asks it which entry handles the scheme.
+    macOS has the bundle's Info.plist and no command: nothing to ask, so nothing to check."""
+    if WIN:
+        q = subprocess.run([str(REG), "query", SCHEME_KEY, "/ve"], capture_output=True, text=True)
+        return q.returncode == 0 and "printpapi-tray.exe" in q.stdout and "%1" in q.stdout
+    if APP_ENTRY is None:
+        return True
+    if not APP_ENTRY.is_file():
+        return False
+    entry = APP_ENTRY.read_text(encoding="utf-8")
+    if f"MimeType={SCHEME_MIME};" not in entry or not re.search(r"(?m)^Exec=.* %u$", entry):
+        return False
+    # xdg-mime reads the database that update-desktop-database writes: ask it only where both exist
+    if shutil.which("xdg-mime") and shutil.which("update-desktop-database"):
+        return scheme_registered_default() == APP_ENTRY.name
+    return True
+
+
+def scheme_registered_default():
+    """The desktop file xdg-mime names for printpapi:// links, empty when none."""
+    q = subprocess.run(["xdg-mime", "query", "default", SCHEME_MIME], capture_output=True, text=True)
+    return q.stdout.strip()
+
+
 def check_status_file(secret_values):
     """The status file the tray icon reads: JSON, online, and without any secret."""
     text = STATUS_FILE.read_text(encoding="utf-8")
@@ -976,8 +1006,13 @@ def main():
 
         start_server()
 
-        key = call(base, token, "POST", "/apikeys", {"label": "setup smoke"})["key"]
         name = "smoke-" + secrets.token_hex(3)
+        # the key comes the way a person gets it: a one-time code, spent for an agent-only key
+        code = call(base, token, "POST", "/pairing", {})["code"]
+        paired = call(base, token, "POST", "/agent/pair", {"code": code, "name": name})
+        key = paired["key"]
+        if paired["name"] != name or paired["replaces"]:
+            raise Fail(f"pairing answered {sorted(paired)}")
         # the ini parser reads `%` as an interpolation, so a percent-escape in the URI needs %%
         target = archive.resolve().as_uri().replace("%", "%%")
         # a header value is a secret as well: it must not reach the status file
@@ -1000,6 +1035,8 @@ def main():
             raise Fail(f"install left no tray program {TRAY} or no tray autostart")
         if APP_ENTRY is not None and not APP_ENTRY.is_file():
             raise Fail(f"install left no {APP_ENTRY}")
+        if not scheme_registered():
+            raise Fail("install did not register the printpapi:// link handler")
         if not WIN:
             # the service runs the binary as root (macOS) or as a user that must not own it: a copy
             # that kept the starting user's ownership would let that user replace what root runs
@@ -1087,6 +1124,11 @@ def main():
             raise Fail(f"uninstall left {left}")
         if tray_registered():
             raise Fail("uninstall left the tray autostart")
+        if WIN and scheme_registered():
+            raise Fail("uninstall left the printpapi:// link handler")
+        if (LINUX and shutil.which("xdg-mime") and shutil.which("update-desktop-database")
+                and scheme_registered_default() == APP_ENTRY.name):
+            raise Fail("uninstall left the printpapi:// link handler")
         if schedule_exists():
             raise Fail("uninstall left the nightly update schedule")
         if WIN:

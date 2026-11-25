@@ -63,6 +63,11 @@ v1 is deliberately small (see [CONTRIBUTING.md](../CONTRIBUTING.md) for the YAGN
   with a prepared `agent.ini` per PC, the agent silently; an `.rpm` for Fedora and openSUSE; Windows on
   ARM64 for the agent, the server and the setup. See [agent.md](agent.md#managed-windows-install-msi).
 
+- ~~**Pairing**~~ ✅ a one-time code or link from the dashboard's Connect device button replaces the copied
+  key: the setup window, `printpapi-agent pair` and plain `curl` fetch an agent-only key; Reconnect gives a
+  device a new key and keeps its name and printer ids, and the old machine's last result is still
+  recorded. See [agent.md](agent.md#connect-with-a-link-or-a-code) and [api.md](api.md#pairing-a-device).
+
 ## v2 candidates
 
 Ranked by demand evidence from a broad research sweep (July 2026) across r/selfhosted, QZ Tray's

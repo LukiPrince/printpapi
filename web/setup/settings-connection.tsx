@@ -18,8 +18,8 @@ export function ConnectionSection({ status, onChange }: { status: AgentStatus | 
         <CardTitle>Connection</CardTitle>
         <CardDescription>
           {status?.keyUnreadable
-            ? "The key stored on this computer cannot be read. Enter the key this device already uses; its name and printers stay."
-            : "Another server: the device is created there under the same name. A new key on the same server needs a new device name."}
+            ? "The key stored on this computer cannot be read. Create a code with Reconnect on this device in your dashboard and enter it here: the device keeps its name and printers. Or enter the key this device already uses."
+            : "Another server: the device is created there. The same server: create a code with Reconnect on this device in the dashboard; it keeps its name and printers."}
         </CardDescription>
       </CardHeader>
       <CardContent className="space-y-3">
@@ -30,8 +30,9 @@ export function ConnectionSection({ status, onChange }: { status: AgentStatus | 
           <dd className="truncate">{status?.name || "—"}</dd>
         </dl>
         <p className="text-sm text-muted-foreground">
-          The printers carry over and are shown in the next steps. The timeout and the headers under
-          Advanced carry over, too; change them there if the new server needs other values.
+          The printers carry over and are shown in the next steps. The timeout carries over. Headers
+          under Advanced carry over with a typed address and key; a pairing link to another server
+          removes them, so that server never sees them.
         </p>
         <Actions>
           <Button type="button" variant="brand" onClick={onChange}>

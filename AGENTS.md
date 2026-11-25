@@ -67,6 +67,12 @@ cd web && npm run build:app     # after any web/ change; commit crates/server/we
 - `python tools/parity/parity.py --rust target/release/printpapi.exe` compares behaviour with the
   v2.5.1 Python server (it extracts that server from the `v2.5.1` tag).
 
+- **Pairing** (`pairing_codes`, docs/api.md "Pairing a device"): codes are stored hashed and work once;
+  `POST /agent/pair` is throttled in its own `pair:` slot and a taken name keeps the slot. A key that may take
+  a device over registers **without touching** it (key hash, `last_seen_at`, printer flags stay, new printers are
+  `pending`); the swap happens at the first poll, through `store::authenticate_poll`, and needs the agent right.
+  Keep the tests for a stolen or replayed code, a narrowed or revoked key, a job in flight and two devices with one name.
+
 ## Agent (`crates/agent`, `agent/`)
 
 - The platform-specific part. Windows: the spooler API directly, SumatraPDF for PDFs.
@@ -112,12 +118,19 @@ cd web && npm run build:app     # after any web/ change; commit crates/server/we
   of which at least one copy was handed over (`print_copies`); in any doubt (no identity, an unknown uid, a
   journal that cannot be read, an acknowledged failure) the agent **prints**: a duplicate is better
   than a label that is silently missing. Opening never rewrites the file; only compaction does.
+- **Pairing on the agent side.** `pair::parse` is the only parser of a `printpapi://` link and `pair::valid_server`
+  the only rule for an address a link or the window names; nobody parses a link twice. `printpapi-agent pair`
+  never takes the code as an argument. Installed `[headers]` belong to the origin they were set for:
+  `config::apply_patch` drops them for a connection to another origin unless the patch says `keep_headers`.
 - The agent writes `status.json` (never the key, never a header value) into the status folder
   (`status::status_dir_in`) only when the `.installed-by-setup` marker sits next to it. It is what
   the tray icon reads: it opens no port and takes no commands. Keep secrets out of it, and keep
   its test for that.
 
 ## Setup (`crates/setup`)
+
+- A key a pairing code made stays in `AppState::paired`, in Rust: never in the window, an argument, a log or
+  `result.json`. The window names the connection by address and `fill_paired` supplies the key.
 
 - Tauri v2 shell around the agent, **outside the workspace** (it needs WebView and system
   libraries, so `cargo test --workspace` never builds it). Test it from `crates/setup`. All logic

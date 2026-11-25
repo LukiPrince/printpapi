@@ -77,3 +77,17 @@ test("stored receipt profiles survive a reload", () => {
 test("the seed gives the receipt printer 58 mm paper", () => {
   assert.equal(seedState(now).receipt_profiles?.[4]?.paper_mm, 58);
 });
+
+test("a state stored before pairing existed gets an empty list of codes and keeps loading", () => {
+  const s = seedState(now) as unknown as Record<string, unknown> & { next: Record<string, unknown> };
+  delete s.pairings;
+  delete s.next.pairing;
+  const back = loadState(JSON.stringify(s), now + 99);
+  assert.deepEqual(back.pairings, []);
+  // and the numbers of the other counters are untouched
+  assert.equal(back.next.job, seedState(now).next.job);
+  // codes made before survive a reload
+  const made = seedState(now);
+  made.pairings = [{ id: 1, org_id: 1, computer_id: null, computer_name: null, created_at: now, expires_at: now + 1800, used_at: null, device_name: null, key_id: null, state: "open", old_key: null }];
+  assert.deepEqual(loadState(saveState(made), now + 5).pairings, made.pairings);
+});

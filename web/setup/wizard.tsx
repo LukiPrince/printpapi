@@ -2,7 +2,7 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import { setup, type Existing, type FoundPrinter, type Platform, type PrinterChoice } from "./api";
+import { setup, type Existing, type FoundPrinter, type PairingView, type Platform, type PrinterChoice } from "./api";
 import { Shell } from "./bits";
 import { StepConnect, type Connection } from "./step-connect";
 import { StepPrinters } from "./step-printers";
@@ -20,6 +20,7 @@ export function Wizard({
   platform,
   existing,
   replacing = null,
+  link = null,
   onDone,
   onCancel,
 }: {
@@ -28,16 +29,16 @@ export function Wizard({
   existing: Existing | null;
   /** Present when an installed agent gets another server or key: the four steps, from what is known. */
   replacing?: Existing | null;
+  /** A pairing link the window was opened with, for the first step. */
+  link?: PairingView | null;
   onDone: () => void;
   /** Leaves a change of an installed agent at its first step, with nothing changed. */
   onCancel?: () => void;
 }) {
   const steps = existing ? CHANGE_STEPS : NEW_STEPS;
   const [i, setI] = useState(0);
-  // the key is never known here: the person types the new one
-  const [connection, setConnection] = useState<Connection | null>(
-    replacing ? { serverUrl: replacing.serverUrl, apiKey: "", name: replacing.name } : null,
-  );
+  // the key is never known here: the person pairs again or types a new one (step 1 starts from `replacing`)
+  const [connection, setConnection] = useState<Connection | null>(null);
   const [selected, setSelected] = useState<PrinterChoice[]>((existing ?? replacing)?.printers ?? []);
   const [found, setFound] = useState<FoundPrinter[] | null>(null);
   const [sumatra, setSumatra] = useState(false);
@@ -45,6 +46,9 @@ export function Wizard({
   const [finished, setFinished] = useState(false);
   // why step 1 is shown again: the install found the key taken, revoked or the name another key's
   const [connectNotice, setConnectNotice] = useState<string | null>(null);
+  // The link this window was opened with, until its code is spent: coming back to step 1 after
+  // that must not put a spent code into the field again.
+  const [pendingLink, setPendingLink] = useState<PairingView | null>(link);
 
   // A machine without printers, or without lpstat, comes back as an empty list, not an error.
   useEffect(() => {
@@ -86,6 +90,8 @@ export function Wizard({
         <StepConnect
           initial={connection}
           replacing={replacing}
+          link={pendingLink}
+          onLinkUsed={() => setPendingLink(null)}
           notice={connectNotice}
           onCancel={replacing ? onCancel : undefined}
           onNext={(c) => {
@@ -124,6 +130,8 @@ export function Wizard({
               ? undefined
               : (message) => {
                   setConnectNotice(message ?? null);
+                  // a paired connection is dropped: the code is spent, the field asks for a new one
+                  setConnection((c) => (c && c.apiKey === null ? null : c));
                   setI(0);
                 }
           }

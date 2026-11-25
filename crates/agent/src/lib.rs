@@ -14,6 +14,7 @@ pub mod journal;
 pub mod keystore;
 pub mod log;
 pub mod marker;
+pub mod pair;
 pub mod print;
 pub mod proc;
 pub mod pyrepr;

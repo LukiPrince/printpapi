@@ -32,7 +32,7 @@ Environment variables:
 | `PRINT_PORT` | `3460` | Listen port |
 | `LOG_REQUESTS` | *(off)* | Set to log every HTTP request |
 | `PRINTAPI_SIGNUP` | `closed` | `open` lets anyone create an org via `POST /signup` — for a hosted deployment, not a private box. `PRINTAPI_SIGNUP`, `PRINTAPI_SIGNUP_QUOTA`, `PRINTAPI_JOB_RETENTION_DAYS` and `PRINTAPI_TERMS_VERSION` (with its links) are start values: while `PRINTAPI_OPERATOR_TOKEN` is set, the operator console can override them at runtime ([live settings](operator.md#live-settings)). With the token set, any value other than `open` (`closed`, `CLOSED`, `off`, a typo) locks signup shut and no override can open it; blank means unset |
-| `PUBLIC_URL` | *(unset)* | This server's own address, e.g. `https://print.example`. Only then does a password-reset mail carry a link (see [api.md](api.md#password-reset)) |
+| `PUBLIC_URL` | *(unset)* | This server's own address, e.g. `https://print.example`. Only then does a password-reset mail carry a link (see [api.md](api.md#password-reset)). It is also the address in a [pairing link](api.md#pairing-a-device) when the dashboard is opened under a local address (`localhost`); otherwise the link names the address the dashboard is opened under |
 | `SMTP_HOST` | *(unset)* | Mail server for password resets. Unset ⇒ the reset token is printed to stderr instead |
 | `SMTP_PORT` | `587` (`465` with `SMTP_SSL`) | |
 | `SMTP_USER` / `SMTP_PASSWORD` | *(unset)* | Omit for an anonymous relay |
@@ -173,8 +173,8 @@ curl -s -X POST localhost:3460/apikeys \
 ```
 
 The answer names the rights only when they are not `full`. Change them later on the same key.
-For an enrolled computer that is the only practical way: a new key means a new device name and new
-printer ids.
+For an enrolled computer that is how to narrow the key in place; a lost or replaced key is better
+handled with **Reconnect** (below), which keeps the device name and the printer ids.
 
 ```bash
 curl -s -X PUT localhost:3460/apikeys/2 \
@@ -187,6 +187,31 @@ longer submit gets `403`, and those orders do not appear in the history (Shopify
 the right is back or they expire, and the job it is printing at that moment can still be reported.
 The dashboard's Keys page does the same with its **Rights** button. Every route and answer is in
 [Key rights](api.md#key-rights).
+
+### Connect a device without copying a key
+
+The dashboard's **Devices** page has a **Connect device** button (root or an account login, never a
+machine key). It makes a one-time code and shows it as a link, a code and a terminal command; the
+[setup app](agent.md#connect-with-a-link-or-a-code) or `printpapi-agent pair` turns it into an
+*Agent only* key labelled `Device <name>` on the Keys page. The code works once and for 30
+minutes; a key that was fetched and never registered is revoked after 24 hours.
+
+- **Reconnect** (on a device) makes a code whose key takes that device over when the new agent
+  first polls: the name, computer id and printer ids stay. An *Agent only* old key is revoked at
+  that moment. **Any other old key stays active**, because it may serve an integration; the Devices
+  page lists it as "old key" with **Revoke old key**, and the dialog says so. After a theft revoke it.
+- The code is stored hashed. A stolen code gives one *Agent only* key (a stolen Reconnect code can
+  take over that one device); the page shows a key that was fetched, with **Revoke**. The server
+  cannot say by whom.
+- **Behind a reverse proxy** set `PRINTAPI_TRUSTED_PROXIES` (see [below](#behind-a-reverse-proxy)).
+  `POST /agent/pair` counts wrong codes per client address, ten in 15 minutes, in memory of the one
+  process, IPv6 per /64, and shares its table with signup and login (a name of its own, `pair:`).
+  Without the setting every client behind the proxy is one address: ten wrong codes from anybody block
+  pairing for everybody for 15 minutes. A key typed by hand still works.
+- The link names the address the dashboard is opened under, so publish the dashboard under the
+  address agents should use, or set `PUBLIC_URL`.
+- Going back to an older server version ignores the table; a registered but not swapped device is
+  simply not swapped.
 
 Add `org_id` to `POST /apikeys` to put the key (and any agent registering with it) in another org
 — see [Multi-tenancy](api.md#multi-tenancy). Without it, everything stays in the single default org,

@@ -98,7 +98,9 @@ Prefer to build it yourself? `docker build -t printpapi .`
 `printpapi-setup-<platform>` file for your system from the
 [latest release](https://github.com/LukiPrince/printpapi/releases/latest) (`.exe` or `.msi` on
 Windows, x64 or ARM64; `.dmg` on macOS; `.deb`, `.rpm` or `.AppImage` on Linux; an AppImage needs
-`chmod +x` first), open it and follow the four steps ([docs](docs/agent.md#setup-app)). The `.msi`
+`chmod +x` first), open it and follow the four steps ([docs](docs/agent.md#setup-app)); the dashboard's **Connect device** button
+(Devices page) makes the link or one-time code you paste in the first step, so no key is copied by
+hand ([docs](docs/agent.md#connect-with-a-link-or-a-code), also [from a terminal](docs/agent.md#pair-from-the-terminal)). The `.msi`
 can also install the agent silently on many PCs, one key and one file per PC
 ([docs](docs/agent.md#managed-windows-install-msi)); the `.rpm` is for Fedora and openSUSE with a
 desktop. The setup also installs a tray icon with a settings window

@@ -2,7 +2,7 @@
 // The dashboard's API, answered inside the browser. Pure: the caller owns the state and the clock,
 // and the browser glue (fetch patch, storage) lives in store.ts. Error texts are copied from
 // crates/server/src/server.rs so the dashboard shows what the real server says.
-import type { ApiKey, Computer, Job, LabelTemplate, Me, Org, OrgUser, Printer, ServerInfo } from "../lib/api";
+import type { ApiKey, Computer, Job, LabelTemplate, Me, Org, OrgUser, PairingInfo, Printer, ServerInfo } from "../lib/api";
 import { KEY_SCOPES, type KeyScope } from "../lib/key-scopes.ts";
 import { BASE_COUNTS } from "./seed.ts";
 import type { DemoState } from "./seed.ts";
@@ -198,6 +198,83 @@ function issueKey(c: Ctx): FakeResponse {
   if (scope && scope !== "full") key.scope = scope;
   c.s.keys.unshift(key);
   return ok({ id: key.id, label, org_id: 1, key: "pp_demo_" + hex32(), ...(key.scope ? { scope: key.scope } : {}) });
+}
+
+// --- pairing: the Devices page's Connect device. Nothing is ever spent in the demo: no machine
+// redeems a code, so a code stays open until it runs out or is cancelled.
+const PAIRING_ALPHABET = "0123456789ABCDEFGHJKMNPQRSTVWXYZ";
+const PAIRING_TTL = 1800;
+
+/** A code that looks like the server's, made from the clock and a counter (the demo has no secrets). */
+function demoCode(now: number, n: number): string {
+  let x = (Math.floor(now) * 2654435761 + n * 40503) >>> 0;
+  let out = "";
+  for (let i = 0; i < 12; i++) {
+    x = (Math.imul(x, 1664525) + 1013904223) >>> 0;
+    out += PAIRING_ALPHABET[(x >>> 27) & 31];
+    if (i % 4 === 3 && i < 11) out += "-";
+  }
+  return out;
+}
+
+function pairingsOf(s: DemoState): PairingInfo[] {
+  return (s.pairings ??= []);
+}
+
+function createPairing(c: Ctx): FakeResponse {
+  const b = obj(c.body);
+  const list = pairingsOf(c.s);
+  let device: { id: number; name: string } | null = null;
+  const id = b?.computer_id;
+  if (id !== undefined && id !== null) {
+    if (typeof id !== "number" || !Number.isInteger(id)) return err(400, "computer_id must be a number");
+    const a = c.s.agents.find((x) => x.id === id);
+    if (!a) return notFound();
+    device = { id: a.id, name: a.name };
+  }
+  // the server's limit: 20 unused codes
+  if (list.filter((p) => p.state === "open" && p.expires_at > c.now).length >= 20) return err(429, "too many open pairing codes");
+  if (device) {
+    // a newer code of a device replaces its unused ones
+    c.s.pairings = list.filter((p) => !(p.state === "open" && p.computer_id === device.id));
+  }
+  c.s.next.pairing ??= 1;
+  const row: PairingInfo = {
+    id: c.s.next.pairing++,
+    org_id: 1,
+    computer_id: device?.id ?? null,
+    computer_name: device?.name ?? null,
+    created_at: c.now,
+    expires_at: c.now + PAIRING_TTL,
+    used_at: null,
+    device_name: null,
+    key_id: null,
+    state: "open",
+    old_key: null,
+  };
+  pairingsOf(c.s).unshift(row);
+  return ok({
+    id: row.id,
+    code: demoCode(c.now, row.id),
+    expires_at: row.expires_at,
+    server_url: null,
+    computer_id: row.computer_id,
+    computer_name: row.computer_name,
+    old_key: null,
+  });
+}
+
+function listPairings(c: Ctx): FakeResponse {
+  const codes = pairingsOf(c.s).map((p) => (p.state === "open" && p.expires_at <= c.now ? { ...p, state: "expired" as const } : p));
+  return ok({ codes: codes.slice(0, 100) });
+}
+
+function cancelPairing(c: Ctx): FakeResponse {
+  const list = pairingsOf(c.s);
+  const i = list.findIndex((p) => p.id === c.id && p.state === "open");
+  if (i < 0) return notFound();
+  list.splice(i, 1);
+  return ok();
 }
 
 function setKeyScope(c: Ctx): FakeResponse {
@@ -455,6 +532,9 @@ const ROUTES: Route[] = [
   { method: "POST", re: /^\/apikeys$/, run: issueKey },
   { method: "PUT", re: /^\/apikeys\/\d+$/, run: setKeyScope },
   { method: "DELETE", re: /^\/apikeys\/\d+$/, run: revokeKey },
+  { method: "POST", re: /^\/pairing$/, run: createPairing },
+  { method: "GET", re: /^\/pairing$/, run: listPairings },
+  { method: "DELETE", re: /^\/pairing\/\d+$/, run: cancelPairing },
   { method: "GET", re: /^\/users$/, run: (c) => ok({ users: c.s.users }) },
   { method: "POST", re: /^\/users$/, run: createUser },
   { method: "DELETE", re: /^\/users\/\d+$/, run: deleteUser },
