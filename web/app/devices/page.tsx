@@ -6,7 +6,7 @@ import { AnimatePresence, motion } from "motion/react";
 import { toast } from "sonner";
 import { Check, FileText, Loader2, Printer, Receipt, Server, Zap } from "lucide-react";
 import { usePoll } from "@/hooks/use-poll";
-import { createJob, listComputers, listPrinters, type Printer as PrinterT } from "@/lib/api";
+import { createJob, getMe, listComputers, listPrinters, type Printer as PrinterT } from "@/lib/api";
 import { fmtAgo } from "@/lib/format";
 import { testJob } from "@/lib/testdoc";
 import { Card, CardContent } from "@/components/ui/card";
@@ -15,6 +15,7 @@ import { Badge } from "@/components/ui/badge";
 import { Skeleton } from "@/components/ui/skeleton";
 import { EmptyState, PulseDot } from "@/components/bits";
 import { ReceiptSettingsDialog } from "@/components/receipt/receipt-settings-dialog";
+import { ConnectDeviceButton, ConnectDeviceProvider, ReconnectButton } from "@/components/connect-device";
 
 type AgentGroup = {
   id: number;
@@ -24,7 +25,21 @@ type AgentGroup = {
   printers: PrinterT[];
 };
 
+/**
+ * The Connect device parts exist only for a login that may make codes (root or an account): the
+ * provider polls /pairing inside, and a machine key would be refused there.
+ */
 export default function DevicesPage() {
+  const { data: me } = usePoll(getMe, 0);
+  const content = <Devices />;
+  return me && (me.kind === "root" || me.kind === "session") ? (
+    <ConnectDeviceProvider>{content}</ConnectDeviceProvider>
+  ) : (
+    content
+  );
+}
+
+function Devices() {
   const { data: printers, loading, refresh } = usePoll(listPrinters, 5000);
   const { data: computers } = usePoll(listComputers, 5000);
 
@@ -73,9 +88,12 @@ export default function DevicesPage() {
           title="No agents have checked in"
           hint="Run the agent on the machine with the printers. It registers itself and its printers on the first poll — no inbound ports needed."
           action={
-            <Button asChild variant="brand" size="sm" className="mt-2">
-              <Link href="/downloads" prefetch={false}>Set up an agent</Link>
-            </Button>
+            <div className="mt-2 flex flex-wrap items-center justify-center gap-3">
+              <ConnectDeviceButton />
+              <Link href="/downloads" prefetch={false} className="text-sm text-brand underline-offset-4 hover:underline">
+                Set up an agent
+              </Link>
+            </div>
           }
         />
       </Card>
@@ -84,6 +102,9 @@ export default function DevicesPage() {
 
   return (
     <div className="space-y-6">
+      <div className="flex justify-end">
+        <ConnectDeviceButton />
+      </div>
       {agents.map((agent, gi) => (
         <motion.section
           key={agent.id}
@@ -103,6 +124,7 @@ export default function DevicesPage() {
               · {agent.printers.length}{" "}
               {agent.printers.length === 1 ? "printer" : "printers"}
             </span>
+            <ReconnectButton device={{ id: agent.id, name: agent.name }} />
           </div>
           {agent.printers.length === 0 ? (
             <Card>

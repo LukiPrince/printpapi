@@ -269,8 +269,15 @@ async fn long_poll(state: &Arc<AppState>, key: &str, want_uid: bool) -> Resp {
     }
     let key = key.to_string();
     let k = key.clone();
-    let aid = match poll_db(state, move |c| store::authenticate_agent(c, &k)).await {
-        Ok(Ok(Some(id))) => id,
+    // The first look also takes a device over for a registered reconnect key (pairing); the old
+    // machine's waiting poll is woken to find its key gone. The re-check in the loop stays plain.
+    let aid = match poll_db(state, move |c| store::authenticate_poll(c, &k, None)).await {
+        Ok(Ok(Some(polled))) => {
+            if polled.swapped {
+                state.waker.wake(polled.agent_id);
+            }
+            polled.agent_id
+        }
         Ok(Ok(None)) => return unauthorized(),
         Ok(Err(e)) => {
             eprintln!("agent auth error: {e}");

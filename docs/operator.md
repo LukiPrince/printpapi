@@ -158,7 +158,7 @@ The row above plus:
 | `usage_by_day` | every UTC day of the **current month** up to today: `{date, jobs, failed}`. Earlier months are not offered: with job retention they would be incomplete |
 | `users` | `id`, `email`, `created_at` |
 | `agents` | `id`, `name`, `last_seen_at`, `online` |
-| `printers` | `id`, `name`, `can_pdf`, `state`, `agent_id` |
+| `printers` | `id`, `name`, `can_pdf`, `state` (`active`, or `pending` for a printer that a Reconnect key declared and whose takeover has not happened yet), `agent_id` |
 | `keys` | `id`, `label`, `active`, `created_at`, `scope` (always there, `full` included): the key itself is never shown |
 | `terms` | the acceptance history, oldest first: `version`, `accepted_at` |
 | `lock` | `null`, or `{reason, locked_at}` while the org is locked |
@@ -252,7 +252,7 @@ token again and they hold again.
 `{reason, confirm}`: `confirm` must equal the org's **current name** exactly, otherwise `400`. The
 default org is never removed (`400`). The org's jobs, printers, agents, keys, accounts, label
 templates, receipt profiles and the copies of receipt documents (database triggers remove those
-with the printers and jobs), terms history and its `org_locks` row go with it; the audit rows stay. The WAL is
+with the printers and jobs), terms history, its pairing codes and its `org_locks` row go with it; the audit rows stay. The WAL is
 truncated after the commit, so removed payloads do not linger in the `-wal` file.
 
 ### `POST /operator/orgs`

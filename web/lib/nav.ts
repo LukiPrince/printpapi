@@ -36,7 +36,7 @@ export const NAV: NavItem[] = [
     label: "Devices",
     eyebrow: "Agents & printers",
     icon: Printer,
-    help: "Every agent from /computers with its printers. Online means the agent polled within the last minute; an offline one shows when it was last seen. Test print sends a sample label or PDF, whichever the printer can handle. The receipt settings button sets paper width, text mode and cutter for a receipt printer.",
+    help: "Every agent from /computers with its printers. Online means the agent polled within the last minute; an offline one shows when it was last seen. Test print sends a sample label or PDF, whichever the printer can handle. The receipt settings button sets paper width, text mode and cutter for a receipt printer. Connect device makes a one-time code or link for a new computer; Reconnect does the same for a device that gets a new key and keeps its name and printers.",
   },
   {
     href: "/history",

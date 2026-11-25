@@ -83,6 +83,51 @@ fn split_scheme(url: &str) -> Option<(bool, &str)> {
     }
 }
 
+/// Whether two server addresses are the same origin: scheme, lower-cased host and port (the
+/// scheme's default when none is written) equal, the path ignored. What cannot be read is not the
+/// same as anything, itself included.
+pub fn same_origin(a: &str, b: &str) -> bool {
+    match (origin_of(a), origin_of(b)) {
+        (Some(a), Some(b)) => a == b,
+        _ => false,
+    }
+}
+
+fn origin_of(url: &str) -> Option<(bool, String, u16)> {
+    let (https, rest) = split_scheme(url.trim())?;
+    let auth = rest.split(['/', '?', '#']).next().unwrap_or("");
+    let auth = auth.rsplit('@').next().unwrap_or(auth);
+    let host = host_of(rest).to_lowercase();
+    if host.is_empty() {
+        return None;
+    }
+    // what follows the host (and the closing bracket of an IPv6 literal) is `:port` or nothing
+    let after_host = if auth.starts_with('[') {
+        auth.split_once(']').map_or("", |(_, r)| r)
+    } else {
+        auth.strip_prefix(host_of(rest)).unwrap_or("")
+    };
+    let port = match after_host.strip_prefix(':') {
+        None if after_host.is_empty() => {
+            if https {
+                443
+            } else {
+                80
+            }
+        }
+        Some("") => {
+            if https {
+                443
+            } else {
+                80
+            }
+        }
+        Some(p) if p.bytes().all(|b| b.is_ascii_digit()) => p.parse().ok()?,
+        _ => return None,
+    };
+    Some((https, host, port))
+}
+
 /// The host of `authority/path`: userinfo, port and IPv6 brackets removed.
 fn host_of(rest: &str) -> &str {
     let auth = rest.split(['/', '?', '#']).next().unwrap_or("");
@@ -113,7 +158,7 @@ pub fn needs_insecure_confirm(url: &str) -> bool {
 /// The failure in words a person can act on. The raw text of the TLS stack or of the JSON parser
 /// (`invalid peer certificate: UnknownIssuer`, `expected value at line 1 column 1`) says nothing
 /// to them. Anything else (`server returned 502`, `connection failed: ...`) is readable as it is.
-fn explain(e: &HttpError) -> String {
+pub(crate) fn explain(e: &HttpError) -> String {
     match e {
         HttpError::Os(m) if m.contains("certificate") => {
             "the server's certificate is not trusted (self-signed, expired or for another name)."
@@ -186,6 +231,40 @@ pub fn agent_seen_after(
         .find(|c| c["name"].as_str() == Some(name))
         .and_then(|c| c["last_seen_at"].as_f64())
         .is_some_and(|seen| seen > baseline))
+}
+
+/// The window's check before a pairing code is spent: can this server be reached the way the setup
+/// needs it? `GET /health` must answer, and `GET /computers` without a key must answer **401** (the
+/// install reads it right after registering). A server that publishes only `/agent/*`, or a login
+/// proxy in front of the rest, shows up here with the code still unspent.
+pub fn reach(http: &dyn Http, base: &str) -> Result<(), crate::pair::PairError> {
+    use crate::pair::PairError;
+    http.get(&format!("{base}/health"), "")
+        .map_err(|e| match http_status(&e) {
+            Some(401 | 403) => PairError::Proxy,
+            _ if matches!(e, HttpError::Value(_)) => PairError::BadReply,
+            _ => PairError::Unreachable(explain(&e)),
+        })?;
+    match http.get(&format!("{base}/computers"), "") {
+        Err(e) if http_status(&e) == Some(401) => Ok(()),
+        Err(e) if http_status(&e) == Some(403) => Err(PairError::Proxy),
+        _ => Err(PairError::Unreachable(
+            "only a part of this server can be reached from here".into(),
+        )),
+    }
+}
+
+/// What the window does with a link or a code: `reach` first, then `pair::redeem`. One function,
+/// so that the order (the code is spent last) is something a test holds and not two lines a
+/// caller could swap.
+pub fn pair_checked(
+    http: &dyn Http,
+    base: &str,
+    code: &str,
+    name: &str,
+) -> Result<crate::pair::Paired, crate::pair::PairError> {
+    reach(http, base)?;
+    crate::pair::redeem(http, base, code, name)
 }
 
 /// One copy of the built-in test page: a PDF only to a printer marked `|pdf`, else the ZPL label.
@@ -695,6 +774,140 @@ mod tests {
         assert_eq!(
             device_name_from(src(vec![("HOSTNAME", "env-name"), proc])),
             "env-name"
+        );
+    }
+}
+
+#[cfg(test)]
+mod pairing_tests {
+    use super::*;
+    use crate::pair::PairError;
+    use serde_json::Value;
+    use std::collections::HashMap;
+
+    #[test]
+    fn same_origin_ignores_case_default_ports_and_the_path() {
+        for (a, b) in [
+            ("https://Print.Example.com", "https://print.example.com/"),
+            ("https://print.example.com:443", "https://print.example.com"),
+            (
+                "http://print.example.com:80/sub",
+                "HTTP://print.example.com",
+            ),
+            ("http://192.168.1.5:3460/x", "http://192.168.1.5:3460"),
+            ("https://[::1]:8443", "https://[::1]:8443/a"),
+            ("https://print.example.com?x=1", "https://print.example.com"),
+        ] {
+            assert!(same_origin(a, b), "{a} {b}");
+        }
+    }
+
+    #[test]
+    fn same_origin_tells_scheme_host_and_port_apart_and_never_trusts_what_it_cannot_read() {
+        for (a, b) in [
+            ("https://a.example", "http://a.example"),
+            ("https://a.example", "https://b.example"),
+            ("https://a.example", "https://a.example:8443"),
+            ("https://a.example", "https://a.example.evil.example"),
+            ("http://[::1]:3460", "http://[::1]:3461"),
+            ("https://a.example:443x", "https://a.example"),
+            ("https://a.example", "https://a.example:99999999999"),
+        ] {
+            assert!(!same_origin(a, b), "{a} {b}");
+        }
+        for unreadable in [
+            "",
+            "not a url",
+            "ftp://a.example",
+            "https://",
+            "a.example",
+            "https://:443",
+        ] {
+            assert!(!same_origin(unreadable, unreadable), "{unreadable}");
+            assert!(
+                !same_origin(unreadable, "https://a.example"),
+                "{unreadable}"
+            );
+        }
+    }
+
+    type Reply = Result<Option<Value>, HttpError>;
+
+    /// `/health` and `/computers` with canned replies.
+    struct Canned(HashMap<&'static str, Reply>);
+
+    impl Http for Canned {
+        fn get(&self, url: &str, key: &str) -> Reply {
+            assert_eq!(key, "", "no credential");
+            let path = url.trim_start_matches("https://x.example");
+            self.0
+                .get(path)
+                .cloned()
+                .unwrap_or(Err(HttpError::Os("server returned 404".into())))
+        }
+        fn get_bytes(&self, _: &str, _: &str) -> Result<Option<Vec<u8>>, HttpError> {
+            unreachable!()
+        }
+        fn post(&self, _: &str, _: &str, _: &Value) -> Reply {
+            unreachable!()
+        }
+    }
+
+    fn status(n: u16) -> Reply {
+        Err(HttpError::Os(format!("server returned {n}")))
+    }
+
+    fn reach_with(health: Reply, computers: Reply) -> Result<(), PairError> {
+        let c = Canned(HashMap::from([
+            ("/health", health),
+            ("/computers", computers),
+        ]));
+        reach(&c, "https://x.example")
+    }
+
+    #[test]
+    fn reach_passes_on_a_401_for_computers() {
+        assert_eq!(
+            reach_with(Ok(Some(serde_json::json!({"ok": true}))), status(401)),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn reach_names_what_stands_in_the_way() {
+        let ok = || Ok(Some(serde_json::json!({"ok": true})));
+        // a server that publishes only /agent/*
+        let part =
+            PairError::Unreachable("only a part of this server can be reached from here".into());
+        assert_eq!(reach_with(ok(), status(404)), Err(part.clone()));
+        assert_eq!(reach_with(ok(), status(502)), Err(part.clone()));
+        assert_eq!(
+            reach_with(ok(), Ok(Some(serde_json::json!({"computers": []})))),
+            Err(part.clone())
+        );
+        assert_eq!(
+            reach_with(ok(), Err(HttpError::Value("html".into()))),
+            Err(part)
+        );
+        // a proxy that asks for a login, or refuses
+        assert_eq!(reach_with(ok(), status(403)), Err(PairError::Proxy));
+        assert_eq!(reach_with(status(403), status(401)), Err(PairError::Proxy));
+        assert_eq!(reach_with(status(401), status(401)), Err(PairError::Proxy));
+        // not a printpapi server, or not there
+        assert_eq!(
+            reach_with(Err(HttpError::Value("<html>".into())), status(401)),
+            Err(PairError::BadReply)
+        );
+        assert_eq!(
+            reach_with(
+                Err(HttpError::Os("connection failed: refused".into())),
+                status(401)
+            ),
+            Err(PairError::Unreachable("connection failed: refused".into()))
+        );
+        assert_eq!(
+            reach_with(status(404), status(401)),
+            Err(PairError::Unreachable("server returned 404".into()))
         );
     }
 }

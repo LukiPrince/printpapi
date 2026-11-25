@@ -56,6 +56,10 @@ Token comparison is constant-time (`hmac.compare_digest`).
 | `GET /plans` | client (`Look`) | The [billing](billing.md) plan catalogue + the caller's current plan |
 | `POST /billing/webhook` | HMAC | The payment provider's callback: this org is on that plan now |
 | `POST /apikeys` | manage | Issue a client key, optionally with a `scope` → `{id, label, org_id, key}` (+ `scope` unless `full`; key shown once) |
+| `POST /pairing` | manage | Make a one-time [pairing code](#pairing-a-device): `{computer_id?, org_id?}` → `{id, code, expires_at, server_url, computer_id, computer_name, old_key}` (code shown once) |
+| `GET /pairing` | manage | The pairing codes of the caller's org (root: all), newest first, with their `state` (never the code) |
+| `DELETE /pairing/{id}` | manage | Cancel an unused code |
+| `POST /agent/pair` | the code, throttled | Spend a code for an agent-only key: `{code, name}` → `{key, name, org, created_by, replaces}` |
 | `GET /support-access` | manage | The [support access](#support-access) grants of the caller's org (root: `?org=`) |
 | `GET /apikeys` | manage | List keys with their org and, unless `full`, their `scope` (never the secret) |
 | `PUT /apikeys/{id}` | manage | Change a key's rights: `{"scope": "agent"}` → `{ok, scope}` |
@@ -63,7 +67,7 @@ Token comparison is constant-time (`hmac.compare_digest`).
 | `POST /agent/register` | agent (`Agent`) | Declare name + printers → `{computer_id, printer_ids}` |
 | `GET /agent/jobs` | agent | Long-poll for a job (204 on timeout); with the request header `X-Printapi-Features: job-uid` the answer also has `job_uid` |
 | `GET /agent/jobs/{id}/payload` | agent | Download the job's bytes |
-| `POST /agent/jobs/{id}/result` | agent | Report `{ok, error?, job_uid?}` |
+| `POST /agent/jobs/{id}/result` | agent | Report `{ok, error?, job_uid?}`; for five minutes after a [takeover](#pairing-a-device) also from the key that was given up, for `ok: true` of a job it had claimed |
 | `POST /agent/results` | agent (strict) | A result delivered late, by job id and `job_uid` → `{ok, state}` ([Job lifecycle](#job-lifecycle)) |
 | `POST\|GET\|DELETE /cloudprnt/{key}` | client key (`CloudPrnt`) | [Star CloudPRNT](cloudprnt.md): the printer polls, downloads and confirms here itself |
 
@@ -80,7 +84,7 @@ Every issued key has one **scope**: `full` (the default, and what every key issu
 existed is), `agent`, `cloudprnt`, `print` or `read`. The scope narrows what a **machine key** may
 call. It does not touch the bootstrap token, browser sessions or agent keys that were never issued
 (self-chosen v2 keys). Managing keys, users, the org and the support log (`/apikeys`, `/users`,
-`/orgs`, `/support-access`, including `event_url` and `shopify_secret`) stays with root and sessions:
+`/orgs`, `/support-access`, `/pairing`, including `event_url` and `shopify_secret`) stays with root and sessions:
 every key, a full one included, still gets `401` there. So does `GET /jobs/{id}/preview`, the
 picture of a receipt job.
 
@@ -155,7 +159,8 @@ What a key without the right gets:
 | CloudPRNT | `401` | `403`, and nothing is enrolled |
 | `POST /agent/register` | `401` | `401` with a message naming the rights needed |
 | other `/agent/*` | `401` | `401` |
-| `/apikeys`, `/users`, `/orgs`, `/support-access`, `/jobs/{id}/preview` | `401` | `401` (no key may) |
+| `/apikeys`, `/users`, `/orgs`, `/support-access`, `/pairing`, `/jobs/{id}/preview` | `401` | `401` (no key may) |
+| `POST /agent/pair` | no key is read; a wrong code is `401` | no key is read |
 
 On the Bearer routes and on PrintNode `POST /printjobs` the right is checked before the body is
 parsed: a refused key with a broken JSON body gets `403`. CloudPRNT and `POST /agent/register`
@@ -364,7 +369,7 @@ Rules:
   already holds (machines enrolled under v2 keep working), and except with
   `PRINTAPI_OPEN_ENROLLMENT=1`, which restores the v2 rule (any key enrolls into org `1`). Agent
   names are unique *per org*, not globally; an agent key is still bound to its name on first
-  contact. Revoking an issued key also stops the agent that enrolled with it. A key whose rights
+  contact (one exception: a key fetched with a Reconnect [pairing code](#pairing-a-device) may take over the device it was made for). Revoking an issued key also stops the agent that enrolled with it. A key whose rights
   lack `Agent` (`print`, `read`, `cloudprnt`) is `401` here, with a message saying which rights are
   needed, also with open enrollment on; an `agent` key cannot take a name that starts with
   `cloudprnt-` (see [Key rights](#key-rights)).
@@ -376,6 +381,145 @@ before, and every issued key resolves to org `1`.
 Deliberately out of scope for now (`# ponytail:` in the code): billing, quotas, and org deletion.
 A *full* key that an agent holds doubles as its org's client key; issue an `agent` key per machine
 to keep a lost machine's blast radius to that machine.
+
+## Pairing a device
+
+A one-time code lets a computer fetch its own agent key, so nobody has to copy a key by hand. The
+dashboard's **Connect device** button makes the code and shows it as a link
+(`printpapi://pair?server=…&code=…`), as a code and as a command for the terminal; the
+[setup app](agent.md#setup-app) and `printpapi-agent pair` take it from there. This section is the
+protocol behind them, for anybody who wants to do it with `curl`
+([agent.md](agent.md#pair-from-the-terminal)).
+
+```bash
+# a manager (root or a session) makes a code; shown once
+curl -s -X POST localhost:3460/pairing -H 'Authorization: Bearer sess_…' -d '{}'
+# -> {"id":1,"code":"7K3M-Q2ZD-9XHT","expires_at":1790000000.0,"server_url":"https://print.example.com",
+#     "computer_id":null,"computer_name":null,"old_key":null}
+
+# the computer spends it: no credential, the code is the credential
+curl -s -X POST localhost:3460/agent/pair -d '{"code":"7K3M-Q2ZD-9XHT","name":"warehouse-pc"}'
+# -> {"key":"…","name":"warehouse-pc","org":"Acme","created_by":"boss@acme.example","replaces":false}
+```
+
+- **Who makes a code.** Root or a browser session (the `manage` gate), never a machine key: a leaked
+  key must not issue itself a successor. `org_id` works as on `POST /apikeys`: a session names its own
+  org or none (`400 org_id not allowed`), root defaults to org 1 (`400 unknown org`). The answer is
+  `Cache-Control: no-store`. `server_url` is `PUBLIC_URL` or `null`, never taken from the `Host` header.
+  At most 20 unused codes per org (`429 too many open pairing codes`).
+- **The code.** 12 symbols of `0123456789ABCDEFGHJKMNPQRSTVWXYZ` (60 bits), written `XXXX-XXXX-XXXX`.
+  Typing it reads case, spaces and dashes loosely, `O` as `0` and `I`/`L` as `1`. Only the sha256
+  of the code is stored, as with every credential. Because 60 bits can be tried on a GPU in days
+  against a copied database, the protection is that a code works **once and for 30 minutes**, not
+  the hash alone. It dies on use, on `DELETE /pairing/{id}` and on a newer code for the same device.
+- **The key.** `POST /agent/pair` makes a new key with the rights `agent` (see [Key rights](#key-rights)),
+  labelled `Device <name>`, in the org of the code. The key can register, poll and report, and read
+  `GET /computers` like any agent key, and nothing else. It shows on the Keys page and can be revoked
+  there. The reply also says the account (`org`) and who made the code (`created_by`, `null` for root),
+  so the person at the computer sees *whose* printers this joins before anything is installed: on an
+  open-signup server the address alone does not say that. Whoever holds a valid code learns both.
+- **Names.** A code for a new device takes the name from the call (1 to 200 characters, no control
+  characters, not starting with `cloudprnt-`, which is reserved for Star printers: `400`, the code stays
+  usable). A name that exists already is `409 a device with this name already exists` and the code
+  stays usable. Two computers that both got a key for the same new name: the first to register
+  keeps it, the other is refused as with any key. To reuse the name of an existing device, make the code with
+  **Reconnect** on that device.
+- **Answers.** An unknown, expired, used or cancelled code is one `401 pairing code is wrong, expired or
+  already used`. A body that is no JSON object, a code of the wrong shape or a bad name is `400`. The
+  account name, the device name and the creator's address are shown to the person who redeems.
+  The **account name** is free text that the account itself cannot change, so it is never refused: the
+  reply carries it without control and invisible characters, cut to 200 characters. A **device name**
+  (sent in the call, or stored for Reconnect) may be 200 characters without a control character and
+  without an invisible one, except the four that names need: U+FE0F (the emoji selector that phones
+  add by themselves), the joiners U+200C and U+200D and the no-break space. A name stored for Reconnect
+  that is empty or has white space at either end is refused as well (the agent would read it back
+  trimmed, and its key could not register). The **creator's address**
+  may not hold any invisible character. What is refused, `POST /pairing` answers `400` and says
+  which and what to do; redeeming a code that became unfit since is `400` with the code unspent.
+  A look-alike (a Cyrillic `а` in a domain) cannot be told from the real letter by any list, so the
+  agent and the setup window show the creator's address with every character outside printable ASCII
+  spelled out (`boss@\u{430}cme.example`). They also say so for any address that is not a bare e-mail
+  address (`<boss@acme.example>`, `boss@acme.example.`, `mailto:boss@acme.example`): a person who signs
+  up with such an address would otherwise show the victim's letters on the screen. No address is refused for that.
+
+### Throttle
+
+`POST /agent/pair` counts attempts per client address in the table that signup and login use, in a
+namespace of its own (`pair:`): ten wrong codes in 15 minutes and the address gets `429 too many
+pairing attempts, try again later`. A malformed request costs nothing; a wrong code, and a taken name,
+cost one (so a valid code cannot be used to reset the counter); a redeemed code clears it. IPv6 counts
+per /64. The address is the client's socket address, or, behind a reverse proxy listed in
+`PRINTAPI_TRUSTED_PROXIES`, the one that proxy reports in `X-Forwarded-For`. **Without that setting every
+client behind the proxy shares one address**, ten wrong codes from anybody block pairing for everybody
+for 15 minutes (a key typed by hand still works), see [server.md](server.md). The counter is in memory
+of one process.
+
+### Reconnect: the same device with a new key
+
+`POST /pairing` with `{"computer_id": 3}` (the Reconnect button on a device) makes a code bound to
+that device. The key fetched with it **may take that device over**: the name, the computer id and every
+printer id stay, so integrations and the history keep working. A Star CloudPRNT printer connects by
+itself: `400`; another org's device is `404`. A computer whose name starts with `cloudprnt-` (a
+full key may register one) cannot be taken over by a code, because the key it hands out may not
+register that name: `400`, before anything is spent; connect it with the key it already uses (an address and
+a key), or with a new key under another name.
+
+| State | Meaning | Ends by |
+|---|---|---|
+| `open` | not used, not expired | use, cancel (`DELETE /pairing/{id}`), 30 minutes, a newer code for the same device |
+| `expired` | not used, past its end | the reaper, a day later |
+| `fetched` | the key was handed out, nothing registered with it | registering; 24 hours later the reaper revokes the key |
+| `registered` | a reconnect key declared its printers, the device is not yet its own | its first poll; revoking the key; a newer code of the device that swaps first. **No time limit**: the computer may be restarted days later |
+| `connected` | the takeover happened, whatever became of its key since (a second Reconnect revokes the first agent-only key), or, for a new device, the key registered | 24 hours later the row goes, the key lives on |
+| `revoked` | the key was revoked before | the reaper |
+
+`GET /pairing` lists them (`id, org_id, computer_id, computer_name, created_at, expires_at, used_at,
+device_name, key_id, state, old_key`). It never shows a code, a hash or who made it. `key_id` of a
+`fetched` row is what **Revoke** deletes (`DELETE /apikeys/{key_id}`): the server cannot say *who*
+fetched a key, only that one was, and when. A *registered* but unclaimed right shows there too.
+
+The takeover happens at the **first poll** (`GET /agent/jobs`) of the new key, not when it is
+fetched or registers: installing a new agent can fail after it registered, and the old agent must keep
+working until the new one runs.
+
+- `POST /agent/register` with such a key answers with the device's ids but leaves the key of the device,
+  its `last_seen_at` and the flags of its printers (`can_pdf`, capabilities) alone: the old agent
+  still prints, and a flag changed early could send a PDF to a label printer. Printers the device does
+  not have yet are added, and no job can be queued for them until the swap (`400 unknown printer`).
+  Until then they are left out of the printer lists, the counts and the PrintNode list; the operator
+  API's org detail shows them with `state: "pending"`.
+  Registering again with the same key gives the same answer. A reconnect key registers **only under
+  the name of its device**: another name is `401` (otherwise it would enrol a second device while the
+  list called the first one connected). A takeover that ends without a swap (its key is
+  revoked) takes the printers it added with it.
+- The first poll of the new key then makes it the device's key, applies the declared printers and
+  ends the old key *as the device's key*: an agent-only old key is revoked, any other key stays active
+  (it may serve an integration), and `old_key` in the list names it for **Revoke**. Its waiting
+  poll is woken and ends with `401`. The right to take over needs the agent right: a key narrowed with
+  `PUT /apikeys/{id}` takes nothing over.
+- **A job in flight.** The old machine may be printing when the swap comes. For 300 seconds after it,
+  `POST /agent/jobs/{id}/result` and `POST /agent/results` accept the old key's `ok: true` for a job that
+  it had claimed before the swap, so the job is recorded as done and the new machine does not print
+  it again. This also holds for an old key that was revoked within those 300 seconds. `ok: false`
+  stays `401`: it may only mean that the old agent could no longer fetch the payload, and then the
+  reaper requeues the job. With a second swap inside those 300 seconds the first key is still
+  accepted for the jobs it claimed, and for no job the second key claimed (the ids of the jobs the
+  device holds are kept in the pairing row at each swap). The swap sets `claimed_at` of the device's claimed jobs to the time of the
+  swap, so the reaper (timeout 300 seconds) waits exactly as long as a late result is accepted. Poll,
+  payload and register of the old key stay refused.
+- **Two codes.** A newer code for the device replaces the unused older one. If the older one was
+  already redeemed, whichever key polls first wins: with the older key first, the newer code still
+  works afterwards; with the newer key first, the older key is revoked and cannot take the device back.
+  Keys fetched earlier and not yet swapped show as `fetched` or `registered` with **Revoke**.
+- **A key that never registers** (nobody ran the setup): revoked after 24 hours, unless somebody has
+  widened its rights meanwhile (`PUT /apikeys/{id}`: that is a decision, not leftover).
+  `printpapi-agent pair` registers at once so this does not apply to it.
+- Going back to an older server: the table is ignored, a registered but not swapped device is simply not
+  swapped and the old agent goes on.
+
+A stolen code gives one agent-only key; a stolen Reconnect code can take over that one device, and
+the dashboard shows that a key was fetched, with **Revoke**. If a device is lost, revoke its keys
+(the old key too, when it is not agent-only: `old_key` in the list) on the Keys page.
 
 ## Accounts and login
 

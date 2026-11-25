@@ -531,3 +531,41 @@ test("the path id is the first number, so suffixed routes and the old routes bot
   // and the new one reads its printer id, not 0
   assert.equal(json(call(s, "GET", "/printers/4/receipt-profile")).printer_id, 4);
 });
+
+test("pairing: create, list and cancel a code; a demo code is never used", () => {
+  const s = seedState(now);
+  assert.deepEqual(json(call(s, "GET", "/pairing")), { codes: [] });
+  const made = json(call(s, "POST", "/pairing", {}));
+  assert.match(made.code, /^[0-9A-HJKMNP-TV-Z]{4}-[0-9A-HJKMNP-TV-Z]{4}-[0-9A-HJKMNP-TV-Z]{4}$/);
+  assert.equal(made.server_url, null);
+  assert.equal(made.expires_at, now + 1800);
+  assert.deepEqual([made.computer_id, made.computer_name, made.old_key], [null, null, null]);
+  const list = json(call(s, "GET", "/pairing")).codes;
+  assert.equal(list.length, 1);
+  assert.equal(list[0].state, "open");
+  assert.equal(JSON.stringify(list).includes(made.code), false, "the list never shows the code");
+  // it runs out, and nothing ever redeems it
+  assert.equal(json(call(s, "GET", "/pairing", undefined, now + 1800)).codes[0].state, "expired");
+  assert.equal(call(s, "DELETE", `/pairing/${made.id}`).status, 200);
+  assert.equal(call(s, "DELETE", `/pairing/${made.id}`).status, 404);
+  assert.deepEqual(json(call(s, "GET", "/pairing")), { codes: [] });
+});
+
+test("pairing: Reconnect names the device, a newer code replaces the unused one, bad input is refused as the server does", () => {
+  const s = seedState(now);
+  const agent = json(call(s, "GET", "/computers")).computers[0];
+  const a = json(call(s, "POST", "/pairing", { computer_id: agent.id }));
+  assert.deepEqual([a.computer_id, a.computer_name], [agent.id, agent.name]);
+  const b = json(call(s, "POST", "/pairing", { computer_id: agent.id }));
+  const codes = json(call(s, "GET", "/pairing")).codes;
+  assert.deepEqual(codes.map((c: J) => c.id), [b.id]);
+  assert.equal(call(s, "POST", "/pairing", { computer_id: 999 }).status, 404);
+  const bad = call(s, "POST", "/pairing", { computer_id: "7" });
+  assert.deepEqual([bad.status, json(bad).error], [400, "computer_id must be a number"]);
+  // twenty open codes, the next is refused
+  for (let i = 0; i < 19; i++) assert.equal(call(s, "POST", "/pairing", {}).status, 200);
+  const many = call(s, "POST", "/pairing", {});
+  assert.deepEqual([many.status, json(many).error], [429, "too many open pairing codes"]);
+  assert.equal(isFakeRoute("GET", "/pairing"), true);
+  assert.equal(isFakeRoute("DELETE", "/pairing/3"), true);
+});

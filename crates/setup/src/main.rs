@@ -20,6 +20,7 @@ use std::sync::{Mutex, PoisonError};
 use tauri::{Manager, RunEvent};
 
 use commands::AppState;
+use printpapi_agent::pair::{self, Pairing};
 
 /// What the person reads when the Microsoft Edge WebView2 Runtime is missing.
 const WEBVIEW_MISSING: &str = "This setup needs the Microsoft Edge WebView2 Runtime.\n\n\
@@ -44,8 +45,13 @@ pub enum Mode {
     Managed(Result<managed::Command, managed::Usage>),
     /// Any argument `--tray`: the icon.
     Tray,
-    /// The settings window or the setup, opened on a section when `--section <word>` names one.
-    Window { section: Option<&'static str> },
+    /// The settings window or the setup, opened on a section when `--section <word>` names one, or
+    /// with a pairing link: exactly one argument, and one that `pair::parse` reads as a link with a
+    /// server (that is how Windows and Linux hand a `printpapi://` link over).
+    Window {
+        section: Option<&'static str>,
+        link: Option<Pairing>,
+    },
 }
 
 /// The mode for the arguments after the program name. A `--section` word that is not one of
@@ -65,7 +71,20 @@ pub fn mode(args: &[OsString]) -> Mode {
         .find(|w| w[0] == "--section")
         .and_then(|w| w[1].to_str())
         .and_then(|word| updates::SECTIONS.iter().copied().find(|s| *s == word));
-    Mode::Window { section }
+    // Split, quoted or injected arguments are no link: a link is the one and only argument.
+    // ponytail: on Windows and Linux (and from the macOS icon) the one-time code stands in the
+    // window's command line, because that is how the systems deliver a URL. Another user of the
+    // machine could read it and spend it first; it works once, for 30 minutes, gives an agent-only
+    // key, and the dashboard shows that a key was fetched, with a Revoke button. The API key is never
+    // in an argument. Ceiling: the code is only as private as the process list of this computer.
+    let link = match args {
+        [one] => one
+            .to_str()
+            .and_then(pair::parse)
+            .filter(|p| p.server.is_some()),
+        _ => None,
+    };
+    Mode::Window { section, link }
 }
 
 fn main() -> ExitCode {
@@ -86,8 +105,10 @@ fn main() -> ExitCode {
         );
         return ExitCode::SUCCESS;
     }
-    if let Mode::Window { section } = &mode {
+    let mut start_link = None;
+    if let Mode::Window { section, link } = &mode {
         updates::set_start_section(*section);
+        start_link = link.clone();
     }
     let tray_mode = mode == Mode::Tray;
     // The icon lives as long as the process; a second icon of this user ends, once the first one
@@ -125,13 +146,16 @@ fn main() -> ExitCode {
                 Ok(())
             }
         })
-        .manage(Mutex::new(AppState::default()))
+        .manage(Mutex::new(AppState::with_link(start_link)))
         .invoke_handler(tauri::generate_handler![
             commands::get_platform,
             commands::detect_install,
             commands::default_name,
             commands::needs_insecure_confirm,
             commands::check_connection,
+            commands::take_link,
+            commands::read_pairing,
+            commands::pair,
             commands::list_printers,
             commands::sumatra_present,
             commands::download_sumatra,
@@ -165,11 +189,35 @@ fn main() -> ExitCode {
     // folder while the process ends, so it is not removed. Ceiling: a setup run again and again.
     // The process ends right after the exit event without dropping managed state, so the working
     // folder (it holds the unpacked agent) is removed here.
-    app.run(|handle, event| {
-        if let RunEvent::Exit = event {
+    app.run(move |handle, event| match event {
+        RunEvent::Exit => {
             let state = handle.state::<Mutex<AppState>>();
             state.lock().unwrap_or_else(PoisonError::into_inner).clear();
         }
+        // macOS opens the running program with a link (`CFBundleURLTypes` of `Info.plist`): the
+        // window keeps it for its next look, the icon starts a window of its own with it.
+        #[cfg(target_os = "macos")]
+        RunEvent::Opened { urls } => {
+            let first = urls
+                .iter()
+                .filter_map(|u| pair::parse(u.as_str()))
+                .find(|p| p.server.is_some());
+            if let Some(p) = first {
+                if tray_mode {
+                    tray::open_with_link(&pair::link(
+                        p.server.as_deref().unwrap_or_default(),
+                        &p.code,
+                    ));
+                } else {
+                    let state = handle.state::<Mutex<AppState>>();
+                    state
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .set_link(p);
+                }
+            }
+        }
+        _ => {}
     });
     ExitCode::SUCCESS
 }
@@ -249,19 +297,16 @@ mod tests {
 
     #[test]
     fn a_window_opens_on_a_known_section_and_ignores_the_rest() {
-        assert_eq!(mode(&[]), Mode::Window { section: None });
+        let plain = |section| Mode::Window {
+            section,
+            link: None,
+        };
+        assert_eq!(mode(&[]), plain(None));
         assert_eq!(
             mode(&words(&["--section", "updates"])),
-            Mode::Window {
-                section: Some("updates")
-            }
+            plain(Some("updates"))
         );
-        assert_eq!(
-            mode(&words(&["x", "--section", "log"])),
-            Mode::Window {
-                section: Some("log")
-            }
-        );
+        assert_eq!(mode(&words(&["x", "--section", "log"])), plain(Some("log")));
         for unknown in [
             &["--section", "remove"][..],
             &["--section"],
@@ -269,12 +314,100 @@ mod tests {
             &["updates"],
             &["--section", "UPDATES"],
         ] {
-            assert_eq!(
-                mode(&words(unknown)),
-                Mode::Window { section: None },
-                "{unknown:?}"
+            assert_eq!(mode(&words(unknown)), plain(None), "{unknown:?}");
+        }
+    }
+
+    const LINK: &str =
+        "printpapi://pair?server=https%3A%2F%2Fprint.example.com&code=7K3M-Q2ZD-9XHT";
+
+    #[test]
+    fn exactly_one_link_argument_opens_the_window_with_it() {
+        let Mode::Window { section, link } = mode(&words(&[LINK])) else {
+            panic!("a window");
+        };
+        assert_eq!(section, None);
+        let link = link.expect("the link");
+        assert_eq!(link.server.as_deref(), Some("https://print.example.com"));
+        assert_eq!(link.code, "7K3M-Q2ZD-9XHT");
+        // the same words with the section rule are not a link
+        assert!(matches!(
+            mode(&words(&["--section", "log"])),
+            Mode::Window { link: None, .. }
+        ));
+    }
+
+    #[test]
+    fn split_quoted_or_injected_arguments_are_no_link() {
+        for args in [
+            &[LINK, "--section", "log"][..],
+            &["--section", "log", LINK],
+            &[LINK, LINK],
+            &[
+                "printpapi://pair?server=https%3A%2F%2Fprint.example.com",
+                "&code=7K3M-Q2ZD-9XHT",
+            ],
+            // quoted by the caller: the quote is part of the argument
+            &["\"printpapi://pair?server=https%3A%2F%2Fprint.example.com&code=7K3M-Q2ZD-9XHT\""],
+            &["printpapi://pair?server=https%3A%2F%2Fprint.example.com&code=7K3M-Q2ZD-9XHT --x"],
+            // a bare code or an address alone has no server to show
+            &["7K3M-Q2ZD-9XHT"],
+            &["https://print.example.com"],
+            &[""],
+        ] {
+            assert!(
+                matches!(mode(&words(args)), Mode::Window { link: None, .. }),
+                "{args:?}"
             );
         }
+    }
+
+    #[test]
+    fn a_link_never_beats_the_tray_or_the_version() {
+        assert_eq!(mode(&words(&["--tray"])), Mode::Tray);
+        assert_eq!(mode(&words(&["--version"])), Mode::Version);
+        assert_eq!(mode(&words(&[LINK, "--tray"])), Mode::Tray);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn an_argument_that_is_no_unicode_does_not_panic() {
+        use std::os::windows::ffi::OsStringExt;
+        let lone_surrogate = OsString::from_wide(&[0x70, 0xD800, 0x71]);
+        assert_eq!(
+            mode(&[lone_surrogate]),
+            Mode::Window {
+                section: None,
+                link: None
+            }
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_argument_that_is_no_unicode_does_not_panic() {
+        use std::os::unix::ffi::OsStringExt;
+        let bad = OsString::from_vec(vec![b'p', 0xFF, 0xFE]);
+        assert_eq!(
+            mode(&[bad]),
+            Mode::Window {
+                section: None,
+                link: None
+            }
+        );
+    }
+
+    /// The scheme the bundle registers on macOS is the one the link parser reads.
+    #[test]
+    fn info_plist_names_the_scheme_of_the_link_parser() {
+        let plist = include_str!("../Info.plist");
+        assert!(plist.contains("CFBundleURLTypes"));
+        assert!(
+            plist.contains(&format!("<string>{}</string>", pair::SCHEME)),
+            "{plist}"
+        );
+        assert!(plist.contains("<string>com.printpapi.setup</string>"));
+        assert!(plist.contains("<string>Editor</string>"));
     }
 
     /// The setup and the agent are released together: one number.

@@ -672,10 +672,11 @@ fn desktop_exec_quote(arg: &str) -> String {
     out
 }
 
-/// A Desktop Entry file that runs the tray program with `extra` arguments.
-fn desktop_entry(l: &Layout, extra: &str) -> Vec<u8> {
+/// A Desktop Entry file that runs the tray program with `extra` arguments, and `lines` after the
+/// last key.
+fn desktop_entry(l: &Layout, extra: &str, lines: &str) -> Vec<u8> {
     format!(
-        "[Desktop Entry]\nType=Application\nName=printpapi Agent\nComment=printpapi agent status and settings\nExec={}{extra}\nTerminal=false\n",
+        "[Desktop Entry]\nType=Application\nName=printpapi Agent\nComment=printpapi agent status and settings\nExec={}{extra}\nTerminal=false\n{lines}",
         desktop_exec_quote(&s(&l.tray))
     )
     .into_bytes()
@@ -709,15 +710,92 @@ fn tray_launchd_plist(l: &Layout) -> String {
 pub fn tray_autostart_file(os: Os, l: &Layout) -> Option<Vec<u8>> {
     match os {
         Os::Windows => None,
-        Os::Linux => Some(desktop_entry(l, " --tray")),
+        Os::Linux => Some(desktop_entry(l, " --tray", "")),
         Os::Macos => Some(tray_launchd_plist(l).into_bytes()),
     }
 }
 
 /// Linux: the entry in the application menu. It opens the window directly (no `--tray`), so the
 /// settings stay reachable on a desktop that shows no tray icons (GNOME without AppIndicator).
+///
+/// It is also the handler of `printpapi://` links (`MimeType=x-scheme-handler/printpapi;`): `%u`
+/// receives the link as the one argument, and the field code stays outside the quotes (it is no
+/// part of a quoted argument). The autostart entry has neither.
+/// https://specifications.freedesktop.org/desktop-entry/latest/exec-variables.html
+/// https://specifications.freedesktop.org/shared-mime-info/latest-single/ (x-scheme-handler)
 pub fn app_entry_file(l: &Layout) -> Vec<u8> {
-    desktop_entry(l, "")
+    desktop_entry(
+        l,
+        " %u",
+        &format!("MimeType=x-scheme-handler/{};\n", crate::pair::SCHEME),
+    )
+}
+
+/// The key of the link handler in the machine's registry classes.
+fn scheme_key() -> String {
+    format!("HKLM\\Software\\Classes\\{}", crate::pair::SCHEME)
+}
+
+/// Make `printpapi://` links open the tray program (the window, with the link). Best effort: the
+/// caller ignores every failure, a convenience must not abort an install.
+/// - Windows: three `reg add` values under `HKLM\Software\Classes\printpapi`: the name, the empty
+///   `URL Protocol` (the empty data is written explicitly), and the command `"<tray>" "%1"`.
+///   https://learn.microsoft.com/en-us/previous-versions/windows/internet-explorer/ie-developer/platform-apis/aa767914(v=vs.85)
+///   https://learn.microsoft.com/en-us/windows-server/administration/windows-commands/reg-add
+/// - Linux: `update-desktop-database` reads the menu entry's `MimeType` line (no `xdg-mime default`:
+///   the deb's own menu entry has no scheme, so there is one handler).
+///   https://manpages.debian.org/bookworm/desktop-file-utils/update-desktop-database.1.en.html
+/// - macOS: the bundle's `Info.plist` (`CFBundleURLTypes`) does it, no command.
+pub fn scheme_register_cmds(os: Os, l: &Layout, sys: &Path) -> Vec<Cmd> {
+    match os {
+        Os::Windows => {
+            let key = scheme_key();
+            let add = |name: &[&str], data: String| {
+                let mut a = vec![tool(os, sys, "reg.exe"), "add".into()];
+                a.extend(name.iter().map(|p| p.to_string()));
+                a.extend(["/t".into(), "REG_SZ".into(), "/d".into(), data, "/f".into()]);
+                cmd(a)
+            };
+            vec![
+                add(&[&key, "/ve"], format!("URL:{}", crate::pair::SCHEME)),
+                add(&[&key, "/v", "URL Protocol"], String::new()),
+                add(
+                    &[&format!("{key}\\shell\\open\\command"), "/ve"],
+                    format!("\"{}\" \"%1\"", s(&l.tray)),
+                ),
+            ]
+        }
+        Os::Linux => update_desktop_database(l),
+        Os::Macos => Vec::new(),
+    }
+}
+
+/// The reverse of [`scheme_register_cmds`]. On Linux it runs after the menu entry is deleted.
+pub fn scheme_unregister_cmds(os: Os, l: &Layout, sys: &Path) -> Vec<Cmd> {
+    match os {
+        Os::Windows => vec![cmd(vec![
+            tool(os, sys, "reg.exe"),
+            "delete".into(),
+            scheme_key(),
+            "/f".into(),
+        ])],
+        Os::Linux => update_desktop_database(l),
+        Os::Macos => Vec::new(),
+    }
+}
+
+fn update_desktop_database(l: &Layout) -> Vec<Cmd> {
+    l.app_entry
+        .as_deref()
+        .and_then(Path::parent)
+        .map(|dir| {
+            vec![cmd(vec![
+                "update-desktop-database".into(),
+                "-q".into(),
+                s(dir),
+            ])]
+        })
+        .unwrap_or_default()
 }
 
 /// Windows: make the tray icon start at every logon, with a value in the `Run` key of all users
@@ -1977,7 +2055,7 @@ mod tests {
         // the application menu entry opens the window directly: no --tray
         let entry = String::from_utf8(app_entry_file(&l)).unwrap();
         assert!(
-            entry.contains("Exec=\"/opt/printpapi-agent/printpapi-tray\"\n"),
+            entry.contains("Exec=\"/opt/printpapi-agent/printpapi-tray\" %u\n"),
             "{entry}"
         );
         assert!(!entry.contains("--tray"), "{entry}");
@@ -2028,6 +2106,92 @@ mod tests {
             "{text}"
         );
         assert!(tray_autostart_file(Os::Windows, &win_layout("C:\\PF")).is_none());
+    }
+
+    #[test]
+    fn windows_scheme_commands_are_absolute_quoted_hklm_with_an_explicit_empty_value() {
+        let l = win_layout("C:\\Program Files");
+        let sys = Path::new(WIN_SYS);
+        let reg = "C:\\Windows\\System32\\reg.exe";
+        let key = "HKLM\\Software\\Classes\\printpapi";
+        assert_eq!(
+            argvs(&scheme_register_cmds(Os::Windows, &l, sys)),
+            [
+                vec![
+                    reg,
+                    "add",
+                    key,
+                    "/ve",
+                    "/t",
+                    "REG_SZ",
+                    "/d",
+                    "URL:printpapi",
+                    "/f"
+                ],
+                vec![
+                    reg,
+                    "add",
+                    key,
+                    "/v",
+                    "URL Protocol",
+                    "/t",
+                    "REG_SZ",
+                    "/d",
+                    "",
+                    "/f"
+                ],
+                vec![
+                    reg,
+                    "add",
+                    "HKLM\\Software\\Classes\\printpapi\\shell\\open\\command",
+                    "/ve",
+                    "/t",
+                    "REG_SZ",
+                    "/d",
+                    "\"C:\\Program Files\\printpapi-agent\\printpapi-tray.exe\" \"%1\"",
+                    "/f"
+                ],
+            ]
+        );
+        assert_eq!(
+            argvs(&scheme_unregister_cmds(Os::Windows, &l, sys)),
+            [vec![reg, "delete", key, "/f"]]
+        );
+        // the tray's Run value is a different command and stays as it was
+        assert_eq!(tray_register_cmds(Os::Windows, &l, sys).len(), 1);
+    }
+
+    #[test]
+    fn linux_scheme_commands_refresh_the_desktop_database_and_macos_has_none() {
+        let l = linux();
+        let sys = Path::new("/usr");
+        let want = vec![vec![
+            "update-desktop-database",
+            "-q",
+            "/usr/share/applications",
+        ]];
+        assert_eq!(argvs(&scheme_register_cmds(Os::Linux, &l, sys)), want);
+        assert_eq!(argvs(&scheme_unregister_cmds(Os::Linux, &l, sys)), want);
+        assert!(scheme_register_cmds(Os::Macos, &mac(), sys).is_empty());
+        assert!(scheme_unregister_cmds(Os::Macos, &mac(), sys).is_empty());
+    }
+
+    #[test]
+    fn the_linux_menu_entry_takes_the_link_and_the_autostart_entry_does_not() {
+        let l = linux();
+        let entry = String::from_utf8(app_entry_file(&l)).unwrap();
+        // %u outside the quotes, the scheme as a MIME type
+        assert!(
+            entry.contains("Exec=\"/opt/printpapi-agent/printpapi-tray\" %u\n"),
+            "{entry}"
+        );
+        assert!(
+            entry.contains("MimeType=x-scheme-handler/printpapi;\n"),
+            "{entry}"
+        );
+        let auto = String::from_utf8(tray_autostart_file(Os::Linux, &l).unwrap()).unwrap();
+        assert!(!auto.contains("%u") && !auto.contains("MimeType"), "{auto}");
+        assert!(auto.contains("--tray"));
     }
 
     #[test]

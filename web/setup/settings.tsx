@@ -13,7 +13,7 @@ import {
   SlidersHorizontal,
   Trash2,
 } from "lucide-react";
-import { setup, toSetupError, type AgentStatus, type Existing, type Platform, type UpdateInfo } from "./api";
+import { setup, toSetupError, type AgentStatus, type Existing, type PairingView, type Platform, type UpdateInfo } from "./api";
 import { errorText, olderCardShown, updateAvailable, type Hold } from "./model";
 import { Shell, type NavItem } from "./bits";
 import { Wizard } from "./wizard";
@@ -25,6 +25,7 @@ import { LogSection } from "./settings-log";
 import { RemoveSection, RestartSection, SumatraSection } from "./settings-actions";
 import { UpdatesSection } from "./settings-updates";
 import { OlderCard } from "./older-card";
+import { usePairingLink } from "./use-pairing-link";
 
 const SECTIONS: (NavItem & { windowsOnly?: boolean })[] = [
   { id: "overview", label: "Overview", icon: Activity },
@@ -103,7 +104,7 @@ function known(status: AgentStatus | null): Existing {
   };
 }
 
-type Flow = { kind: "printers" | "connection"; existing: Existing };
+type Flow = { kind: "printers" | "connection"; existing: Existing; link?: PairingView };
 
 /**
  * The window of an agent that is installed: its state and the settings that matter, in sections.
@@ -130,6 +131,14 @@ export function Settings({ platform, onRemoved }: { platform: Platform; onRemove
   }, []);
   // the printer steps and the connection step of the setup, started from what is known now
   const [flow, setFlow] = useState<Flow | null>(null);
+  // A pairing link opens the connection step with the link in it (nothing is contacted yet). Only
+  // once the status is read and while no flow is open: the flow's own first step takes a later one.
+  usePairingLink((link) => {
+    if (status) {
+      setSection("connection");
+      setFlow({ kind: "connection", existing: known(status), link });
+    }
+  }, flow === null && status !== null);
 
   // An installed agent that is newer than this program: nothing here may change it by accident.
   if (info && olderCardShown(info, installedHere, hold)) {
@@ -152,6 +161,7 @@ export function Settings({ platform, onRemoved }: { platform: Platform; onRemove
         platform={platform}
         existing={flow.kind === "printers" ? flow.existing : null}
         replacing={flow.kind === "connection" ? flow.existing : null}
+        link={flow.link ?? null}
         onDone={() => {
           setFlow(null);
           void refresh();

@@ -61,10 +61,27 @@ export type ConfigPatch = {
   /** This older program may replace the newer installed agent on purpose. */
   goBack?: boolean;
 };
+/** What the shell read from a pairing link or code (crates/setup/src/commands.rs, `PairingView`). */
+export type PairingView = { serverUrl: string | null; code: string };
+/** What a redeemed code says, to confirm before anything changes: no key (it stays in the shell). */
+export type PairedView = {
+  name: string;
+  org: string;
+  /** Spelled out (`\u{430}`) where the address is not plain ASCII; `createdByEscaped` is set for any address that is not a bare e-mail address. */
+  createdBy: string | null;
+  createdByEscaped: boolean;
+  replaces: boolean;
+  /** Which pairing this is; the install names it again, so it installs the one the card showed. */
+  pairId: number;
+  /** The address the code was spent at, as the shell used it. */
+  serverUrl: string;
+};
 export type ApplyRequest = {
   serverUrl: string | null;
   apiKey: string | null;
   name: string | null;
+  /** The pairing the person confirmed, when the connection is named by its address only. */
+  pairId: number | null;
   printers: PrinterChoice[];
 };
 
@@ -93,6 +110,13 @@ export const setup = {
   /** true: a device with this name already exists on the server. */
   checkConnection: (serverUrl: string, apiKey: string, name: string) =>
     call<boolean>("check_connection", { serverUrl, apiKey, name }),
+  /** The link this window was started with, once; null when there is none (or it was taken). */
+  takeLink: () => call<PairingView | null>("take_link"),
+  /** What a pasted link or code says; null when it is none. Nothing is contacted. */
+  readPairing: (text: string) => call<PairingView | null>("read_pairing", { text }),
+  /** Spends the code. The key stays in the shell; ApplyRequest then names the address with apiKey null. */
+  pair: (serverUrl: string, code: string, name: string, insecureOk: boolean) =>
+    call<PairedView>("pair", { serverUrl, code, name, insecureOk }),
   listPrinters: () => call<FoundPrinter[]>("list_printers"),
   sumatraPresent: () => call<boolean>("sumatra_present"),
   downloadSumatra: () => call<void>("download_sumatra"),

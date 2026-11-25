@@ -609,6 +609,9 @@ pub struct Patch {
     pub headers: Vec<(String, Option<String>)>,
     /// The update mode, `notify`, `auto` or `off` (see `update::Mode`), or [`LOWER_UPDATES`].
     pub updates: Option<String>,
+    /// A connection to another origin drops every installed header the patch does not name, unless
+    /// this is set (see [`dropped_headers`]). The window sets it for a key the person typed.
+    pub keep_headers: bool,
 }
 
 // Not derived: the connection holds the key.
@@ -620,6 +623,7 @@ impl std::fmt::Debug for Patch {
             .field("timeout", &self.timeout)
             .field("headers", &self.headers)
             .field("updates", &self.updates)
+            .field("keep_headers", &self.keep_headers)
             .finish()
     }
 }
@@ -659,6 +663,11 @@ pub fn parse_patch(json: &str) -> Result<Patch, String> {
                     .as_f64()
                     .ok_or_else(|| bad("timeout is not a number"))?;
                 patch.timeout = Some(t);
+            }
+            "keep_headers" => {
+                patch.keep_headers = value
+                    .as_bool()
+                    .ok_or_else(|| bad("keep_headers is not true or false"))?;
             }
             "updates" => {
                 let mode = value
@@ -708,6 +717,33 @@ fn valid_header_name(name: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&b))
 }
 
+/// The installed `[headers]` that a connection to `new_server` must not take along. A header can
+/// hold a proxy's secret, and the secret belongs to the origin it was set for: with a pairing link
+/// the sender chooses the address. Names (lower case) of every installed header when the installed
+/// `server_url` is not the same origin as `new_server` (unreadable or missing counts as another),
+/// none otherwise. The decision belongs to the elevated process, which has the file.
+pub fn dropped_headers(installed: &str, new_server: &str) -> Vec<String> {
+    let Ok(cfg) = Config::from_text(installed) else {
+        return Vec::new(); // not a file apply_patch could write: it fails on its own
+    };
+    let same = cfg
+        .get("server_url")
+        .ok()
+        .flatten()
+        .is_some_and(|old| crate::setup::same_origin(&old, new_server));
+    if same {
+        return Vec::new();
+    }
+    let defaults = cfg.ini.defaults();
+    cfg.ini
+        .section("headers")
+        .unwrap_or_default()
+        .iter()
+        .filter(|(name, _)| !defaults.iter().any(|(k, _)| k == name))
+        .map(|(name, _)| name.to_lowercase())
+        .collect()
+}
+
 /// `installed` with `patch` merged in. The result must pass what the agent reads at start:
 /// `Config::from_text`, `http_settings` and `parse_printers`, otherwise `Err` and the installed file
 /// stays as it is. Errors never quote the file: it holds the key.
@@ -751,13 +787,24 @@ pub fn apply_patch(installed: &str, patch: &Patch) -> Result<String, String> {
     }
     let timeout = patch.timeout.map(|t| t.to_string());
     let conn = patch.connection.as_ref();
+    // Decided here, in the elevated process that holds the file, before `http_settings`: the
+    // register that follows already goes out without the dropped headers. Headers the patch names
+    // win over the drop.
+    let mut headers = patch.headers.clone();
+    if let Some((url, _, _)) = conn.filter(|_| !patch.keep_headers) {
+        for name in dropped_headers(installed, url) {
+            if !headers.iter().any(|(n, _)| n.eq_ignore_ascii_case(&name)) {
+                headers.push((name, None));
+            }
+        }
+    }
     let update = IniUpdate {
         server_url: conn.map(|c| c.0.as_str()),
         api_key: conn.map(|c| c.1.as_str()),
         name: conn.map(|c| c.2.as_str()),
         printers: patch.printers.as_deref(),
         timeout: timeout.as_deref(),
-        headers: Some(&patch.headers),
+        headers: Some(&headers),
         updates: None,
     };
     let mut text = update_ini(Some(installed), &update);
@@ -1329,6 +1376,92 @@ mod tests {
         );
     }
 
+    const WITH_HEADERS: &str = "[agent]\nserver_url = https://print.example.com\napi_key = OLD\nname = pc\nprinters = a\ntimeout = 45\n\n[headers]\nCF-Access-Client-Id = id1\nCF-Access-Client-Secret = s3\n";
+
+    fn moved(json: &str) -> Config {
+        let text = apply_patch(WITH_HEADERS, &patch(json)).unwrap();
+        Config::from_text(&text).unwrap()
+    }
+
+    #[test]
+    fn a_connection_to_another_origin_drops_the_installed_headers() {
+        let cfg =
+            moved(r#"{"server_url":"https://other.example.org","api_key":"NEW","name":"pc"}"#);
+        assert!(cfg.http_settings().unwrap().headers.is_empty());
+        // everything else stays: the timeout is not a secret of the old origin
+        assert_eq!(cfg.http_settings().unwrap().timeout, 45.0);
+        // another port, another scheme: another origin
+        for url in ["https://print.example.com:8443", "http://print.example.com"] {
+            let cfg = moved(&format!(
+                r#"{{"server_url":"{url}","api_key":"NEW","name":"pc"}}"#
+            ));
+            assert!(cfg.http_settings().unwrap().headers.is_empty(), "{url}");
+        }
+    }
+
+    #[test]
+    fn keep_headers_and_the_same_origin_keep_them() {
+        let cfg = moved(
+            r#"{"server_url":"https://other.example.org","api_key":"NEW","name":"pc","keep_headers":true}"#,
+        );
+        assert_eq!(cfg.http_settings().unwrap().headers.len(), 2);
+        // host case, default port and path do not make another origin
+        let cfg = moved(
+            r#"{"server_url":"HTTPS://Print.Example.com:443/sub","api_key":"NEW","name":"pc"}"#,
+        );
+        assert_eq!(cfg.http_settings().unwrap().headers.len(), 2);
+    }
+
+    #[test]
+    fn a_header_the_patch_names_wins_over_the_drop() {
+        let cfg = moved(
+            r#"{"server_url":"https://other.example.org","api_key":"NEW","name":"pc","headers":[["cf-access-client-id","new-id"],["X-New","v"]]}"#,
+        );
+        let h = cfg.http_settings().unwrap().headers;
+        assert_eq!(h.len(), 2);
+        assert_eq!(
+            h.get("cf-access-client-id").map(String::as_str),
+            Some("new-id")
+        );
+        assert_eq!(h.get("x-new").map(String::as_str), Some("v"));
+    }
+
+    #[test]
+    fn a_patch_without_a_connection_never_drops_a_header() {
+        let cfg = moved(r#"{"printers":"b"}"#);
+        assert_eq!(cfg.http_settings().unwrap().headers.len(), 2);
+    }
+
+    #[test]
+    fn an_unreadable_installed_server_counts_as_another_origin() {
+        for installed in [
+            "[agent]\nserver_url = not a url\napi_key = K\nname = pc\nprinters = a\n[headers]\nX-Secret = s\n",
+            "[agent]\napi_key = K\nname = pc\nprinters = a\n[headers]\nX-Secret = s\n",
+        ] {
+            assert_eq!(
+                dropped_headers(installed, "https://x.example"),
+                ["x-secret"]
+            );
+            let p = patch(r#"{"server_url":"https://x.example","api_key":"N","name":"pc"}"#);
+            let text = apply_patch(installed, &p).unwrap();
+            assert!(!text.contains("X-Secret") && !text.contains("x-secret"));
+        }
+    }
+
+    #[test]
+    fn parse_patch_takes_keep_headers_only_as_a_bool() {
+        assert!(patch(r#"{"keep_headers":true}"#).keep_headers);
+        assert!(!patch(r#"{"keep_headers":false}"#).keep_headers);
+        assert!(!patch(r#"{}"#).keep_headers);
+        for bad in [
+            r#"{"keep_headers":"true"}"#,
+            r#"{"keep_headers":1}"#,
+            r#"{"keep_headers":null}"#,
+        ] {
+            assert!(parse_patch(bad).is_err(), "{bad}");
+        }
+    }
+
     #[test]
     fn a_patch_can_move_the_connection_and_keeps_headers_and_timeout() {
         // a new server or key from a window that never read the installed file: the patch names
@@ -1344,7 +1477,7 @@ printers = a
 timeout = 45
 ";
         let p = patch(
-            r#"{"server_url":"https://y","api_key":"NEW%KEY","name":"pc2","printers":"b|pdf"}"#,
+            r#"{"server_url":"https://y","api_key":"NEW%KEY","name":"pc2","printers":"b|pdf","keep_headers":true}"#,
         );
         let text = apply_patch(installed, &p).unwrap();
         let cfg = Config::from_text(&text).unwrap();

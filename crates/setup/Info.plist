@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- Merged into the bundle's Info.plist by the Tauri CLI (src-tauri/Info.plist next to tauri.conf.json):
+     printpapi:// links open this app. https://v2.tauri.app/distribute/macos-application-bundle/
+     https://developer.apple.com/documentation/bundleresources/information-property-list/cfbundleurltypes -->
+<plist version="1.0">
+<dict>
+  <key>CFBundleURLTypes</key>
+  <array>
+    <dict>
+      <key>CFBundleURLName</key>
+      <string>com.printpapi.setup</string>
+      <key>CFBundleTypeRole</key>
+      <string>Editor</string>
+      <key>CFBundleURLSchemes</key>
+      <array>
+        <string>printpapi</string>
+      </array>
+    </dict>
+  </array>
+</dict>
+</plist>

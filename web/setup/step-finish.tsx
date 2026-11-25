@@ -80,6 +80,7 @@ export function StepFinish({
             serverUrl: connection.serverUrl,
             apiKey: connection.apiKey,
             name: connection.name,
+            pairId: connection.paired?.pairId ?? null,
             printers: selected,
           })
         : await setup.applyPatch(patchFor({ printers: changeFrom }, { printers: selected }));
@@ -134,11 +135,11 @@ export function StepFinish({
           {connection && (
             <>
               <dt className="text-muted-foreground">Server</dt>
-              <dd className="truncate font-mono">{connection.serverUrl}</dd>
+              <dd className="break-all font-mono">{connection.serverUrl}</dd>
             </>
           )}
           <dt className="text-muted-foreground">Device</dt>
-          <dd className="truncate">{deviceName}</dd>
+          <dd className="break-all">{deviceName}</dd>
           <dt className="text-muted-foreground">Printers</dt>
           <dd className="break-words">{selected.map((p) => p.name).join(", ")}</dd>
         </dl>

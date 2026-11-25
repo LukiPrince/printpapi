@@ -746,6 +746,13 @@ fn apply_with(staging: &Path, env: &Env, sumatra_sha: &str) -> Result<Baselines,
     // After the start, and never a reason to start the old agent again: the agent runs, and the
     // text says what is left to do.
     update::sync_schedule(env, update::wants_schedule(env, &staged.text))?;
+    // `printpapi://` links open the tray program. Last, with a tray only, and every failure is
+    // ignored: a convenience must not abort an install that worked.
+    if staged.tray.is_some() {
+        for c in install::scheme_register_cmds(env.os, &env.layout, &env.sys) {
+            let _ = (env.run)(&c);
+        }
+    }
     Ok(Baselines {
         key_sealed,
         ..baselines
@@ -1422,6 +1429,11 @@ pub fn remove(env: &Env) -> Result<(), ApplyError> {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(e) => return Err(system("cannot delete the autostart file", e)),
         }
+    }
+    // after the menu entry is gone (Linux reads it), best effort, whether or not the tray program
+    // is still there: a scanner may have quarantined it, and the handler must not outlive it
+    for c in install::scheme_unregister_cmds(env.os, l, &env.sys) {
+        let _ = (env.run)(&c);
     }
     // the tray program (outside the install folder on macOS) and the status folder
     remove_tray(env, &remove_tree)?;
@@ -2760,7 +2772,18 @@ mod tests {
                 "run systemctl stop printpapi-agent".to_string(),
                 format!("run pgrep -f {}", fx.layout.tray.display()),
                 "run systemctl is-active --quiet printpapi-agent".to_string(),
-                "run systemctl disable printpapi-agent".to_string()
+                "run systemctl disable printpapi-agent".to_string(),
+                // the link handler goes with every removal, tray or not
+                format!(
+                    "run update-desktop-database -q {}",
+                    fx.layout
+                        .app_entry
+                        .as_ref()
+                        .unwrap()
+                        .parent()
+                        .unwrap()
+                        .display()
+                ),
             ]
         );
         assert!(!fx.layout.dir.exists());
@@ -3411,6 +3434,87 @@ mod tests {
         assert!(!fx.layout.tray_autostart.as_ref().unwrap().exists());
         // the agent still gets its status folder
         assert!(fx.layout.status_dir.is_dir());
+    }
+
+    #[test]
+    fn the_link_handler_is_registered_after_the_start_and_only_with_a_tray() {
+        for os in [Os::Windows, Os::Linux] {
+            let fx = Fixture::new(os);
+            fx.stage_tray(b"the tray");
+            apply(&fx.staging, &fx.env()).unwrap();
+            let ev = fx.events();
+            let pos = |needle: &str| ev.iter().position(|e| e.contains(needle));
+            let (scheme, start) = if os == Os::Windows {
+                (pos("Classes\\printpapi /ve"), pos("schtasks.exe /run"))
+            } else {
+                (pos("update-desktop-database"), pos("systemctl"))
+            };
+            let all = ev.join("\n");
+            let scheme = scheme.unwrap_or_else(|| panic!("no handler command: {all}"));
+            let start = start.unwrap_or_else(|| panic!("no start command: {all}"));
+            assert!(
+                scheme > start,
+                "{os:?}: the handler comes after the agent starts\n{}",
+                ev.join("\n")
+            );
+            if os == Os::Linux {
+                let entry = tray_text(fx.layout.app_entry.as_ref().unwrap());
+                assert!(
+                    entry.contains("MimeType=x-scheme-handler/printpapi;"),
+                    "{entry}"
+                );
+            }
+            // no tray: no handler
+            let fx = Fixture::new(os);
+            apply(&fx.staging, &fx.env()).unwrap();
+            let ev = fx.events().join("\n");
+            assert!(
+                !ev.contains("Classes\\printpapi") && !ev.contains("update-desktop-database"),
+                "{os:?}: {ev}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_failing_link_handler_command_fails_neither_install_nor_removal() {
+        for (os, text) in [
+            (Os::Windows, "Classes\\printpapi"),
+            (Os::Linux, "update-desktop-database"),
+        ] {
+            let fx = Fixture::new(os);
+            fx.failing.borrow_mut().push(text.to_string());
+            fx.stage_tray(b"the tray");
+            apply(&fx.staging, &fx.env()).expect("the install works without the handler");
+            assert!(
+                fx.events().iter().any(|e| e.contains(text)),
+                "{os:?}: it was tried"
+            );
+            fx.events.borrow_mut().clear();
+            remove(&fx.env()).expect("the removal works without it");
+            assert!(
+                fx.events().iter().any(|e| e.contains(text)),
+                "{os:?}: removal tried too"
+            );
+            assert!(!fx.layout.dir.exists());
+        }
+    }
+
+    #[test]
+    fn the_link_handler_goes_even_when_the_tray_program_is_already_gone() {
+        for (os, text) in [
+            (Os::Windows, "Classes\\printpapi /f"),
+            (Os::Linux, "update-desktop-database"),
+        ] {
+            let fx = Fixture::new(os);
+            fx.stage_tray(b"the tray");
+            apply(&fx.staging, &fx.env()).unwrap();
+            // a virus scanner took the unsigned tray program away
+            std::fs::remove_file(&fx.layout.tray).unwrap();
+            fx.events.borrow_mut().clear();
+            remove(&fx.env()).unwrap();
+            let ev = fx.events().join("\n");
+            assert!(ev.contains(text), "{os:?}: {ev}");
+        }
     }
 
     #[test]
@@ -4425,6 +4529,35 @@ mod tests {
     }
 
     #[test]
+    fn a_patch_with_a_connection_to_another_origin_drops_the_installed_headers() {
+        let fx = Fixture::new(Os::Linux);
+        std::fs::write(
+            fx.staging.join("agent.ini"),
+            format!("{INI}timeout = 45\n\n[headers]\nX-Via = proxy\n"),
+        )
+        .unwrap();
+        apply(&fx.staging, &fx.env()).unwrap();
+        fx.after_an_elevated_install();
+        // a pairing link names the address: the proxy's secret stays out of the call and the file
+        fx.stage_patch(
+            r#"{"server_url": "https://other.example.com", "api_key": "NEW-KEY", "name": "pc2", "printers": "Zebra GK420d"}"#,
+        );
+        apply(&fx.staging, &fx.env()).unwrap();
+        let ini = std::fs::read_to_string(&fx.layout.ini).unwrap();
+        assert!(
+            !ini.contains("X-Via") && ini.contains("timeout = 45"),
+            "{ini}"
+        );
+        let settings = fx.settings.borrow();
+        let last = settings.last().unwrap();
+        assert!(
+            last.headers.is_empty(),
+            "the register went out without the header"
+        );
+        assert_eq!(last.timeout, 45.0);
+    }
+
+    #[test]
     fn a_patch_with_a_new_connection_keeps_the_installed_headers_and_timeout() {
         let fx = Fixture::new(Os::Linux);
         std::fs::write(
@@ -4442,7 +4575,7 @@ X-Via = proxy
         fx.after_an_elevated_install();
         // one prompt: the window names the connection, and the installed file supplies the rest
         fx.stage_patch(
-            r#"{"server_url": "https://other.example.com", "api_key": "NEW-KEY", "name": "pc2", "printers": "Zebra GK420d"}"#,
+            r#"{"server_url": "https://other.example.com", "api_key": "NEW-KEY", "name": "pc2", "printers": "Zebra GK420d", "keep_headers": true}"#,
         );
         apply(&fx.staging, &fx.env()).unwrap();
         let ini = std::fs::read_to_string(&fx.layout.ini).unwrap();

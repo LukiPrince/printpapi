@@ -1,6 +1,6 @@
 // printpapi — self-hosted PrintNode alternative. Elastic License 2.0 (see LICENSE).
 // The demo's starting state: about six hours of job history for the fictional shop, ending at #1291.
-import type { ApiKey, JobState, LabelTemplate, OrgUser, ReceiptProfile } from "../lib/api";
+import type { ApiKey, JobState, LabelTemplate, OrgUser, PairingInfo, ReceiptProfile } from "../lib/api";
 import { SHOP, rng } from "./data.ts";
 
 export type JobKind = "label" | "slip" | "receipt" | "invoice" | "test" | "doc";
@@ -36,9 +36,11 @@ export type DemoState = {
   labels: LabelTemplate[]; // label templates, ids ascending
   // stored receipt profiles by printer id; a printer without one has the defaults. Optional: a state stored before receipts existed has none (persist.ts fills it in)
   receipt_profiles?: Record<number, ReceiptProfile>;
+  // pairing codes made on the Devices page. Optional like receipt_profiles: a state stored before pairing existed has none (persist.ts fills it in). A demo code never becomes used.
+  pairings?: PairingInfo[];
   org: { id: 1; name: string; event_url: string | null; shopify_secret_set: boolean; job_quota: number; month_base: number; created_at: number };
   me: { user_id: number; email: string };
-  next: { job: number; order: number; receipt: number; key: number; user: number; label: number };
+  next: { job: number; order: number; receipt: number; key: number; user: number; label: number; pairing?: number };
   // counts of jobs trim() dropped from `jobs`, so the totals keep rising; since_seed = those above SEED_LAST_JOB, not cancelled
   trimmed: { done: number; failed: number; cancelled: number; since_seed: number };
   traffic: boolean;
@@ -174,6 +176,7 @@ export function seedState(t: number): DemoState {
       { id: 4, label: "n8n · labels + invoices", active: 1, created_at: t - DAY * 33, scope: "print" },
       { id: 5, label: "old-test-key", active: 0, created_at: t - DAY * 140 },
     ],
+    pairings: [],
     users: [
       { id: 1, org_id: 1, email: "jana@nordlicht.example", created_at: t - DAY * 120 },
       { id: 2, org_id: 1, email: "lager@nordlicht.example", created_at: t - DAY * 58 },

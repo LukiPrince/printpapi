@@ -14,13 +14,16 @@ fn main() -> ExitCode {
         return ExitCode::SUCCESS;
     }
     install_panic_hook();
-    if let Some(code) = printpapi_agent::apply::cli(&args) {
-        return code;
-    }
     let base_dir = std::env::current_exe()
         .ok()
         .and_then(|p| p.parent().map(|d| d.to_path_buf()))
         .unwrap_or_else(|| std::path::PathBuf::from("."));
+    if let Some(code) = printpapi_agent::pair::cli(&args, &base_dir) {
+        return code;
+    }
+    if let Some(code) = printpapi_agent::apply::cli(&args) {
+        return code;
+    }
     match run(&base_dir) {
         Ok(()) => ExitCode::SUCCESS,
         Err(fatal) => {
