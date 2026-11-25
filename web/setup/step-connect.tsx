@@ -10,6 +10,7 @@ import { FieldLabel } from "@/components/bits";
 import { setup, toSetupError, type PairedView, type PairingView } from "./api";
 import {
   errorText,
+  fixedServerHint,
   formEdited,
   formFromLink,
   formServer,
@@ -22,6 +23,7 @@ import {
   type PairForm,
 } from "./model";
 import { Actions, Notice } from "./bits";
+import { useBrand } from "./brand";
 import { usePairingLink } from "./use-pairing-link";
 
 /** `apiKey` is null for a connection a pairing code made: the key stays in the shell. */
@@ -75,6 +77,8 @@ function PairConnect({
   onNext,
   onSwitch,
 }: StepProps & { onSwitch: () => void }) {
+  const { brand } = useBrand();
+  const fixedHint = fixedServerHint(brand);
   // A connection that was already paired shows its card again; the link the window was opened with
   // was spent by it and is not seeded a second time.
   const seed = initial?.paired ? null : link;
@@ -83,7 +87,7 @@ function PairConnect({
     text: seed?.code ?? "",
     view: seed,
     fromLink: seed !== null,
-    typedServer: startServer(initial, replacing),
+    typedServer: startServer(initial, replacing, brand),
   });
   const [name, setName] = useState(initial?.name ?? replacing?.name ?? "");
   const [paired, setPaired] = useState<PairedView | null>(initial?.paired ?? null);
@@ -199,7 +203,7 @@ function PairConnect({
                   text: "",
                   view: null,
                   fromLink: false,
-                  typedServer: startServer(initial, replacing),
+                  typedServer: startServer(initial, replacing, brand),
                 }));
                 setError(null);
               }}
@@ -257,6 +261,7 @@ function PairConnect({
                 placeholder="https://print.example.com"
                 autoComplete="off"
                 disabled={busy}
+                readOnly={fixedHint !== null}
                 value={form.typedServer}
                 onChange={(e) => {
                   setForm((f) => ({ ...f, typedServer: e.target.value }));
@@ -264,6 +269,7 @@ function PairConnect({
                   setError(null);
                 }}
               />
+              {fixedHint && <p className="mt-1 text-xs text-muted-foreground">{fixedHint}</p>}
             </div>
           )}
           <div>
@@ -347,7 +353,9 @@ function KeyConnect({
   onNext,
   onSwitch,
 }: StepProps & { onSwitch: () => void }) {
-  const [serverUrl, setServerUrl] = useState(startServer(initial, replacing));
+  const { brand } = useBrand();
+  const fixedHint = fixedServerHint(brand);
+  const [serverUrl, setServerUrl] = useState(startServer(initial, replacing, brand));
   const [apiKey, setApiKey] = useState(initial?.apiKey ?? "");
   const [name, setName] = useState(initial?.name ?? replacing?.name ?? "");
   const [busy, setBusy] = useState(false);
@@ -435,9 +443,11 @@ function KeyConnect({
               className="mt-1.5 font-mono"
               placeholder="https://print.example.com"
               autoComplete="off"
+              readOnly={fixedHint !== null}
               value={serverUrl}
               onChange={edit(setServerUrl)}
             />
+            {fixedHint && <p className="mt-1 text-xs text-muted-foreground">{fixedHint}</p>}
           </div>
           <div>
             <FieldLabel htmlFor="key">Agent key</FieldLabel>

@@ -5,6 +5,7 @@
 pub mod apply;
 pub mod backend_cups;
 pub mod backend_windows;
+pub mod brand;
 pub mod client;
 pub mod config;
 pub mod discover;

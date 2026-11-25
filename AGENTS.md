@@ -35,6 +35,7 @@ python -m pytest tools/docs
 python -m pytest tools/release tools/smoke   # the signed update file's script, the smoke helpers
 python tools/docs/check_docs.py   # docs at HEAD: links and anchors to files in git, setup file names, source-available wording
 cd web && npm run build:app     # after any web/ change; commit crates/server/web with it
+cargo build -p printpapi-server && cd clients/js && npm ci && npm test   # the JS client against the real binary (Node 20 or newer)
 ```
 
 ## Hard-won pitfalls
@@ -72,6 +73,20 @@ cd web && npm run build:app     # after any web/ change; commit crates/server/we
   a device over registers **without touching** it (key hash, `last_seen_at`, printer flags stay, new printers are
   `pending`); the swap happens at the first poll, through `store::authenticate_poll`, and needs the agent right.
   Keep the tests for a stolen or replayed code, a narrowed or revoked key, a job in flight and two devices with one name.
+
+- **A new or changed public route updates `crates/server/openapi.json` in the same change**, with its
+  `x-roles` and `x-rights`, a first description sentence that says who may call it, the scope words of the
+  keys that may (in `security`, checked against `Scope::allows`), then `cd clients/js && npm run gen-types`.
+  `crates/server/tests/openapi.rs` fails for a route the router answers and the file does not list (a
+  pinned list: any line that reads the request path must be documented or pinned there, and the
+  dispatchers may use their request target only in the forms the scan reads: `t == "/x"`,
+  `id_of(t, "/p/", "/s")` with two literals and `match t` with literal arms only. A call such as
+  `self.helper(t)` or `matches!(t, ..)`, a constant or binding arm, a guard, or a path built by
+  `format!` is not read: the first kinds fail until documented or pinned, the last one only test A
+  covers), and for a documented route the router lacks.
+  Response objects stay closed (`additionalProperties: false`). `info.version` of the document is its
+  own version, bumped by hand when the document changes; it is not the server's, and the unauthenticated
+  document never carries the server version.
 
 ## Agent (`crates/agent`, `agent/`)
 
@@ -155,6 +170,16 @@ cd web && npm run build:app     # after any web/ change; commit crates/server/we
   `staging::private_root`): nothing SYSTEM runs or reads may lie in the starter's profile. The .msi hook is `wix/managed.wxs`, written against the template of
   tauri-cli 2.12.6 (pinned in ci.yml and release.yml): read the template again before changing the pin.
   MSI-only Tauri settings live in `tauri.msi.conf.json`, never in `tauri.conf.json`.
+- White-label builds: `PRINTPAPI_BRAND_DIR` (absolute path of a brand folder) plus its `tauri.conf.json` as
+  `TAURI_CONFIG`. The validator is `crates/agent/src/brand.rs`, shared with `build.rs` through
+  `#[path]`, so it uses `std` and `serde_json` only. The build fails on a brand without its config and on
+  a brand config without a brand. The licence notice, About and the tray line are written by the code, a
+  brand has no field for them, and every brand has `updates_enabled` false. The marker
+  `.installed-by-setup` carries `brand=<id>`; `marker::may_replace` guards the elevated install
+  (`other_brand`). `stage_own_tray` also stages `brand.json`. The names in install.rs (task,
+  service, labels, marker, paths, identifier, bin name) never change for a brand. After a brand change,
+  run `cargo test` and `cargo clippy` in `crates/setup` with the example brand (CI does:
+  `docs/white-label.md`). The `brand` window code is `web/setup/brand.tsx`.
 - `web/lib/setup-downloads.json` is the one list of setup files. The downloads page and
   `release.yml` both read it; a variant nobody has run by hand is `"beta": true`.
   `tools/docs/test_release_assets.py` keeps the list a subset of what `release.yml` builds. The .msi
@@ -175,6 +200,31 @@ cd web && npm run build:app     # after any web/ change; commit crates/server/we
   deploys to printpapi.lukaswotzka.com; it is never synced into the binary. Demo code lives only
   in `web/demo/`. Product files reach it only through the `printpapi-demo` module, which resolves
   to the stub `web/demo/off.ts` in the normal build. `npm run check:bundles` must pass.
+
+## Client (`clients/js`)
+
+- `@printpapi/client` is a placeholder name; the maintainer decides the package name and the first
+  publication. `.github/workflows/publish-client.yml` is started by hand, never by a push, and was never
+  run. Nothing in the repository runs `npm publish`.
+- ESM, `fetch` only, **no runtime dependency**; devDependencies are `typescript` and `@types/node` and
+  nothing else. `src/` builds with no Node types (`tsconfig.json`, `types: []`), so it stays usable in a
+  browser; the tests and `testkit/` use Node (`tsconfig.test.json`).
+- `src/types.ts` is generated from `crates/server/openapi.json` by `npm run gen-types`; never edit it. The
+  tests run the real server binary (explicit environment, loopback port) and check what goes through the
+  recorder, request and answer, against the document. The server is never mocked; a throwaway server, a
+  fault proxy or an injected fetch only stands in for what goes wrong (a page, a redirect, a lost answer,
+  a clock).
+- The key lives in a private field and in the `Authorization` header only: never in a URL, a message, a
+  stack, a property or a log line (an error built from an answer that echoes it has it replaced by `[key]` in the decoded value; a success is never rewritten). Redirects are
+  never followed. Keep the test for that.
+- Anything that goes into a path is a whole number (`pathId`), a blank `idempotency_key` is no key, and a
+  2xx that is not a JSON object with the field the call reads (`job_id`, a list, `state`) is an error of kind `server`. Keep those tests.
+- A submit or orders call makes one idempotency key and every attempt reuses it; `err.idempotencyKey` hands
+  it back. Never make a new key for a repeat.
+- `clients/js/package.json` follows the workspace version (a Rust test enforces it) and is in the release
+  bump list with `Cargo.toml`, `Cargo.lock`, `crates/setup/Cargo.toml`, `crates/setup/Cargo.lock`,
+  `docs/operator.md` and `clients/js/package-lock.json`. `crates/server/openapi.json` is not.
+- CI runs the client tests in the `parity` job (Node 22, then Node 20 for the built tests).
 
 ## Maintainer-local files
 

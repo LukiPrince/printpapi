@@ -2,6 +2,7 @@
 // No console window next to the setup window in a release build.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod brand;
 mod commands;
 mod elevate;
 mod managed;
@@ -138,16 +139,16 @@ fn main() -> ExitCode {
             if tray_mode {
                 tray::setup(app)
             } else {
-                tauri::WebviewWindowBuilder::from_config(
-                    app.handle(),
-                    &app.config().app.windows[0],
-                )?
-                .build()?;
-                Ok(())
+                open_window(app)
             }
         })
         .manage(Mutex::new(AppState::with_link(start_link)))
         .invoke_handler(tauri::generate_handler![
+            brand::get_brand,
+            brand::brand_icon,
+            brand::license_text,
+            brand::open_support,
+            brand::show_window,
             commands::get_platform,
             commands::detect_install,
             commands::default_name,
@@ -222,6 +223,29 @@ fn main() -> ExitCode {
     ExitCode::SUCCESS
 }
 
+/// How long a branded window may stay hidden. It is shown as soon as the page has rendered the
+/// brand; this is for a bundle that never gets there, so that the window is never lost.
+const SHOW_BACKSTOP: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Make the window. In a branded build it starts hidden: the page the window loads is the stock one
+/// until it has asked for the brand, and that must not be seen first (the page shows the window
+/// itself, `brand::show_window`). The stock build shows it at once, as it always did.
+fn open_window(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
+    let brand = brand::current();
+    let window =
+        tauri::WebviewWindowBuilder::from_config(app.handle(), &app.config().app.windows[0])?
+            .title(brand::window_title(brand))
+            .visible(brand.is_none())
+            .build()?;
+    if brand.is_some() {
+        std::thread::spawn(move || {
+            std::thread::sleep(SHOW_BACKSTOP);
+            let _ = window.show();
+        });
+    }
+    Ok(())
+}
+
 /// Say why the setup cannot start. A program without a console cannot say so on stderr, so on
 /// Windows a message box says it, too.
 fn fail(text: &str) {
@@ -237,7 +261,7 @@ fn fail(text: &str) {
                 .collect()
         };
         let text = wide(text);
-        let title = wide("printpapi Agent Setup");
+        let title = wide(brand::window_title(brand::current()));
         // SAFETY: both buffers are NUL-terminated and outlive the call; no owner window.
         unsafe {
             MessageBoxW(

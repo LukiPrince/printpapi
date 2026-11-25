@@ -218,6 +218,7 @@ fn routes() -> Vec<(&'static str, &'static str)> {
     vec![
         ("GET", "/"),
         ("GET", "/health"),
+        ("GET", "/openapi.json"),
         ("GET", "/metrics"),
         ("POST", "/jobs"),
         ("GET", "/labels"),

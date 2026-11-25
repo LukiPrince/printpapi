@@ -11,7 +11,8 @@ The easiest way on Windows, macOS and Linux with a desktop: download `printpapi-
 [latest release](https://github.com/LukiPrince/printpapi/releases/latest), open it and go through
 four steps (connect to the server with a pairing link or an agent key, pick the printers, test
 print, done). The way in is [a link or a code](#connect-with-a-link-or-a-code) from the dashboard:
-no key to copy.
+no key to copy. An IT provider can build this program under its own name, see
+[White-label builds](white-label.md).
 It writes `agent.ini`, installs the agent to `%ProgramFiles%\printpapi-agent\` (Windows) or
 `/opt/printpapi-agent/` (macOS, Linux) and starts it with the machine: a scheduled task
 `printpapi-agent` on Windows, a launchd daemon `com.printpapi.agent` on macOS, a systemd unit
@@ -364,14 +365,19 @@ again.
   A failure line goes to `printpapi-managed.log` in the `%LOCALAPPDATA%` of the account you typed it
   in, not to the LocalSystem profile.
 - A new `.msi` (another product code, the same upgrade code) is a major upgrade. With `AGENT_INI` the
-  agent is installed again from that file. Without it the agent program and the tray program are replaced
+  agent is installed again from that file; an agent that a white-label build took over (or whose marker
+  cannot be read) is refused by that install, so the upgrade ends with 1603 and an "other build" line in
+  `printpapi-managed.log`. Without it the agent program and the tray program are replaced
   and every setting stays; a newer installed agent is never replaced by an older one. The x64 and the
   ARM64 `.msi` are one product: the other architecture is an upgrade.
 - Removing the `.msi` removes the agent that it installed, and only that one. The `.msi` leaves a
   flag file `.managed-install` next to the setup program to remember that it installed the agent. On a
   PC where it never did, removing the `.msi` keeps the agent. The other way round: when somebody
   removes the agent with the window and installs it again by hand, the flag is still there, so
-  removing the `.msi` removes that agent too. Do not mix the two ways on one PC.
+  removing the `.msi` removes that agent too. Do not mix the two ways on one PC. An agent that a
+  white-label build took over (its marker names a brand) stays, and so does its key: the removal logs
+  "left alone" in `printpapi-managed.log` and succeeds. A refresh without `AGENT_INI` leaves such an
+  agent, and one whose marker cannot be read, alone the same way.
 - `--managed-refresh` and `--managed-uninstall` are what upgrade and removal run; they are not for
   typing. The `.msi` starts them only on a PC where the flag file `.managed-install` exists: on a PC
   that has the plain `.msi`, removing it never starts the unsigned setup program, so a policy or

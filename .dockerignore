@@ -5,6 +5,7 @@ __pycache__/
 tests/
 agent/
 docs/
+clients/
 *.db
 *.db-wal
 *.db-shm

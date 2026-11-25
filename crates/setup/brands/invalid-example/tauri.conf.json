@@ -1,0 +1,19 @@
+{
+  "productName": "Invalid Example",
+  "identifier": "com.example.setup",
+  "bundle": {
+    "icon": [
+      "brands/example/icons/icon.ico"
+    ],
+    "linux": {
+      "deb": {
+        "replaces": [
+          "printpapi-agent-setup"
+        ],
+        "conflicts": [
+          "printpapi-agent-setup"
+        ]
+      }
+    }
+  }
+}

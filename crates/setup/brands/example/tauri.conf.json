@@ -1,0 +1,25 @@
+{
+  "productName": "Example Print",
+  "bundle": {
+    "icon": [
+      "brands/example/icons/32x32.png",
+      "brands/example/icons/128x128.png",
+      "brands/example/icons/128x128@2x.png",
+      "brands/example/icons/icon.icns",
+      "brands/example/icons/icon.ico"
+    ],
+    "publisher": "Example Provider GmbH",
+    "copyright": "Example Provider GmbH",
+    "shortDescription": "Example Print agent setup",
+    "linux": {
+      "deb": {
+        "replaces": [
+          "printpapi-agent-setup"
+        ],
+        "conflicts": [
+          "printpapi-agent-setup"
+        ]
+      }
+    }
+  }
+}

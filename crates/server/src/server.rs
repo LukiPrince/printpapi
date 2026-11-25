@@ -711,6 +711,28 @@ fn jerr(status: u16, msg: impl AsRef<str>) -> Resp {
     Resp::json(status, &json!({ "error": msg.as_ref() }))
 }
 
+/// `crates/server/openapi.json`: the OpenAPI 3.1 description of the public API. It lives beside the
+/// sources, not in docs/, because the Dockerfile copies only crates/. `info.version` is the version
+/// of the description itself; the document says nothing about this server's patch level.
+const OPENAPI: &str = include_str!("../openapi.json");
+
+/// `GET /openapi.json`, or `HEAD` with its headers and no body. Always the same bytes.
+fn openapi(head: bool) -> Resp {
+    Resp {
+        status: 200,
+        headers: vec![
+            ("Content-Type", "application/json".into()),
+            ("Cache-Control", "no-cache".into()),
+            ("Content-Length", OPENAPI.len().to_string()),
+        ],
+        body: if head {
+            RespBody::Empty
+        } else {
+            RespBody::Bytes(Bytes::from_static(OPENAPI.as_bytes()))
+        },
+    }
+}
+
 fn unauthorized() -> Resp {
     jerr(401, "unauthorized")
 }
@@ -2737,6 +2759,9 @@ impl Ctx<'_> {
         if self.target() == "/health" {
             return Resp::empty(200);
         }
+        if self.target() == "/openapi.json" {
+            return openapi(true);
+        }
         self.dashboard(true).unwrap_or_else(|| Resp::empty(404))
     }
 
@@ -2769,6 +2794,9 @@ impl Ctx<'_> {
                 }
                 return Ok(Resp::json(200, &h));
             }
+            // The description of this API: static, no database, no credential (docs/api.md,
+            // "Machine-readable API").
+            "/openapi.json" => return Ok(openapi(false)),
             "/metrics" => {
                 let org = gate!(self.client(Right::Look)?).org_id;
                 let m = self.db(|c| store::metrics(c, self.cfg().online_window_s, None, org))?;

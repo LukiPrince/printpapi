@@ -8,6 +8,7 @@ import { Button } from "@/components/ui/button";
 import { setup, toSetupError, type Platform, type PrinterChoice } from "./api";
 import { connectMayHelp, errorText, logLocation, patchFor, returnsToConnect } from "./model";
 import { Actions, Notice, Path } from "./bits";
+import { useInstallChanged } from "./settings-apply";
 import type { Connection } from "./step-connect";
 
 type Phase =
@@ -57,6 +58,7 @@ export function StepFinish({
 }) {
   const [phase, setPhase] = useState<Phase>({ at: "idle" });
   const changing = connection === null;
+  const installChanged = useInstallChanged();
 
   async function wait(baseline: number) {
     setPhase({ at: "waiting", baseline });
@@ -84,6 +86,8 @@ export function StepFinish({
             printers: selected,
           })
         : await setup.applyPatch(patchFor({ printers: changeFrom }, { printers: selected }));
+      // the install is in place (it staged this window's brand), whatever the wait finds
+      installChanged();
     } catch (e) {
       const err = toSetupError(e);
       if (onBackToConnect && returnsToConnect(err.code)) {

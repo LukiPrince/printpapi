@@ -504,7 +504,8 @@ pub fn facts() -> Facts {
     let l = layout();
     let status_text = tray::load_status(&tray::status_path(), SystemTime::now());
     Facts {
-        supported: update::supported(),
+        // a branded build has no updates (the agent side refuses on a branded marker as well)
+        supported: crate::brand::updates_possible(update::supported(), crate::brand::current()),
         status_text,
         marker_version: marker::read(&l.marker).and_then(|m| m.version),
         own: env!("CARGO_PKG_VERSION").to_string(),
@@ -633,7 +634,7 @@ pub fn installed_for_download(f: &Facts) -> Version {
 
 #[tauri::command(async)]
 pub fn download_update(state: Shared) -> Result<String, SetupError> {
-    if !update::supported() {
+    if !crate::brand::updates_possible(update::supported(), crate::brand::current()) {
         return Err(SetupError::new(
             "no_key",
             "This build has no update key, so it cannot check for updates.",

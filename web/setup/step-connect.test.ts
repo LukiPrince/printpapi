@@ -34,13 +34,24 @@ test("nothing that changes the connection can be clicked while the key is being 
   assert.match(swap, /disabled=\{busy\}/, "Use a pairing link or code");
 });
 
+test("the question about plain http can end in a refusal that the form shows as an error", () => {
+  // needs_insecure_confirm answers server_fixed for a link to another server, before "Use it anyway"
+  const keyForm = source.slice(source.indexOf("function KeyConnect"));
+  for (const [name, text] of [["pairing", pairing], ["key", keyForm]] as const) {
+    const at = text.indexOf("await setup.needsInsecureConfirm");
+    assert.ok(at > 0, name);
+    const body = text.slice(text.lastIndexOf("try {", at), text.indexOf("finally", at));
+    assert.match(body, /catch \(e\) \{\s*setError\(errorText\(toSetupError\(e\)/, `${name}: the refusal is shown`);
+  }
+});
+
 test("the install names the pairing the card showed", () => {
   const finish = readFileSync(new URL("./step-finish.tsx", import.meta.url), "utf8");
   assert.ok(finish.includes("pairId: connection.paired?.pairId"), "apply sends the pairing id back");
 });
 
 test("a server that is spent or hostile never fills the address field", () => {
-  assert.ok(pairing.includes("startServer(initial, replacing)"));
+  assert.ok(pairing.includes("startServer(initial, replacing, brand)"));
   assert.ok(!/typedServer: initial\?\.serverUrl/.test(source), "no field starts from initial.serverUrl directly");
   assert.ok(!/useState\(initial\?\.serverUrl/.test(source));
 });
