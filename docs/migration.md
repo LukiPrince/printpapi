@@ -126,7 +126,7 @@ On each machine:
 6. Start it and check the dashboard's **Devices** page: the computer shows as online under its old
    name.
 
-An agent that the setup app installed on Windows stores its key encrypted from this version on; to go
+An agent that the setup app installed on Windows stores its key encrypted from 3.7.0 on; to go
 back to an older agent or to the Python agent, see
 [Going back to an older version or to the Python agent](agent.md#going-back-to-an-older-version-or-to-the-python-agent).
 

@@ -143,7 +143,7 @@ a brand's text in a stock-looking executable) and a `TAURI_CONFIG` with a `produ
 but no brand folder (a stock-behaving build under a brand's name and icon). The stock release builds
 set neither variable and are not affected.
 
-**Not supported in this version: a branded .msi and a branded .rpm.** Do not ship them. The build
+**Not supported yet: a branded .msi and a branded .rpm.** Do not ship them. The build
 script refuses only the Tauri config keys such a package needs in a brand's patch (`bundle.windows`,
 `bundle.linux.rpm`); it does **not** stop `--bundles msi` or `--bundles rpm`. An `.rpm` built that way
 carries the program under the stock file name and has no relation to the stock package, and an `.msi`

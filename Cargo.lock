@@ -993,7 +993,7 @@ dependencies = [
 
 [[package]]
 name = "printpapi-agent"
-version = "3.6.0"
+version = "3.7.0"
 dependencies = [
  "chrono",
  "libc",
@@ -1009,7 +1009,7 @@ dependencies = [
 
 [[package]]
 name = "printpapi-server"
-version = "3.6.0"
+version = "3.7.0"
 dependencies = [
  "barcoders",
  "base64",
