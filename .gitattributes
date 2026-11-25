@@ -5,3 +5,12 @@
 # the fonts ride on git's binary heuristic and every JS chunk is a normalization candidate, so a
 # rebuild could "change" files it never touched.
 crates/server/web/** -text
+
+# Terminus Font (SIL OFL 1.1), embedded byte for byte: the licence text has CRLF line ends and the
+# font files are shipped unmodified, so git must not normalise either of them. The licence is also
+# served from the built dashboard (web/public/licenses), which crates/server/web/** keeps as built.
+crates/server/assets/terminus/** -text
+web/public/licenses/** -text
+
+# A signed file is byte-exact: a signature covers the payload as it is, so git must not touch it.
+crates/agent/testdata/** -text

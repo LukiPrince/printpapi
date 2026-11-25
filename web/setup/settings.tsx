@@ -4,6 +4,7 @@
 import { useCallback, useEffect, useState } from "react";
 import {
   Activity,
+  CircleArrowUp,
   FileDown,
   Plug,
   Printer,
@@ -12,8 +13,8 @@ import {
   SlidersHorizontal,
   Trash2,
 } from "lucide-react";
-import { setup, toSetupError, type AgentStatus, type Existing, type Platform } from "./api";
-import { errorText } from "./model";
+import { setup, toSetupError, type AgentStatus, type Existing, type Platform, type UpdateInfo } from "./api";
+import { errorText, olderCardShown, updateAvailable, type Hold } from "./model";
 import { Shell, type NavItem } from "./bits";
 import { Wizard } from "./wizard";
 import { Overview } from "./settings-overview";
@@ -22,9 +23,12 @@ import { ConnectionSection } from "./settings-connection";
 import { AdvancedSection } from "./settings-advanced";
 import { LogSection } from "./settings-log";
 import { RemoveSection, RestartSection, SumatraSection } from "./settings-actions";
+import { UpdatesSection } from "./settings-updates";
+import { OlderCard } from "./older-card";
 
 const SECTIONS: (NavItem & { windowsOnly?: boolean })[] = [
   { id: "overview", label: "Overview", icon: Activity },
+  { id: "updates", label: "Updates", icon: CircleArrowUp },
   { id: "printers", label: "Printers", icon: Printer },
   { id: "connection", label: "Connection", icon: Plug },
   { id: "advanced", label: "Advanced", icon: SlidersHorizontal },
@@ -62,6 +66,33 @@ function useStatus() {
   return { status, error, refresh };
 }
 
+/**
+ * What the window knows about updates. It is read at the start and then with the status poll (no
+ * network: files only), so a window left open overnight notices that an update installed a newer
+ * agent and shows the older card. The one look at the signed file is made when the window opens;
+ * the cache keeps it to one request a day, and nothing is asked in the mode "off".
+ */
+function useUpdateInfo() {
+  const [info, setInfo] = useState<UpdateInfo | null>(null);
+  const refresh = useCallback(async () => {
+    try {
+      setInfo(await setup.updateInfo());
+    } catch {
+      // the sections still work without it
+    }
+  }, []);
+  useEffect(() => {
+    // a read on mount, a look at the signed file once, and a read on a timer; each sets state
+    // once the answer is in
+    // eslint-disable-next-line react-hooks/set-state-in-effect
+    void refresh();
+    void setup.checkUpdate(false).then(setInfo, () => undefined);
+    const timer = setInterval(() => void refresh(), POLL_MS);
+    return () => clearInterval(timer);
+  }, [refresh]);
+  return { info, setInfo, refresh };
+}
+
 /** What the setup flow is told about the agent that is there now. */
 function known(status: AgentStatus | null): Existing {
   return {
@@ -80,9 +111,40 @@ type Flow = { kind: "printers" | "connection"; existing: Existing };
  */
 export function Settings({ platform, onRemoved }: { platform: Platform; onRemoved: () => void }) {
   const { status, error, refresh } = useStatus();
+  const { info, setInfo, refresh: refreshInfo } = useUpdateInfo();
   const [section, setSection] = useState("overview");
+  // An install started here makes the installed agent newer than this program until the window
+  // reopens as the new version: the card for that must not replace the notice of the install.
+  const [installedHere, setInstalledHere] = useState(false);
+  // What the window keeps on screen while an install it started runs: the poll reads the new
+  // marker half way through, and swapping the screen would drop the notice of how it ended.
+  const [hold, setHold] = useState<Hold>(null);
+  // the section the command line asked for (the tray's "Updates…"), taken once
+  useEffect(() => {
+    void setup.startSection().then(
+      (s) => {
+        if (s && SECTIONS.some((x) => x.id === s)) setSection(s);
+      },
+      () => undefined,
+    );
+  }, []);
   // the printer steps and the connection step of the setup, started from what is known now
   const [flow, setFlow] = useState<Flow | null>(null);
+
+  // An installed agent that is newer than this program: nothing here may change it by accident.
+  if (info && olderCardShown(info, installedHere, hold)) {
+    return (
+      <Shell>
+        <OlderCard
+          info={info}
+          platform={platform}
+          onChanged={() => { void refresh(); void refreshInfo(); }}
+          onHold={() => setHold("card")}
+          onContinue={() => setHold(null)}
+        />
+      </Shell>
+    );
+  }
 
   if (flow) {
     return (
@@ -102,7 +164,23 @@ export function Settings({ platform, onRemoved }: { platform: Platform; onRemove
   const items = SECTIONS.filter((s) => !s.windowsOnly || platform === "windows");
   return (
     <Shell nav={{ label: "Settings sections", items, current: section, onSelect: setSection }}>
-      {section === "overview" && <Overview status={status} error={error} />}
+      {section === "overview" && (
+        <Overview status={status} error={error} update={info && updateAvailable(info) ? info : null} onUpdates={() => setSection("updates")} />
+      )}
+      {section === "updates" && (
+        <UpdatesSection
+          info={info}
+          status={status}
+          platform={platform}
+          onChanged={() => { void refresh(); void refreshInfo(); }}
+          onInfo={setInfo}
+          onInstallStart={() => setHold("section")}
+          onInstallEnd={(installed) => {
+            if (installed) setInstalledHere(true);
+            setHold(null);
+          }}
+        />
+      )}
       {section === "printers" && (
         <PrintersSection status={status} onChange={() => setFlow({ kind: "printers", existing: known(status) })} />
       )}

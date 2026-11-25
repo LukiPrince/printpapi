@@ -603,6 +603,8 @@ pub struct Patch {
     pub timeout: Option<f64>,
     /// `Some(value)` sets a header, `None` removes it.
     pub headers: Vec<(String, Option<String>)>,
+    /// The update mode, `notify`, `auto` or `off` (see `update::Mode`), or [`LOWER_UPDATES`].
+    pub updates: Option<String>,
 }
 
 // Not derived: the connection holds the key.
@@ -613,9 +615,15 @@ impl std::fmt::Debug for Patch {
             .field("printers", &self.printers)
             .field("timeout", &self.timeout)
             .field("headers", &self.headers)
+            .field("updates", &self.updates)
             .finish()
     }
 }
+
+/// The patch value that makes `auto` into `notify` and leaves every other mode as it is. The window
+/// of a stopped agent cannot read the mode and sends this on "Go back": the install can read the
+/// file, and must not switch off an `updates = off` that somebody chose.
+pub const LOWER_UPDATES: &str = "notify-if-auto";
 
 /// `{"printers": "...", "timeout": 60, "headers": [["Name", "value"], ["Other", null]]}`, every
 /// field optional, plus `server_url`, `api_key` and `name` together for a new connection. Anything
@@ -647,6 +655,13 @@ pub fn parse_patch(json: &str) -> Result<Patch, String> {
                     .as_f64()
                     .ok_or_else(|| bad("timeout is not a number"))?;
                 patch.timeout = Some(t);
+            }
+            "updates" => {
+                let mode = value
+                    .as_str()
+                    .filter(|m| ["notify", "auto", "off", LOWER_UPDATES].contains(m))
+                    .ok_or_else(|| bad("updates is not notify, auto, off or notify-if-auto"))?;
+                patch.updates = Some(mode.to_string());
             }
             "headers" => {
                 let list = value
@@ -740,7 +755,26 @@ pub fn apply_patch(installed: &str, patch: &Patch) -> Result<String, String> {
         timeout: timeout.as_deref(),
         headers: Some(&patch.headers),
     };
-    let text = update_ini(Some(installed), &update);
+    let mut text = update_ini(Some(installed), &update);
+    if let Some(mode) = &patch.updates {
+        let mode = if mode == LOWER_UPDATES {
+            let auto = Config::from_text(&text)
+                .is_ok_and(|c| crate::update::settings(&c).mode == crate::update::Mode::Auto);
+            auto.then_some("notify")
+        } else {
+            Some(mode.as_str())
+        };
+        // the mode is one of three words (parse_patch): it needs no escaping
+        if let Some(mode) = mode {
+            text = rewrite(
+                Some(&text),
+                [
+                    vec![("updates".to_string(), Some(format!("updates = {mode}")))],
+                    Vec::new(),
+                ],
+            );
+        }
+    }
     // The parser's own complaint quotes the offending line, and that can be the `api_key` line.
     let cfg =
         Config::from_text(&text).map_err(|_| "the changed agent.ini cannot be read".to_string())?;
@@ -1437,6 +1471,74 @@ timeout = 45
         let e =
             apply_patch("[agent]\napi_key = SECRET-KEY\nbroken line\n", &patch("{}")).unwrap_err();
         assert!(!e.contains("SECRET-KEY"), "{e}");
+    }
+
+    #[test]
+    fn a_patch_writes_the_update_mode_and_keeps_everything_else() {
+        let installed = "; by hand\n[agent]\nserver_url = https://x\napi_key = K\nname = pc\nprinters = p\nupdates = notify\n\n[headers]\nA = b\n";
+        let p = parse_patch(r#"{"updates":"auto"}"#).unwrap();
+        assert_eq!(p.updates.as_deref(), Some("auto"));
+        let text = apply_patch(installed, &p).unwrap();
+        assert!(text.starts_with("; by hand\n"));
+        assert!(text.contains("updates = auto"), "{text}");
+        assert!(!text.contains("updates = notify"));
+        assert!(text.contains("[headers]\nA = b"));
+        assert_eq!(
+            Config::from_text(&text)
+                .unwrap()
+                .require("api_key")
+                .unwrap(),
+            "K"
+        );
+        // a key that is not there yet is added to [agent]
+        let text = apply_patch(&installed.replace("updates = notify\n", ""), &p).unwrap();
+        assert!(text.contains("updates = auto"), "{text}");
+        let cfg = Config::from_text(&text).unwrap();
+        assert_eq!(cfg.require("updates").unwrap(), "auto");
+        // no updates in the patch: the file's value stays
+        let same = apply_patch(installed, &parse_patch(r#"{"timeout":30}"#).unwrap()).unwrap();
+        assert!(same.contains("updates = notify"));
+    }
+
+    #[test]
+    fn notify_if_auto_lowers_only_an_automatic_setting() {
+        // "Go back" from a window that cannot read the mode: the install reads the file
+        let p = parse_patch(r#"{"updates":"notify-if-auto"}"#).unwrap();
+        let base = "[agent]\nserver_url = https://x\napi_key = K\nname = pc\nprinters = p\n";
+        for (line, lowered) in [
+            ("updates = auto\n", true),
+            ("updates = AUTO\n", true),
+            ("updates = off\n", false),
+            ("updates = notify\n", false),
+            // a typo already counts as off
+            ("updates = atuo\n", false),
+            ("", false),
+        ] {
+            let installed = format!("{base}{line}");
+            let text = apply_patch(&installed, &p).unwrap();
+            if lowered {
+                assert!(text.contains("updates = notify"), "{line}: {text}");
+            } else {
+                assert_eq!(text, installed, "{line}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_patch_takes_only_the_three_update_words() {
+        for ok in ["notify", "auto", "off", "notify-if-auto"] {
+            assert!(parse_patch(&format!(r#"{{"updates":"{ok}"}}"#)).is_ok());
+        }
+        for bad in [
+            r#"{"updates":"AUTO"}"#,
+            r#"{"updates":"yes"}"#,
+            r#"{"updates":true}"#,
+            r#"{"updates":null}"#,
+            r#"{"update_url":"https://x"}"#,
+            r#"{"seal_key":"no"}"#,
+        ] {
+            assert!(parse_patch(bad).is_err(), "{bad}");
+        }
     }
 
     #[test]

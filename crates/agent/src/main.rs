@@ -6,8 +6,14 @@ use std::process::ExitCode;
 use printpapi_agent::{Fatal, err_line, install_panic_hook, log, run};
 
 fn main() -> ExitCode {
-    install_panic_hook();
     let args: Vec<String> = std::env::args().skip(1).collect();
+    // exactly this one argument, before anything else: the updater starts the new program with it
+    // to learn that it runs at all and which version it is. Every other word still runs the agent.
+    if args == ["--version"] {
+        printpapi_agent::out_line(&printpapi_agent::version_line());
+        return ExitCode::SUCCESS;
+    }
+    install_panic_hook();
     if let Some(code) = printpapi_agent::apply::cli(&args) {
         return code;
     }

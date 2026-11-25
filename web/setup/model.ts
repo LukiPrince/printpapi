@@ -1,6 +1,6 @@
 // printpapi — self-hosted PrintNode alternative. Elastic License 2.0 (see LICENSE).
 // The setup window's rules, free of React and of Tauri so they can be tested.
-import type { AgentStatus, ConfigPatch, FoundPrinter, Platform, PrinterChoice, SetupError } from "./api";
+import type { AgentStatus, ConfigPatch, FoundPrinter, Platform, PrinterChoice, SetupError, UpdateInfo, UpdateMode } from "./api";
 
 /** `printers` in agent.ini is `name[=target][|pdf]` joined by `;`, so these cannot appear in a name. */
 const NAME_FORBIDDEN = /[;=|]/;
@@ -198,4 +198,142 @@ export function patchFor(before: Partial<Settings>, after: Partial<Settings>): C
     if (changes.length > 0) patch.headers = changes;
   }
   return patch;
+}
+
+/** `a` is a higher N.N.N than `b` (3.10.0 is newer than 3.9.9). Anything that is no version is never newer. */
+export function isNewer(a: string | null | undefined, b: string | null | undefined): boolean {
+  const parse = (v: string | null | undefined) => {
+    const m = /^(\d+)\.(\d+)\.(\d+)$/.exec(v ?? "");
+    return m ? [Number(m[1]), Number(m[2]), Number(m[3])] : null;
+  };
+  const x = parse(a);
+  const y = parse(b);
+  if (!x || !y) return false;
+  for (let i = 0; i < 3; i++) if (x[i] !== y[i]) return x[i] > y[i];
+  return false;
+}
+
+/** The version that counts as "installed" for comparing: the agent's, else this program's. */
+const current = (info: UpdateInfo) => info.installed ?? info.own;
+
+/** A newer version than the installed one was found. */
+export function updateAvailable(info: UpdateInfo): boolean {
+  return isNewer(info.latest, current(info));
+}
+
+/** The installed agent is newer than this program: the window offers the installed one instead of its sections. */
+export function installedIsNewer(info: UpdateInfo): boolean {
+  return isNewer(info.installed, info.own);
+}
+
+/** The installed agent is older than this program: "Install X from this setup" is offered. */
+export function ownIsNewer(info: UpdateInfo): boolean {
+  return isNewer(info.own, info.installed);
+}
+
+/** The one sentence under the title of Updates. */
+export function updateLine(info: UpdateInfo, ago: (ts: number | null) => string): string {
+  if (!info.supported) return "This build has no update key, so it cannot check for updates.";
+  if (info.mode === "off") {
+    return "Checking is switched off in agent.ini (updates = off, or an update_url that is not a usable folder).";
+  }
+  if (info.mode === "unknown") {
+    return "The agent has not said how it is set up: it is stopped, or older than this program. Start it, or install this program's version of it.";
+  }
+  const tried = info.lastAttempt;
+  if (tried && !tried.ok && tried.version === info.latest && updateAvailable(info)) {
+    // the stored sentence is the whole story ("Version 3.8.0 did not connect, so 3.7.0 was put back. ...")
+    return tried.message.startsWith(`Version ${tried.version}`)
+      ? tried.message
+      : `Version ${tried.version} was not installed: ${tried.message}`;
+  }
+  if (updateAvailable(info) && info.latest) return `Version ${info.latest} is available.`;
+  if (info.error) return info.error;
+  if (info.checkedAt !== null) return `Up to date. Checked ${ago(info.checkedAt)}.`;
+  return "Not checked yet.";
+}
+
+/** The second line, for the mode that installs on its own. */
+export function autoLine(mode: UpdateInfo["mode"]): string | null {
+  return mode === "auto" ? "Installed automatically, usually at night." : null;
+}
+
+/** The words of the three modes, as the select shows them. */
+export const MODES: { value: UpdateMode; label: string }[] = [
+  { value: "notify", label: "Tell me" },
+  { value: "auto", label: "Install automatically" },
+  { value: "off", label: "Off" },
+];
+
+/** The patch of a change of mode: nothing when it is the mode already. */
+export function modePatch(before: UpdateInfo["mode"], after: UpdateMode): ConfigPatch | null {
+  return before === after ? null : { updates: after };
+}
+
+/**
+ * "Go back to X" leaves the unattended mode, or the nightly update would install the newer version
+ * again at once. A stopped agent does not say its mode (the file may hold auto, or off, which a
+ * company chose): the install reads the file and lowers only an automatic setting.
+ */
+export function goBackPatch(mode: UpdateInfo["mode"]): ConfigPatch {
+  if (mode === "auto") return { updates: "notify", goBack: true };
+  if (mode === "unknown") return { updates: "notify-if-auto", goBack: true };
+  return { goBack: true };
+}
+
+/** The sentence of the confirmation that says what happens to the update mode, if anything. */
+export function goBackNote(mode: UpdateInfo["mode"]): string | null {
+  const why = "or the agent would install the newer version again at night.";
+  if (mode === "auto") return `Updates are switched to "Tell me", ${why}`;
+  if (mode === "unknown") {
+    return `If updates are set to "Install automatically", they are switched to "Tell me", ${why} Any other setting stays as it is.`;
+  }
+  return null;
+}
+
+/** What keeps one screen of the settings window in place while an install that it started runs. */
+export type Hold = "card" | "section" | null;
+
+/**
+ * Whether the card for a newer installed agent replaces the sections. While Go back runs (the card
+ * is held) it stays, whatever the marker says half way through: its notice is the only place that
+ * says how it ended. While an install from Updates runs the sections stay: the marker is new
+ * before that install has finished.
+ */
+export function olderCardShown(info: UpdateInfo | null, installedHere: boolean, hold: Hold): boolean {
+  if (hold === "card") return true;
+  if (hold === "section") return false;
+  return info !== null && installedIsNewer(info) && !installedHere;
+}
+
+/** The mode was changed to one that looks, and the agent still says off: its update_url is no folder. */
+export function modeStillOff(asked: UpdateMode, now: UpdateInfo["mode"]): boolean {
+  return asked !== "off" && now === "off";
+}
+
+export const UPDATE_URL_TEXT =
+  "Saved, but the agent still reads updates as off. update_url in agent.ini has to be an http:// or https:// folder (no user name, no password, no ? and no #): correct it there, or remove the line.";
+
+/** The sentence for the agent that must be connected before an update (also the reason the button is off). */
+export const NEEDS_CONNECTED =
+  "The agent has to be connected, so that the update can check the new version. Otherwise run the setup of the new version.";
+
+/** The text of a failed download or install; the rest speak for themselves. */
+export function updateErrorText(e: SetupError): string {
+  switch (e.code) {
+    case "not_published":
+      return "No signed update has been published yet.";
+    case "bad_signature":
+      return "The update is not signed with a key this program knows. It was not installed.";
+    case "bad_file":
+      return "A downloaded file is not the one the release lists. Try again in a few minutes.";
+    case "wont_start":
+      return "The new version cannot be started on this computer (it may be blocked). Nothing was changed.";
+    case "no_target":
+      return "This release has no file for this installation. Use the setup program.";
+    case "offline":
+      return NEEDS_CONNECTED;
+    default:
+      return errorText(e);
+  }
 }

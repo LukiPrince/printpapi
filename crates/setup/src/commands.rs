@@ -36,16 +36,21 @@ use crate::tray;
 /// (`proxy`, `cancelled`, ...), `message` is text for the person.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct SetupError {
-    code: String,
-    message: String,
+    pub(crate) code: String,
+    pub(crate) message: String,
 }
 
 impl SetupError {
-    fn new(code: &str, message: impl Into<String>) -> SetupError {
+    pub(crate) fn new(code: &str, message: impl Into<String>) -> SetupError {
         SetupError {
             code: code.into(),
             message: message.into(),
         }
+    }
+
+    /// The text for the person.
+    pub fn message(&self) -> &str {
+        &self.message
     }
 
     fn io(what: &str, e: std::io::Error) -> SetupError {
@@ -98,7 +103,7 @@ pub struct AppState {
 }
 
 impl AppState {
-    fn staging(&mut self) -> Result<&Staging, SetupError> {
+    pub(crate) fn staging(&mut self) -> Result<&Staging, SetupError> {
         match &mut self.staging {
             Some(s) => Ok(s),
             slot @ None => Ok(slot.insert(
@@ -115,9 +120,9 @@ impl AppState {
     }
 }
 
-type Shared<'a> = State<'a, Mutex<AppState>>;
+pub(crate) type Shared<'a> = State<'a, Mutex<AppState>>;
 
-fn lock<'a>(state: &'a Shared) -> MutexGuard<'a, AppState> {
+pub(crate) fn lock<'a>(state: &'a Shared) -> MutexGuard<'a, AppState> {
     state.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
@@ -447,32 +452,15 @@ fn sumatra_path(installed: &Path, staging: &Path) -> PathBuf {
     }
 }
 
-const BROWSER_UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36";
 /// The name of the exe inside the pinned ZIP.
 const SUMATRA_EXE_IN_ZIP: &str = "SumatraPDF-3.6.1-64.exe";
 /// The pinned ZIP is 10 MB (10,031,830 bytes); the limit leaves room for a later pin.
 const MAX_SUMATRA_ZIP: u64 = 64 * 1024 * 1024;
 
+/// The pinned download: no key, none of agent.ini's headers, the browser User-Agent, the proxy
+/// settings of this person, at most three minutes for all of it (`printpapi_agent::client::download`).
 fn download(url: &str) -> Result<Vec<u8>, String> {
-    use ureq::config::Config;
-    use ureq::tls::{RootCerts, TlsConfig};
-    let agent = ureq::Agent::new_with_config(
-        Config::builder()
-            .user_agent(BROWSER_UA)
-            .timeout_global(Some(Duration::from_secs(180)))
-            .tls_config(
-                TlsConfig::builder()
-                    .root_certs(RootCerts::PlatformVerifier)
-                    .build(),
-            )
-            .build(),
-    );
-    let mut reply = agent.get(url).call().map_err(|e| e.to_string())?;
-    reply
-        .body_mut()
-        .with_config()
-        .limit(MAX_SUMATRA_ZIP)
-        .read_to_vec()
+    printpapi_agent::client::download(url, MAX_SUMATRA_ZIP, Duration::from_secs(180))
         .map_err(|e| e.to_string())
 }
 
@@ -721,6 +709,8 @@ fn window_elevator() -> impl Fn(&Path, &[&OsStr]) -> Result<(), Elevate> {
 
 #[tauri::command(async)]
 pub fn apply(state: Shared, request: ApplyRequest) -> Result<f64, SetupError> {
+    // an installed agent that is newer than this program is not put back by accident
+    crate::updates::older_guard(false)?;
     let (agent, dir) = staged(&state)?;
     let tray_staged = stage_own_tray(&dir)?;
     let elevate = window_elevator();
@@ -833,6 +823,12 @@ pub struct PatchRequest {
     timeout: Option<f64>,
     /// `[name, value]` sets a header, `[name, null]` removes it.
     headers: Option<Vec<(String, Option<String>)>>,
+    /// `notify`, `auto` or `off`.
+    #[serde(default)]
+    updates: Option<String>,
+    /// Go back to this older program on purpose (see `updates::older_guard`).
+    #[serde(default, rename = "goBack")]
+    go_back: bool,
 }
 
 /// What the agent reads at start, with nothing else in it: a patch is tried on this before the
@@ -861,6 +857,9 @@ pub fn patch_json(req: &PatchRequest) -> Result<String, SetupError> {
     }
     if let Some(h) = &req.headers {
         obj.insert("headers".into(), serde_json::json!(h));
+    }
+    if let Some(u) = &req.updates {
+        obj.insert("updates".into(), Value::String(u.clone()));
     }
     let text = Value::Object(obj).to_string();
     let change = |m: String| SetupError::new("change", m);
@@ -913,6 +912,8 @@ fn apply_over_installed_in(
         printers: Some(request.printers.clone()),
         timeout: None,
         headers: None,
+        updates: None,
+        go_back: false,
     };
     apply_patch_in(elevate, agent, dir, &patch)
 }
@@ -922,6 +923,7 @@ fn apply_over_installed_in(
 /// is no server-side start time to give).
 #[tauri::command(async)]
 pub fn apply_patch(state: Shared, patch: PatchRequest) -> Result<f64, SetupError> {
+    crate::updates::older_guard(patch.go_back)?;
     let (agent, dir) = staged(&state)?;
     let tray_staged = stage_own_tray(&dir)?;
     let baseline = apply_patch_in(&window_elevator(), &agent, &dir, &patch);
@@ -1148,7 +1150,10 @@ mod tests {
         assert_eq!(download(&url).unwrap(), b"zip bytes");
         let head = server.join().unwrap().to_ascii_lowercase();
         assert!(
-            head.contains(&format!("user-agent: {}", BROWSER_UA.to_ascii_lowercase())),
+            head.contains(&format!(
+                "user-agent: {}",
+                printpapi_agent::client::BROWSER_UA.to_ascii_lowercase()
+            )),
             "{head}"
         );
     }
@@ -1550,7 +1555,26 @@ mod tests {
                     .map(|(n, v)| (n.to_string(), v.map(String::from)))
                     .collect()
             }),
+            updates: None,
+            go_back: false,
         }
+    }
+
+    #[test]
+    fn a_change_can_carry_the_update_mode_and_nothing_else_of_the_connection() {
+        let mut req = patch_request(None, None, None);
+        req.updates = Some("auto".into());
+        assert_eq!(patch_json(&req).unwrap(), r#"{"updates":"auto"}"#);
+        // the agent's own rule: three words only, so a prompt is never shown for a typo
+        req.updates = Some("sometimes".into());
+        assert_eq!(patch_json(&req).unwrap_err().code, "change");
+        // the window sends goBack and updates by these names
+        let parsed: PatchRequest =
+            serde_json::from_str(r#"{"updates":"off","goBack":true}"#).unwrap();
+        assert_eq!(parsed.updates.as_deref(), Some("off"));
+        assert!(parsed.go_back);
+        let plain: PatchRequest = serde_json::from_str("{}").unwrap();
+        assert!(!plain.go_back && plain.updates.is_none());
     }
 
     #[test]

@@ -1,0 +1,8 @@
+# Public keys that may sign an agent update: one 64 digit lower-case hex Ed25519 key per line,
+# `#` starts a comment. printpapi-update.txt is accepted when any signature line in it verifies under any
+# key listed here, so a new key can be added while the old one still signs (rotation).
+#
+# This file ships with comments only: a build made from it cannot check for updates and makes no
+# request. The owner of a release adds the public half of the signing key here once the signing
+# environment exists (see SECURITY.md, "Signed updates"). A fork that publishes its own releases
+# edits this file; there is no environment variable and no runtime override.

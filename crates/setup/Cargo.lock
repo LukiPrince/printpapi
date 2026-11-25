@@ -2417,6 +2417,7 @@ dependencies = [
  "chrono",
  "libc",
  "percent-encoding",
+ "ring",
  "serde_json",
  "sha2 0.11.1",
  "ureq",
@@ -2429,12 +2430,12 @@ name = "printpapi-setup"
 version = "3.6.0"
 dependencies = [
  "printpapi-agent",
+ "ring",
  "serde",
  "serde_json",
  "tauri",
  "tauri-build",
  "tempfile",
- "ureq",
  "windows-sys 0.61.2",
 ]
 

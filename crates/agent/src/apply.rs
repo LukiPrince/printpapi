@@ -5,6 +5,11 @@
 //! write there. `install` and `uninstall` may add `--keep-pid <number>`, the process id of the
 //! setup window, which stays alive when the tray icons are ended.
 //!
+//! `restart --update-from <staging folder>` and `restart --update now` are the two forms of the signed
+//! update ([`crate::update`]): attended, with the files the window staged, and unattended, from the
+//! nightly task, timer or job. Both have three words so that every older agent answers them with
+//! usage and exit 2 (its parser takes two or four).
+//!
 //! `install` also takes an optional `tray` (the tray icon program, on macOS an `.app` folder) and,
 //! instead of a whole `agent.ini`, an optional `patch.json` that it merges into the installed
 //! `agent.ini` itself, so a change needs the key neither in the window nor in a second prompt.
@@ -27,13 +32,15 @@ use std::process::ExitCode;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
-use crate::client::{Client, Http, HttpError, http_status};
+use crate::client::{Client, DownloadFn, Http, HttpError, http_status};
 use crate::config::{
     Config, HttpSettings, Printer, apply_patch, decode_ini, parse_patch, parse_printers,
 };
 use crate::install::{self, Layout, Os};
 use crate::keystore::{self, KeyStore};
+use crate::marker;
 use crate::proc::{Runner, real_runner};
+use crate::update::{self, Source, StatusFn};
 
 /// SumatraPDF 3.6.1 (64 bit), pinned: 3.7 and later need a DLL next to the exe, and `orientation`
 /// has to be retested with newer versions (roadmap 15).
@@ -47,7 +54,7 @@ pub const SUMATRA_EXE_SHA256: &str =
     "719f689b34f47be8ca105ce8484948474dafde0e106bab599e4a89326070c3d0";
 
 /// How often a locked file is tried (a running exe stays locked for a moment on Windows).
-const FILE_ATTEMPTS: u32 = 10;
+pub(crate) const FILE_ATTEMPTS: u32 = 10;
 
 /// Why an admin subcommand stopped. `code` is what `result.json` carries for the window.
 #[derive(Debug, Clone, PartialEq)]
@@ -63,6 +70,8 @@ pub enum ApplyError {
     Proxy,
     Unreachable(String),
     System(String),
+    /// A refusal or failure of an update, with the code the window reads (see `update`).
+    Coded(&'static str, String),
 }
 
 impl ApplyError {
@@ -74,6 +83,7 @@ impl ApplyError {
             ApplyError::Proxy => "proxy",
             ApplyError::Unreachable(_) => "unreachable",
             ApplyError::System(_) => "system",
+            ApplyError::Coded(code, _) => code,
         }
     }
 }
@@ -95,7 +105,7 @@ impl fmt::Display for ApplyError {
                  headers it expects under [headers] in agent.ini (see docs/agent.md).",
             ),
             ApplyError::Unreachable(m) => write!(f, "The server could not be reached: {m}"),
-            ApplyError::System(m) => f.write_str(m),
+            ApplyError::System(m) | ApplyError::Coded(_, m) => f.write_str(m),
         }
     }
 }
@@ -124,13 +134,21 @@ pub struct Env<'a> {
     pub serves_mount: &'a dyn Fn(u32) -> bool,
     /// The system's store for the agent key (DPAPI on Windows), `None` where the file keeps it.
     pub keystore: Option<KeyStore>,
+    /// The public keys an update may be signed with (`update::keys`); none means no update.
+    pub update_keys: &'a [[u8; 32]],
+    /// A file from the network, for an unattended update: url, size limit, deadline.
+    pub download: &'a DownloadFn<'a>,
+    /// The status file of the agent as it is now, `None` when there is no regular file.
+    pub read_status: &'a StatusFn,
+    /// The version of this program (`env!("CARGO_PKG_VERSION")`).
+    pub version: &'a str,
 }
 
-fn bad(msg: impl Into<String>) -> ApplyError {
+pub(crate) fn bad(msg: impl Into<String>) -> ApplyError {
     ApplyError::BadStaging(msg.into())
 }
 
-fn system(what: &str, e: impl fmt::Display) -> ApplyError {
+pub(crate) fn system(what: &str, e: impl fmt::Display) -> ApplyError {
     ApplyError::System(format!("{what}: {e}"))
 }
 
@@ -173,7 +191,7 @@ pub(crate) fn is_link(meta: &std::fs::Metadata) -> bool {
 // ponytail: a same-user attacker can still swap a file between this check and the read. The spec
 // accepts that gap for an unsigned setup (roadmap 12 closes it), since the same user can swap the
 // setup exe itself before the elevation prompt.
-fn check_staging(staging: &Path) -> Result<(), ApplyError> {
+pub(crate) fn check_staging(staging: &Path) -> Result<(), ApplyError> {
     let meta = std::fs::symlink_metadata(staging).map_err(|e| bad(format!("{e}")))?;
     if is_link(&meta) || !meta.is_dir() {
         return Err(bad("the folder is a link or not a folder"));
@@ -302,7 +320,7 @@ fn link_stays_inside(dir: &Path, target: &Path) -> bool {
 /// a folder that is a link on the way does not fool it); one that does not resolve (nothing there
 /// yet) is judged by its text, [`link_stays_inside`]. A folder that is not there is fine: there is
 /// nothing to check.
-fn check_app_links(app: &Path) -> Result<(), String> {
+pub(crate) fn check_app_links(app: &Path) -> Result<(), String> {
     let Ok(root) = std::fs::canonicalize(app) else {
         return Ok(());
     };
@@ -415,7 +433,7 @@ fn read_staged(staging: &Path, env: &Env, sumatra_sha: &str) -> Result<Staged, A
 /// leaves (pkexec does not reset it, and 077 would keep the service user and every other user out
 /// of a new `/etc/xdg/autostart` or `/usr/share/applications`). Folders that were there are left
 /// alone.
-fn create_dirs(path: &Path) -> std::io::Result<()> {
+pub(crate) fn create_dirs(path: &Path) -> std::io::Result<()> {
     let mut missing = Vec::new();
     let mut at = Some(path);
     while let Some(p) = at.filter(|p| !p.as_os_str().is_empty() && !p.exists()) {
@@ -433,7 +451,7 @@ fn create_dirs(path: &Path) -> std::io::Result<()> {
 }
 
 /// `f` until it works, at most `attempts` times, with a second between tries.
-fn retry<T>(
+pub(crate) fn retry<T>(
     attempts: u32,
     sleep: &dyn Fn(u64),
     f: &mut dyn FnMut() -> std::io::Result<T>,
@@ -453,13 +471,13 @@ fn retry<T>(
 
 /// Rights come from an explicit mode, never from the source file or the umask.
 #[cfg(unix)]
-fn set_mode(path: &Path, mode: u32) -> std::io::Result<()> {
+pub(crate) fn set_mode(path: &Path, mode: u32) -> std::io::Result<()> {
     use std::os::unix::fs::PermissionsExt;
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
 }
 
 #[cfg(not(unix))]
-fn set_mode(_: &Path, _: u32) -> std::io::Result<()> {
+pub(crate) fn set_mode(_: &Path, _: u32) -> std::io::Result<()> {
     Ok(())
 }
 
@@ -497,7 +515,7 @@ pub(crate) fn create_new_file(path: &Path, mode: u32) -> std::io::Result<std::fs
 /// of the caller, which pkexec does not reset, must not decide), then renamed over `to`. A reader
 /// never sees half a file, and on macOS a new inode matters, because the kernel caches the code
 /// signature per vnode and kills a binary that was overwritten in place.
-fn place_file(to: &Path, bytes: &[u8], mode: u32) -> std::io::Result<()> {
+pub(crate) fn place_file(to: &Path, bytes: &[u8], mode: u32) -> std::io::Result<()> {
     let name = to.file_name().unwrap_or_default().to_string_lossy();
     let tmp = to.with_file_name(format!(".{name}.new"));
     let result = create_new_file(&tmp, mode)
@@ -563,7 +581,7 @@ fn own_files_in_dir(l: &Layout) -> Vec<PathBuf> {
 }
 
 /// What `place_file` and `write_ini` write before they rename it over `path`.
-fn leftover_of(path: &Path) -> PathBuf {
+pub(crate) fn leftover_of(path: &Path) -> PathBuf {
     let name = path.file_name().unwrap_or_default().to_string_lossy();
     path.with_file_name(format!(".{name}.new"))
 }
@@ -607,14 +625,14 @@ fn check_install_dir_as(l: &Layout, root: bool) -> Result<(), ApplyError> {
 
 /// `check_install_dir_as` for the real user id (`std` has no `geteuid`, hence the `libc` crate).
 #[cfg(unix)]
-fn check_install_dir(l: &Layout) -> Result<(), ApplyError> {
+pub(crate) fn check_install_dir(l: &Layout) -> Result<(), ApplyError> {
     check_install_dir_as(l, unsafe { libc::geteuid() } == 0)
 }
 
 // ponytail: Windows has no check. The folder is under `%ProgramFiles%`, which only administrators
 // can write to, so nobody else can plant a link there.
 #[cfg(not(unix))]
-fn check_install_dir(_: &Layout) -> Result<(), ApplyError> {
+pub(crate) fn check_install_dir(_: &Layout) -> Result<(), ApplyError> {
     Ok(())
 }
 
@@ -643,6 +661,9 @@ fn apply_with(staging: &Path, env: &Env, sumatra_sha: &str) -> Result<Baselines,
     let l = &env.layout;
     // before the server or the machine is touched
     check_install_dir(l)?;
+    // held until this function returns: no update, uninstall or second install runs meanwhile.
+    // Only when the lock file exists (an installation made before the updater has none).
+    let _lock = update::lock_if_exists(env)?;
     // Before the server and every stop command, so a refusal changes nothing. An install is the
     // only place that seals: every first install, reinstall and change of the settings ends here.
     let key_sealed = match keystore::seal(&staged.text, env.keystore.as_ref()) {
@@ -713,16 +734,22 @@ fn apply_with(staging: &Path, env: &Env, sumatra_sha: &str) -> Result<Baselines,
     if staged.tray.is_some() {
         stop_trays(env);
     }
-    replace_install(env, &staged, &*http, computer_id, first_seen)
-        .map(|b| Baselines { key_sealed, ..b })
-        .inspect_err(|_| {
+    let baselines =
+        replace_install(env, &staged, &*http, computer_id, first_seen).inspect_err(|_| {
             if was_installed {
                 // best effort: the original error is the one the window shows
                 for c in install::start_cmds(env.os, l, &env.sys) {
                     let _ = (env.run)(&c);
                 }
             }
-        })
+        })?;
+    // After the start, and never a reason to start the old agent again: the agent runs, and the
+    // text says what is left to do.
+    update::sync_schedule(env, update::wants_schedule(env, &staged.text))?;
+    Ok(Baselines {
+        key_sealed,
+        ..baselines
+    })
 }
 
 /// Everything after the old agent is stopped: files, key, marker, autostart, start. Returns the
@@ -739,6 +766,8 @@ fn replace_install(
     create_dirs(&l.dir).map_err(|e| system("cannot create the install folder", e))?;
     // the service user has to get into the folder whatever the umask of the caller is
     set_mode(&l.dir, 0o755).map_err(|e| system("cannot set the install folder's rights", e))?;
+    // the private folder and the lock inside it, before any program is written
+    update::ensure_private_dir(env)?;
     retry(FILE_ATTEMPTS, env.sleep, &mut || {
         install_binary(&env.self_exe, &l.binary)
     })
@@ -751,7 +780,17 @@ fn replace_install(
     }
     write_ini(env, &staged.text)?;
     // The marker before the autostart file: a run that dies in between is found as ours next time.
-    place_file(&l.marker, b"", 0o644).map_err(|e| system("cannot write the marker", e))?;
+    // It says which version this is. Lines it already has (a brand) stay, unless it is unreadable.
+    let old_marker = marker::read_text(&l.marker)
+        .and_then(|b| String::from_utf8(b).ok())
+        .filter(|t| marker::parse(t.as_bytes()).brand != marker::BrandMark::Unreadable)
+        .unwrap_or_default();
+    place_file(
+        &l.marker,
+        marker::with_version(&old_marker, env.version).as_bytes(),
+        0o644,
+    )
+    .map_err(|e| system("cannot write the marker", e))?;
     if let Some(parent) = l.autostart.parent() {
         create_dirs(parent).map_err(|e| system("cannot create the autostart folder", e))?;
     }
@@ -1084,7 +1123,7 @@ fn prepare_status_dir(env: &Env) -> Result<(), ApplyError> {
 }
 
 /// Delete `path` whatever it is, without following a link. A missing path is fine.
-fn remove_tree(path: &Path) -> std::io::Result<()> {
+pub(crate) fn remove_tree(path: &Path) -> std::io::Result<()> {
     match std::fs::symlink_metadata(path) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(e) => Err(e),
@@ -1123,6 +1162,12 @@ fn remove_tray(env: &Env, remove: &dyn Fn(&Path) -> std::io::Result<()>) -> Resu
 
 /// See [`remove_tray`].
 fn park_tray(env: &Env) -> std::io::Result<()> {
+    park(env, &env.layout.tray)
+}
+
+/// Move `path` (a file that cannot be deleted) into the folder next to the install folder and
+/// register the file and then the folder for deletion at the next restart.
+fn park(env: &Env, path: &Path) -> std::io::Result<()> {
     let l = &env.layout;
     let trash = l
         .dir
@@ -1130,10 +1175,29 @@ fn park_tray(env: &Env) -> std::io::Result<()> {
         .unwrap_or(&l.dir)
         .join("printpapi-agent.removed");
     std::fs::create_dir_all(&trash)?;
-    let parked = trash.join(l.tray.file_name().unwrap_or_default());
-    std::fs::rename(&l.tray, &parked)?;
+    let parked = trash.join(path.file_name().unwrap_or_default());
+    std::fs::rename(path, &parked)?;
     (env.delete_at_reboot)(&parked)?;
     (env.delete_at_reboot)(&trash)
+}
+
+/// The `.old` copies of the tray program an update moved aside. A settings window that was open
+/// during the update still runs from one of them, and on Windows a running exe cannot be deleted
+/// but can be renamed: whatever stays locked is parked like the tray itself, so the removal does
+/// not stop half way and every retry from that window fails the same way.
+fn remove_tray_leftovers(
+    env: &Env,
+    remove: &dyn Fn(&Path) -> std::io::Result<()>,
+) -> Result<(), ApplyError> {
+    if env.os != Os::Windows {
+        return Ok(());
+    }
+    for old in update::leftovers_of(&env.layout.tray) {
+        if remove(&old).is_err() && std::fs::symlink_metadata(&old).is_ok() {
+            park(env, &old).map_err(|e| system("cannot delete the install folder", e))?;
+        }
+    }
+    Ok(())
 }
 
 /// `MoveFileExW(path, NULL, MOVEFILE_DELAY_UNTIL_REBOOT)`: delete `path` when the system restarts,
@@ -1250,6 +1314,7 @@ pub fn restart(env: &Env) -> Result<f64, ApplyError> {
             "This agent was not installed by the setup, so the setup leaves it alone.".into(),
         ));
     }
+    let _lock = update::lock_if_exists(env)?;
     let plan = install::restart_plan(env.os, l, &env.sys);
     for c in &plan.stop {
         let _ = (env.run)(c);
@@ -1261,13 +1326,17 @@ pub fn restart(env: &Env) -> Result<f64, ApplyError> {
     for c in &plan.start {
         (env.run)(c).map_err(|e| system("cannot start the agent", e))?;
     }
+    // after the start: the schedule follows the mode of the installed agent.ini
+    if let Ok(ini) = std::fs::read(&l.ini) {
+        update::sync_schedule(env, update::wants_schedule(env, &decode_ini(&ini)))?;
+    }
     Ok(local)
 }
 
 /// Look at the task until it is no longer running, for at most [`install::RESTART_WAIT_SECS`]
 /// seconds. A task that cannot be asked about (the look fails) is not waited for; one whose state
 /// is not recognised is waited for the whole time, never taken for stopped.
-fn wait_until_stopped(env: &Env, look: &crate::proc::Cmd) {
+pub(crate) fn wait_until_stopped(env: &Env, look: &crate::proc::Cmd) {
     for _ in 0..install::RESTART_WAIT_SECS {
         match (env.run)(look) {
             Ok(out) if install::parse_task_state(&out) != install::TaskState::Stopped => {}
@@ -1302,6 +1371,11 @@ pub fn remove(env: &Env) -> Result<(), ApplyError> {
         return Err(ApplyError::System(
             "This agent was not installed by the setup, so the setup leaves it alone.".into(),
         ));
+    }
+    let lock = update::lock_if_exists(env)?;
+    // the unattended update goes first: nothing may start an update in the middle of the removal
+    if let Err(e) = update::remove_schedule(env) {
+        crate::err_line(&e.to_string());
     }
     for c in install::stop_cmds(env.os, l, &env.sys) {
         let _ = (env.run)(&c);
@@ -1352,8 +1426,16 @@ pub fn remove(env: &Env) -> Result<(), ApplyError> {
     // The marker goes last: a locked file (a running exe, a hung SumatraPDF) stops the removal, and
     // a second try must still find the marker instead of leaving the folder behind as "foreign".
     // Only what the installation made is deleted; the folder goes only when that leaves it empty.
+    // the lock goes with its folder, and a handle on it would keep the folder on Windows
+    drop(lock);
+    remove_tray_leftovers(env, &remove_tree)?;
     retry(FILE_ATTEMPTS, env.sleep, &mut || {
-        own_files_in_dir(l).iter().try_for_each(|f| remove_tree(f))
+        own_files_in_dir(l)
+            .iter()
+            .try_for_each(|f| remove_tree(f))?;
+        update::paths_to_remove(l)
+            .iter()
+            .try_for_each(|f| remove_tree(f))
     })
     .map_err(|e| system("cannot delete the install folder", e))?;
     retry(FILE_ATTEMPTS, env.sleep, &mut || {
@@ -1405,6 +1487,7 @@ pub fn unprotect_key(env: &Env) -> Result<&'static str, ApplyError> {
             "This agent was not installed by the setup, so the setup leaves it alone.".into(),
         ));
     }
+    let _lock = update::lock_if_exists(env)?;
     let ini = std::fs::read(&env.layout.ini)
         .map_err(|e| system("cannot read the installed agent.ini", e))?;
     let text = decode_ini(&ini);
@@ -1483,6 +1566,7 @@ pub fn cli(args: &[String]) -> Option<ExitCode> {
             None
         }
     };
+    let update_keys = update::keys();
     let env = std::env::current_exe()
         .map(|self_exe| Env {
             os,
@@ -1498,6 +1582,10 @@ pub fn cli(args: &[String]) -> Option<ExitCode> {
             owner_sid: &owner_sid,
             serves_mount: &serves_mount,
             keystore: keystore::host(),
+            update_keys: &update_keys,
+            download: &crate::client::download,
+            read_status: &update::read_status_file,
+            version: env!("CARGO_PKG_VERSION"),
         })
         .map_err(|e| system("cannot find the running program", e));
     run_args(args, env.as_ref().map_err(Clone::clone)).map(ExitCode::from)
@@ -1545,12 +1633,87 @@ fn run_unprotect_key(args: &[String], env: Result<&Env, ApplyError>) -> u8 {
     }
 }
 
+/// `restart --update-from <staging>`: the attended update, started by the window. The outcome goes
+/// to `<staging>/result.json` like every other admin command's.
+fn run_update_from(staging: &Path, env: Result<&Env, ApplyError>) -> u8 {
+    let outcome = env.and_then(|env| update::update(Source::Staged(staging), env));
+    let (result, code) = match outcome {
+        Ok(Some(v)) => (json!({"ok": true, "version": v.to_string()}), 0),
+        // an attended update never leaves quietly
+        Ok(None) => (json!({"ok": true}), 0),
+        Err(e) => {
+            crate::err_line(&e.to_string());
+            (
+                json!({"ok": false, "code": e.code(), "message": e.to_string()}),
+                1,
+            )
+        }
+    };
+    match write_result(staging, &result) {
+        Ok(()) => code,
+        Err(e) => {
+            crate::err_line(&format!("cannot write result.json: {e}"));
+            1
+        }
+    }
+}
+
+/// `restart --update now`: the unattended update from the nightly task, timer or job. No result file;
+/// the messages go to stderr (journald, `/var/log/printpapi-agent-update.log`), and on Windows also to
+/// the log of the status folder when that folder is one the agent may use. On Linux and macOS root
+/// never writes into the status folder, which a service user owns. Nothing to do is silence and 0.
+fn run_update_now(env: Result<&Env, ApplyError>) -> u8 {
+    let report = |env: Option<&Env>, text: &str| {
+        crate::err_line(text);
+        if let Some(env) = env
+            && env.os == Os::Windows
+            && crate::status::usable_status_dir(&env.layout.status_dir, env.os).is_ok()
+        {
+            crate::log::append_log(&env.layout.status_dir, &format!("update: {text}"));
+        }
+    };
+    let env = match env {
+        Ok(env) => env,
+        Err(e) => {
+            report(None, &e.to_string());
+            return 1;
+        }
+    };
+    match update::update(Source::Fetch, env) {
+        Ok(Some(v)) => {
+            report(Some(env), &format!("updated to {v}"));
+            0
+        }
+        Ok(None) => 0,
+        Err(e) => {
+            report(Some(env), &e.to_string());
+            1
+        }
+    }
+}
+
 /// `cli` with the machine handed in, so tests never touch the real one. The exit code is 0 for
 /// success, 1 for a failure and 2 for a wrong call.
 fn run_args(args: &[String], env: Result<&Env, ApplyError>) -> Option<u8> {
     // typed by a person on an administrator console, no staging folder and no result.json
     if args.first().map(String::as_str) == Some("unprotect-key") {
         return Some(run_unprotect_key(args, env));
+    }
+    // The two forms of an update, fixed positions, tested before the old match. Each has three
+    // words behind the known word, so every released agent (3.3.0 to 3.6.0, whose parser takes
+    // two or four) answers them with usage and exit 2 instead of doing something else.
+    if let [first, flag, dir] = args
+        && first == "restart"
+        && flag == "--update-from"
+    {
+        return Some(run_update_from(Path::new(dir), env));
+    }
+    if let [first, flag, now] = args
+        && first == "restart"
+        && flag == "--update"
+        && now == "now"
+    {
+        return Some(run_update_now(env));
     }
     let command = match args.first().map(String::as_str) {
         Some(c @ ("install" | "uninstall" | "read-config" | "restart")) => c,
@@ -1689,6 +1852,12 @@ mod tests {
         /// the listed processes that serve a mount (the FUSE process of an AppImage)
         mount_servers: Rc<RefCell<Vec<u32>>>,
         serves: Box<dyn Fn(u32) -> bool>,
+        /// commands whose argv contains the text fail this many times, then work
+        flaky: Rc<RefCell<Vec<(String, u32)>>>,
+        /// the public keys an update accepts (none: no update)
+        update_keys: Vec<[u8; 32]>,
+        read_status: Box<StatusFn>,
+        download: Box<DownloadFn<'static>>,
         /// what was handed to the delete-at-reboot call, in order
         at_reboot: Rc<RefCell<Vec<PathBuf>>>,
         reboot: RebootFn,
@@ -1756,8 +1925,9 @@ mod tests {
             let pids: Rc<RefCell<String>> = Rc::default();
             let at_reboot: Rc<RefCell<Vec<PathBuf>>> = Rc::default();
             let mount_servers: Rc<RefCell<Vec<u32>>> = Rc::default();
+            let flaky: Rc<RefCell<Vec<(String, u32)>>> = Rc::default();
             let run: Runner = {
-                let (events, failing, running, plant, task_states, pids, probes) = (
+                let (events, failing, running, plant, task_states, pids, probes, flaky) = (
                     events.clone(),
                     failing.clone(),
                     running.clone(),
@@ -1765,6 +1935,7 @@ mod tests {
                     task_states.clone(),
                     pids.clone(),
                     probes.clone(),
+                    flaky.clone(),
                 );
                 let layout = layout.clone();
                 Rc::new(move |c| {
@@ -1794,6 +1965,13 @@ mod tests {
                             layout.autostart.exists()
                         ));
                     }
+                    if line.contains("icacls") && line.contains(".update") {
+                        // the private folder is closed while it is still empty
+                        note.push_str(&format!(
+                            " [lock {}]",
+                            layout.dir.join(".update").join("lock").exists()
+                        ));
+                    }
                     events.borrow_mut().push(note);
                     for (when, path) in plant.borrow().iter() {
                         if line.contains(when.as_str()) {
@@ -1821,6 +1999,12 @@ mod tests {
                         } else {
                             Err(format!("not running: {line}"))
                         };
+                    }
+                    for (pattern, left) in flaky.borrow_mut().iter_mut() {
+                        if *left > 0 && line.contains(pattern.as_str()) {
+                            *left -= 1;
+                            return Err(format!("flaky: {line}"));
+                        }
                     }
                     if failing.borrow().iter().any(|f| line.contains(f.as_str())) {
                         Err(format!("failed: {line}"))
@@ -1867,6 +2051,10 @@ mod tests {
                 slept: slept.clone(),
                 probes,
                 keystore: std::cell::Cell::new((os == Os::Windows).then_some(FAKE_STORE)),
+                update_keys: Vec::new(),
+                flaky,
+                read_status: Box::new(|_| None),
+                download: Box::new(|_, _, _| Err(crate::client::DownloadError::NotFound)),
                 note_now: note_now.clone(),
                 keep_pid: Rc::default(),
                 pids,
@@ -1916,6 +2104,10 @@ mod tests {
                 owner_sid: &|_| Some("S-1-5-21-1-2-3-1001".into()),
                 serves_mount: &*self.serves,
                 keystore: self.keystore.get(),
+                update_keys: &self.update_keys,
+                download: &*self.download,
+                read_status: &*self.read_status,
+                version: "3.6.0",
             }
         }
 
@@ -2399,7 +2591,12 @@ mod tests {
         names.sort();
         assert_eq!(
             names,
-            [".installed-by-setup", "agent.ini", "printpapi-agent"]
+            [
+                ".installed-by-setup",
+                ".update",
+                "agent.ini",
+                "printpapi-agent"
+            ]
         );
     }
 
@@ -2551,6 +2748,9 @@ mod tests {
         assert_eq!(
             fx.events(),
             vec![
+                // the nightly update first, whether or not it was ever set up
+                "run systemctl disable --now printpapi-agent-update.timer".to_string(),
+                "run systemctl daemon-reload".to_string(),
                 "run systemctl stop printpapi-agent".to_string(),
                 format!("run pgrep -f {}", fx.layout.tray.display()),
                 "run systemctl is-active --quiet printpapi-agent".to_string(),
@@ -2621,7 +2821,11 @@ mod tests {
             assert!(fx.layout.binary.is_file(), "{os:?}");
             assert!(fx.layout.marker.is_file(), "{os:?}");
             assert!(fx.layout.autostart.is_file(), "{os:?}");
-            let ev = fx.events();
+            let ev: Vec<String> = fx
+                .events()
+                .into_iter()
+                .filter(|e| !e.contains("agent-update"))
+                .collect();
             assert!(
                 ev.iter()
                     .all(|e| !e.contains("disable") && !e.contains("remove")),
@@ -3351,6 +3555,83 @@ mod tests {
         assert_eq!(std::fs::read(&parked).unwrap(), b"the tray");
         // the file first, then its folder, which only goes when it is empty by then
         assert_eq!(*fx.at_reboot.borrow(), [parked, trash]);
+    }
+
+    #[test]
+    fn a_tray_moved_aside_by_an_update_that_still_runs_is_parked_not_a_reason_to_stop() {
+        let fx = Fixture::new(Os::Windows);
+        fx.stage_tray(b"the tray");
+        apply(&fx.staging, &fx.env()).unwrap();
+        let (old, old1) = {
+            let all = update::leftovers_of(&fx.layout.tray);
+            (all[2].clone(), all[3].clone())
+        };
+        std::fs::write(&old, b"the window still runs this").unwrap();
+        std::fs::write(&old1, b"free to delete").unwrap();
+        let locked = |p: &Path| -> std::io::Result<()> {
+            if *p == old {
+                Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied))
+            } else {
+                remove_tree(p)
+            }
+        };
+        remove_tray_leftovers(&fx.env(), &locked).unwrap();
+        let trash = fx
+            .layout
+            .dir
+            .parent()
+            .unwrap()
+            .join("printpapi-agent.removed");
+        let parked = trash.join(old.file_name().unwrap());
+        assert_eq!(
+            std::fs::read(&parked).unwrap(),
+            b"the window still runs this"
+        );
+        assert!(!old.exists() && !old1.exists());
+        assert_eq!(*fx.at_reboot.borrow(), [parked.clone(), trash.clone()]);
+        // the removal itself goes on to the end: only the parked file is left behind
+        remove(&fx.env()).unwrap();
+        assert!(!fx.layout.dir.exists());
+        // elsewhere nothing is parked
+        let fx = Fixture::new(Os::Linux);
+        remove_tray_leftovers(&fx.env(), &locked).unwrap();
+        assert!(fx.at_reboot.borrow().is_empty());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_running_old_tray_exe_really_cannot_be_deleted_and_is_parked() {
+        // a real running program: a copy of ping.exe that waits for a while
+        let ping = Path::new(r"C:\Windows\System32\PING.EXE");
+        if !ping.exists() {
+            return;
+        }
+        let fx = Fixture::new(Os::Windows);
+        fx.stage_tray(b"the tray");
+        apply(&fx.staging, &fx.env()).unwrap();
+        let old = update::leftovers_of(&fx.layout.tray)[2].clone();
+        std::fs::copy(ping, &old).unwrap();
+        let mut child = std::process::Command::new(&old)
+            .args(["-n", "30", "127.0.0.1"])
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        assert!(
+            remove_tree(&old).is_err(),
+            "a running exe cannot be deleted"
+        );
+        remove_tray_leftovers(&fx.env(), &remove_tree).unwrap();
+        let trash = fx
+            .layout
+            .dir
+            .parent()
+            .unwrap()
+            .join("printpapi-agent.removed");
+        let parked = trash.join(old.file_name().unwrap());
+        assert!(parked.is_file() && !old.exists());
+        assert_eq!(*fx.at_reboot.borrow(), [parked, trash]);
+        child.kill().unwrap();
+        child.wait().unwrap();
     }
 
     #[test]
@@ -4944,5 +5225,623 @@ X-Via = proxy
         }
         let (code, said) = everything_said(&Fixture::new(Os::Windows), &words("unprotect-key"));
         assert_eq!(code, Some(1), "{said}");
+    }
+
+    // ---- updates: marker, private folder, lock, schedule, command lines ----
+
+    const AUTO: &str = "updates = auto\n";
+
+    /// `fx` with a key and `updates = auto` in the staged ini.
+    fn auto_fixture(os: Os) -> Fixture {
+        let mut fx = Fixture::new(os);
+        fx.update_keys = vec![[7; 32]];
+        std::fs::write(fx.staging.join("agent.ini"), format!("{INI}{AUTO}")).unwrap();
+        fx
+    }
+
+    fn schedule_events(fx: &Fixture) -> Vec<String> {
+        fx.events()
+            .into_iter()
+            .filter(|e| e.contains("agent-update"))
+            .collect()
+    }
+
+    fn update_files(fx: &Fixture) -> Vec<PathBuf> {
+        install::update_schedule(fx.os, &fx.layout, &fx.env().sys)
+            .files
+            .into_iter()
+            .map(|(p, _)| p)
+            .collect()
+    }
+
+    #[test]
+    fn the_marker_holds_the_version_of_the_installing_program() {
+        let fx = Fixture::new(Os::Linux);
+        apply(&fx.staging, &fx.env()).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&fx.layout.marker).unwrap(),
+            "version=3.6.0\n"
+        );
+        let m = marker::read(&fx.layout.marker).unwrap();
+        assert_eq!(m.version.as_deref(), Some("3.6.0"));
+        assert_eq!(m.brand, marker::BrandMark::Stock);
+    }
+
+    #[test]
+    fn a_reinstall_keeps_the_other_lines_of_the_marker_and_replaces_an_unreadable_one() {
+        let fx = Fixture::new(Os::Linux);
+        std::fs::create_dir_all(&fx.layout.dir).unwrap();
+        std::fs::write(&fx.layout.marker, "version=3.3.0\nbrand=acme\nfuture=1\n").unwrap();
+        apply(&fx.staging, &fx.env()).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&fx.layout.marker).unwrap(),
+            "version=3.6.0\nbrand=acme\nfuture=1\n"
+        );
+        // a marker that cannot be read is not copied
+        fx.after_an_elevated_install();
+        std::fs::write(&fx.layout.marker, b"\xff\xfe junk").unwrap();
+        apply(&fx.staging, &fx.env()).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&fx.layout.marker).unwrap(),
+            "version=3.6.0\n"
+        );
+    }
+
+    #[test]
+    fn an_empty_marker_of_an_older_setup_still_counts_as_installed() {
+        let fx = Fixture::new(Os::Linux);
+        apply(&fx.staging, &fx.env()).unwrap();
+        std::fs::write(&fx.layout.marker, b"").unwrap();
+        restart(&fx.env()).expect("an empty marker is an installation of the setup");
+        remove(&fx.env()).expect("and it can be removed");
+    }
+
+    #[test]
+    fn the_private_folder_exists_before_anything_else_in_it_and_the_lock_is_never_recreated() {
+        let fx = Fixture::new(Os::Windows);
+        apply(&fx.staging, &fx.env()).unwrap();
+        let dir = fx.layout.dir.join(".update");
+        assert!(dir.is_dir());
+        assert!(dir.join("lock").is_file());
+        // icacls ran on the folder while the lock did not exist yet
+        let icacls = fx
+            .events()
+            .into_iter()
+            .find(|e| e.contains("icacls") && e.contains(".update"));
+        let icacls = icacls.expect("the private folder is closed");
+        assert!(icacls.contains("[lock false]"), "{icacls}");
+        assert!(icacls.contains("/inheritance:r"), "{icacls}");
+        // the lock keeps its identity: a second install does not replace it
+        std::fs::write(dir.join("lock"), b"mine").unwrap();
+        fx.after_an_elevated_install();
+        apply(&fx.staging, &fx.env()).unwrap();
+        assert_eq!(std::fs::read(dir.join("lock")).unwrap(), b"mine");
+    }
+
+    #[test]
+    fn unix_makes_the_folder_with_no_command_and_no_rights_for_others() {
+        let fx = Fixture::new(Os::Linux);
+        apply(&fx.staging, &fx.env()).unwrap();
+        assert!(
+            fx.events().iter().all(|e| !e.contains(".update")),
+            "{:?}",
+            fx.events()
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(fx.layout.dir.join(".update"))
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o777, 0o700);
+            let lock = std::fs::metadata(fx.layout.dir.join(".update").join("lock")).unwrap();
+            assert_eq!(lock.permissions().mode() & 0o777, 0o600);
+        }
+    }
+
+    /// Hold the lock of the installation like another admin command would.
+    fn hold_lock(fx: &Fixture) -> std::fs::File {
+        let f = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(fx.layout.dir.join(".update").join("lock"))
+            .unwrap();
+        f.try_lock().unwrap();
+        f
+    }
+
+    #[test]
+    fn a_held_lock_stops_every_admin_command_with_busy_and_changes_nothing() {
+        let fx = Fixture::new(Os::Windows);
+        apply(&fx.staging, &fx.env()).unwrap();
+        fx.after_an_elevated_install();
+        let before = std::fs::read(&fx.layout.ini).unwrap();
+        let held = hold_lock(&fx);
+        fx.events.borrow_mut().clear();
+        fx.slept.borrow_mut().clear();
+        for outcome in [
+            apply(&fx.staging, &fx.env()).map(|_| ()),
+            restart(&fx.env()).map(|_| ()),
+            remove(&fx.env()),
+            unprotect_key(&fx.env()).map(|_| ()),
+        ] {
+            let e = outcome.unwrap_err();
+            assert_eq!(e.code(), "busy", "{e}");
+            assert!(
+                e.to_string()
+                    .contains("An update or another change is running")
+            );
+        }
+        // five tries a second apart per command: four waits each
+        assert_eq!(fx.slept.borrow().iter().filter(|s| **s == 1).count(), 16);
+        // no command ran, nothing was written, nothing was removed
+        assert!(
+            fx.events()
+                .iter()
+                .all(|e| !e.contains("schtasks") && !e.contains("POST")),
+            "{:?}",
+            fx.events()
+        );
+        assert_eq!(std::fs::read(&fx.layout.ini).unwrap(), before);
+        assert!(fx.layout.binary.exists());
+        drop(held);
+        restart(&fx.env()).expect("the lock is free again");
+    }
+
+    #[test]
+    fn read_config_does_not_take_the_lock() {
+        let fx = Fixture::new(Os::Linux);
+        apply(&fx.staging, &fx.env()).unwrap();
+        let _held = hold_lock(&fx);
+        export_config(&fx.staging, &fx.env()).expect("read-config never waits for an update");
+    }
+
+    #[test]
+    fn an_installation_without_a_lock_file_runs_its_commands_as_before() {
+        let fx = Fixture::new(Os::Linux);
+        apply(&fx.staging, &fx.env()).unwrap();
+        // what 3.3.0 to 3.6.0 left: no .update at all
+        std::fs::remove_dir_all(fx.layout.dir.join(".update")).unwrap();
+        restart(&fx.env()).expect("restart");
+        remove(&fx.env()).expect("uninstall");
+    }
+
+    #[test]
+    fn the_default_mode_runs_no_command_of_the_schedule() {
+        for os in [Os::Linux, Os::Windows, Os::Macos] {
+            let fx = Fixture::new(os);
+            apply(&fx.staging, &fx.env()).unwrap();
+            assert!(schedule_events(&fx).is_empty(), "{os:?}: {:?}", fx.events());
+            fx.after_an_elevated_install();
+            restart(&fx.env()).unwrap();
+            assert!(schedule_events(&fx).is_empty(), "{os:?}");
+        }
+    }
+
+    #[test]
+    fn auto_with_a_key_registers_the_schedule_after_the_agent_started() {
+        let fx = auto_fixture(Os::Linux);
+        apply(&fx.staging, &fx.env()).unwrap();
+        let events = fx.events();
+        // the lines of enable commands carry a note about the marker
+        let start = events
+            .iter()
+            .position(|e| e.starts_with("run systemctl enable --now printpapi-agent ["))
+            .unwrap();
+        let timer = events
+            .iter()
+            .position(|e| e.starts_with("run systemctl enable --now printpapi-agent-update.timer"))
+            .expect("the timer is enabled");
+        assert!(timer > start, "{events:?}");
+        for f in update_files(&fx) {
+            assert!(f.is_file(), "{}", f.display());
+        }
+        // nothing but the timer is enabled
+        assert!(
+            !events
+                .iter()
+                .any(|e| e.contains("enable") && e.contains("agent-update.service"))
+        );
+    }
+
+    #[test]
+    fn a_failure_of_the_schedule_is_an_error_that_says_the_agent_runs() {
+        let fx = auto_fixture(Os::Linux);
+        fx.failing.borrow_mut().push("agent-update.timer".into());
+        let e = apply(&fx.staging, &fx.env()).unwrap_err();
+        assert_eq!(e.code(), "system");
+        assert!(
+            e.to_string()
+                .starts_with("The agent runs, but the update schedule could not be changed"),
+            "{e}"
+        );
+        // the agent was started, and not started a second time because of this
+        let events = fx.events();
+        let starts = events
+            .iter()
+            .filter(|e| e.starts_with("run systemctl enable --now printpapi-agent ["))
+            .count();
+        assert_eq!(starts, 1, "{events:?}");
+    }
+
+    #[test]
+    fn a_schedule_that_failed_to_register_is_registered_again_by_the_next_restart() {
+        for os in [Os::Linux, Os::Windows, Os::Macos] {
+            let fx = auto_fixture(os);
+            let word = match os {
+                Os::Linux => "agent-update.timer",
+                Os::Windows => "/create",
+                Os::Macos => "agent-update.plist",
+            };
+            fx.failing.borrow_mut().push(word.into());
+            let first = apply(&fx.staging, &fx.env());
+            assert!(first.is_err(), "{os:?}: {:?}", fx.events());
+            fx.failing.borrow_mut().clear();
+            fx.events.borrow_mut().clear();
+            fx.after_an_elevated_install();
+            restart(&fx.env()).unwrap();
+            let events = schedule_events(&fx);
+            assert!(
+                events.iter().any(|e| e.contains(match os {
+                    Os::Linux => "enable --now printpapi-agent-update.timer",
+                    Os::Windows => "/create",
+                    Os::Macos => "bootstrap",
+                })),
+                "{os:?}: the nightly update was never registered: {events:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_schedule_that_was_registered_is_unregistered_when_the_new_registration_fails() {
+        // the files are deleted after a failed registration, so a task or timer that an earlier
+        // run registered must go with them: nothing is left to take it out later
+        for os in [Os::Linux, Os::Windows, Os::Macos] {
+            let fx = auto_fixture(os);
+            apply(&fx.staging, &fx.env()).unwrap();
+            fx.after_an_elevated_install();
+            std::fs::write(&update_files(&fx)[0], b"edited").unwrap();
+            fx.events.borrow_mut().clear();
+            fx.failing.borrow_mut().push(
+                match os {
+                    Os::Linux => "enable --now printpapi-agent-update",
+                    Os::Windows => "/create",
+                    Os::Macos => "bootstrap",
+                }
+                .into(),
+            );
+            assert!(restart(&fx.env()).is_err(), "{os:?}");
+            let events = schedule_events(&fx);
+            let last_register = events
+                .iter()
+                .rposition(|e| {
+                    e.contains("enable --now printpapi-agent-update")
+                        || e.contains("/create")
+                        || e.contains("bootstrap")
+                })
+                .unwrap();
+            assert!(
+                events[last_register..].iter().any(|e| e.contains(match os {
+                    Os::Linux => "disable --now printpapi-agent-update.timer",
+                    Os::Windows => "/delete",
+                    Os::Macos => "bootout",
+                })),
+                "{os:?}: the registered entry stays behind: {events:?}"
+            );
+            assert!(update_files(&fx).iter().all(|f| !f.exists()), "{os:?}");
+        }
+    }
+
+    #[test]
+    fn uninstall_takes_the_schedule_out_even_when_its_files_are_gone() {
+        for os in [Os::Linux, Os::Windows, Os::Macos] {
+            // no schedule files at all (a failed registration deleted them, or an earlier run did)
+            let fx = Fixture::new(os);
+            apply(&fx.staging, &fx.env()).unwrap();
+            fx.after_an_elevated_install();
+            assert!(update_files(&fx).iter().all(|f| !f.exists()));
+            fx.events.borrow_mut().clear();
+            remove(&fx.env()).unwrap();
+            let events = schedule_events(&fx);
+            assert!(
+                events.iter().any(|e| e.contains(match os {
+                    Os::Linux => "disable --now printpapi-agent-update.timer",
+                    Os::Windows => "/delete",
+                    Os::Macos => "bootout",
+                })),
+                "{os:?}: {events:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_ordinary_install_and_restart_run_no_schedule_command_when_there_is_none() {
+        for os in [Os::Linux, Os::Windows, Os::Macos] {
+            let fx = Fixture::new(os);
+            apply(&fx.staging, &fx.env()).unwrap();
+            fx.after_an_elevated_install();
+            restart(&fx.env()).unwrap();
+            assert!(schedule_events(&fx).is_empty(), "{os:?}: {:?}", fx.events());
+        }
+    }
+
+    #[test]
+    fn equal_bytes_on_disk_mean_nothing_to_do_even_much_later() {
+        let fx = auto_fixture(Os::Linux);
+        apply(&fx.staging, &fx.env()).unwrap();
+        fx.events.borrow_mut().clear();
+        restart(&fx.env()).unwrap();
+        assert!(schedule_events(&fx).is_empty(), "{:?}", fx.events());
+        // a changed file is written and registered again
+        let service = &update_files(&fx)[0];
+        std::fs::write(service, b"edited").unwrap();
+        restart(&fx.env()).unwrap();
+        assert!(
+            schedule_events(&fx)
+                .iter()
+                .any(|e| e.contains("enable --now printpapi-agent-update.timer"))
+        );
+        assert!(
+            std::fs::read_to_string(service)
+                .unwrap()
+                .contains("Type=oneshot")
+        );
+    }
+
+    #[test]
+    fn notify_off_no_key_and_a_branded_install_take_the_schedule_out_and_never_stop_its_service() {
+        for case in ["notify", "off", "typo", "no key", "brand", "bad url"] {
+            let mut fx = auto_fixture(Os::Linux);
+            apply(&fx.staging, &fx.env()).unwrap();
+            let files = update_files(&fx);
+            assert!(files.iter().all(|f| f.is_file()), "{case}");
+            match case {
+                "no key" => fx.update_keys.clear(),
+                "brand" => {
+                    std::fs::write(&fx.layout.marker, "version=3.6.0\nbrand=acme\n").unwrap()
+                }
+                other => {
+                    let word = match other {
+                        "typo" => "autoo",
+                        "bad url" => "auto\nupdate_url = ftp://x",
+                        w => w,
+                    };
+                    let ini = std::fs::read_to_string(&fx.layout.ini)
+                        .unwrap()
+                        .replace("updates = auto", &format!("updates = {word}"));
+                    std::fs::write(&fx.layout.ini, ini).unwrap();
+                }
+            }
+            fx.events.borrow_mut().clear();
+            restart(&fx.env()).unwrap();
+            let events = fx.events();
+            assert!(
+                events.contains(
+                    &"run systemctl disable --now printpapi-agent-update.timer".to_string()
+                ),
+                "{case}: {events:?}"
+            );
+            assert!(files.iter().all(|f| !f.exists()), "{case}");
+            assert!(
+                !events
+                    .iter()
+                    .any(|e| e.contains("stop printpapi-agent-update")),
+                "{case}"
+            );
+            // and a second restart finds nothing to do
+            fx.events.borrow_mut().clear();
+            restart(&fx.env()).unwrap();
+            assert!(schedule_events(&fx).is_empty(), "{case}: {:?}", fx.events());
+        }
+    }
+
+    #[test]
+    fn the_macos_job_is_booted_out_when_it_changes_and_bootstrapped_with_retries() {
+        let fx = auto_fixture(Os::Macos);
+        fx.flaky.borrow_mut().push(("bootstrap system".into(), 0));
+        // the first two bootstrap tries of the update job fail, the third works
+        fx.flaky.borrow_mut().clear();
+        fx.flaky.borrow_mut().push(("agent-update.plist".into(), 2));
+        apply(&fx.staging, &fx.env()).unwrap();
+        let bootstraps = schedule_events(&fx)
+            .iter()
+            .filter(|e| e.contains("bootstrap"))
+            .count();
+        assert_eq!(bootstraps, 3);
+        assert_eq!(fx.slept.borrow().iter().filter(|s| **s == 1).count(), 2);
+        // no bootout of a job that did not exist
+        assert!(!schedule_events(&fx).iter().any(|e| e.contains("bootout")));
+        // a changed file: bootout first, then bootstrap
+        let plist = &update_files(&fx)[0];
+        std::fs::write(plist, b"old plist").unwrap();
+        fx.events.borrow_mut().clear();
+        restart(&fx.env()).unwrap();
+        let events = schedule_events(&fx);
+        assert!(
+            events[0].contains("bootout system/com.printpapi.agent-update"),
+            "{events:?}"
+        );
+        assert!(events[1].contains("bootstrap system"), "{events:?}");
+    }
+
+    #[test]
+    fn the_macos_job_gives_up_after_ten_tries_with_the_sentence_of_the_schedule() {
+        let fx = auto_fixture(Os::Macos);
+        fx.failing.borrow_mut().push("bootstrap system /".into());
+        fx.failing
+            .borrow_mut()
+            .retain(|f| f != "bootstrap system /");
+        fx.flaky
+            .borrow_mut()
+            .push(("agent-update.plist".into(), 100));
+        let e = apply(&fx.staging, &fx.env()).unwrap_err();
+        assert!(
+            e.to_string()
+                .starts_with("The agent runs, but the update schedule"),
+            "{e}"
+        );
+        assert_eq!(
+            schedule_events(&fx)
+                .iter()
+                .filter(|e| e.contains("bootstrap"))
+                .count(),
+            10
+        );
+    }
+
+    #[test]
+    fn the_windows_task_is_created_from_its_file_and_deleted_on_uninstall() {
+        let fx = auto_fixture(Os::Windows);
+        apply(&fx.staging, &fx.env()).unwrap();
+        let create = schedule_events(&fx);
+        assert_eq!(create.len(), 1, "{create:?}");
+        assert!(
+            create[0].contains("/create /tn printpapi-agent-update /xml"),
+            "{create:?}"
+        );
+        assert!(create[0].contains(" /f"), "{create:?}");
+        let xml = update_files(&fx)[0].clone();
+        assert!(xml.is_file());
+        fx.events.borrow_mut().clear();
+        remove(&fx.env()).unwrap();
+        assert!(
+            schedule_events(&fx)
+                .iter()
+                .any(|e| e.contains("/delete /tn printpapi-agent-update /f"))
+        );
+        assert!(!fx.layout.dir.exists());
+    }
+
+    #[test]
+    fn uninstall_takes_the_schedule_the_private_folder_the_state_and_the_leftovers_with_it() {
+        for os in [Os::Linux, Os::Windows, Os::Macos] {
+            let fx = auto_fixture(os);
+            apply(&fx.staging, &fx.env()).unwrap();
+            let l = &fx.layout;
+            std::fs::write(update::state_path(l), "{}").unwrap();
+            std::fs::write(l.dir.join(".update").join("agent-probe"), b"x").unwrap();
+            let mut leftovers = Vec::new();
+            for program in [&l.binary, &l.tray] {
+                for p in update::leftovers_of(program) {
+                    std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+                    std::fs::write(&p, b"left").unwrap();
+                    leftovers.push(p);
+                }
+            }
+            // something foreign beside them stays, and so does the folder around it
+            std::fs::write(l.dir.join("printpapi"), b"the server").unwrap();
+            remove(&fx.env()).unwrap();
+            assert!(update_files(&fx).iter().all(|f| !f.exists()), "{os:?}");
+            assert!(!l.dir.join(".update").exists(), "{os:?}");
+            assert!(!update::state_path(l).exists(), "{os:?}");
+            for p in &leftovers {
+                assert!(!p.exists(), "{os:?} {}", p.display());
+            }
+            assert_eq!(
+                std::fs::read(l.dir.join("printpapi")).unwrap(),
+                b"the server",
+                "{os:?}"
+            );
+            assert!(l.dir.exists(), "{os:?}: the folder holds something foreign");
+        }
+    }
+
+    #[test]
+    fn the_two_update_forms_are_exactly_two_and_every_other_three_word_form_is_usage() {
+        // the argument parser of the released agents (3.3.0 to 3.6.0, run_args of v3.6.0): a known
+        // first word takes the staging folder, or the folder and --keep-pid with a number
+        fn released(args: &[&str]) -> Option<u8> {
+            let known = matches!(
+                args.first(),
+                Some(&("install" | "uninstall" | "read-config" | "restart"))
+            );
+            if !known {
+                return None;
+            }
+            match args {
+                [_, _] => Some(0),
+                [_, _, flag, pid]
+                    if *flag == "--keep-pid"
+                        && !pid.is_empty()
+                        && pid.bytes().all(|b| b.is_ascii_digit()) =>
+                {
+                    Some(0)
+                }
+                _ => Some(2),
+            }
+        }
+        let fx = Fixture::new(Os::Linux);
+        let env = fx.env();
+        let dir = fx.staging.display().to_string();
+        let forms: [Vec<&str>; 2] = [
+            vec!["restart", "--update-from", &dir],
+            vec!["restart", "--update", "now"],
+        ];
+        for form in &forms {
+            assert_eq!(released(form), Some(2), "a released agent refuses {form:?}");
+            let args: Vec<String> = form.iter().map(|s| s.to_string()).collect();
+            // the new parser knows it: it does not answer with usage
+            assert_ne!(run_args(&args, Ok(&env)), Some(2), "{form:?}");
+        }
+        // every other form with three words stays usage, in the new parser too
+        for bad in [
+            vec!["restart", "--update", "later"],
+            vec!["restart", "--update", "now", "x"],
+            vec!["restart", "--update-from", "a", "b"],
+            vec!["install", "--update-from", "a"],
+            vec!["uninstall", "--update", "now"],
+            vec!["read-config", "--update", "now"],
+            vec!["restart", "now", "--update"],
+            vec!["restart", "--Update", "now"],
+        ] {
+            let args: Vec<String> = bad.iter().map(|s| s.to_string()).collect();
+            assert_eq!(run_args(&args, Ok(&env)), Some(2), "{bad:?}");
+        }
+        assert!(fx.events().is_empty());
+    }
+
+    #[test]
+    fn restart_update_from_reports_through_result_json_like_the_other_commands() {
+        let fx = Fixture::new(Os::Linux);
+        apply(&fx.staging, &fx.env()).unwrap();
+        let args: Vec<String> = [
+            "restart",
+            "--update-from",
+            &fx.staging.display().to_string(),
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        // no key in this build: a refusal with its code, no change
+        assert_eq!(run_args(&args, Ok(&fx.env())), Some(1));
+        let v: Value =
+            serde_json::from_slice(&std::fs::read(fx.staging.join("result.json")).unwrap())
+                .unwrap();
+        assert_eq!(v["ok"], json!(false));
+        assert_eq!(v["code"], json!("no_key"));
+        assert!(v["message"].as_str().unwrap().contains("no update key"));
+    }
+
+    #[test]
+    fn restart_update_now_is_silent_when_there_is_nothing_to_do() {
+        let fx = Fixture::new(Os::Linux);
+        apply(&fx.staging, &fx.env()).unwrap();
+        crate::ERR_LINES.with(|l| l.borrow_mut().clear());
+        let args: Vec<String> = ["restart", "--update", "now"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert_eq!(run_args(&args, Ok(&fx.env())), Some(0));
+        assert!(crate::ERR_LINES.with(|l| l.borrow().is_empty()));
+        // and it writes no result file anywhere
+        assert!(!fx.staging.join("result.json").exists());
+        assert_eq!(
+            run_args(
+                &args,
+                Err(ApplyError::System("cannot find the running program".into()))
+            ),
+            Some(1)
+        );
     }
 }

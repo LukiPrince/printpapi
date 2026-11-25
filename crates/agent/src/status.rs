@@ -210,6 +210,13 @@ pub struct Status {
     /// The key stored in agent.ini cannot be read here: the agent waits instead of ending, and
     /// the window offers to enter it again.
     pub key_unreadable: bool,
+    /// The update mode as the agent applies it: `notify`, `auto` or `off` (also for an
+    /// `update_url` that is no valid folder, which switches checking off).
+    pub updates: &'static str,
+    /// The mirror folder of agent.ini, `None` for the release folder. Never with user info.
+    pub update_url: Option<String>,
+    /// A job was claimed and is not finished: an update waits.
+    pub busy: bool,
 }
 
 impl Status {
@@ -240,6 +247,16 @@ impl Status {
             .flatten()
             .unwrap_or_else(|| "agent".into());
         let server = cfg.get("server_url").ok().flatten().unwrap_or_default();
+        let update = crate::update::settings(cfg);
+        let updates = match (update.mode, &update.base) {
+            (crate::update::Mode::Off, _) | (_, None) => "off",
+            (crate::update::Mode::Notify, _) => "notify",
+            (crate::update::Mode::Auto, _) => "auto",
+        };
+        let update_url = update
+            .base
+            .filter(|b| b != crate::update::DEFAULT_BASE)
+            .map(|b| mask_key(without_credentials(&b), &key));
         Status {
             version: env!("CARGO_PKG_VERSION").to_string(),
             started_at: process_started_at(),
@@ -253,6 +270,9 @@ impl Status {
             header_names: settings.headers.into_keys().collect(),
             error: None,
             key_unreadable: false,
+            updates,
+            update_url,
+            busy: false,
         }
     }
 }
@@ -287,6 +307,9 @@ pub fn render(s: &Status) -> String {
         "header_names": s.header_names,
         "error": s.error,
         "key_unreadable": s.key_unreadable,
+        "updates": s.updates,
+        "update_url": s.update_url,
+        "busy": s.busy,
     })
     .to_string()
 }
@@ -440,8 +463,16 @@ impl Reporter {
         self.flush(now);
     }
 
+    /// A job was claimed: busy, and written at once, so an update that looks in the next second
+    /// does not stop the agent in the middle of it.
+    pub fn claimed(&mut self, now: f64) {
+        self.status.busy = true;
+        self.flush(now);
+    }
+
     /// One poll came to `outcome`.
     pub fn polled(&mut self, outcome: &PollOutcome, now: f64) {
+        self.status.busy = false;
         match outcome {
             Err(e) => {
                 self.status.state = "offline";
@@ -973,6 +1004,75 @@ printers = p
         let v = file();
         assert_eq!(v["error"], "refused ***");
         assert!(!v.to_string().contains(KEY));
+    }
+
+    fn config_with(extra: &str) -> Config {
+        Config::from_text(&format!(
+            "[agent]\nserver_url = https://x\napi_key = {KEY}\nprinters = p\n{extra}"
+        ))
+        .unwrap()
+    }
+
+    #[test]
+    fn the_status_names_the_update_mode_and_a_mirror_but_never_a_secret() {
+        let v = |extra: &str| -> Value {
+            serde_json::from_str(&render(&Status::from_config(&config_with(extra)))).unwrap()
+        };
+        let d = v("");
+        assert_eq!(d["updates"], "notify");
+        assert_eq!(d["update_url"], Value::Null);
+        assert_eq!(d["busy"], false);
+        assert_eq!(v("updates = auto\n")["updates"], "auto");
+        assert_eq!(v("updates = Off\n")["updates"], "off");
+        // a typo is off
+        assert_eq!(v("updates = yes\n")["updates"], "off");
+        // a mirror that is no valid folder switches checking off (spec: a bad update_url disables
+        // checks), and nothing of it is written to the file
+        for bad in [
+            "https://u:p@m.example/x",
+            "https://m.example/x?token=SECRET",
+            "ftp://m.example/x",
+        ] {
+            let b = v(&format!("updates = auto\nupdate_url = {bad}\n"));
+            assert_eq!(b["updates"], "off", "{bad}");
+            assert_eq!(b["update_url"], Value::Null, "{bad}");
+            assert!(!b.to_string().contains("SECRET"), "{bad}");
+        }
+        let m = v("update_url = https://m.example/x/\n");
+        assert_eq!(m["update_url"], "https://m.example/x");
+        assert_eq!(m["updates"], "notify");
+        assert!(!m.to_string().contains(KEY));
+        // the key inside the folder is masked like everywhere else in this file
+        let k = v(&format!("update_url = https://m.example/{KEY}/x\n"));
+        assert_eq!(k["update_url"], "https://m.example/***/x");
+        assert!(!k.to_string().contains(KEY));
+    }
+
+    #[test]
+    fn busy_is_true_from_the_claim_to_the_result_and_written_at_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = || -> Value {
+            serde_json::from_str(&std::fs::read_to_string(dir.path().join("status.json")).unwrap())
+                .unwrap()
+        };
+        let mut r = Reporter::new(
+            Status::from_config(&config()),
+            Some(StatusWriter::new(dir.path().to_path_buf())),
+            KEY.to_string(),
+        );
+        r.registered(10.0);
+        assert_eq!(file()["busy"], false);
+        // one second later: inside the 60 s refresh window, so only a changed file is written
+        r.claimed(11.0);
+        assert_eq!(file()["busy"], true);
+        r.polled(&Ok(Some(crate::run::JobDone { id: 7, ok: true })), 12.0);
+        let v = file();
+        assert_eq!(v["busy"], false);
+        assert_eq!(v["last_job"]["id"], 7);
+        // an empty poll and a failed poll clear it too
+        r.claimed(13.0);
+        r.polled(&Err("down".into()), 14.0);
+        assert_eq!(file()["busy"], false);
     }
 
     #[test]

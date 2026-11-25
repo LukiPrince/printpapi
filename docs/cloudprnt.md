@@ -56,6 +56,10 @@ A `pdf` job queued to one of these is **failed on the next poll** with
 paper. `POST /orders` (packing slips) refuses these printers up front for the same reason: render
 the document somewhere else and submit it as `raw_*`, or point orders at a PDF-capable printer.
 
+A [receipt job](receipts.md) (`"type": "receipt"`) is refused for these printers with `400`
+`CloudPRNT printers cannot print receipts — send raw Star commands`: the server lays receipts out
+as ESC/POS, and a Star printer needs Star commands. The receipt profile routes answer the same `400`.
+
 `copies` works — the stream is simply repeated. Per-job `options` (duplex, tray, …) are a PDF
 feature and do not apply.
 

@@ -58,3 +58,22 @@ test("stored label templates survive a reload", () => {
   assert.equal(back.labels.length, 1);
   assert.equal(back.next.label, 9);
 });
+
+test("a state stored before receipt profiles existed loads, with none stored", () => {
+  const s = seedState(now) as unknown as Record<string, unknown>;
+  delete s.receipt_profiles;
+  const back = loadState(JSON.stringify(s), now + 99);
+  assert.deepEqual(back.receipt_profiles, {});
+  assert.equal(back.jobs.length, seedState(now).jobs.length);
+});
+
+test("stored receipt profiles survive a reload", () => {
+  const s = seedState(now);
+  s.receipt_profiles = { 1: { paper_mm: 58, width_dots: 320, codepage: "cp1252", codepage_number: 19, cut: "full", output: "escpos" } };
+  const back = loadState(saveState(s), now + 99);
+  assert.deepEqual(back.receipt_profiles, s.receipt_profiles);
+});
+
+test("the seed gives the receipt printer 58 mm paper", () => {
+  assert.equal(seedState(now).receipt_profiles?.[4]?.paper_mm, 58);
+});

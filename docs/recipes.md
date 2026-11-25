@@ -43,6 +43,23 @@ printer what it understands, a PDF or ZPL:
 Same one HTTP node. `label_base64` takes an image you hold, `label_text` prints a short text such
 as an error code or a shelf name. See [labels.md](labels.md).
 
+### Receipts: let the server lay it out
+
+A till or a shop that prints a receipt sends the receipt as data, not as ESC/POS bytes. The server
+draws it for the printer (umlauts and the euro sign included), with a QR code, a barcode, a cut and
+the cash drawer:
+
+```json
+{"printer_id": 3, "type": "receipt", "title": "Bon 4711", "idempotency_key": "bon-4711",
+ "receipt": {"content": [
+   {"type": "text", "text": "Café Müller", "align": "center", "bold": true, "size": 2},
+   {"type": "columns", "cells": [{"text": "2 x Weißbrot"}, {"text": "5,80 €", "align": "right", "width": 10}]},
+   {"type": "qr", "data": "https://example.com/r/4711"}]}}
+```
+
+Same one HTTP node. `POST /receipts/preview` draws it as a PNG first, and the dashboard's *Receipt*
+tab does that while you type. See [receipts.md](receipts.md).
+
 Two fields worth setting on every automated job:
 
 - **`idempotency_key`** — order webhooks get redelivered. With a stable key (the order id) a

@@ -873,9 +873,266 @@ pub fn status_dir_cmds(os: Os, l: &Layout, sys: &Path) -> Vec<Cmd> {
 /// command, which the caller lets fail: a local copy may not carry it). Empty elsewhere, where the
 /// tray is one file that is written directly.
 pub fn tray_copy_cmds(os: Os, from: &Path, l: &Layout, sys: &Path) -> Vec<Cmd> {
+    tray_copy_cmds_to(os, from, &l.tray, sys)
+}
+
+/// Name of the Windows task that installs updates at night (mode `auto` only).
+pub const UPDATE_TASK_NAME: &str = "printpapi-agent-update";
+/// launchd label of the nightly update job (mode `auto` only).
+pub const UPDATE_LAUNCHD_LABEL: &str = "com.printpapi.agent-update";
+/// The arguments of the nightly run. At least three words behind a known word: every released agent
+/// (3.3.0 to 3.6.0) answers that with usage and exit 2 instead of doing something else (AGENTS.md).
+pub const UPDATE_ARGS: [&str; 3] = ["restart", "--update", "now"];
+const UPDATE_LOG: &str = "/var/log/printpapi-agent-update.log";
+
+/// The unattended update as data: files to write, and what to run to register or take it out.
+#[derive(Debug, Clone, PartialEq)]
+pub struct UpdateSchedule {
+    /// `(path, bytes)`: the task XML (Windows), the service and timer unit (Linux), the plist (macOS).
+    pub files: Vec<(PathBuf, Vec<u8>)>,
+    /// Run after the files were written.
+    pub register: Vec<Cmd>,
+    /// Run to take it out, before the files are deleted. A failure is ignored: it may not be there.
+    pub unregister: Vec<Cmd>,
+    /// Run after the files were deleted (systemd reads its unit files again).
+    pub reload: Vec<Cmd>,
+}
+
+fn utf16_bom(text: &str) -> Vec<u8> {
+    let mut bytes = vec![0xFF, 0xFE];
+    for unit in text.replace('\n', "\r\n").encode_utf16() {
+        bytes.extend_from_slice(&unit.to_le_bytes());
+    }
+    bytes
+}
+
+/// Task Scheduler XML of the nightly update: 03:00 every day with up to six hours of random delay (a
+/// fleet does not ask all at once), SYSTEM, a missed run starts when the computer is back,
+/// `IgnoreNew` so a second start does nothing, at most an hour (the update itself ends far sooner).
+/// The order inside the trigger is the one of the schema's `calendarTriggerType` (a sequence: `RandomDelay`
+/// first, then the choice `ScheduleByDay`, taskschedulerschema-calendartriggertype-complextype) and the one
+/// Windows writes itself (checked in the exports of the tasks on a Windows 11 machine with `schtasks /query
+/// /xml`: `StartBoundary`, `RandomDelay`, `ScheduleByDay`).
+/// Element names: https://learn.microsoft.com/en-us/windows/win32/taskschd/task-scheduler-schema ;
+/// `CalendarTrigger`, `RandomDelay` and `StartWhenAvailable` are the elements of
+/// taskschedulerschema-calendartrigger-triggergroup-element, -randomdelay-calendartriggertype-element
+/// and -startwhenavailable-settingstype-element.
+fn update_task_xml(l: &Layout) -> Vec<u8> {
+    let text = format!(
+        r#"<?xml version="1.0" encoding="UTF-16"?>
+<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <RegistrationInfo>
+    <Description>printpapi agent update</Description>
+  </RegistrationInfo>
+  <Triggers>
+    <CalendarTrigger>
+      <StartBoundary>2026-01-01T03:00:00</StartBoundary>
+      <Enabled>true</Enabled>
+      <RandomDelay>PT6H</RandomDelay>
+      <ScheduleByDay>
+        <DaysInterval>1</DaysInterval>
+      </ScheduleByDay>
+    </CalendarTrigger>
+  </Triggers>
+  <Principals>
+    <Principal id="Author">
+      <UserId>S-1-5-18</UserId>
+      <RunLevel>HighestAvailable</RunLevel>
+    </Principal>
+  </Principals>
+  <Settings>
+    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
+    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
+    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
+    <StartWhenAvailable>true</StartWhenAvailable>
+    <AllowHardTerminate>true</AllowHardTerminate>
+    <AllowStartOnDemand>true</AllowStartOnDemand>
+    <Enabled>true</Enabled>
+    <ExecutionTimeLimit>PT1H</ExecutionTimeLimit>
+    <Priority>7</Priority>
+  </Settings>
+  <Actions Context="Author">
+    <Exec>
+      <Command>{}</Command>
+      <Arguments>{}</Arguments>
+    </Exec>
+  </Actions>
+</Task>
+"#,
+        xml_escape(&s(&l.binary)),
+        UPDATE_ARGS.join(" ")
+    );
+    utf16_bom(&text)
+}
+
+/// `printpapi-agent-update.service`: one run of the update. `Type=oneshot` has no start timeout
+/// unless one is set, so `TimeoutStartSec=1h` is the same bound as the Windows task's.
+/// https://raw.githubusercontent.com/systemd/systemd/main/man/systemd.service.xml
+fn update_service_unit(l: &Layout) -> String {
+    format!(
+        "[Unit]\nDescription=printpapi agent update\nAfter=network-online.target\n\n\
+         [Service]\nType=oneshot\nExecStart={} {}\nTimeoutStartSec=1h\n",
+        s(&l.binary),
+        UPDATE_ARGS.join(" ")
+    )
+}
+
+/// `printpapi-agent-update.timer`: every day at 03:00 plus up to six hours; `Persistent=true` runs a
+/// missed one at the next boot. https://www.freedesktop.org/software/systemd/man/latest/systemd.timer.html
+fn update_timer_unit() -> String {
+    "[Unit]\nDescription=printpapi agent update, daily\n\n\
+     [Timer]\nOnCalendar=*-*-* 03:00:00\nRandomizedDelaySec=6h\nPersistent=true\n\n\
+     [Install]\nWantedBy=timers.target\n"
+        .to_string()
+}
+
+/// The launchd job: 03:17 every day, a fixed minute so the file's bytes never change (equal bytes
+/// mean nothing to do), and no `RunAtLoad`, which would start an update at every boot.
+/// https://keith.github.io/xcode-man-pages/launchd.plist.5.html
+fn update_plist(l: &Layout) -> String {
+    format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>{UPDATE_LAUNCHD_LABEL}</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>{}</string>
+    <string>{}</string>
+    <string>{}</string>
+    <string>{}</string>
+  </array>
+  <key>StartCalendarInterval</key>
+  <dict>
+    <key>Hour</key><integer>3</integer>
+    <key>Minute</key><integer>17</integer>
+  </dict>
+  <key>StandardOutPath</key><string>{UPDATE_LOG}</string>
+  <key>StandardErrorPath</key><string>{UPDATE_LOG}</string>
+</dict>
+</plist>
+"#,
+        xml_escape(&s(&l.binary)),
+        UPDATE_ARGS[0],
+        UPDATE_ARGS[1],
+        UPDATE_ARGS[2]
+    )
+}
+
+/// The unattended update for this system. It sits next to the autostart file of the agent (the
+/// install folder on Windows, `/etc/systemd/system`, `/Library/LaunchDaemons`), so a layout in a
+/// test folder keeps all of it in that folder.
+pub fn update_schedule(os: Os, l: &Layout, sys: &Path) -> UpdateSchedule {
+    let beside = |name: &str| {
+        let parent = l.autostart.parent().unwrap_or(&l.dir);
+        join(os, parent, name)
+    };
+    match os {
+        Os::Windows => {
+            let xml = join(os, &l.dir, "printpapi-agent-update-task.xml");
+            let schtasks = tool(os, sys, "schtasks.exe");
+            UpdateSchedule {
+                register: vec![cmd(vec![
+                    schtasks.clone(),
+                    "/create".into(),
+                    "/tn".into(),
+                    UPDATE_TASK_NAME.into(),
+                    "/xml".into(),
+                    s(&xml),
+                    "/f".into(),
+                ])],
+                unregister: vec![cmd(vec![
+                    schtasks,
+                    "/delete".into(),
+                    "/tn".into(),
+                    UPDATE_TASK_NAME.into(),
+                    "/f".into(),
+                ])],
+                reload: Vec::new(),
+                files: vec![(xml, update_task_xml(l))],
+            }
+        }
+        Os::Linux => UpdateSchedule {
+            files: vec![
+                (
+                    beside("printpapi-agent-update.service"),
+                    update_service_unit(l).into_bytes(),
+                ),
+                (
+                    beside("printpapi-agent-update.timer"),
+                    update_timer_unit().into_bytes(),
+                ),
+            ],
+            // only the timer is enabled: the service has no [Install] and runs when the timer says
+            register: vec![
+                cmd(argv(&["systemctl", "daemon-reload"])),
+                cmd(argv(&[
+                    "systemctl",
+                    "enable",
+                    "--now",
+                    "printpapi-agent-update.timer",
+                ])),
+            ],
+            unregister: vec![cmd(argv(&[
+                "systemctl",
+                "disable",
+                "--now",
+                "printpapi-agent-update.timer",
+            ]))],
+            reload: vec![cmd(argv(&["systemctl", "daemon-reload"]))],
+        },
+        Os::Macos => {
+            let plist = beside("com.printpapi.agent-update.plist");
+            let launchctl = tool(os, sys, "bin/launchctl");
+            UpdateSchedule {
+                register: vec![cmd(vec![
+                    launchctl.clone(),
+                    "bootstrap".into(),
+                    "system".into(),
+                    s(&plist),
+                ])],
+                unregister: vec![cmd(vec![
+                    launchctl,
+                    "bootout".into(),
+                    format!("system/{UPDATE_LAUNCHD_LABEL}"),
+                ])],
+                reload: Vec::new(),
+                files: vec![(plist, update_plist(l).into_bytes())],
+            }
+        }
+    }
+}
+
+/// The commands that make `dir` (the private `.update` folder) readable and writable for SYSTEM and
+/// the administrators only. Windows: `icacls` by SID, inheritance cut, run **before** anything is
+/// created in the folder. Not `ini_acl_cmds`: on Linux that gives the service user read access, and
+/// a file that anyone can open can be locked by anyone. Unix needs no command: the folder is made
+/// with mode 0700 by root.
+pub fn private_dir_cmds(os: Os, dir: &Path, sys: &Path) -> Vec<Cmd> {
+    match os {
+        Os::Windows => vec![cmd(vec![
+            tool(os, sys, "icacls.exe"),
+            s(dir),
+            "/inheritance:r".into(),
+            "/grant:r".into(),
+            format!("{SID_SYSTEM}:(OI)(CI)F"),
+            format!("{SID_ADMINISTRATORS}:(OI)(CI)F"),
+        ])],
+        Os::Linux | Os::Macos => Vec::new(),
+    }
+}
+
+/// The ditto program (macOS), which also unpacks the app ZIP of an update.
+pub fn ditto_program(os: Os, sys: &Path) -> String {
+    tool(os, sys, "usr/bin/ditto")
+}
+
+/// [`tray_copy_cmds`] for any target: macOS copies the `.app` folder `from` to `to`.
+pub fn tray_copy_cmds_to(os: Os, from: &Path, to: &Path, sys: &Path) -> Vec<Cmd> {
     match os {
         Os::Macos => {
-            let app = s(&l.tray);
+            let app = s(to);
             vec![
                 cmd(vec![tool(os, sys, "usr/bin/ditto"), s(from), app.clone()]),
                 cmd(vec![
@@ -2272,5 +2529,215 @@ mod tests {
             assert_eq!(detect(os, &l, Path::new("/"), &running), Installed::Foreign);
             assert_eq!(seen.borrow().len(), 1);
         }
+    }
+
+    #[test]
+    fn the_windows_update_task_runs_nightly_as_system_with_the_three_word_command() {
+        let l = win_layout("C:\\Program Files");
+        let sch = update_schedule(Os::Windows, &l, Path::new(WIN_SYS));
+        let [(path, bytes)] = sch.files.as_slice() else {
+            panic!("one file")
+        };
+        assert_eq!(
+            p(path),
+            "C:\\Program Files\\printpapi-agent\\printpapi-agent-update-task.xml"
+        );
+        let xml = utf16(bytes);
+        for needle in [
+            "<CalendarTrigger>",
+            "<StartBoundary>2026-01-01T03:00:00</StartBoundary>",
+            "<DaysInterval>1</DaysInterval>",
+            "<RandomDelay>PT6H</RandomDelay>",
+            "<StartWhenAvailable>true</StartWhenAvailable>",
+            "<ExecutionTimeLimit>PT1H</ExecutionTimeLimit>",
+            "<MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>",
+            "<UserId>S-1-5-18</UserId>",
+            "<Command>C:\\Program Files\\printpapi-agent\\printpapi-agent.exe</Command>",
+            "<Arguments>restart --update now</Arguments>",
+        ] {
+            assert!(xml.contains(needle), "{needle}");
+        }
+        assert!(!xml.contains("BootTrigger"));
+        // the schema is a sequence: RandomDelay comes before the schedule, as Windows writes it
+        let at = |tag: &str| xml.find(tag).unwrap_or_else(|| panic!("{tag}"));
+        assert!(at("<StartBoundary>") < at("<RandomDelay>"));
+        assert!(at("<RandomDelay>") < at("<ScheduleByDay>"));
+        assert_eq!(
+            argvs(&sch.register),
+            vec![vec![
+                format!("{WIN_SYS}\\schtasks.exe"),
+                "/create".into(),
+                "/tn".into(),
+                "printpapi-agent-update".into(),
+                "/xml".into(),
+                p(path),
+                "/f".into()
+            ]]
+        );
+        assert_eq!(
+            argvs(&sch.unregister),
+            vec![vec![
+                format!("{WIN_SYS}\\schtasks.exe"),
+                "/delete".into(),
+                "/tn".into(),
+                "printpapi-agent-update".into(),
+                "/f".into()
+            ]]
+        );
+        assert_eq!(UPDATE_ARGS, ["restart", "--update", "now"]);
+    }
+
+    #[test]
+    fn the_linux_update_is_a_oneshot_service_and_a_timer_and_only_the_timer_is_enabled() {
+        let l = linux();
+        let sch = update_schedule(Os::Linux, &l, Path::new("/"));
+        let text = |name: &str| {
+            let (_, bytes) = sch
+                .files
+                .iter()
+                .find(|(path, _)| path.ends_with(name))
+                .unwrap_or_else(|| panic!("{name}"));
+            String::from_utf8(bytes.clone()).unwrap()
+        };
+        let service = text("printpapi-agent-update.service");
+        assert!(service.contains("Type=oneshot"));
+        assert!(
+            service.contains("ExecStart=/opt/printpapi-agent/printpapi-agent restart --update now")
+        );
+        assert!(service.contains("TimeoutStartSec=1h"));
+        assert!(
+            !service.contains("[Install]"),
+            "nothing enables the service itself"
+        );
+        let timer = text("printpapi-agent-update.timer");
+        assert!(timer.contains("OnCalendar=*-*-* 03:00:00"));
+        assert!(timer.contains("RandomizedDelaySec=6h"));
+        assert!(timer.contains("Persistent=true"));
+        assert!(timer.contains("WantedBy=timers.target"));
+        for (path, _) in &sch.files {
+            assert_eq!(path.parent(), Some(Path::new("/etc/systemd/system")));
+        }
+        assert_eq!(
+            argvs(&sch.register),
+            vec![
+                argv(&["systemctl", "daemon-reload"]),
+                argv(&[
+                    "systemctl",
+                    "enable",
+                    "--now",
+                    "printpapi-agent-update.timer"
+                ])
+            ]
+        );
+        assert_eq!(
+            argvs(&sch.unregister),
+            vec![argv(&[
+                "systemctl",
+                "disable",
+                "--now",
+                "printpapi-agent-update.timer"
+            ])]
+        );
+        assert_eq!(
+            argvs(&sch.reload),
+            vec![argv(&["systemctl", "daemon-reload"])]
+        );
+    }
+
+    #[test]
+    fn the_macos_update_has_a_fixed_minute_and_does_not_run_at_load() {
+        let l = mac();
+        let sch = update_schedule(Os::Macos, &l, Path::new("/"));
+        let [(path, bytes)] = sch.files.as_slice() else {
+            panic!("one file")
+        };
+        assert_eq!(
+            p(path),
+            "/Library/LaunchDaemons/com.printpapi.agent-update.plist"
+        );
+        let plist = String::from_utf8(bytes.clone()).unwrap();
+        assert!(plist.contains("<key>Hour</key><integer>3</integer>"));
+        assert!(plist.contains("<key>Minute</key><integer>17</integer>"));
+        assert!(!plist.contains("RunAtLoad"));
+        assert!(!plist.contains("KeepAlive"));
+        for word in [
+            "<string>/opt/printpapi-agent/printpapi-agent</string>",
+            "<string>restart</string>",
+            "<string>--update</string>",
+            "<string>now</string>",
+            "com.printpapi.agent-update",
+        ] {
+            assert!(plist.contains(word), "{word}");
+        }
+        assert_eq!(
+            argvs(&sch.register),
+            vec![argv(&["/bin/launchctl", "bootstrap", "system", &p(path)])]
+        );
+        assert_eq!(
+            argvs(&sch.unregister),
+            vec![argv(&[
+                "/bin/launchctl",
+                "bootout",
+                "system/com.printpapi.agent-update"
+            ])]
+        );
+    }
+
+    #[test]
+    fn the_schedule_bytes_never_change_between_calls() {
+        // equal bytes on disk mean "nothing to do", so no clock and no random value may get in
+        for os in [Os::Windows, Os::Linux, Os::Macos] {
+            let l = layout(os, Path::new("C:\\Program Files"));
+            assert_eq!(
+                update_schedule(os, &l, Path::new("/")),
+                update_schedule(os, &l, Path::new("/"))
+            );
+        }
+    }
+
+    #[test]
+    fn the_private_folder_is_closed_to_everybody_but_system_and_administrators() {
+        let cmds = private_dir_cmds(
+            Os::Windows,
+            Path::new("C:\\Program Files\\printpapi-agent\\.update"),
+            Path::new(WIN_SYS),
+        );
+        assert_eq!(
+            argvs(&cmds),
+            vec![vec![
+                format!("{WIN_SYS}\\icacls.exe"),
+                "C:\\Program Files\\printpapi-agent\\.update".into(),
+                "/inheritance:r".into(),
+                "/grant:r".into(),
+                "*S-1-5-18:(OI)(CI)F".into(),
+                "*S-1-5-32-544:(OI)(CI)F".into()
+            ]]
+        );
+        // nobody else is named: no Users, no service user
+        let joined = argvs(&cmds)[0].join(" ");
+        assert!(!joined.contains("S-1-5-32-545"));
+        assert!(private_dir_cmds(Os::Linux, Path::new("/x"), Path::new("/")).is_empty());
+        assert!(private_dir_cmds(Os::Macos, Path::new("/x"), Path::new("/")).is_empty());
+    }
+
+    #[test]
+    fn the_app_copy_goes_where_it_is_told() {
+        let to = Path::new("/Applications/.printpapi Agent.app.new");
+        let cmds = tray_copy_cmds_to(
+            Os::Macos,
+            Path::new("/opt/printpapi-agent/.update/app/x.app"),
+            to,
+            Path::new("/"),
+        );
+        assert_eq!(cmds.len(), 4);
+        assert_eq!(cmds[0].argv[0], "/usr/bin/ditto");
+        assert_eq!(cmds[0].argv[2], "/Applications/.printpapi Agent.app.new");
+        // the old entry point still copies to the layout's tray
+        let l = mac();
+        assert_eq!(
+            tray_copy_cmds(Os::Macos, Path::new("/src.app"), &l, Path::new("/"))[0].argv[2],
+            p(&l.tray)
+        );
+        assert!(tray_copy_cmds_to(Os::Linux, Path::new("/a"), to, Path::new("/")).is_empty());
     }
 }

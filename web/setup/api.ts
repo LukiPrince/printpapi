@@ -29,9 +29,38 @@ export type AgentStatus = {
   error: string | null;
   /** The key stored in agent.ini cannot be read on this computer (copied file, damaged value). */
   keyUnreadable: boolean;
+  /** The update mode as the agent applies it ("notify", "auto", "off"); empty for an older agent. */
+  updates: string;
+  /** The mirror folder agent.ini names, null for the release folder. */
+  updateUrl: string | null;
 };
+/** What the window knows about updates (crates/setup/src/updates.rs). */
+export type UpdateInfo = {
+  /** This build has a public key, so it can check and install. */
+  supported: boolean;
+  mode: "notify" | "auto" | "off" | "unknown";
+  /** The version of this program. */
+  own: string;
+  /** The version of the installed agent: the marker, else the status file, else unknown. */
+  installed: string | null;
+  /** This window runs from the installed program. */
+  fromInstalled: boolean;
+  latest: string | null;
+  /** Seconds since the epoch of this computer. */
+  checkedAt: number | null;
+  lastAttempt: { version: string; ok: boolean; message: string; at: number } | null;
+  error: string | null;
+};
+export type UpdateMode = "notify" | "auto" | "off";
 /** A change of the installed agent.ini: only what is named is touched. A header value of null removes it. */
-export type ConfigPatch = { printers?: PrinterChoice[]; timeout?: number; headers?: [string, string | null][] };
+export type ConfigPatch = {
+  printers?: PrinterChoice[];
+  timeout?: number;
+  headers?: [string, string | null][];
+  updates?: UpdateMode | "notify-if-auto";
+  /** This older program may replace the newer installed agent on purpose. */
+  goBack?: boolean;
+};
 export type ApplyRequest = {
   serverUrl: string | null;
   apiKey: string | null;
@@ -89,6 +118,19 @@ export const setup = {
   restartAgent: () => call<number>("restart_agent"),
   /** The values of the installed [headers] (they are secrets): one administrator prompt. */
   headerValues: () => call<[string, string][]>("header_values"),
+  /** What is known about updates; no network, no administrator rights. */
+  updateInfo: () => call<UpdateInfo>("update_info"),
+  /** Looks at the signed file (at most once a day unless forced). */
+  checkUpdate: (force: boolean) => call<UpdateInfo>("check_update", { force }),
+  /** Downloads and checks the release into the private working folder. Returns its version. */
+  downloadUpdate: () => call<string>("download_update"),
+  /** One administrator prompt: the installed agent swaps itself and its tray program. Returns the version. */
+  installUpdate: () => call<string>("install_update"),
+  openReleaseNotes: (version: string) => call<void>("open_release_notes", { version }),
+  /** Starts the installed version's window and ends this one. */
+  openInstalled: () => call<void>("open_installed"),
+  /** The section the command line asked for (--section), or null. */
+  startSection: () => call<string | null>("start_section"),
   /**
    * Closes the window, and with it the program. Needs `core:window:allow-close` in
    * crates/setup/capabilities/default.json (https://v2.tauri.app/learn/window-customization/).

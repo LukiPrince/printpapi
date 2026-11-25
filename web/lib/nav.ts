@@ -22,7 +22,7 @@ export const NAV: NavItem[] = [
     label: "Print Something",
     eyebrow: "Submit a job",
     icon: Send,
-    help: "Pick a source and a printer, then hit PRINT. Label printers are raw-only — they cannot render a PDF, so send them ZPL/ESC-POS. A callback URL gets a POST when the job finishes.",
+    help: "Pick a source and a printer, then hit PRINT. Label printers are raw-only — they cannot render a PDF, so send them ZPL/ESC-POS. A callback URL gets a POST when the job finishes. The Receipt tab lays a receipt out from JSON and shows a live preview before it prints.",
   },
   {
     href: "/labels",
@@ -36,7 +36,7 @@ export const NAV: NavItem[] = [
     label: "Devices",
     eyebrow: "Agents & printers",
     icon: Printer,
-    help: "Every agent from /computers with its printers. Online means the agent polled within the last minute; an offline one shows when it was last seen. Test print sends a sample label or PDF, whichever the printer can handle.",
+    help: "Every agent from /computers with its printers. Online means the agent polled within the last minute; an offline one shows when it was last seen. Test print sends a sample label or PDF, whichever the printer can handle. The receipt settings button sets paper width, text mode and cutter for a receipt printer.",
   },
   {
     href: "/history",

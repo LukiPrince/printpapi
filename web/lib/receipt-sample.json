@@ -1,0 +1,84 @@
+{
+  "cut": true,
+  "content": [
+    {
+      "type": "text",
+      "text": "Café Müller",
+      "align": "center",
+      "bold": true,
+      "size": 2
+    },
+    {
+      "type": "text",
+      "text": "Hauptstraße 12 · 10115 Berlin",
+      "align": "center"
+    },
+    {
+      "type": "divider"
+    },
+    {
+      "type": "columns",
+      "cells": [
+        {
+          "text": "2 x Weißbrot"
+        },
+        {
+          "text": "5,80 €",
+          "align": "right",
+          "width": 10
+        }
+      ]
+    },
+    {
+      "type": "columns",
+      "cells": [
+        {
+          "text": "1 x Käsekuchen"
+        },
+        {
+          "text": "3,90 €",
+          "align": "right",
+          "width": 10
+        }
+      ]
+    },
+    {
+      "type": "columns",
+      "cells": [
+        {
+          "text": "Gesamt",
+          "bold": true
+        },
+        {
+          "text": "9,70 €",
+          "align": "right",
+          "bold": true,
+          "width": 10
+        }
+      ]
+    },
+    {
+      "type": "divider",
+      "char": "="
+    },
+    {
+      "type": "text",
+      "text": "Größe äöüß ÄÖÜ · Preise in €",
+      "align": "center"
+    },
+    {
+      "type": "qr",
+      "data": "https://example.com/r/4711"
+    },
+    {
+      "type": "barcode",
+      "format": "ean13",
+      "data": "4006381333931"
+    },
+    {
+      "type": "text",
+      "text": "Vielen Dank für Ihren Besuch!",
+      "align": "center"
+    }
+  ]
+}

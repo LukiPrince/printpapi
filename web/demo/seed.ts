@@ -1,6 +1,6 @@
 // printpapi — self-hosted PrintNode alternative. Elastic License 2.0 (see LICENSE).
 // The demo's starting state: about six hours of job history for the fictional shop, ending at #1291.
-import type { ApiKey, JobState, LabelTemplate, OrgUser } from "../lib/api";
+import type { ApiKey, JobState, LabelTemplate, OrgUser, ReceiptProfile } from "../lib/api";
 import { SHOP, rng } from "./data.ts";
 
 export type JobKind = "label" | "slip" | "receipt" | "invoice" | "test" | "doc";
@@ -34,6 +34,8 @@ export type DemoState = {
   keys: ApiKey[];
   users: OrgUser[];
   labels: LabelTemplate[]; // label templates, ids ascending
+  // stored receipt profiles by printer id; a printer without one has the defaults. Optional: a state stored before receipts existed has none (persist.ts fills it in)
+  receipt_profiles?: Record<number, ReceiptProfile>;
   org: { id: 1; name: string; event_url: string | null; shopify_secret_set: boolean; job_quota: number; month_base: number; created_at: number };
   me: { user_id: number; email: string };
   next: { job: number; order: number; receipt: number; key: number; user: number; label: number };
@@ -177,6 +179,8 @@ export function seedState(t: number): DemoState {
       { id: 2, org_id: 1, email: "lager@nordlicht.example", created_at: t - DAY * 58 },
     ],
     labels: seedLabels(t),
+    // the demo's receipt printer takes 58 mm paper
+    receipt_profiles: { 4: { paper_mm: 58, width_dots: 384, codepage: "raster", codepage_number: 16, cut: "partial", output: "auto" } },
     org: { id: 1, name: SHOP.name, event_url: "https://hooks.nordlicht.example/printpapi", shopify_secret_set: false, job_quota: 2000, month_base: 812, created_at: t - DAY * 120 },
     me: { user_id: 1, email: "jana@nordlicht.example" },
     next: { job: id, order, receipt: rc, key: 6, user: 3, label: 3 },

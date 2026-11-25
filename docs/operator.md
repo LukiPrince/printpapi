@@ -251,7 +251,8 @@ token again and they hold again.
 
 `{reason, confirm}`: `confirm` must equal the org's **current name** exactly, otherwise `400`. The
 default org is never removed (`400`). The org's jobs, printers, agents, keys, accounts, label
-templates, terms history and its `org_locks` row go with it; the audit rows stay. The WAL is
+templates, receipt profiles and the copies of receipt documents (database triggers remove those
+with the printers and jobs), terms history and its `org_locks` row go with it; the audit rows stay. The WAL is
 truncated after the commit, so removed payloads do not linger in the `-wal` file.
 
 ### `POST /operator/orgs`
@@ -439,6 +440,14 @@ With an active grant each job also carries its `title`. A full page always offer
 Every row has `target` `grant:<id>` and the org it concerns. Each titled page and each payload
 read also adds one to the grant's `reads`. The rows hold ids only: no e-mail address, name, title
 or payload. Each of these writes is one transaction with its audit row.
+
+### Receipts are not copied while this is on
+
+A [receipt](receipts.md) job's document is normally kept for a history preview. While
+`PRINTAPI_OPERATOR_TOKEN` is set no copy is written and `GET /jobs/{id}/preview` answers `404`: root
+can make a user with a known password in any org, so a session-readable copy would be a way round
+the grant. What the operator reads of a receipt job is the stored payload, under a grant, as for any
+job.
 
 ### What the customer sees
 

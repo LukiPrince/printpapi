@@ -495,6 +495,22 @@ pub fn parse_label_job(body: &Map<String, Value>) -> Result<Option<LabelJob>, Di
     Ok(Some(LabelJob { template, text }))
 }
 
+/// `Ok(None)` unless `type` is `receipt`; then the parsed document. Pure field checks, so a bad
+/// receipt 400s before the printer or anything else is looked at.
+pub fn parse_receipt_job(
+    body: &Map<String, Value>,
+) -> Result<Option<crate::receipt::Doc>, DispatchError> {
+    if body.get("type").and_then(Value::as_str) != Some("receipt") {
+        return Ok(None);
+    }
+    match body.get("receipt") {
+        None | Some(Value::Null) => invalid("missing 'receipt'"),
+        Some(v) => crate::receipt::parse_doc(v)
+            .map(Some)
+            .map_err(DispatchError::Invalid),
+    }
+}
+
 /// "pdf" for the pdf_* types, "raw" for everything else (unknown types included).
 pub fn agent_mode(type_: &Value) -> &'static str {
     match type_.as_str() {
@@ -886,6 +902,38 @@ mod tests {
     fn label_text_has_no_payload_to_decode() {
         // label_text is rendered from the body itself; decode_payload is not its path
         assert!(dp(json!({"type": "label_text", "text": "x", "template": "t"})).is_err());
+    }
+
+    #[test]
+    fn receipt_job_fields() {
+        let job = |v: Value| parse_receipt_job(&obj(v));
+        assert_eq!(job(json!({"type": "raw_uri"})), Ok(None));
+        assert_eq!(job(json!({})), Ok(None));
+        // a receipt object on another type is not looked at
+        assert_eq!(job(json!({"type": "raw_base64", "receipt": 5})), Ok(None));
+        let d = job(json!({"type": "receipt", "receipt": {"content": [{"type": "cut"}]}}))
+            .unwrap()
+            .unwrap();
+        assert_eq!(d.content.len(), 1);
+        for (bad, want) in [
+            (json!({"type": "receipt"}), "missing 'receipt'"),
+            (
+                json!({"type": "receipt", "receipt": null}),
+                "missing 'receipt'",
+            ),
+            (
+                json!({"type": "receipt", "receipt": 5}),
+                "receipt must be an object",
+            ),
+            (
+                json!({"type": "receipt", "receipt": {"content": [{"type": "x"}]}}),
+                "receipt.content[0]: unknown type \"x\"",
+            ),
+        ] {
+            assert_eq!(job(bad), Err(DispatchError::Invalid(want.into())));
+        }
+        // the agent mode of the type string alone stays raw; the printer decides for a receipt
+        assert_eq!(agent_mode(&json!("receipt")), "raw");
     }
 
     #[test]

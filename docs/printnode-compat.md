@@ -78,7 +78,7 @@ Field mapping onto [`POST /jobs`](api.md#submitting-a-job):
 | Their field | Becomes | Note |
 |---|---|---|
 | `printerId` | `printer_id` | unknown/foreign printer → `400` |
-| `contentType` | `type` | `pdf_base64`, `pdf_uri`, `raw_base64`, `raw_uri` — anything else `400` |
+| `contentType` | `type` | `pdf_base64`, `pdf_uri`, `raw_base64`, `raw_uri` — anything else `400`, a `receipt` included |
 | `content` | `content`, or `url` for the `*_uri` types | they carry the URL in `content`, we take it in `url` |
 | `title` | `title` | optional here |
 | `qty` (or `options.copies`) | `copies` | integer `1`–`100`, else `400` |
@@ -86,6 +86,10 @@ Field mapping onto [`POST /jobs`](api.md#submitting-a-job):
 | `options.paper`, `.bin`, `.color`, `.duplex`, `.pages` | `options.*` | applied by the agent |
 | `options.*` (anything else) | dropped | see below |
 | `source` | — | not stored; every job reports `"printpapi"` back |
+
+A job made through the native API as a [receipt](receipts.md) is listed here with `contentType`
+`receipt`, as the `label_*` jobs are with theirs; this layer cannot create one, and the receipt routes
+answer `401` to a Basic login.
 
 A create can also fail with `402` `QuotaExceeded` (monthly job quota spent), `502` `DownstreamError`
 (the `*_uri` content could not be fetched) and `503` `ServiceUnavailable` (the org has too many

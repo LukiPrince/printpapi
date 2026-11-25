@@ -430,6 +430,22 @@ CREATE TABLE IF NOT EXISTS settings(
   key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at REAL NOT NULL);
 -- finds the audit rows of one grant (`grant:<id>`) without a scan
 CREATE INDEX IF NOT EXISTS operator_audit_target ON operator_audit(target);
+-- Receipts. The profile of one printer, and the copy of a receipt job's document that the history
+-- preview draws. Additive: the Python server ignores both tables. Neither carries an org_id:
+-- jobs.id and printers.id are AUTOINCREMENT and never reused (orgs.id is), so every read goes
+-- through the owning row. The triggers clean up under every binary, a downgrade included: the copy
+-- goes when the payload is emptied (retention) or the job is deleted, the profile with its printer.
+-- SQLite does not count what a trigger deletes in sqlite3_changes(), so `Purged` keeps its numbers.
+CREATE TABLE IF NOT EXISTS receipt_profiles(
+  printer_id INTEGER PRIMARY KEY, spec TEXT NOT NULL, updated_at REAL NOT NULL);
+CREATE TABLE IF NOT EXISTS job_receipts(
+  job_id INTEGER PRIMARY KEY, doc TEXT NOT NULL);
+CREATE TRIGGER IF NOT EXISTS job_receipts_scrub AFTER UPDATE OF payload ON jobs
+  WHEN length(NEW.payload)=0 BEGIN DELETE FROM job_receipts WHERE job_id=NEW.id; END;
+CREATE TRIGGER IF NOT EXISTS job_receipts_gone AFTER DELETE ON jobs
+  BEGIN DELETE FROM job_receipts WHERE job_id=OLD.id; END;
+CREATE TRIGGER IF NOT EXISTS receipt_profiles_gone AFTER DELETE ON printers
+  BEGIN DELETE FROM receipt_profiles WHERE printer_id=OLD.id; END;
 ";
 
 const MIGRATIONS: &[&str] = &[
@@ -1656,6 +1672,18 @@ pub fn enqueue_job_with(
     job: &NewJob<'_>,
     enforce_locks: bool,
 ) -> Result<Enqueued> {
+    enqueue_receipt_job(conn, job, enforce_locks, None)
+}
+
+/// `enqueue_job_with`, and when `doc` is given and the job is created (not an idempotent
+/// resubmit), the copy of the receipt document (`{"receipt":…, "profile":…}`) in the same
+/// transaction. The server passes `None` while the operator token is set: no copy is kept there.
+pub fn enqueue_receipt_job(
+    conn: &Connection,
+    job: &NewJob<'_>,
+    enforce_locks: bool,
+    doc: Option<&str>,
+) -> Result<Enqueued> {
     let now = crate::now();
     let unknown = || {
         StoreError::UnknownPrinter(format!(
@@ -1732,6 +1760,10 @@ pub fn enqueue_job_with(
         now
     ])?;
     let job_id = tx.last_insert_rowid();
+    if let Some(doc) = doc {
+        tx.prepare_cached("INSERT INTO job_receipts(job_id, doc) VALUES(?,?)")?
+            .execute(params![job_id, doc])?;
+    }
     tx.commit()?;
     Ok(Enqueued {
         job_id,
@@ -2422,6 +2454,119 @@ pub fn delete_label_template(conn: &Connection, id: i64, org: Option<i64>) -> Re
     )?;
     tx.commit()?;
     Ok(n == 1)
+}
+
+// --- receipts ---------------------------------------------------------------------------------
+
+/// A stored text that no longer parses is reported as a database error, like `label_row`.
+fn bad_receipt(e: String) -> rusqlite::Error {
+    rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, e.into())
+}
+
+fn profile_of(text: &str) -> rusqlite::Result<crate::receipt::Profile> {
+    serde_json::from_str::<Value>(text)
+        .map_err(|e| bad_receipt(e.to_string()))?
+        .as_object()
+        .ok_or_else(|| bad_receipt("not an object".into()))
+        .and_then(|m| crate::receipt::parse_profile(m).map_err(bad_receipt))
+}
+
+/// Whether printer `id` exists (in `org`, unless root).
+fn printer_visible(conn: &Connection, id: i64, org: Option<i64>) -> Result<bool> {
+    Ok(conn
+        .query_row(
+            "SELECT 1 FROM printers WHERE id=:id AND (:org IS NULL OR org_id=:org)",
+            named_params! {":id": id, ":org": org},
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some())
+}
+
+/// The profile stored for a printer: `None` for an unknown or foreign printer and for one without
+/// a stored profile (the caller tells them apart with `printer_visible` or its own lookup).
+pub fn get_receipt_profile(
+    conn: &Connection,
+    printer_id: i64,
+    org: Option<i64>,
+) -> Result<Option<crate::receipt::Profile>> {
+    Ok(conn
+        .query_row(
+            "SELECT r.spec FROM printers p JOIN receipt_profiles r ON r.printer_id=p.id \
+             WHERE p.id=:id AND (:org IS NULL OR p.org_id=:org)",
+            named_params! {":id": printer_id, ":org": org},
+            |r| profile_of(&r.get::<_, String>(0)?),
+        )
+        .optional()?)
+}
+
+/// Store (replace) a printer's profile. `false` when the printer is unknown or foreign. The
+/// printer is checked in the same transaction as the write.
+pub fn put_receipt_profile(
+    conn: &Connection,
+    printer_id: i64,
+    org: Option<i64>,
+    profile: &crate::receipt::Profile,
+) -> Result<bool> {
+    let tx = begin(conn)?;
+    if !printer_visible(&tx, printer_id, org)? {
+        return Ok(false);
+    }
+    tx.execute(
+        "INSERT INTO receipt_profiles(printer_id, spec, updated_at) VALUES(?,?,?) \
+         ON CONFLICT(printer_id) DO UPDATE SET spec=excluded.spec, updated_at=excluded.updated_at",
+        params![
+            printer_id,
+            crate::receipt::profile_json(profile).to_string(),
+            crate::now()
+        ],
+    )?;
+    tx.commit()?;
+    Ok(true)
+}
+
+/// Drop a printer's stored profile (the defaults apply again). `false` when the printer is
+/// unknown or foreign; `true` also when it had no profile.
+pub fn delete_receipt_profile(
+    conn: &Connection,
+    printer_id: i64,
+    org: Option<i64>,
+) -> Result<bool> {
+    let tx = begin(conn)?;
+    if !printer_visible(&tx, printer_id, org)? {
+        return Ok(false);
+    }
+    tx.execute(
+        "DELETE FROM receipt_profiles WHERE printer_id=?",
+        [printer_id],
+    )?;
+    tx.commit()?;
+    Ok(true)
+}
+
+/// The document and profile a receipt job was printed with, for the history preview. Read through
+/// the job: foreign (unless root) and purged jobs (empty payload) have none, whatever `job_receipts`
+/// still holds.
+pub fn get_job_receipt(
+    conn: &Connection,
+    job_id: i64,
+    org: Option<i64>,
+) -> Result<Option<(crate::receipt::Doc, crate::receipt::Profile)>> {
+    Ok(conn
+        .query_row(
+            "SELECT r.doc FROM jobs j JOIN job_receipts r ON r.job_id=j.id \
+             WHERE j.id=:id AND (:org IS NULL OR j.org_id=:org) AND length(j.payload)>0",
+            named_params! {":id": job_id, ":org": org},
+            |r| {
+                let text: String = r.get(0)?;
+                let v: Value =
+                    serde_json::from_str(&text).map_err(|e| bad_receipt(e.to_string()))?;
+                let doc = crate::receipt::parse_doc(&v["receipt"]).map_err(bad_receipt)?;
+                let profile = profile_of(&v["profile"].to_string())?;
+                Ok((doc, profile))
+            },
+        )
+        .optional()?)
 }
 
 /// True for the pseudo-agent `register_cloudprnt` makes (its key hash starts with `cloudprnt:`).

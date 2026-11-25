@@ -83,6 +83,8 @@ export function installDemo(): void {
     const before = progress(s); // a GET only changes state through handle()'s advance()
     const res = handle(s, { method, path: url.pathname, body }, nowS());
     if (method !== "GET" || progress(s) !== before) changed();
+    // a pre-rendered picture of the sample receipt, served from the demo's own files
+    if (res.asset !== undefined) return realFetch(res.asset);
     if (res.json !== undefined) {
       return new Response(JSON.stringify(res.json), { status: res.status, headers: { "content-type": "application/json" } });
     }

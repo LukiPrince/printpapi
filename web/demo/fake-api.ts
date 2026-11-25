@@ -7,9 +7,11 @@ import { KEY_SCOPES, type KeyScope } from "../lib/key-scopes.ts";
 import { BASE_COUNTS } from "./seed.ts";
 import type { DemoState } from "./seed.ts";
 import { advance, cancel, enqueue, mode, SEED_LAST_JOB } from "./sim.ts";
+import { DEFAULT_PROFILE, parseProfile, previewOf, sampleAsset } from "./receipt-fake.ts";
 
 export type FakeRequest = { method: string; path: string; body: unknown };
-export type FakeResponse = { status: number; json?: unknown; text?: string };
+// `asset`: answer with this file of the demo (the pre-rendered sample receipt) instead of a body
+export type FakeResponse = { status: number; json?: unknown; text?: string; asset?: string };
 
 type Ctx = { s: DemoState; body: unknown; id: number; now: number };
 type Route = { method: string; re: RegExp; run: (c: Ctx) => FakeResponse };
@@ -41,7 +43,7 @@ function jobsOut(s: DemoState): Job[] {
       title: j.title,
       state: j.state,
       type: j.type,
-      mode: mode(j.type, p?.can_pdf),
+      mode: mode(j.type, p?.can_pdf, s.receipt_profiles?.[j.printer_id]?.output === "escpos"),
       error: j.error,
       created_at: j.created_at,
       finished_at: j.finished_at,
@@ -73,7 +75,11 @@ function postJob(c: Ctx): FakeResponse {
   const b = obj(c.body);
   if (!b || typeof b.printer_id !== "number") return err(400, "bad json or missing printer_id");
   const isLabel = typeof b.type === "string" && LABEL_JOBS.includes(b.type);
-  if (!isLabel && !c.s.printers.some((p) => p.id === b.printer_id)) return notFound();
+  if (b.type === "receipt") {
+    // the server's order: the receipt is checked before the printer is looked at
+    if (b.receipt == null) return err(400, "missing 'receipt'");
+    if (!c.s.printers.some((p) => p.id === b.printer_id)) return err(400, `unknown printer: ${String(b.printer_id)}`);
+  } else if (!isLabel && !c.s.printers.some((p) => p.id === b.printer_id)) return notFound();
   const copies = b.copies ?? 1;
   if (typeof copies !== "number" || !Number.isInteger(copies) || copies < 1 || copies > COPIES_MAX) {
     return err(400, `copies must be an integer 1..${COPIES_MAX}`);
@@ -83,7 +89,7 @@ function postJob(c: Ctx): FakeResponse {
     if (refused) return refused;
   }
   const title = typeof b.title === "string" && b.title ? b.title : "Print job";
-  // `content` is dropped on purpose: a pasted PDF must not fill the visitor's sessionStorage
+  // `content` and `receipt` are dropped on purpose: a pasted PDF must not fill the visitor's sessionStorage
   const job = enqueue(
     c.s,
     {
@@ -99,6 +105,60 @@ function postJob(c: Ctx): FakeResponse {
   );
   c.s.todo.test = true;
   return ok({ job_id: job.id });
+}
+
+// ---- receipts: the routes of crates/server/src/server.rs, same texts ----
+
+const profileOf = (s: DemoState, id: number) => s.receipt_profiles?.[id] ?? DEFAULT_PROFILE;
+
+function getReceiptProfile(c: Ctx): FakeResponse {
+  if (!c.s.printers.some((p) => p.id === c.id)) return notFound();
+  return ok({ printer_id: c.id, stored: c.s.receipt_profiles?.[c.id] !== undefined, profile: profileOf(c.s, c.id) });
+}
+
+function putReceiptProfile(c: Ctx): FakeResponse {
+  const body = obj(c.body);
+  if (!body) return err(400, "bad json");
+  const profile = parseProfile(body);
+  if (typeof profile === "string") return err(400, profile);
+  if (!c.s.printers.some((p) => p.id === c.id)) return notFound();
+  (c.s.receipt_profiles ??= {})[c.id] = profile;
+  return ok({ printer_id: c.id, stored: true, profile });
+}
+
+function deleteReceiptProfile(c: Ctx): FakeResponse {
+  if (!c.s.printers.some((p) => p.id === c.id)) return notFound();
+  delete c.s.receipt_profiles?.[c.id];
+  return ok();
+}
+
+function previewReceipt(c: Ctx): FakeResponse {
+  const body = obj(c.body);
+  if (!body) return err(400, "bad json");
+  if (body.receipt == null) return err(400, "missing 'receipt'");
+  const named = body.printer_id ?? null;
+  const given = body.profile ?? null;
+  if (named !== null && given !== null) return err(400, "send printer_id or profile, not both");
+  let profile = DEFAULT_PROFILE;
+  if (named !== null) {
+    if (typeof named !== "number" || !c.s.printers.some((p) => p.id === named)) return err(400, `unknown printer: ${String(named)}`);
+    profile = profileOf(c.s, named);
+  } else if (given !== null) {
+    const m = obj(given);
+    if (!m) return err(400, "profile must be an object");
+    const parsed = parseProfile(m);
+    if (typeof parsed === "string") return err(400, parsed);
+    profile = parsed;
+  }
+  const r = previewOf(body.receipt, profile);
+  return r.status === 200 ? { status: 200, asset: r.asset } : err(400, r.error);
+}
+
+// GET /jobs/{id}/preview: the receipt of a job that was made as a receipt, drawn for its printer
+function jobPreview(c: Ctx): FakeResponse {
+  const j = c.s.jobs.find((x) => x.id === c.id);
+  if (!j || j.type !== "receipt") return notFound();
+  return { status: 200, asset: sampleAsset(profileOf(c.s, j.printer_id)) };
 }
 
 function metrics(s: DemoState): FakeResponse {
@@ -381,6 +441,11 @@ const ROUTES: Route[] = [
       return ok();
     },
   },
+  { method: "POST", re: /^\/receipts\/preview$/, run: previewReceipt },
+  { method: "GET", re: /^\/printers\/\d+\/receipt-profile$/, run: getReceiptProfile },
+  { method: "PUT", re: /^\/printers\/\d+\/receipt-profile$/, run: putReceiptProfile },
+  { method: "DELETE", re: /^\/printers\/\d+\/receipt-profile$/, run: deleteReceiptProfile },
+  { method: "GET", re: /^\/jobs\/\d+\/preview$/, run: jobPreview },
   { method: "GET", re: /^\/labels$/, run: listLabels },
   { method: "POST", re: /^\/labels$/, run: (c) => saveLabel(c, null) },
   { method: "PUT", re: /^\/labels\/\d+$/, run: (c) => saveLabel(c, c.id) },
@@ -411,6 +476,7 @@ export function handle(s: DemoState, req: FakeRequest, now: number): FakeRespons
   advance(s, now);
   const route = ROUTES.find((r) => r.method === req.method && r.re.test(req.path));
   if (!route) return notFound();
-  const id = Number(/\/(\d+)$/.exec(req.path)?.[1] ?? 0);
+  // the first number in the path: /jobs/12, /printers/4/receipt-profile, /jobs/12/preview
+  const id = Number(/\/(\d+)(?=\/|$)/.exec(req.path)?.[1] ?? 0);
   return route.run({ s, body: req.body, id, now });
 }

@@ -34,6 +34,10 @@ up and prints it: documents **and** label printers (Zebra/ZPL, Bixolon, thermal)
 - **Label templates**: set up once where an image or text sits on a label (sizes from the
   catalogue, drag and scale in the dashboard); every job that names the template is rendered to
   PDF or ZPL by the server ([docs](docs/labels.md))
+- **Receipts from JSON**: send a till receipt as data (texts, columns, logo, QR code, barcode, cut,
+  cash drawer); the server lays it out as ESC/POS, or a PDF where the printer takes one, with a
+  live preview in the dashboard ([docs](docs/receipts.md); built to the published commands, not yet
+  verified on a physical receipt printer)
 - **Virtual print server**: a `file://` printer archives the job to a directory instead of paper
   ([docs](docs/agent.md#file-output-virtual-print-server))
 - Multi-tenant: orgs isolate API keys, agents, printers and jobs, each with its own
@@ -95,7 +99,9 @@ Prefer to build it yourself? `docker build -t printpapi .`
 [latest release](https://github.com/LukiPrince/printpapi/releases/latest) (`.exe` on Windows, `.dmg`
 on macOS, `.deb` or `.AppImage` on Linux; an AppImage needs `chmod +x` first), open it and follow
 the four steps ([docs](docs/agent.md#setup-app)). It also installs a tray icon with a settings window
-([docs](docs/agent.md#tray-icon-and-settings)). Every setup download is Beta until someone has run
+([docs](docs/agent.md#tray-icon-and-settings)). The agent and the icon can update themselves from a
+signed file, in one click or at night, and go back to the old version when the new one does not
+connect ([docs](docs/agent.md#updates)). Every setup download is Beta until someone has run
 it by hand. It is not code-signed yet, so the system warns first, and Smart App Control / WDAC block
 it: use the Python agent there ([docs](docs/agent.md#locked-down-windows)). Or by hand:
 
@@ -185,6 +191,7 @@ sponsored by PrintNode.*
 | [PrintNode-compatible API](docs/printnode-compat.md) | point an existing PrintNode client at printpapi |
 | [Star CloudPRNT](docs/cloudprnt.md) | Star printers polling the server directly, without an agent |
 | [Label templates](docs/labels.md) | size and position of images and text on a label, rendered by the server to PDF or ZPL |
+| [Receipts](docs/receipts.md) | a JSON document rendered to ESC/POS for a receipt printer (or to a PDF), with a preview, printer profiles, limits and errors |
 | [Recipes](docs/recipes.md) | print from n8n, Zapier, Make, curl in one HTTP node |
 | [E-commerce](docs/ecommerce.md) | WooCommerce plugin, Shopify webhook, `POST /orders` |
 | [Billing](docs/billing.md) | plans, checkout links, the signed provider webhook, org deletion |
@@ -211,6 +218,9 @@ Two scope notes:
 - **Everything up to and including v1.4.0 was released under the MIT License and stays MIT**
   ([docs/licenses/MIT-until-v1.4.0.txt](docs/licenses/MIT-until-v1.4.0.txt)). The current license
   applies to later versions.
+- The drawn text of [receipts](docs/receipts.md) uses **Terminus Font** (SIL Open Font License 1.1,
+  embedded unmodified). Its licence text ships with every server at
+  [/licenses/terminus-font-OFL.txt](web/public/licenses/terminus-font-OFL.txt).
 - The [WooCommerce plugin](integrations/woocommerce) is **GPL-2.0-or-later**, because WordPress
   plugins must be GPL-compatible. It only calls the HTTP API.
 

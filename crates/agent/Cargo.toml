@@ -17,10 +17,17 @@ path = "src/main.rs"
 [dependencies]
 chrono = { version = "0.4.45", default-features = false, features = ["clock", "std"] }
 percent-encoding = "2.3.2"
+# Ed25519 for the signed update file. Already in both lock files through ureq -> rustls.
+ring = "0.17"
 serde_json = { version = "1.0.154", features = ["preserve_order"] }
 sha2 = "0.11.1"
 ureq = { version = "3.5.0", default-features = false, features = ["rustls", "platform-verifier", "win-system-proxy"] }
 wait-timeout = "0.2.1"
+
+# Adds the public half of the committed test seed (examples/sign_update.rs) to the keys an update
+# accepts and shortens the health wait. Only the CI smoke build enables it; release.yml never does.
+[features]
+update-test-key = []
 
 [dev-dependencies]
 tempfile = "3.27.0"

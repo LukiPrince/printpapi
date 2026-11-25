@@ -3,11 +3,12 @@
 import { useMemo, useState } from "react";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
-import { AnimatePresence, motion } from "motion/react";
+import { AnimatePresence } from "motion/react";
 import { toast } from "sonner";
-import { AlertTriangle, FileText, Link2, Loader2, Minus, Plus, Printer, Zap } from "lucide-react";
+import { FileText, Link2, Loader2, Minus, Plus, Printer, Receipt, Zap } from "lucide-react";
 import { usePoll } from "@/hooks/use-poll";
 import { createJob, fileToBase64, listPrinters, type NewJob, type Printer as PrinterT } from "@/lib/api";
+import { receiptForJob } from "@/lib/receipt";
 import { TEST_PDF_B64, TEST_ZPL_B64 } from "@/lib/testdoc";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
@@ -24,9 +25,13 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { Dropzone } from "@/components/dropzone";
-import { EmptyState, FieldLabel, PulseDot } from "@/components/bits";
+import { EmptyState, FieldLabel, Note, PulseDot } from "@/components/bits";
+import { ReceiptSource } from "@/components/receipt/receipt-source";
+import sample from "@/lib/receipt-sample.json";
 
-type Source = "pdf" | "raw" | "url" | "test";
+type Source = "pdf" | "raw" | "url" | "test" | "receipt";
+
+const SAMPLE_RECEIPT = JSON.stringify(sample, null, 2);
 
 export default function PrintPage() {
   const router = useRouter();
@@ -40,6 +45,7 @@ export default function PrintPage() {
   const [copies, setCopies] = useState(1);
   const [callback, setCallback] = useState("");
   const [busy, setBusy] = useState(false);
+  const [receiptText, setReceiptText] = useState(SAMPLE_RECEIPT);
 
   const list = useMemo(() => printers ?? [], [printers]);
   const printer = useMemo(() => list.find((p) => String(p.id) === printerId), [list, printerId]);
@@ -67,6 +73,9 @@ export default function PrintPage() {
         type: source === "pdf" ? "pdf_base64" : "raw_base64",
         content: await fileToBase64(file),
       };
+    }
+    if (source === "receipt") {
+      return { ...withHook, type: "receipt", receipt: receiptForJob(receiptText) };
     }
     if (source === "url") {
       if (!url.trim()) throw new Error("Enter a URL.");
@@ -127,16 +136,19 @@ export default function PrintPage() {
           <Tabs value={source} onValueChange={(v) => setSource(v as Source)}>
             <TabsList className="w-full">
               <TabsTrigger value="pdf">
-                <FileText /> PDF
+                <FileText className="max-sm:hidden" /> PDF
               </TabsTrigger>
               <TabsTrigger value="raw">
-                <Zap /> Raw / ZPL
+                <Zap className="max-sm:hidden" /> Raw / ZPL
               </TabsTrigger>
               <TabsTrigger value="url">
-                <Link2 /> URL
+                <Link2 className="max-sm:hidden" /> URL
               </TabsTrigger>
               <TabsTrigger value="test">
-                <Printer /> Test
+                <Printer className="max-sm:hidden" /> Test
+              </TabsTrigger>
+              <TabsTrigger value="receipt">
+                <Receipt className="max-sm:hidden" /> Receipt
               </TabsTrigger>
             </TabsList>
 
@@ -180,6 +192,13 @@ export default function PrintPage() {
                 Sends the built-in sample: a one-page PDF for document printers, a ZPL label for raw
                 ones. Picked automatically from the printer&apos;s capabilities.
               </p>
+            </TabsContent>
+            <TabsContent value="receipt" className="mt-4">
+              <ReceiptSource
+                printer={printer}
+                text={receiptText}
+                onText={setReceiptText}
+              />
             </TabsContent>
           </Tabs>
         </CardContent>
@@ -304,21 +323,5 @@ export default function PrintPage() {
         </span>
       </div>
     </form>
-  );
-}
-
-function Note({ tone, children }: { tone: "warn" | "bad"; children: React.ReactNode }) {
-  const color = tone === "bad" ? "var(--state-failed)" : "var(--state-queued)";
-  return (
-    <motion.p
-      initial={{ opacity: 0, height: 0 }}
-      animate={{ opacity: 1, height: "auto" }}
-      exit={{ opacity: 0, height: 0 }}
-      className="mt-2 flex items-start gap-1.5 overflow-hidden text-sm"
-      style={{ color }}
-    >
-      <AlertTriangle className="mt-0.5 size-3.5 shrink-0" />
-      <span>{children}</span>
-    </motion.p>
   );
 }

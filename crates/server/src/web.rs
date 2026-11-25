@@ -226,6 +226,19 @@ mod tests {
     }
 
     #[test]
+    fn a_nested_text_file_of_the_bundle_is_served_as_text() {
+        // /licenses/terminus-font-OFL.txt (web/public/licenses): the licence of the receipt font
+        let b = Bundle::from_files(&[
+            ("index.html", b"root"),
+            ("licenses/terminus-font-OFL.txt", b"SIL OPEN FONT LICENSE"),
+        ]);
+        let f = b.lookup("/licenses/terminus-font-OFL.txt").unwrap();
+        assert_eq!(f.data, b"SIL OPEN FONT LICENSE");
+        assert_eq!(f.content_type, "text/plain; charset=utf-8");
+        assert!(!f.immutable);
+    }
+
+    #[test]
     fn immutable_is_decided_by_the_resolved_file() {
         let f = sample()
             .lookup("/_next/static/..%2f..%2findex.html")
