@@ -445,15 +445,18 @@ fn is_printing(v: &Value, now: f64) -> bool {
     matches!(job_age, Some(age) if (0.0..JOB_QUIET_SECS).contains(&age))
 }
 
-/// A fresh status file of an online agent that prints or printed a moment ago, whatever its last
-/// contact with the server: a long print does not refresh `last_contact`, and a rollback must not
-/// stop the agent in the middle of it.
+/// A fresh status file of an agent that prints, or of an online one that printed a moment ago,
+/// whatever its last contact with the server: a long print does not refresh `last_contact`, and a
+/// rollback must not stop the agent in the middle of it. `busy` counts whatever `state` says: the
+/// first job after an offline phase prints while the file still says offline (`claimed` sets `busy`,
+/// the state turns online only when the poll is done).
 pub fn still_printing(seen: Option<&StatusSeen>, now: f64) -> bool {
     let Some(seen) = seen.filter(|s| !s.age.is_nan() && s.age <= FRESH_SECS) else {
         return false;
     };
     serde_json::from_str::<Value>(&seen.text).is_ok_and(|v| {
-        v.get("state").and_then(Value::as_str) == Some("online") && is_printing(&v, now)
+        v.get("busy").and_then(Value::as_bool) == Some(true)
+            || (v.get("state").and_then(Value::as_str) == Some("online") && is_printing(&v, now))
     })
 }
 
@@ -2259,6 +2262,16 @@ mod tests {
             now
         ));
         assert!(!still_printing(Some(&seen(121.0, &stale)), now));
+        // the first job after an offline phase: claimed() sets busy, the state turns online only
+        // after the print (polled), so the file says offline while the job prints
+        let first = status(r#","busy":true"#).replace("online", "offline");
+        assert!(still_printing(Some(&seen(1.0, &first)), now));
+        assert!(
+            !still_printing(Some(&seen(121.0, &first)), now),
+            "an old file is nobody's"
+        );
+        let idle = status(r#","busy":false"#).replace("online", "offline");
+        assert!(!still_printing(Some(&seen(1.0, &idle)), now));
         assert!(!still_printing(Some(&seen(1.0, "not json")), now));
         assert!(!still_printing(None, now));
         let done = r#","last_job":{"id":1,"ok":true,"at":1997.0}"#;

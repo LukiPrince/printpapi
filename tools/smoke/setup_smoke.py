@@ -23,6 +23,12 @@ everything is gone. Runs elevated: administrator on Windows, `sudo` on Linux and
 DO NOT RUN THIS ON A MACHINE YOU CARE ABOUT. It creates a SYSTEM task / systemd unit / launchd
 daemon and writes to the real install folder. It is meant for the throwaway CI runners only.
 
+With --msi A.msi --msi-upgrade B.msi (Windows only, two builds of the same .msi, see `check_msi`) it
+tests the managed install instead: msiexec installs A with AGENT_INI (a folder with
+<COMPUTERNAME>.ini), runs it again, repairs it with another ini, upgrades it with B without
+AGENT_INI, removes it, installs without AGENT_INI and with INSTALLDIR=C:/x. msiexec needs
+administrator rights and changes the machine: throwaway runners only.
+
 Python 3 stdlib only.
 """
 import argparse
@@ -38,6 +44,7 @@ import socket
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -534,14 +541,400 @@ def dump_logs(server_log):
         subprocess.run(["sudo", "journalctl", "-u", "printpapi-agent", "--no-pager", "-n", "50"])
 
 
+# ---- the .msi (--msi): the managed install of the setup program, see docs/agent.md
+
+MSI_DIR = Path(os.environ.get("ProgramFiles", r"C:\Program Files")) / "printpapi Agent Setup"
+MSI_EXE = MSI_DIR / "printpapi-setup.exe"
+MSI_FLAG = MSI_DIR / ".managed-install"
+MSI_REG_KEY = r"HKLM\SOFTWARE\printpapi\Setup"
+# msiexec: 0 is done, 3010 is done and a restart is wanted (nothing here needs one)
+MSI_OK = (0, 3010)
+
+
+def read_log(path):
+    """A Windows Installer log as text: UTF-16 with a byte order mark when msiexec wrote one, else
+    the ANSI text it usually writes."""
+    data = Path(path).read_bytes()
+    if data[:2] in (b"\xff\xfe", b"\xfe\xff"):
+        return data.decode("utf-16", errors="replace")
+    return data.decode("cp1252", errors="replace")
+
+
+def msiexec_cmd(verb, msi, log, *properties):
+    """The msiexec command line: silent, no restart, a verbose log, then PROPERTY=value words."""
+    return ["msiexec", verb, str(msi), "/qn", "/norestart", "/l*v", str(log), *properties]
+
+
+def starter_env():
+    """The environment msiexec is started with: a proxy that does not exist. The headless modes run as
+    LocalSystem and must not see it (crates/setup/src/winenv.rs), or no server is reached."""
+    return dict(os.environ, http_proxy="http://127.0.0.1:9", HTTP_PROXY="http://127.0.0.1:9")
+
+
+def msiexec(verb, msi, log, *properties):
+    p = subprocess.run(msiexec_cmd(verb, msi, log, *properties), capture_output=True, text=True,
+                       env=starter_env(),
+                       timeout=900)
+    return p.returncode
+
+
+def msiexec_ok(what, verb, msi, log, *properties):
+    code = msiexec(verb, msi, log, *properties)
+    print(f"--- msiexec {verb} ({what}): exit {code}", flush=True)
+    if code not in MSI_OK:
+        raise Fail(f"msiexec {verb} ({what}) exited {code}; see {log}")
+
+
+def write_prepared_ini(folder, computer, base, key, target, header_value):
+    """<COMPUTERNAME>.ini for one PC: no name (the install fills in the computer's name)."""
+    folder.mkdir(parents=True, exist_ok=True)
+    (folder / f"{computer}.ini").write_text(
+        f"[agent]\nserver_url = {base}\napi_key = {key}\nprinters = archive = {target}\n\n"
+        f"[headers]\nX-Smoke = {header_value}\n", encoding="utf-8")
+
+
+def lock_down_commands(folder):
+    """The icacls line of docs/agent.md, "Managed Windows install (.msi)", "Protect the file", for
+    one folder, word for word (test_setup_smoke_msi.py compares it with the docs): only SYSTEM and
+    the Administrators may use it. A folder that somebody else made is not repaired (no /setowner,
+    no /reset /T: they follow a junction in it); the docs put it where users cannot make one."""
+    return [["icacls", str(folder), "/inheritance:r", "/grant:r", "*S-1-5-18:(OI)(CI)F",
+             "*S-1-5-32-544:(OI)(CI)F"]]
+
+
+def lock_down(folder):
+    # an elevated Command Prompt or PowerShell makes files of the Administrators; Git Bash, which runs
+    # this in CI, makes them the user's own. Safe here: the folder was made a moment ago by this script
+    subprocess.run(["icacls", str(folder), "/setowner", "*S-1-5-32-544", "/T"], check=True,
+                   capture_output=True)
+    for cmd in lock_down_commands(folder):
+        subprocess.run(cmd, check=True, capture_output=True)
+
+
+def ran_action(log_text, action):
+    """Whether a Windows Installer verbose log shows that the custom action was run (and not
+    skipped because its condition was false)."""
+    return re.search(rf"Doing action: {re.escape(action)}\b", log_text) is not None
+
+
+def telling_lines(log_text):
+    """What a verbose Windows Installer log says about the custom actions and the reason of a
+    failure: the reason stands far above the end of the log, which is a list of properties."""
+    words = re.compile(r"Managed(Install|Refresh|Uninstall)|--managed-|CustomAction|Return value 3"
+                       r"|Error 1[0-9]{3}\b|PinInstallDir|INSTALLDIR = ")
+    return [line for line in log_text.splitlines() if words.search(line)]
+
+
+def managed_log():
+    """Where the headless modes write when msiexec runs them: LocalSystem's profile."""
+    return (Path(os.environ.get("SystemRoot", r"C:\Windows")) / "System32" / "config" / "systemprofile"
+            / "AppData" / "Local" / "printpapi-managed.log")
+
+
+# the names icacls prints for groups a standard user is in (the runners speak English)
+EVERYBODY = ("BUILTIN\\Users", "Everyone", "Authenticated Users", "INTERACTIVE")
+
+
+def open_to_users(icacls_text):
+    """The groups of ordinary users that an access list names."""
+    return [name for name in EVERYBODY if name.lower() in icacls_text.lower()]
+
+
+class StagingWatch(threading.Thread):
+    """Where the private working folder (printpapi-setup-*, it holds the agent that SYSTEM starts and
+    the agent.ini with the key) appears while msiexec runs."""
+
+    def __init__(self, roots):
+        super().__init__(daemon=True)
+        self.roots, self.seen, self.done = roots, {name: set() for name in roots}, threading.Event()
+
+    def look(self):
+        for name, root in self.roots.items():
+            try:
+                self.seen[name].update(p.name for p in Path(root).glob("printpapi-setup-*"))
+            except OSError:
+                pass
+
+    def run(self):
+        while not self.done.wait(0.05):
+            self.look()
+
+    def __exit__(self, *_):
+        self.done.set()
+        self.join(timeout=10)
+
+    def __enter__(self):
+        self.start()
+        return self
+
+
+def run_key(base, token, label):
+    return call(base, token, "POST", "/apikeys", {"label": label, "scope": "agent"})["key"]
+
+
+def reg_value(key, value):
+    q = subprocess.run([str(REG), "query", key, "/v", value], capture_output=True, text=True)
+    return q.stdout if q.returncode == 0 else None
+
+
+def sha(path):
+    return sha256(Path(path).read_bytes()).hexdigest()
+
+
+def check_msi(args):
+    """Install A with AGENT_INI, run it again, repair it, upgrade it to B without AGENT_INI, remove
+    it; then install without AGENT_INI and with INSTALLDIR on the command line (docs/agent.md,
+    "Managed Windows install (.msi)"). Needs a server binary, and A and B: the same .msi built twice,
+    which gives B another ProductCode and so makes it a real major upgrade of A."""
+    msi_a, msi_b = Path(args.msi).resolve(), Path(args.msi_upgrade).resolve()
+    server_bin = args.server
+    computer = os.environ["COMPUTERNAME"]
+    work = Path(tempfile.mkdtemp(prefix="printpapi-msi-smoke-"))
+    open_dir(work, 0o755)
+    staging, archive, logs = work / "staging", work / "archive", work / "logs"
+    for d in (staging, archive, logs):
+        open_dir(d, 0o777)
+    server_log = work / "server.log"
+    token, port = secrets.token_hex(16), free_port()
+    base = f"http://127.0.0.1:{port}"
+    env = dict(os.environ, PRINTAPI_TOKEN=token, PRINT_DB=str(work / "smoke.db"),
+               PRINT_PORT=str(port))
+    server = None
+    installed = False
+    try:
+        with server_log.open("ab") as log:
+            server = subprocess.Popen([server_bin], env=env, stdout=log, stderr=log)
+        wait_for("the server", lambda: urllib.request.urlopen(base + "/health", timeout=2),
+                 timeout=30)
+        target = archive.resolve().as_uri().replace("%", "%%")
+        header_value = "msi-header-" + secrets.token_hex(8)
+        key = run_key(base, token, "msi smoke")
+        ini_dir = work / "ini"
+        write_prepared_ini(ini_dir, computer, base, key, target, header_value)
+        lock_down(ini_dir)
+
+        def last_seen():
+            for c in call(base, token, "GET", "/computers")["computers"]:
+                if c["name"] == computer:
+                    return c.get("last_seen_at") or 0
+            return 0
+
+        def online_since(baseline):
+            return lambda: last_seen() > baseline
+
+        def started_at():
+            return json.loads(STATUS_FILE.read_text(encoding="utf-8")).get("started_at") or 0
+
+        def print_a_job(what):
+            body = b"^XA^FDmsi smoke " + what.encode() + b"^FS^XZ"
+            pid = wait_for("the printer to be listed", lambda: next(
+                (p["id"] for p in call(base, token, "GET", "/printers")["printers"]
+                 if p["name"] == "archive" and p["agent_name"] == computer), None))
+            job = call(base, token, "POST", "/jobs", {
+                "printer_id": pid, "type": "raw_base64", "title": what,
+                "content": base64.b64encode(body).decode()})["job_id"]
+            out = archive / f"job-{job}.prn"
+            wait_for(f"{out.name} to arrive ({what})", out.is_file)
+            if out.read_bytes() != body:
+                raise Fail(f"{out.name} has the wrong content")
+
+        # (0) a folder that is not there: the install fails with one line of LocalSystem's own log, and
+        # nothing is written to the profile of whoever started it
+        missing = work / "missing"
+        if msiexec("/i", msi_a, logs / "0-missing.log", f"AGENT_INI={missing}") in MSI_OK:
+            raise Fail("an AGENT_INI that does not exist was accepted")
+        if str(missing) not in managed_log().read_text(errors="replace"):
+            raise Fail(f"{managed_log()} does not name {missing}")
+        rights = subprocess.run(["icacls", str(managed_log().parent)], capture_output=True, text=True,
+                                check=True).stdout
+        if open_to_users(rights):
+            raise Fail(f"{managed_log().parent} is open to {open_to_users(rights)}:\n{rights}")
+        theirs = sorted(p.name for p in Path(os.environ["LOCALAPPDATA"]).glob("printpapi-*"))
+        if theirs:
+            raise Fail(f"LocalSystem wrote to the starter's profile: {theirs}")
+
+        # (1) A with AGENT_INI as a folder: the file of this computer is found, the agent is
+        # installed, online and prints. The baseline is taken AFTER msiexec has returned: register
+        # itself writes last_seen_at, so an earlier baseline would pass without a running agent.
+        installed = True
+        with StagingWatch({"system": managed_log().parent,
+                           "starter": os.environ["LOCALAPPDATA"]}) as watch:
+            msiexec_ok("A, AGENT_INI", "/i", msi_a, logs / "1-install.log", f"AGENT_INI={ini_dir}")
+        if not watch.seen["system"] or watch.seen["starter"]:
+            raise Fail(f"the working folder of the install was seen in {watch.seen}")
+        if not MSI_EXE.is_file() or not MSI_FLAG.is_file():
+            raise Fail(f"the install left no {MSI_EXE} or no {MSI_FLAG}")
+        if not INSTALL_DIR.is_dir() or not AUTOSTART.is_file() or not TRAY.exists():
+            raise Fail(f"the install left no agent in {INSTALL_DIR}")
+        if not tray_registered():
+            raise Fail("the install left no tray autostart")
+        baseline = last_seen()
+        wait_for("the managed agent to come online", online_since(baseline))
+        wait_for("the status file", STATUS_FILE.is_file)
+        check_status_file([key, header_value])
+        text = read_installed_ini()
+        if not re.search(rf"(?m)^name *= *{re.escape(computer)} *$", text):
+            raise Fail("the device name is not the name of this computer")
+        if not re.search(r"(?m)^updates *= *off *$", text):
+            raise Fail("a managed install must write updates = off")
+        if key in text or not re.search(r"(?m)^api_key_dpapi *=", text):
+            raise Fail("the key is not stored sealed")
+        print_a_job("after the install")
+        # the resolved path is in the log; the key is in no log
+        log1 = read_log(logs / "1-install.log")
+        if not any("--managed-install" in l and str(ini_dir) in l for l in log1.splitlines()):
+            raise Fail("the install log does not show the resolved AGENT_INI path")
+        if key in log1:
+            raise Fail("the key is in the Windows Installer log")
+
+        # (2) the same file again is maintenance mode: a no-op, the agent is not restarted
+        ini_hash, started = sha(agent_ini_path()), started_at()
+        msiexec_ok("A again", "/i", msi_a, logs / "2-again.log", f"AGENT_INI={ini_dir}")
+        if sha(agent_ini_path()) != ini_hash or started_at() != started:
+            raise Fail("running the same .msi again changed the agent (it must be a no-op)")
+
+        # (3) a repair with another AGENT_INI must not replace the configuration
+        other = work / "ini-other"
+        write_prepared_ini(other, computer, base, run_key(base, token, "msi smoke other"),
+                           target, header_value)
+        lock_down(other)
+        msiexec_ok("A, repair", "/fa", msi_a, logs / "3-repair.log", f"AGENT_INI={other}")
+        if sha(agent_ini_path()) != ini_hash:
+            raise Fail("a repair with another AGENT_INI replaced agent.ini")
+
+        # (4) B without AGENT_INI is a major upgrade: the agent is refreshed, the settings stay
+        # a copy runs the change: `install` replaces the installed program, which a running copy of
+        # itself cannot be replaced by
+        runner = work / "printpapi-agent-copy.exe"
+        shutil.copy(INSTALLED_AGENT, runner)
+        result = install_patch(runner, staging, {"timeout": 77})
+        wait_for("the agent online after a change", online_after(result["baseline_local"]), timeout=90)
+        before = started_at()
+        # the refresh exists to replace the programs: the agent is the same file in A and B, so what
+        # shows that it was replaced is its modification time, and a marker in place of the tray
+        agent_mtime = INSTALLED_AGENT.stat().st_mtime_ns
+        stale_tray = b"stale tray, to be replaced by the refresh"
+        TRAY.write_bytes(stale_tray)
+        msiexec_ok("B, upgrade", "/i", msi_b, logs / "4-upgrade.log")
+        if INSTALLED_AGENT.stat().st_mtime_ns <= agent_mtime:
+            raise Fail("the upgrade did not replace the agent program")
+        if TRAY.read_bytes() == stale_tray:
+            raise Fail("the upgrade did not replace the tray program")
+        wait_for("the refreshed agent to start", lambda: started_at() > before, timeout=90)
+        baseline = last_seen()
+        wait_for("the refreshed agent to come online", online_since(baseline))
+        text = read_installed_ini()
+        if (not re.search(r"(?m)^timeout *= *77", text) or not re.search(r"(?m)^updates *= *off *$", text)
+                or not re.search(rf"(?m)^name *= *{re.escape(computer)} *$", text)):
+            raise Fail("the upgrade did not keep the settings")
+        if key in text or not re.search(r"(?m)^api_key_dpapi *=", text):
+            raise Fail("the upgrade did not keep the key sealed")
+        if not MSI_FLAG.is_file() or not MSI_EXE.is_file():
+            raise Fail("the upgrade lost the setup program or the flag")
+        print_a_job("after the upgrade")
+
+        # (4) and (5) run with /qn, which has no UI sequence. A double-clicked upgrade and a
+        # double-clicked Remove (AppSearch ran unelevated in the UI sequence; the flag property is
+        # secure for that) cannot run here: do both by hand on a test PC before a release.
+
+        # (5) removing B takes the agent, its task, its status folder, its own folder and the flag
+        msiexec_ok("B, remove", "/x", msi_b, logs / "5-remove.log")
+        installed = False
+        if not ran_action(read_log(logs / "5-remove.log"), "ManagedUninstall"):
+            raise Fail("the removal of a PC with the flag did not run ManagedUninstall")
+        left = [p for p in (INSTALL_DIR, AUTOSTART, TRAY, STATUS_DIR, MSI_DIR, MSI_FLAG) if p.exists()]
+        if left:
+            raise Fail(f"the removal left {left}")
+        if tray_registered():
+            raise Fail("the removal left the tray autostart")
+        if subprocess.run(["schtasks", "/Query", "/TN", "printpapi-agent"],
+                          capture_output=True).returncode == 0:
+            raise Fail("the removal left the scheduled task")
+
+        # (6) without AGENT_INI only the setup program is installed
+        installed = True
+        msiexec_ok("B, no AGENT_INI", "/i", msi_b, logs / "6-plain.log")
+        if not MSI_EXE.is_file() or INSTALL_DIR.exists() or MSI_FLAG.exists():
+            raise Fail("an install without AGENT_INI must install the setup program only")
+        msiexec_ok("B, remove", "/x", msi_b, logs / "6-remove.log")
+        installed = False
+        # no flag: the .msi never installed an agent here, so the unsigned exe is not started at all
+        if ran_action(read_log(logs / "6-remove.log"), "ManagedUninstall"):
+            raise Fail("the removal of a plain install ran ManagedUninstall")
+        if MSI_DIR.exists():
+            raise Fail("the removal left the setup program's folder")
+
+        # (7) INSTALLDIR on the command line cannot move the exe out of Program Files
+        installed = True
+        elsewhere = Path(r"C:\x")
+        msiexec_ok("B, INSTALLDIR", "/i", msi_b, logs / "7-installdir.log", "INSTALLDIR=C:\\x\\")
+        if not MSI_EXE.is_file() or elsewhere.exists():
+            raise Fail("INSTALLDIR on the command line moved the setup program")
+        shown = reg_value(MSI_REG_KEY, "InstallDir") or ""
+        if str(MSI_DIR).lower() not in shown.lower():
+            raise Fail(f"the registry does not name {MSI_DIR}: {shown!r}")
+        msiexec_ok("B, remove", "/x", msi_b, logs / "7-remove.log")
+        installed = False
+        print("setup smoke (msi): ok", flush=True)
+        return 0
+    except (Fail, OSError, subprocess.SubprocessError) as e:
+        print(f"setup smoke (msi) FAILED: {e}", file=sys.stderr, flush=True)
+        dump_logs(server_log)
+        print("===== printpapi-managed.log (LocalSystem) =====", flush=True)
+        try:
+            print(managed_log().read_text(errors="replace"))
+        except OSError as e2:
+            print(f"({e2})")
+        for log in sorted(logs.glob("*.log")):
+            text = read_log(log)
+            print(f"===== {log.name} (custom actions and errors) =====", flush=True)
+            print("\n".join(telling_lines(text)[-60:]))
+            print(f"===== {log.name} (tail) =====", flush=True)
+            print("\n".join(text.splitlines()[-25:]))
+        return 1
+    finally:
+        if installed:  # leave the runner as it was found, whatever happened
+            for msi in (msi_b, msi_a):
+                try:
+                    msiexec("/x", msi, logs / "cleanup.log")
+                except (OSError, subprocess.SubprocessError):
+                    pass
+            if INSTALLED_AGENT.exists():
+                try:
+                    # a copy again: the installed program cannot be replaced while it runs
+                    runner = work / "printpapi-agent-cleanup.exe"
+                    shutil.copy(INSTALLED_AGENT, runner)
+                    subprocess.run(agent_cmd(runner, "uninstall", staging),
+                                   capture_output=True, timeout=300)
+                except (OSError, subprocess.SubprocessError):
+                    pass
+        if server is not None and server.poll() is None:
+            server.terminate()
+            try:
+                server.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                server.kill()
+        shutil.rmtree(work, ignore_errors=True)
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("--server", required=True, help="path of the printpapi server binary")
-    ap.add_argument("--agent", required=True, help="path of the printpapi-agent binary")
+    ap.add_argument("--agent", help="path of the printpapi-agent binary (not with --msi)")
+    ap.add_argument("--msi", help="the .msi (build A): test the managed install of the .msi")
+    ap.add_argument("--msi-upgrade", help="the same .msi built a second time (build B), with --msi")
     ap.add_argument("--update-agent", help="the agent built as version 99.0.0 (with the test key)")
     ap.add_argument("--sign-update", help="the sign_update example binary")
     ap.add_argument("--fake-tray", help="the fake_tray example binary")
     args = ap.parse_args()
+    if bool(args.msi) != bool(args.msi_upgrade):
+        ap.error("--msi and --msi-upgrade come together")
+    if args.msi:
+        if not WIN:
+            ap.error("--msi tests the Windows installer and runs on Windows only")
+        return check_msi(args)
+    if not args.agent:
+        ap.error("--agent is required")
     agent = Path(args.agent).resolve()
     update_files = [args.update_agent, args.sign_update, args.fake_tray]
     if any(update_files) and not all(update_files):

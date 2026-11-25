@@ -26,6 +26,7 @@ const SETUP_PLATFORMS: {
     notes: [
       "Windows may warn about an unknown publisher. Click More info, then Run anyway.",
       "Smart App Control blocks unsigned programs with no way around it. Use the Python agent below.",
+      "The .msi installs the setup for all users. Administrators can also install the agent silently with it, see the agent docs.",
     ],
   },
   {
@@ -42,6 +43,7 @@ const SETUP_PLATFORMS: {
     icon: Terminal,
     notes: [
       "An AppImage starts only once it is executable: run chmod +x on the file, or tick Allow executing as program in its properties.",
+      "The .rpm is for Fedora and openSUSE with a desktop.",
       "Linux without a desktop still needs the manual steps below.",
     ],
   },
@@ -57,6 +59,7 @@ const STEPS = [
           latest release
         </a>
         : <code className="font-mono">printpapi-agent-windows-x86_64.zip</code>,{" "}
+        <code className="font-mono">-windows-aarch64.zip</code>,{" "}
         <code className="font-mono">-linux-x86_64</code>,{" "}
         <code className="font-mono">-linux-aarch64</code>,{" "}
         <code className="font-mono">-macos-aarch64</code> or{" "}

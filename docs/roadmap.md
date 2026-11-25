@@ -55,6 +55,13 @@ v1 is deliberately small (see [CONTRIBUTING.md](../CONTRIBUTING.md) for the YAGN
   connect is replaced by the old one. Modes Tell me, Install automatically and Off, a mirror for
   companies, Ed25519 signature checked before anything changes. See [agent.md](agent.md#updates)
   and [SECURITY.md](../SECURITY.md#signed-updates).
+- ~~**Print journal**~~ ✅ the agent writes the outcome of a printed job to disk before it reports it,
+  delivers it later when the report fails and answers a job the server hands out again from the
+  journal instead of printing it a second time; a job that printed past the reaper's timeout ends
+  `done`. See [agent.md](agent.md#the-print-journal) and [api.md](api.md#job-lifecycle).
+- ~~**More installers**~~ ✅ (Beta) a Windows `.msi` that installs the setup program for all users and,
+  with a prepared `agent.ini` per PC, the agent silently; an `.rpm` for Fedora and openSUSE; Windows on
+  ARM64 for the agent, the server and the setup. See [agent.md](agent.md#managed-windows-install-msi).
 
 ## v2 candidates
 

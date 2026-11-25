@@ -169,7 +169,7 @@ async fn respond(
         } else {
             key
         };
-        long_poll(&ctx.state, key).await
+        long_poll(&ctx.state, key, server::wants_job_uid(&parts.headers)).await
     } else {
         let declared = parts
             .headers
@@ -259,7 +259,10 @@ fn bearer(headers: &hyper::HeaderMap) -> &str {
 /// `GET /agent/jobs`: hold the request until a job is queued for the agent or the timeout passes.
 /// Waits on the agent's `Waker` (enqueue wakes it) with a timed recheck as the safety net, so an
 /// idle agent costs a task, not a thread.
-async fn long_poll(state: &Arc<AppState>, key: &str) -> Resp {
+///
+/// `want_uid`: the agent asked for the job identity (`X-Printapi-Features: job-uid`); without it
+/// the claim is byte-identical to what agents before it got.
+async fn long_poll(state: &Arc<AppState>, key: &str, want_uid: bool) -> Resp {
     let unauthorized = || Resp::json(401, &json!({"error": "unauthorized"}));
     if key.is_empty() {
         return unauthorized();
@@ -303,7 +306,10 @@ async fn long_poll(state: &Arc<AppState>, key: &str) -> Resp {
         .await;
         match claimed {
             Ok(Ok(None)) => return unauthorized(),
-            Ok(Ok(Some(Some(job)))) => {
+            Ok(Ok(Some(Some(mut job)))) => {
+                if !want_uid {
+                    job.job_uid = None;
+                }
                 let v = serde_json::to_value(&job).expect("a ClaimedJob always serializes");
                 return Resp::json(200, &v);
             }

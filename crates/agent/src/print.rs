@@ -288,6 +288,23 @@ pub fn print_job(
     fns: &Fns,
     job_id: Option<&str>,
 ) -> SendResult {
+    print_copies(mode, entry, data, copies, options, fns, job_id, &mut 0)
+}
+
+/// [`print_job`] that counts in `sent` every copy that was handed over without an error, also
+/// when a later copy fails: the run loop journals a job only when `sent > 0` (docs/agent.md,
+/// Reliability), because then paper may be out and printing it again is the worse mistake.
+#[allow(clippy::too_many_arguments)] // print_job's list plus the counter
+pub fn print_copies(
+    mode: &str,
+    entry: &Printer,
+    data: &[u8],
+    copies: i64,
+    options: Option<&Options>,
+    fns: &Fns,
+    job_id: Option<&str>,
+    sent: &mut u32,
+) -> SendResult {
     let target = entry.target.as_str();
     if mode != "raw" && mode != "pdf" {
         return Err(format!("bad mode: {mode}"));
@@ -322,6 +339,7 @@ pub fn print_job(
     };
     for i in 1..=copies.max(0) {
         send(i as u32)?;
+        *sent += 1;
     }
     Ok(())
 }
@@ -434,6 +452,98 @@ pub(crate) mod tests {
         let e = print_job("raw", &entry("Z", false, "Z"), b"x", 3, None, &fns, None).unwrap_err();
         assert_eq!(e, "spooler down");
         assert_eq!(*n.borrow(), 1);
+    }
+
+    #[test]
+    fn print_copies_counts_every_copy_handed_over_also_when_a_later_one_fails() {
+        let n = Rc::new(RefCell::new(0));
+        let c = n.clone();
+        let fns = Fns {
+            raw: Box::new(move |_, _| {
+                *c.borrow_mut() += 1;
+                if *c.borrow() == 3 {
+                    Err("jam".into())
+                } else {
+                    Ok(())
+                }
+            }),
+            ..Fns::refusing()
+        };
+        let mut sent = 0;
+        let e = print_copies(
+            "raw",
+            &entry("Z", false, "Z"),
+            b"x",
+            5,
+            None,
+            &fns,
+            None,
+            &mut sent,
+        )
+        .unwrap_err();
+        assert_eq!((e.as_str(), sent), ("jam", 2));
+        // all copies out: the counter says so, and it keeps counting from where it was
+        let ok = Fns {
+            raw: Box::new(|_, _| Ok(())),
+            ..Fns::refusing()
+        };
+        let mut sent = 0;
+        print_copies(
+            "raw",
+            &entry("Z", false, "Z"),
+            b"x",
+            4,
+            None,
+            &ok,
+            None,
+            &mut sent,
+        )
+        .unwrap();
+        assert_eq!(sent, 4);
+        // nothing handed over: zero copies, a refused mode, a first copy that failed
+        let mut sent = 0;
+        print_copies(
+            "raw",
+            &entry("Z", false, "Z"),
+            b"x",
+            0,
+            None,
+            &ok,
+            None,
+            &mut sent,
+        )
+        .unwrap();
+        assert!(
+            print_copies(
+                "scan",
+                &entry("Z", false, "Z"),
+                b"x",
+                2,
+                None,
+                &ok,
+                None,
+                &mut sent
+            )
+            .is_err()
+        );
+        let bad = Fns {
+            raw: Box::new(|_, _| Err("down".into())),
+            ..Fns::refusing()
+        };
+        assert!(
+            print_copies(
+                "raw",
+                &entry("Z", false, "Z"),
+                b"x",
+                2,
+                None,
+                &bad,
+                None,
+                &mut sent
+            )
+            .is_err()
+        );
+        assert_eq!(sent, 0);
     }
 
     #[test]

@@ -3,9 +3,10 @@
 
 use serde_json::{Value, json};
 
-use crate::client::{Http, HttpError};
+use crate::client::{Http, HttpError, http_status};
 use crate::config::Printer;
-use crate::print::{Fns, MAX_COPIES, Options, print_job, safe_job_id};
+use crate::journal::{Entry, Journal, valid_uid};
+use crate::print::{Fns, MAX_COPIES, Options, print_copies, safe_job_id};
 use crate::pyrepr::{py_str, repr};
 use crate::{err_line, out_line};
 
@@ -129,6 +130,16 @@ pub fn register_with_retry(
     }
 }
 
+/// The body of `POST /agent/jobs/{id}/result`: `{ok, error}`, and `job_uid` when the claim came
+/// with one, so a server whose database was reset since cannot take the result for another job.
+fn result_body(ok: bool, error: Option<&str>, job_uid: Option<&str>) -> Value {
+    let mut body = json!({"ok": ok, "error": error});
+    if let (Some(uid), Some(o)) = (job_uid, body.as_object_mut()) {
+        o.insert("job_uid".into(), json!(uid));
+    }
+    body
+}
+
 pub fn report_result(
     http: &dyn Http,
     base: &str,
@@ -136,17 +147,21 @@ pub fn report_result(
     job_id: &str,
     ok: bool,
     error: Option<&str>,
+    job_uid: Option<&str>,
 ) -> Result<(), HttpError> {
     http.post(
         &format!("{base}/agent/jobs/{job_id}/result"),
         key,
-        &json!({"ok": ok, "error": error}),
+        &result_body(ok, error, job_uid),
     )
     .map(|_| ())
 }
 
 /// A lost result makes the server's reaper requeue the job -> duplicate print. Retry hard.
 /// `Ok(false)` once the attempts are used up; only a non-JSON reply (not retried) is an `Err`.
+/// This is the path of a job that handed over no copy, and of one that has no `job_uid` (an old
+/// server, a proxy that strips `X-Printapi-Features`); a job with an identity that did hand over
+/// a copy goes through the journal ([`Outbox`]).
 #[allow(clippy::too_many_arguments)] // mirrors the Python signature; a struct would only move the list
 pub fn report_with_retry(
     http: &dyn Http,
@@ -155,11 +170,12 @@ pub fn report_with_retry(
     job_id: &str,
     ok: bool,
     error: Option<&str>,
+    job_uid: Option<&str>,
     attempts: u32,
     sleep: Sleep,
 ) -> Result<bool, HttpError> {
     for i in 0..attempts {
-        match report_result(http, base, key, job_id, ok, error) {
+        match report_result(http, base, key, job_id, ok, error, job_uid) {
             Ok(()) => return Ok(true),
             Err(e @ HttpError::Value(_)) => return Err(e),
             Err(e) => {
@@ -173,7 +189,10 @@ pub fn report_with_retry(
             }
         }
     }
-    // ponytail: after 5 tries we drop the result; the reaper requeues -> possible duplicate print
+    // ponytail: after 5 tries we drop the result; the reaper requeues and the job prints again.
+    // Ceiling: with no copy handed over that is the right outcome. A job without a `job_uid` may
+    // have printed, and there five lost reports still mean a second print (nothing is journaled
+    // without an identity).
     Ok(false)
 }
 
@@ -188,6 +207,8 @@ fn job_id_text(v: &Value) -> Result<String, String> {
 
 /// Everything after the job is claimed and before its result is reported; any `Err` becomes the
 /// failure text the server shows.
+/// `sent` counts the copies that were handed over without an error, whatever happens later.
+#[allow(clippy::too_many_arguments)] // the loop's environment; a struct would only move the list
 fn execute(
     job: &Value,
     job_id: &str,
@@ -196,6 +217,7 @@ fn execute(
     printers: &PrinterMap,
     http: &dyn Http,
     fns: &Fns,
+    sent: &mut u32,
 ) -> Result<(), String> {
     let payload = http
         .get_bytes(&format!("{base}/agent/jobs/{job_id}/payload"), key)
@@ -224,7 +246,16 @@ fn execute(
         Some(Value::Object(o)) => Some(o),
         Some(other) => return Err(format!("options must be an object, got {}", py_str(other))),
     };
-    print_job(mode, printer, &payload, copies, options, fns, Some(job_id))
+    print_copies(
+        mode,
+        printer,
+        &payload,
+        copies,
+        options,
+        fns,
+        Some(job_id),
+        sent,
+    )
 }
 
 /// A job this poll handled, for the status file.
@@ -237,7 +268,179 @@ pub struct JobDone {
 /// What one poll came to: `Ok(None)` = no job, `Ok(Some(_))` = a job was handled.
 pub type PollOutcome = Result<Option<JobDone>, String>;
 
+/// Results waiting to reach the server, and the journal behind them (docs/agent.md,
+/// Reliability).
+pub struct Outbox {
+    journal: Journal,
+    /// Monotonic seconds, so a wall clock that jumps blocks nothing.
+    clock: Box<dyn Fn() -> f64>,
+    /// Seconds to wait after a failed flush pass (0 = the last pass worked).
+    pause: f64,
+    not_before: f64,
+}
+
+/// Posts of late results per pass.
+const FLUSH_MAX: usize = 20;
+/// The first wait after a failed pass; doubled per further failure up to [PAUSE_MAX].
+const PAUSE_FIRST: f64 = 30.0;
+const PAUSE_MAX: f64 = 600.0;
+/// Tries to deliver one result right after printing.
+const DELIVER_TRIES: u32 = 5;
+
+/// The reply of `POST /agent/results` that counts as delivered: `{"ok": true, "state": text or
+/// null}`. A proxy's `{}`, an empty body or a page is none, whatever its status.
+fn late_state(reply: Option<Value>) -> Result<Option<String>, String> {
+    if let Some(Value::Object(o)) = &reply
+        && o.get("ok") == Some(&Value::Bool(true))
+    {
+        match o.get("state") {
+            Some(Value::String(s)) => return Ok(Some(s.clone())),
+            Some(Value::Null) => return Ok(None),
+            _ => {}
+        }
+    }
+    Err("unexpected reply from /agent/results".into())
+}
+
+/// `POST /agent/results`: the result of a job by id and uid, accepted whatever the server did to
+/// the job since (it was requeued, failed by the reaper). The old server answers 404.
+fn post_late(http: &dyn Http, base: &str, key: &str, e: &Entry) -> Result<Option<String>, String> {
+    let body = json!({"job_id": e.job_id, "job_uid": e.uid, "ok": e.ok, "error": e.error});
+    http.post(&format!("{base}/agent/results"), key, &body)
+        .map_err(|err| err.to_string())
+        .and_then(late_state)
+}
+
+impl Outbox {
+    pub fn new(journal: Journal, clock: Box<dyn Fn() -> f64>) -> Outbox {
+        Outbox {
+            journal,
+            clock,
+            pause: 0.0,
+            not_before: 0.0,
+        }
+    }
+
+    pub fn journal(&self) -> &Journal {
+        &self.journal
+    }
+
+    /// One try to deliver `e` right after printing it: the old route first with today's body (the
+    /// server handed this id out moments ago, and behind every proxy that route is known), and
+    /// only when it answers 404, which is all it says about a job it no longer holds as claimed,
+    /// the new one in the same try. Anything else (another status, no connection, `{}`, a page) is
+    /// a failed try.
+    fn try_deliver(&self, http: &dyn Http, base: &str, key: &str, e: &Entry) -> Result<(), String> {
+        let url = format!("{base}/agent/jobs/{}/result", e.job_id);
+        match http.post(
+            &url,
+            key,
+            &result_body(e.ok, e.error.as_deref(), Some(&e.uid)),
+        ) {
+            Ok(Some(Value::Object(o))) if o.get("ok") == Some(&Value::Bool(true)) => Ok(()),
+            Ok(_) => Err("unexpected reply".into()),
+            Err(err) if http_status(&err) == Some(404) => post_late(http, base, key, e).map(|_| ()),
+            Err(err) => Err(err.to_string()),
+        }
+    }
+
+    /// Report a journaled result: five tries, 1, 2, 4, 8 s between them. Delivered = acknowledged
+    /// in the journal. Not delivered: the entry stays pending and [`Outbox::flush`] sends it later.
+    #[allow(clippy::too_many_arguments)] // the run loop's environment
+    fn deliver(
+        &mut self,
+        http: &dyn Http,
+        base: &str,
+        key: &str,
+        e: &Entry,
+        sleep: Sleep,
+        log: Log,
+    ) -> bool {
+        for i in 0..DELIVER_TRIES {
+            match self.try_deliver(http, base, key, e) {
+                Ok(()) => {
+                    self.journal.delivered(&e.uid, log);
+                    return true;
+                }
+                Err(err) => {
+                    err_line(&format!(
+                        "report_result failed (try {}/{DELIVER_TRIES}): {err}",
+                        i + 1
+                    ));
+                    if i + 1 < DELIVER_TRIES {
+                        sleep(1u64 << i);
+                    }
+                }
+            }
+        }
+        log(&format!(
+            "result of job {} could not be delivered; it is kept and sent later",
+            e.job_id
+        ));
+        false
+    }
+
+    /// Send what is still pending, oldest first, before the next poll. Only the new route, one
+    /// post per entry, at most [FLUSH_MAX] per pass. A server that has the route answers every
+    /// well-formed call with 200, so any other reply says something about the path and not the
+    /// entry: the pass ends, the entry goes to the back (one a WAF refuses must not block the
+    /// others) and nothing is tried for 30 s, doubling to 10 minutes; nothing is ever discarded
+    /// because of a status code.
+    // ponytail: one post per entry, no batch; a batch endpoint if a site ever has hundreds pending.
+    pub fn flush(&mut self, http: &dyn Http, base: &str, key: &str, log: Log) {
+        let pending = self.journal.pending();
+        if pending.is_empty() {
+            // whatever failed was delivered another way (the job was handed out again): the next
+            // outage starts with the first pause again
+            self.pause = 0.0;
+            self.not_before = 0.0;
+            return;
+        }
+        if (self.clock)() < self.not_before {
+            return;
+        }
+        for e in pending.into_iter().take(FLUSH_MAX) {
+            match post_late(http, base, key, &e) {
+                Ok(state) => {
+                    self.journal.delivered(&e.uid, log);
+                    self.pause = 0.0;
+                    self.not_before = 0.0;
+                    log(&format!(
+                        "result of job {} delivered late ({})",
+                        e.job_id,
+                        state.as_deref().unwrap_or("the server has no such job")
+                    ));
+                }
+                Err(err) => {
+                    self.journal.defer(&e.uid);
+                    if self.pause == 0.0 {
+                        log(&format!(
+                            "result of job {} could not be sent ({err}); kept, trying again later",
+                            e.job_id
+                        ));
+                    }
+                    self.pause = if self.pause == 0.0 {
+                        PAUSE_FIRST
+                    } else {
+                        (self.pause * 2.0).min(PAUSE_MAX)
+                    };
+                    self.not_before = (self.clock)() + self.pause;
+                    return;
+                }
+            }
+        }
+    }
+}
+
+/// The identity of a claim: its `job_uid`, only when it is a safe word and the job id is a JSON
+/// integer. Without it the job takes the old path.
+fn claim_identity(job: &Value) -> Option<(String, i64)> {
+    let uid = job.get("job_uid")?.as_str().filter(|u| valid_uid(u))?;
+    Some((uid.to_string(), job.get("job_id")?.as_i64()?))
+}
+
 /// Poll once; print and report if there was a job.
+#[allow(clippy::too_many_arguments)] // the loop's whole environment; a struct would only move the list
 pub fn run_once(
     base: &str,
     key: &str,
@@ -245,12 +448,32 @@ pub fn run_once(
     http: &dyn Http,
     fns: &Fns,
     report_sleep: Sleep,
+    outbox: &mut Outbox,
+    log: Log,
 ) -> PollOutcome {
-    run_once_with(base, key, printers, http, fns, report_sleep, &|| {})
+    run_once_with(
+        base,
+        key,
+        printers,
+        http,
+        fns,
+        report_sleep,
+        outbox,
+        &|| {},
+        log,
+    )
 }
 
 /// [`run_once`] with `claimed`, called once right after a job with an id arrived and before it is
-/// printed: the status file then says `busy`, which is what an update waits for.
+/// printed: the status file then says `busy`, which is what an update waits for. Not called for
+/// a job that is answered from the journal: nothing is printed.
+///
+/// First the results that could not be delivered earlier. Then the poll; a job the journal knows
+/// is not printed again, its recorded result is reported. Otherwise it is printed; when at least
+/// one copy was handed over, the outcome is written to the journal before it is reported (a crash
+/// or a lost report then costs no second print). Every other case (no identity, nothing printed)
+/// is the old path: report, and if that fails the reaper hands the job out again.
+#[allow(clippy::too_many_arguments)] // the loop's whole environment; a struct would only move the list
 pub fn run_once_with(
     base: &str,
     key: &str,
@@ -258,8 +481,11 @@ pub fn run_once_with(
     http: &dyn Http,
     fns: &Fns,
     report_sleep: Sleep,
+    outbox: &mut Outbox,
     claimed: &dyn Fn(),
+    log: Log,
 ) -> PollOutcome {
+    outbox.flush(http, base, key, log);
     let Some(job) = http
         .get(&format!("{base}/agent/jobs"), key)
         .map_err(|e| e.to_string())?
@@ -274,20 +500,46 @@ pub fn run_once_with(
     if job.get("printer_id").is_none() {
         return Err("job reply has no printer_id".into());
     }
+    let identity = claim_identity(&job);
+    // ponytail: the server's ids are integers; a plain-word id (which `job_id_text` still lets
+    // through) shows as 0 in the status file
+    let id = job_id.parse().unwrap_or(0);
+    if let Some((uid, _)) = &identity
+        && let Some(entry) = outbox.journal.get(uid).cloned()
+    {
+        log(&format!(
+            "job {job_id} was handed out again; it was already printed here, the recorded result is reported"
+        ));
+        outbox.journal.reopen(uid, log);
+        outbox.deliver(http, base, key, &entry, report_sleep, log);
+        return Ok(Some(JobDone { id, ok: entry.ok }));
+    }
     claimed();
-    let outcome = execute(&job, &job_id, base, key, printers, http, fns);
+    let mut sent = 0;
+    let outcome = execute(&job, &job_id, base, key, printers, http, fns, &mut sent);
     let (ok, error) = match &outcome {
         Ok(()) => (true, None),
         Err(e) => (false, Some(e.as_str())),
     };
-    report_with_retry(http, base, key, &job_id, ok, error, 5, report_sleep)
-        .map_err(|e| e.to_string())?;
-    // ponytail: the server's ids are integers; a plain-word id (which `job_id_text` still lets
-    // through) shows as 0 in the status file
-    Ok(Some(JobDone {
-        id: job_id.parse().unwrap_or(0),
-        ok,
-    }))
+    match identity {
+        Some((uid, jid)) if sent > 0 => {
+            outbox.journal.record(&uid, jid, ok, error, log);
+            let entry = outbox.journal.get(&uid).cloned().unwrap_or(Entry {
+                uid,
+                job_id: jid,
+                ok,
+                error: error.map(str::to_string),
+                acked: false,
+            });
+            outbox.deliver(http, base, key, &entry, report_sleep, log);
+        }
+        identity => {
+            let uid = identity.as_ref().map(|(u, _)| u.as_str());
+            report_with_retry(http, base, key, &job_id, ok, error, uid, 5, report_sleep)
+                .map_err(|e| e.to_string())?;
+        }
+    }
+    Ok(Some(JobDone { id, ok }))
 }
 
 /// The loop behind [`poll_forever`]: `next` returns the outcome of one poll, or `None` to stop.
@@ -333,13 +585,14 @@ pub fn poll_forever(
     fns: &Fns,
     sleep: Sleep,
     log: Log,
+    outbox: &mut Outbox,
     observe: &mut dyn FnMut(&PollOutcome),
     claimed: &dyn Fn(),
 ) {
     poll_while(
         &mut || {
             Some(run_once_with(
-                base, key, printers, http, fns, sleep, claimed,
+                base, key, printers, http, fns, sleep, outbox, claimed, log,
             ))
         },
         observe,
@@ -410,6 +663,56 @@ mod tests {
 
     fn no_sleep(_: u64) {}
 
+    /// An outbox over a journal in memory and a clock that only moves when a test says so.
+    fn outbox() -> Outbox {
+        Outbox::new(Journal::memory(), Box::new(|| 0.0))
+    }
+
+    fn silent(_: &str) {}
+
+    /// [`run_once`] with a fresh outbox, for the tests that do not look at it.
+    fn once(
+        base: &str,
+        key: &str,
+        printers: &PrinterMap,
+        http: &dyn Http,
+        fns: &Fns,
+        sleep: Sleep,
+    ) -> PollOutcome {
+        run_once(
+            base,
+            key,
+            printers,
+            http,
+            fns,
+            sleep,
+            &mut outbox(),
+            &silent,
+        )
+    }
+
+    fn once_with(
+        base: &str,
+        key: &str,
+        printers: &PrinterMap,
+        http: &dyn Http,
+        fns: &Fns,
+        sleep: Sleep,
+        claimed: &dyn Fn(),
+    ) -> PollOutcome {
+        run_once_with(
+            base,
+            key,
+            printers,
+            http,
+            fns,
+            sleep,
+            &mut outbox(),
+            claimed,
+            &silent,
+        )
+    }
+
     fn collect<T: 'static>(store: &std::rc::Rc<RefCell<Vec<T>>>) -> Box<dyn Fn(T)> {
         let s = store.clone();
         Box::new(move |v| s.borrow_mut().push(v))
@@ -430,7 +733,7 @@ mod tests {
             }),
             ..Fns::refusing()
         };
-        let handled = run_once(
+        let handled = once(
             "http://x",
             "k",
             &pm(1, entry("Zebra", false, "Zebra")),
@@ -459,7 +762,7 @@ mod tests {
             raw: Box::new(|_, _| Err("spooler down".into())),
             ..Fns::refusing()
         };
-        let handled = run_once(
+        let handled = once(
             "http://x",
             "k",
             &pm(1, entry("Zebra", false, "Zebra")),
@@ -478,7 +781,7 @@ mod tests {
     #[test]
     fn a_null_poll_body_is_no_job() {
         let http = FakeHttp::new(Some(Value::Null), b"");
-        let r = run_once(
+        let r = once(
             "http://x",
             "k",
             &PrinterMap::default(),
@@ -493,7 +796,7 @@ mod tests {
     fn test_run_once_no_job_returns_false() {
         let http = FakeHttp::new(None, b"");
         assert!(
-            run_once(
+            once(
                 "http://x",
                 "k",
                 &PrinterMap::default(),
@@ -525,7 +828,7 @@ mod tests {
             ..Fns::refusing()
         };
         assert!(
-            run_once(
+            once(
                 "http://x",
                 "k",
                 &pm(1, entry("Zebra", true, "Zebra")),
@@ -562,7 +865,7 @@ mod tests {
             },
             ..Fns::refusing()
         };
-        run_once(
+        once(
             "http://x",
             "k",
             &pm(1, entry("Z", false, "Z")),
@@ -591,7 +894,7 @@ mod tests {
             },
             ..Fns::refusing()
         };
-        run_once(
+        once(
             "http://x",
             "k",
             &pm(1, entry("Z", false, "Z")),
@@ -620,7 +923,7 @@ mod tests {
             },
             ..Fns::refusing()
         };
-        run_once(
+        once(
             "http://x",
             "k",
             &pm(1, entry("HP", true, "HP")),
@@ -648,6 +951,7 @@ mod tests {
             "1",
             true,
             None,
+            None,
             5,
             &*collect(&waits),
         )
@@ -670,6 +974,7 @@ mod tests {
                 "1",
                 true,
                 None,
+                None,
                 5,
                 &*collect(&waits)
             )
@@ -680,7 +985,9 @@ mod tests {
 
         let mut html = FakeHttp::new(None, b"");
         html.post_default = Err(HttpError::Value("Expecting value".into()));
-        assert!(report_with_retry(&html, "http://x", "k", "1", true, None, 5, &no_sleep).is_err());
+        assert!(
+            report_with_retry(&html, "http://x", "k", "1", true, None, None, 5, &no_sleep).is_err()
+        );
         assert_eq!(html.posts.borrow().len(), 1);
     }
 
@@ -702,7 +1009,7 @@ mod tests {
             },
             ..Fns::refusing()
         };
-        let ret = run_once(
+        let ret = once(
             "http://x",
             "k",
             &pm(5, entry("p", false, "p")),
@@ -724,7 +1031,7 @@ mod tests {
         let target = file_uri(&dir.path().join("out"));
         let fns = Fns::native(Box::new(|_, _| Ok(())), Box::new(|_, _, _| Ok(())));
         assert!(
-            run_once(
+            once(
                 "http://x",
                 "k",
                 &pm(1, entry("archive", true, &target)),
@@ -751,7 +1058,7 @@ mod tests {
             b"x",
         );
         assert!(
-            run_once(
+            once(
                 "http://x",
                 "k",
                 &PrinterMap::default(),
@@ -789,7 +1096,7 @@ mod tests {
         for (job, want) in cases {
             let http = FakeHttp::new(Some(job), b"x");
             assert!(
-                run_once("http://x", "k", &p, &http, &Fns::refusing(), &no_sleep)
+                once("http://x", "k", &p, &http, &Fns::refusing(), &no_sleep)
                     .unwrap()
                     .is_some_and(|d| !d.ok)
             );
@@ -803,10 +1110,10 @@ mod tests {
             json!({"job_id": "../x", "printer_id": 1}),
         ] {
             let http = FakeHttp::new(Some(job), b"x");
-            assert!(run_once("http://x", "k", &p, &http, &Fns::refusing(), &no_sleep).is_err());
+            assert!(once("http://x", "k", &p, &http, &Fns::refusing(), &no_sleep).is_err());
         }
         let http = FakeHttp::new(Some(json!({"job_id": 1, "mode": "raw"})), b"x");
-        assert!(run_once("http://x", "k", &p, &http, &Fns::refusing(), &no_sleep).is_err());
+        assert!(once("http://x", "k", &p, &http, &Fns::refusing(), &no_sleep).is_err());
     }
 
     #[test]
@@ -816,7 +1123,7 @@ mod tests {
             b"",
         );
         http.payload = None;
-        run_once(
+        once(
             "http://x",
             "k",
             &pm(1, entry("Z", false, "Z")),
@@ -1017,22 +1324,649 @@ mod tests {
         };
         let p = pm(1, entry("Zebra", false, "Zebra"));
         let hook = || o2.borrow_mut().push("claimed");
-        let r = run_once_with("http://x", "k", &p, &http, &fns, &no_sleep, &hook);
+        let r = once_with("http://x", "k", &p, &http, &fns, &no_sleep, &hook);
         assert_eq!(r, Ok(Some(JobDone { id: 7, ok: true })));
         assert_eq!(*order.borrow(), vec!["claimed", "print"]);
         // an empty poll: the hook stays quiet
         order.borrow_mut().clear();
         let empty = FakeHttp::new(None, b"");
         assert_eq!(
-            run_once_with("http://x", "k", &p, &empty, &fns, &no_sleep, &hook),
+            once_with("http://x", "k", &p, &empty, &fns, &no_sleep, &hook),
             Ok(None)
         );
         assert!(order.borrow().is_empty());
         // run_once is the same call without a hook
         assert_eq!(
-            run_once("http://x", "k", &p, &http, &fns, &no_sleep),
+            once("http://x", "k", &p, &http, &fns, &no_sleep),
             Ok(Some(JobDone { id: 7, ok: true }))
         );
+    }
+
+    // --- the journal: results that outlive a lost report --------------------------------------
+
+    type Reply = Result<Option<Value>, HttpError>;
+    type Answer = Box<dyn FnMut(&str, &Value) -> Reply>;
+
+    /// A scripted server: the claim it hands out, the payload, and how it answers each post.
+    struct Net {
+        claim: RefCell<Option<Value>>,
+        /// Hand the claim out on every poll (the reaper handing the same job out again).
+        keep: std::cell::Cell<bool>,
+        payload: RefCell<Result<(), HttpError>>,
+        payload_gets: std::cell::Cell<u32>,
+        posts: RefCell<Vec<(String, Value)>>,
+        reply: RefCell<Answer>,
+    }
+
+    fn healthy(url: &str, _: &Value) -> Reply {
+        Ok(Some(if url.ends_with("/agent/results") {
+            json!({"ok": true, "state": "done"})
+        } else {
+            json!({"ok": true})
+        }))
+    }
+
+    impl Net {
+        fn new(claim: Option<Value>) -> Net {
+            Net {
+                claim: RefCell::new(claim),
+                keep: std::cell::Cell::new(false),
+                payload: RefCell::new(Ok(())),
+                payload_gets: std::cell::Cell::new(0),
+                posts: RefCell::new(Vec::new()),
+                reply: RefCell::new(Box::new(healthy)),
+            }
+        }
+        fn answer(&self, f: impl FnMut(&str, &Value) -> Reply + 'static) {
+            *self.reply.borrow_mut() = Box::new(f);
+        }
+        fn urls(&self) -> Vec<String> {
+            self.posts
+                .borrow()
+                .iter()
+                .map(|(u, _)| u.trim_start_matches("http://x").to_string())
+                .collect()
+        }
+    }
+
+    impl Http for Net {
+        fn get(&self, _: &str, _: &str) -> Reply {
+            if self.keep.get() {
+                Ok(self.claim.borrow().clone())
+            } else {
+                Ok(self.claim.borrow_mut().take())
+            }
+        }
+        fn get_bytes(&self, _: &str, _: &str) -> Result<Option<Vec<u8>>, HttpError> {
+            self.payload_gets.set(self.payload_gets.get() + 1);
+            match &*self.payload.borrow() {
+                Ok(()) => Ok(Some(b"DATA".to_vec())),
+                Err(e) => Err(e.clone()),
+            }
+        }
+        fn post(&self, url: &str, _: &str, body: &Value) -> Reply {
+            self.posts
+                .borrow_mut()
+                .push((url.to_string(), body.clone()));
+            (self.reply.borrow_mut())(url, body)
+        }
+    }
+
+    const UID: &str = "9f0123456789abcdef0123456789abcd";
+
+    fn claim_of(id: i64, uid: &str, copies: i64) -> Value {
+        json!({"job_id": id, "printer_id": 1, "mode": "raw", "copies": copies, "job_uid": uid})
+    }
+
+    /// A printer that counts the copies it was handed and fails from copy `fail_from` on (0 = never).
+    fn printer(fail_from: u32) -> (Fns, std::rc::Rc<std::cell::Cell<u32>>) {
+        let n = std::rc::Rc::new(std::cell::Cell::new(0));
+        let c = n.clone();
+        let fns = Fns {
+            raw: Box::new(move |_, _| {
+                c.set(c.get() + 1);
+                if fail_from != 0 && c.get() >= fail_from {
+                    Err("jam".into())
+                } else {
+                    Ok(())
+                }
+            }),
+            ..Fns::refusing()
+        };
+        (fns, n)
+    }
+
+    fn zebra() -> PrinterMap {
+        pm(1, entry("Z", false, "Z"))
+    }
+
+    fn file_outbox(dir: &std::path::Path, clock: std::rc::Rc<std::cell::Cell<f64>>) -> Outbox {
+        let journal = Journal::open(dir.join(crate::journal::FILE_NAME), "", &silent);
+        Outbox::new(journal, Box::new(move || clock.get()))
+    }
+
+    fn at_zero() -> std::rc::Rc<std::cell::Cell<f64>> {
+        std::rc::Rc::new(std::cell::Cell::new(0.0))
+    }
+
+    fn step(net: &Net, fns: &Fns, ob: &mut Outbox) -> PollOutcome {
+        run_once("http://x", "k", &zebra(), net, fns, &no_sleep, ob, &silent)
+    }
+
+    fn refuse(status: u16) -> Reply {
+        Err(HttpError::Os(format!("server returned {status}")))
+    }
+
+    #[test]
+    fn a_claim_without_job_uid_is_never_journaled_and_posts_only_to_the_old_route() {
+        let net = Net::new(Some(json!({"job_id": 7, "printer_id": 1, "mode": "raw"})));
+        let (fns, n) = printer(0);
+        let dir = tempfile::tempdir().unwrap();
+        let mut ob = file_outbox(dir.path(), at_zero());
+        assert_eq!(
+            step(&net, &fns, &mut ob),
+            Ok(Some(JobDone { id: 7, ok: true }))
+        );
+        assert_eq!(n.get(), 1);
+        assert_eq!(net.urls(), ["/agent/jobs/7/result"]);
+        assert_eq!(net.posts.borrow()[0].1, json!({"ok": true, "error": null}));
+        assert!(!dir.path().join(crate::journal::FILE_NAME).exists());
+        // a bad uid or a job id that is no integer: the same
+        for claim in [
+            json!({"job_id": 7, "printer_id": 1, "mode": "raw", "job_uid": "bad uid"}),
+            json!({"job_id": 7, "printer_id": 1, "mode": "raw", "job_uid": 5}),
+            json!({"job_id": "7", "printer_id": 1, "mode": "raw", "job_uid": UID}),
+        ] {
+            let net = Net::new(Some(claim));
+            step(&net, &fns, &mut ob).unwrap();
+            assert_eq!(net.urls(), ["/agent/jobs/7/result"]);
+            assert!(!dir.path().join(crate::journal::FILE_NAME).exists());
+        }
+    }
+
+    #[test]
+    fn the_result_is_in_the_journal_file_before_the_first_post() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(crate::journal::FILE_NAME);
+        let seen = std::rc::Rc::new(RefCell::new(Vec::<String>::new()));
+        let net = Net::new(Some(claim_of(7, UID, 1)));
+        let (s, p) = (seen.clone(), path.clone());
+        net.answer(move |_, _| {
+            s.borrow_mut()
+                .push(std::fs::read_to_string(&p).unwrap_or_default());
+            Ok(Some(json!({"ok": true})))
+        });
+        let (fns, _) = printer(0);
+        step(&net, &fns, &mut file_outbox(dir.path(), at_zero())).unwrap();
+        let seen = seen.borrow();
+        assert_eq!(seen.len(), 1);
+        assert!(
+            seen[0].contains(UID) && seen[0].contains("\"acked\":false"),
+            "{}",
+            seen[0]
+        );
+    }
+
+    #[test]
+    fn the_normal_report_is_one_post_with_todays_body_and_the_job_uid() {
+        let net = Net::new(Some(claim_of(7, UID, 1)));
+        let (fns, _) = printer(0);
+        let mut ob = outbox();
+        step(&net, &fns, &mut ob).unwrap();
+        assert_eq!(net.urls(), ["/agent/jobs/7/result"]);
+        assert_eq!(
+            net.posts.borrow()[0].1,
+            json!({"ok": true, "error": null, "job_uid": UID})
+        );
+        assert!(ob.journal().get(UID).unwrap().acked);
+    }
+
+    #[test]
+    fn only_a_404_on_the_old_route_goes_on_to_the_new_one_in_the_same_try() {
+        for (answer, goes_on) in [
+            (refuse(404), true),
+            (refuse(403), false),
+            (refuse(405), false),
+            (refuse(503), false),
+            (
+                Err(HttpError::Os("connection failed: refused".into())),
+                false,
+            ),
+            (Ok(Some(json!({}))), false),
+            (Ok(None), false),
+            (Err(HttpError::Value("<html>login</html>".into())), false),
+        ] {
+            let net = Net::new(Some(claim_of(7, UID, 1)));
+            let a = answer.clone();
+            net.answer(move |url, b| {
+                if url.ends_with("/agent/results") {
+                    assert_eq!(
+                        b,
+                        &json!({"job_id": 7, "job_uid": UID, "ok": true, "error": null})
+                    );
+                    Ok(Some(json!({"ok": true, "state": "done"})))
+                } else {
+                    a.clone()
+                }
+            });
+            let (fns, n) = printer(0);
+            let mut ob = outbox();
+            assert_eq!(
+                step(&net, &fns, &mut ob),
+                Ok(Some(JobDone { id: 7, ok: true }))
+            );
+            assert_eq!(n.get(), 1);
+            let urls = net.urls();
+            if goes_on {
+                // in the same try: old route, new route, and it is delivered
+                assert_eq!(
+                    urls,
+                    ["/agent/jobs/7/result", "/agent/results"],
+                    "{answer:?}"
+                );
+                assert!(ob.journal().get(UID).unwrap().acked);
+            } else {
+                assert!(
+                    urls.iter().all(|u| u == "/agent/jobs/7/result"),
+                    "{answer:?}: {urls:?}"
+                );
+                assert_eq!(urls.len(), 5, "{answer:?}");
+                assert!(!ob.journal().get(UID).unwrap().acked, "{answer:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_reply_to_the_new_route_that_is_no_acknowledgement_is_none() {
+        for reply in [
+            Ok(Some(json!({}))),
+            Ok(Some(json!({"ok": true}))),
+            Ok(Some(json!({"ok": true, "state": 5}))),
+            Ok(Some(json!({"ok": false, "state": "done"}))),
+            Ok(None),
+            refuse(400),
+            Err(HttpError::Value("page".into())),
+        ] {
+            let net = Net::new(Some(claim_of(7, UID, 1)));
+            let r = reply.clone();
+            net.answer(move |url, _| {
+                if url.ends_with("/agent/results") {
+                    r.clone()
+                } else {
+                    refuse(404)
+                }
+            });
+            let (fns, _) = printer(0);
+            let mut ob = outbox();
+            step(&net, &fns, &mut ob).unwrap();
+            assert!(!ob.journal().get(UID).unwrap().acked, "{reply:?}");
+        }
+        // state null is an answer: the server has no such job, and that is final
+        let net = Net::new(Some(claim_of(7, UID, 1)));
+        net.answer(|url, _| {
+            if url.ends_with("/agent/results") {
+                Ok(Some(json!({"ok": true, "state": null})))
+            } else {
+                refuse(404)
+            }
+        });
+        let (fns, _) = printer(0);
+        let mut ob = outbox();
+        step(&net, &fns, &mut ob).unwrap();
+        assert!(ob.journal().get(UID).unwrap().acked);
+    }
+
+    #[test]
+    fn five_failed_tries_leave_the_entry_pending_and_the_next_run_delivers_it_through_the_new_route()
+     {
+        let net = Net::new(Some(claim_of(7, UID, 1)));
+        net.answer(|_, _| refuse(503));
+        let (fns, n) = printer(0);
+        let dir = tempfile::tempdir().unwrap();
+        let slept = std::rc::Rc::new(RefCell::new(Vec::new()));
+        let mut ob = file_outbox(dir.path(), at_zero());
+        let r = run_once(
+            "http://x",
+            "k",
+            &zebra(),
+            &net,
+            &fns,
+            &*collect(&slept),
+            &mut ob,
+            &silent,
+        );
+        assert_eq!(r, Ok(Some(JobDone { id: 7, ok: true })));
+        assert_eq!(net.posts.borrow().len(), 5);
+        assert_eq!(*slept.borrow(), vec![1, 2, 4, 8]);
+        assert_eq!(ob.journal().pending().len(), 1);
+        // the server is back; nothing new to claim
+        net.answer(healthy);
+        assert_eq!(step(&net, &fns, &mut ob), Ok(None));
+        assert_eq!(n.get(), 1, "printed once");
+        assert_eq!(net.urls().last().unwrap(), "/agent/results");
+        assert!(ob.journal().pending().is_empty());
+        // and it is still delivered after the agent restarted
+        let ob = file_outbox(dir.path(), at_zero());
+        assert!(ob.journal().pending().is_empty());
+        assert!(ob.journal().get(UID).unwrap().acked);
+    }
+
+    #[test]
+    fn a_job_handed_out_again_is_answered_from_the_journal_without_download_or_print() {
+        for (fail_from, copies) in [(0, 1), (2, 3)] {
+            let net = Net::new(Some(claim_of(7, UID, copies)));
+            net.answer(|_, _| refuse(503)); // the first report is lost
+            let (fns, n) = printer(fail_from);
+            let dir = tempfile::tempdir().unwrap();
+            let mut ob = file_outbox(dir.path(), at_zero());
+            step(&net, &fns, &mut ob).unwrap();
+            let printed = n.get();
+            assert_eq!(printed, if fail_from == 0 { 1 } else { 2 });
+            let gets = net.payload_gets.get();
+            // the reaper hands the same job out again; the flush path is blocked, the old route works
+            net.answer(|url, b| {
+                if url.ends_with("/agent/results") {
+                    refuse(403)
+                } else {
+                    healthy(url, b)
+                }
+            });
+            *net.claim.borrow_mut() = Some(claim_of(7, UID, copies));
+            let claimed = std::cell::Cell::new(0);
+            let r = run_once_with(
+                "http://x",
+                "k",
+                &zebra(),
+                &net,
+                &fns,
+                &no_sleep,
+                &mut ob,
+                &|| claimed.set(claimed.get() + 1),
+                &silent,
+            );
+            assert_eq!(
+                r,
+                Ok(Some(JobDone {
+                    id: 7,
+                    ok: fail_from == 0
+                }))
+            );
+            assert_eq!(n.get(), printed, "nothing printed");
+            assert_eq!(net.payload_gets.get(), gets, "nothing downloaded");
+            assert_eq!(
+                claimed.get(),
+                0,
+                "no claim hook for a job that is not printed"
+            );
+            let last = net.posts.borrow().last().unwrap().clone();
+            assert_eq!(last.0, "http://x/agent/jobs/7/result");
+            assert_eq!(last.1["ok"], json!(fail_from == 0));
+            if fail_from != 0 {
+                assert_eq!(last.1["error"], json!("jam"));
+            }
+        }
+    }
+
+    #[test]
+    fn an_acked_ok_handed_out_again_is_pending_again_so_a_lost_report_is_flushed() {
+        let net = Net::new(Some(claim_of(7, UID, 1)));
+        let (fns, n) = printer(0);
+        let dir = tempfile::tempdir().unwrap();
+        let mut ob = file_outbox(dir.path(), at_zero());
+        step(&net, &fns, &mut ob).unwrap();
+        assert!(ob.journal().get(UID).unwrap().acked);
+        // handed out again (a restored backup), and now every post fails
+        net.answer(|_, _| refuse(503));
+        *net.claim.borrow_mut() = Some(claim_of(7, UID, 1));
+        step(&net, &fns, &mut ob).unwrap();
+        assert_eq!(n.get(), 1);
+        assert_eq!(ob.journal().pending().len(), 1);
+        assert!(
+            !file_outbox(dir.path(), at_zero())
+                .journal()
+                .get(UID)
+                .unwrap()
+                .acked
+        );
+        // the flush of the next run delivers it
+        net.answer(healthy);
+        step(&net, &fns, &mut ob).unwrap();
+        assert!(ob.journal().pending().is_empty());
+        assert_eq!(net.urls().last().unwrap(), "/agent/results");
+    }
+
+    #[test]
+    fn an_acked_failure_handed_out_again_prints() {
+        let net = Net::new(Some(claim_of(7, UID, 3)));
+        let (fns, n) = printer(2);
+        let mut ob = outbox();
+        step(&net, &fns, &mut ob).unwrap();
+        assert_eq!(n.get(), 2);
+        assert!(
+            ob.journal().get(UID).is_none(),
+            "the server has the failure: forgotten"
+        );
+        *net.claim.borrow_mut() = Some(claim_of(7, UID, 3));
+        let (fns2, n2) = printer(0);
+        step(&net, &fns2, &mut ob).unwrap();
+        assert_eq!(n2.get(), 3);
+    }
+
+    #[test]
+    fn the_same_job_id_with_another_uid_is_another_job_and_prints() {
+        let net = Net::new(Some(claim_of(7, UID, 1)));
+        let (fns, n) = printer(0);
+        let mut ob = outbox();
+        step(&net, &fns, &mut ob).unwrap();
+        *net.claim.borrow_mut() = Some(claim_of(7, "another-database", 1));
+        step(&net, &fns, &mut ob).unwrap();
+        assert_eq!(n.get(), 2);
+        assert!(ob.journal().get("another-database").is_some());
+    }
+
+    #[test]
+    fn what_printed_nothing_is_not_journaled_and_prints_on_the_next_hand_out() {
+        // payload download fails
+        let net = Net::new(Some(claim_of(7, UID, 1)));
+        *net.payload.borrow_mut() = Err(HttpError::Os("server returned 502".into()));
+        let (fns, n) = printer(0);
+        let mut ob = outbox();
+        assert_eq!(
+            step(&net, &fns, &mut ob),
+            Ok(Some(JobDone { id: 7, ok: false }))
+        );
+        assert_eq!(
+            (n.get(), net.urls()),
+            (0, vec!["/agent/jobs/7/result".to_string()])
+        );
+        assert!(ob.journal().get(UID).is_none());
+        // the old route carries the uid, too, so a reset server cannot take it for another job
+        assert_eq!(net.posts.borrow()[0].1["job_uid"], json!(UID));
+        // an unknown printer
+        let net2 = Net::new(Some(
+            json!({"job_id": 7, "printer_id": 99, "mode": "raw", "job_uid": UID}),
+        ));
+        step(&net2, &fns, &mut ob).unwrap();
+        assert!(ob.journal().get(UID).is_none());
+        // zero copies send nothing and take the old path
+        let net3 = Net::new(Some(claim_of(7, UID, 0)));
+        step(&net3, &fns, &mut ob).unwrap();
+        assert_eq!(
+            (n.get(), net3.urls()),
+            (0, vec!["/agent/jobs/7/result".to_string()])
+        );
+        assert!(ob.journal().get(UID).is_none());
+        // a first copy that failed
+        let (failing, n2) = printer(1);
+        let net4 = Net::new(Some(claim_of(7, UID, 2)));
+        step(&net4, &failing, &mut ob).unwrap();
+        assert_eq!(n2.get(), 1);
+        assert_eq!(net4.urls(), ["/agent/jobs/7/result"]);
+        assert!(ob.journal().get(UID).is_none());
+        // and when it is handed out again it prints
+        let net5 = Net::new(Some(claim_of(7, UID, 2)));
+        step(&net5, &fns, &mut ob).unwrap();
+        assert_eq!(n.get(), 2);
+    }
+
+    #[test]
+    fn a_later_copy_that_fails_is_journaled_and_not_printed_again_when_the_report_was_lost() {
+        let net = Net::new(Some(claim_of(7, UID, 3)));
+        net.answer(|_, _| refuse(503));
+        let (fns, n) = printer(2);
+        let dir = tempfile::tempdir().unwrap();
+        step(&net, &fns, &mut file_outbox(dir.path(), at_zero())).unwrap();
+        assert_eq!(n.get(), 2);
+        // the agent restarts while the server is still unreachable, the reaper hands the job out again
+        let net = Net::new(Some(claim_of(7, UID, 3)));
+        net.answer(|_, _| refuse(503));
+        let mut ob = file_outbox(dir.path(), at_zero());
+        let r = step(&net, &fns, &mut ob);
+        assert_eq!(r, Ok(Some(JobDone { id: 7, ok: false })));
+        assert_eq!(n.get(), 2, "not printed again");
+        assert_eq!(net.posts.borrow()[0].1["error"], json!("jam"));
+    }
+
+    #[test]
+    fn a_crash_while_printing_leaves_no_record_and_the_whole_job_prints_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let net = Net::new(Some(claim_of(7, UID, 3)));
+        let died = Fns {
+            raw: Box::new(|_, _| panic!("power cut")),
+            ..Fns::refusing()
+        };
+        let hit = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = step(&net, &died, &mut file_outbox(dir.path(), at_zero()));
+        }));
+        assert!(hit.is_err());
+        let net = Net::new(Some(claim_of(7, UID, 3)));
+        let (fns, n) = printer(0);
+        step(&net, &fns, &mut file_outbox(dir.path(), at_zero())).unwrap();
+        assert_eq!(n.get(), 3);
+    }
+
+    // --- the flush ----------------------------------------------------------------------------
+
+    fn pending_outbox(clock: &std::rc::Rc<std::cell::Cell<f64>>, jobs: &[i64]) -> Outbox {
+        let c = clock.clone();
+        let mut ob = Outbox::new(Journal::memory(), Box::new(move || c.get()));
+        for id in jobs {
+            ob.journal
+                .record(&format!("uid{id}"), *id, true, None, &silent);
+        }
+        ob
+    }
+
+    fn flush_with(net: &Net, ob: &mut Outbox, log: Log) {
+        ob.flush(net, "http://x", "k", log);
+    }
+
+    #[test]
+    fn flush_never_uses_the_old_route_and_delivers_oldest_first() {
+        let net = Net::new(None);
+        let clock = at_zero();
+        let mut ob = pending_outbox(&clock, &[5, 6, 7]);
+        flush_with(&net, &mut ob, &silent);
+        assert_eq!(net.urls(), ["/agent/results"; 3]);
+        let ids: Vec<i64> = net
+            .posts
+            .borrow()
+            .iter()
+            .map(|(_, b)| b["job_id"].as_i64().unwrap())
+            .collect();
+        assert_eq!(ids, [5, 6, 7]);
+        assert!(ob.journal().pending().is_empty());
+    }
+
+    #[test]
+    fn flush_stops_at_the_first_non_acknowledgement_and_backs_off_30_60_to_600_seconds() {
+        let net = Net::new(None);
+        net.answer(|_, _| refuse(403));
+        let clock = at_zero();
+        let mut ob = pending_outbox(&clock, &[5, 6]);
+        let logged = std::rc::Rc::new(RefCell::new(Vec::<String>::new()));
+        let l = logged.clone();
+        let log = move |m: &str| l.borrow_mut().push(m.to_string());
+        flush_with(&net, &mut ob, &log);
+        assert_eq!(net.posts.borrow().len(), 1, "the pass ends");
+        // that entry went to the back
+        assert_eq!(ob.journal().pending()[0].job_id, 6);
+        // nothing is tried before the pause is over
+        clock.set(29.0);
+        flush_with(&net, &mut ob, &log);
+        assert_eq!(net.posts.borrow().len(), 1);
+        clock.set(30.0);
+        flush_with(&net, &mut ob, &log);
+        assert_eq!(net.posts.borrow().len(), 2);
+        // the series, with the pause read off the clock directly
+        let mut ob = pending_outbox(&clock, &[9]);
+        let mut pauses = Vec::new();
+        clock.set(1000.0);
+        for _ in 0..7 {
+            flush_with(&net, &mut ob, &silent);
+            pauses.push(ob.not_before - clock.get());
+            clock.set(ob.not_before);
+        }
+        assert_eq!(pauses, [30.0, 60.0, 120.0, 240.0, 480.0, 600.0, 600.0]);
+        // logged once for the series, not once per pass
+        assert_eq!(logged.borrow().len(), 1, "{:?}", logged.borrow());
+        // a success resets it
+        net.answer(healthy);
+        flush_with(&net, &mut ob, &silent);
+        assert_eq!((ob.pause, ob.not_before), (0.0, 0.0));
+        assert!(ob.journal().pending().is_empty());
+    }
+
+    #[test]
+    fn a_result_delivered_another_way_ends_the_back_off_of_the_flush() {
+        let net = Net::new(None);
+        net.answer(|_, _| refuse(403));
+        let clock = at_zero();
+        let mut ob = pending_outbox(&clock, &[7]);
+        flush_with(&net, &mut ob, &silent);
+        assert_eq!(ob.pause, 30.0, "an outage: the first pause is 30 s");
+        flush_with(&net, &mut ob, &silent);
+        clock.set(ob.not_before);
+        flush_with(&net, &mut ob, &silent);
+        assert_eq!(ob.pause, 60.0);
+        // the server is back and hands job 7 out again: answered over the old route
+        let healthy_net = Net::new(None);
+        let e = ob.journal().get("uid7").cloned().unwrap();
+        assert!(ob.deliver(&healthy_net, "http://x", "k", &e, &no_sleep, &silent));
+        // the next poll's flush finds nothing pending
+        flush_with(&healthy_net, &mut ob, &silent);
+        assert_eq!((ob.pause, ob.not_before), (0.0, 0.0));
+        // a day later another report is lost and its flush fails
+        clock.set(100_000.0);
+        ob.journal.record("uid8", 8, true, None, &silent);
+        let logged = std::rc::Rc::new(RefCell::new(Vec::<String>::new()));
+        let l = logged.clone();
+        flush_with(&net, &mut ob, &move |m| l.borrow_mut().push(m.to_string()));
+        assert_eq!(ob.not_before - clock.get(), 30.0);
+        assert_eq!(logged.borrow().len(), 1, "{:?}", logged.borrow());
+    }
+
+    #[test]
+    fn flush_posts_at_most_twenty_per_pass() {
+        let net = Net::new(None);
+        let clock = at_zero();
+        let ids: Vec<i64> = (1..=30).collect();
+        let mut ob = pending_outbox(&clock, &ids);
+        flush_with(&net, &mut ob, &silent);
+        assert_eq!(net.posts.borrow().len(), 20);
+        assert_eq!(ob.journal().pending().len(), 10);
+        flush_with(&net, &mut ob, &silent);
+        assert!(ob.journal().pending().is_empty());
+    }
+
+    #[test]
+    fn flush_logs_a_late_delivery() {
+        let net = Net::new(None);
+        let mut ob = pending_outbox(&at_zero(), &[7]);
+        let logged = std::rc::Rc::new(RefCell::new(Vec::<String>::new()));
+        let l = logged.clone();
+        flush_with(&net, &mut ob, &move |m| l.borrow_mut().push(m.to_string()));
+        assert_eq!(*logged.borrow(), ["result of job 7 delivered late (done)"]);
     }
 
     // --- start-up: printers by id ---

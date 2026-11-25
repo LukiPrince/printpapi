@@ -4,10 +4,13 @@
 
 mod commands;
 mod elevate;
+mod managed;
 mod settings;
 mod staging;
 mod tray;
 mod updates;
+#[cfg(windows)]
+mod winenv;
 
 use std::ffi::OsString;
 use std::io::Write;
@@ -36,6 +39,9 @@ fn startup_problem(webview: Result<String, String>, on_windows: bool) -> Option<
 pub enum Mode {
     /// Exactly `--version`: print the version and end, before anything else is looked at.
     Version,
+    /// An argument that starts with `--managed-`: the headless modes of the .msi (Windows only,
+    /// `managed.rs`). A call that is not one of the three forms is kept as an error: exit 2.
+    Managed(Result<managed::Command, managed::Usage>),
     /// Any argument `--tray`: the icon.
     Tray,
     /// The settings window or the setup, opened on a section when `--section <word>` names one.
@@ -47,6 +53,9 @@ pub enum Mode {
 pub fn mode(args: &[OsString]) -> Mode {
     if args.len() == 1 && args[0] == "--version" {
         return Mode::Version;
+    }
+    if let Some(call) = managed::parse(args) {
+        return Mode::Managed(call);
     }
     if args.iter().any(|a| a == "--tray") {
         return Mode::Tray;
@@ -62,6 +71,10 @@ pub fn mode(args: &[OsString]) -> Mode {
 fn main() -> ExitCode {
     let args: Vec<OsString> = std::env::args_os().skip(1).collect();
     let mode = mode(&args);
+    // the installer's modes: no tray lock, no web view check, no window (session 0 has no desktop)
+    if let Mode::Managed(call) = &mode {
+        return managed::run(call);
+    }
     updates::note_start();
     // the updater starts the new program with this before it changes anything: no lock, no web
     // view check, no window. `let _`: a program without a console may have no stdout.

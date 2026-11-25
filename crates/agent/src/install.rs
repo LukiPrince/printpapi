@@ -1708,6 +1708,28 @@ mod tests {
         );
     }
 
+    /// docs/agent.md tells a manual systemd user to add `StateDirectory=printpapi-agent-manual`
+    /// to their own unit. systemd hands that folder to the service user, so the name must be
+    /// neither the setup's status folder (the agent's own state, kept for SYSTEM-like owners) nor
+    /// the server's data folder (docs/migration.md).
+    #[test]
+    fn the_state_directory_the_docs_name_is_nobody_elses_folder() {
+        let doc = include_str!("../../../docs/agent.md").replace("\r\n", "\n");
+        let names: Vec<&str> = doc
+            .lines()
+            .filter_map(|l| l.trim().strip_prefix("StateDirectory="))
+            .collect();
+        assert_eq!(names, ["printpapi-agent-manual"]);
+        let status = crate::status::status_dir(Os::Linux);
+        let last = status.file_name().unwrap().to_str().unwrap();
+        assert_eq!(last, "printpapi-agent");
+        assert_ne!(names[0], last);
+        assert_ne!(names[0], "printpapi");
+        // and the setup's own unit sets none: it has no use for one
+        let unit = String::from_utf8(autostart_file(Os::Linux, &linux())).unwrap();
+        assert!(!unit.contains("StateDirectory"));
+    }
+
     #[test]
     fn plist_escapes_the_path() {
         let mut l = mac();

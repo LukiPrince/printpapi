@@ -151,7 +151,9 @@ print(json.load(urllib.request.urlopen(req)))          # -> {"job_id": 1}
 `POST /jobs` returns as soon as the job is queued — it does **not** wait for paper. To find out
 the outcome, pick one:
 
-- **Poll** `GET /jobs/{id}` until `state` is `done` / `failed` / `cancelled`.
+- **Poll** `GET /jobs/{id}` until `state` is `done` / `failed` / `cancelled`. A job that failed with
+  `retry limit exceeded`, `expired` or `retention` can still become `done` when its agent delivers
+  the result late ([api.md](api.md#job-lifecycle)), so do not resubmit on `failed` at once.
 - **Webhook**: set `callback_url` on the job and the server POSTs the outcome to you once
   (at-least-once — dedupe on `job_id` + `state`). See [api.md](api.md#webhooks).
 - **Fleet health**: `GET /computers` tells you whether the agent is even online, and an org's

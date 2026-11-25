@@ -16,7 +16,13 @@ use crate::run::PollOutcome;
 const FILE_NAME: &str = "status.json";
 const TMP_NAME: &str = "status.json.tmp";
 /// Every file the agent writes into its status folder: what removal may delete, and nothing else.
-pub const FILES: [&str; 3] = [FILE_NAME, TMP_NAME, crate::log::LOG_NAME];
+pub const FILES: [&str; 5] = [
+    FILE_NAME,
+    TMP_NAME,
+    crate::log::LOG_NAME,
+    crate::journal::FILE_NAME,
+    crate::journal::TMP_NAME,
+];
 /// An unchanged status is still written this often, so the tray sees a living agent (it calls a
 /// file older than 120 s "not running").
 const REFRESH_SECS: f64 = 60.0;

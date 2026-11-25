@@ -175,7 +175,7 @@ pub fn verify_sha256(path: &Path, expected_hex: &str) -> Result<(), String> {
 }
 
 /// A symlink, or on Windows any reparse point (a junction is not a symlink to Rust).
-pub(crate) fn is_link(meta: &std::fs::Metadata) -> bool {
+pub fn is_link(meta: &std::fs::Metadata) -> bool {
     #[cfg(windows)]
     {
         use std::os::windows::fs::MetadataExt;
@@ -625,14 +625,14 @@ fn check_install_dir_as(l: &Layout, root: bool) -> Result<(), ApplyError> {
 
 /// `check_install_dir_as` for the real user id (`std` has no `geteuid`, hence the `libc` crate).
 #[cfg(unix)]
-pub(crate) fn check_install_dir(l: &Layout) -> Result<(), ApplyError> {
+pub fn check_install_dir(l: &Layout) -> Result<(), ApplyError> {
     check_install_dir_as(l, unsafe { libc::geteuid() } == 0)
 }
 
 // ponytail: Windows has no check. The folder is under `%ProgramFiles%`, which only administrators
 // can write to, so nobody else can plant a link there.
 #[cfg(not(unix))]
-pub(crate) fn check_install_dir(_: &Layout) -> Result<(), ApplyError> {
+pub fn check_install_dir(_: &Layout) -> Result<(), ApplyError> {
     Ok(())
 }
 
@@ -878,7 +878,7 @@ fn status_dir_owners(_: Os) -> Vec<u32> {
 /// made first is theirs (they hold WRITE_DAC as owner, and icacls `/grant:r` leaves explicit
 /// entries for other SIDs alone), so it has to go, not be fixed up. Pure, so it is tested on every
 /// system.
-pub(crate) fn trusted_windows_owner(sid: &str) -> bool {
+pub fn trusted_windows_owner(sid: &str) -> bool {
     let star = format!("*{sid}");
     star == install::SID_ADMINISTRATORS || star == install::SID_SYSTEM
 }
@@ -889,7 +889,7 @@ pub(crate) fn trusted_windows_owner(sid: &str) -> bool {
 /// https://learn.microsoft.com/en-us/windows/win32/api/sddl/nf-sddl-convertsidtostringsidw
 /// (the text is released with `LocalFree` too).
 #[cfg(windows)]
-pub(crate) fn dir_owner_sid(dir: &Path) -> std::io::Result<String> {
+pub fn dir_owner_sid(dir: &Path) -> std::io::Result<String> {
     use std::os::windows::ffi::OsStrExt;
     use std::ptr::null_mut;
     use windows_sys::Win32::Foundation::{ERROR_SUCCESS, LocalFree};
@@ -1052,10 +1052,13 @@ fn foreign_status_dir(dir: &Path) -> ApplyError {
 /// already (`icacls` without `/T` changes the folder only). A planted `status.json.tmp`, or a link
 /// under any of the agent's file names, would be taken over by the agent, which runs as SYSTEM. The
 /// agent is stopped while this runs, and it writes its status again within seconds of its start.
-/// Only a log that is a plain file (no link) and that Administrators or SYSTEM own stays, so the
-/// history of earlier runs survives a change of the printers. A log a user made in the gap keeps
-/// that user as its owner, who may rewrite it or point it somewhere later, and the agent appends
-/// to it as SYSTEM.
+/// Only a log and a print journal that are plain files (no link) and that Administrators or SYSTEM
+/// own stay, so the history of earlier runs survives a change of the printers, and so do the results
+/// of printed jobs the server may still hand out again (without the journal a change of a setting
+/// could print a job twice). A log a user made in the gap keeps that user as its owner, who may
+/// rewrite it or point it somewhere later, and the agent appends to it as SYSTEM; the same goes
+/// for a journal, which is why one of any other owner is dropped. The journal's tmp file is always
+/// removed: a compaction that died leaves it, and nobody trusted wrote it.
 fn purge_status_dir(
     dir: &Path,
     owner_sid: &dyn Fn(&Path) -> Option<String>,
@@ -1064,8 +1067,11 @@ fn purge_status_dir(
         let entry = entry?;
         // `DirEntry::metadata` does not follow links
         let meta = entry.metadata()?;
-        let log = entry.file_name() == std::ffi::OsStr::new(crate::log::LOG_NAME);
-        if log
+        let name = entry.file_name();
+        let kept = [crate::log::LOG_NAME, crate::journal::FILE_NAME]
+            .iter()
+            .any(|n| name == std::ffi::OsStr::new(n));
+        if kept
             && meta.is_file()
             && !is_link(&meta)
             && owner_sid(&entry.path()).is_some_and(|sid| trusted_windows_owner(&sid))
@@ -3720,6 +3726,8 @@ mod tests {
             std::fs::write(fx.layout.status_dir.join("status.json"), b"{}").unwrap();
             std::fs::write(fx.layout.status_dir.join("status.json.tmp"), b"{").unwrap();
             std::fs::write(fx.layout.status_dir.join("print_agent-error.log"), b"x").unwrap();
+            std::fs::write(fx.layout.status_dir.join("print-journal.jsonl"), b"{}").unwrap();
+            std::fs::write(fx.layout.status_dir.join("print-journal.jsonl.tmp"), b"{").unwrap();
             fx.events.borrow_mut().clear();
             remove(&fx.env()).unwrap();
             assert!(!fx.layout.dir.exists(), "{os:?}");
@@ -3998,6 +4006,31 @@ mod tests {
     }
 
     #[test]
+    fn an_apply_keeps_the_journal_of_a_trusted_owner_and_drops_any_other_and_its_tmp_file() {
+        // every apply, a changed setting included, runs the purge on Windows; the file is put there
+        // while the rights are set, as a journal of an earlier run would be
+        for (owner, kept) in [("S-1-5-18", true), ("S-1-5-21-1-2-3-1001", false)] {
+            let fx = Fixture::new(Os::Windows);
+            let dir = &fx.layout.status_dir;
+            let (journal, tmp) = (
+                dir.join(crate::journal::FILE_NAME),
+                dir.join(crate::journal::TMP_NAME),
+            );
+            for p in [&journal, &tmp] {
+                fx.plant
+                    .borrow_mut()
+                    .push(("/inheritance:r".into(), p.clone()));
+            }
+            let who = |_: &Path| Some(owner.to_string());
+            let mut env = fx.env();
+            env.owner_sid = &who;
+            apply(&fx.staging, &env).unwrap();
+            assert_eq!(journal.exists(), kept, "{owner}");
+            assert!(!tmp.exists(), "{owner}: the tmp file never stays");
+        }
+    }
+
+    #[test]
     fn the_status_folder_purge_keeps_only_a_real_log_file() {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().join("status");
@@ -4024,6 +4057,32 @@ mod tests {
             b"earlier run"
         );
         // a link is removed, never followed
+        assert!(elsewhere.join("precious").is_file());
+    }
+
+    #[test]
+    fn the_status_folder_purge_keeps_a_trusted_journal_and_drops_the_rest_of_its_kind() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("status");
+        std::fs::create_dir(&dir).unwrap();
+        let journal = dir.join(crate::journal::FILE_NAME);
+        let jtmp = dir.join(crate::journal::TMP_NAME);
+        // trusted owner: the journal stays, its tmp file never does
+        std::fs::write(&journal, b"{}").unwrap();
+        std::fs::write(&jtmp, b"half").unwrap();
+        purge_status_dir(&dir, &|_| Some("S-1-5-18".into())).unwrap();
+        assert_eq!(std::fs::read(&journal).unwrap(), b"{}");
+        assert!(!jtmp.exists());
+        // a user's file is dropped (the owner of a file made in the gap is that user)
+        purge_status_dir(&dir, &|_| Some("S-1-5-21-1-2-3-1001".into())).unwrap();
+        assert!(!journal.exists());
+        // a folder in its place, and a link: removed, never followed
+        let elsewhere = tmp.path().join("elsewhere");
+        std::fs::create_dir(&elsewhere).unwrap();
+        std::fs::write(elsewhere.join("precious"), b"x").unwrap();
+        link_dir(&journal, &elsewhere);
+        purge_status_dir(&dir, &|_| Some("S-1-5-18".into())).unwrap();
+        assert!(!journal.exists());
         assert!(elsewhere.join("precious").is_file());
     }
 
@@ -4297,7 +4356,13 @@ mod tests {
             let fx = Fixture::new(os);
             apply(&fx.staging, &fx.env()).unwrap();
             let dir = &fx.layout.status_dir;
-            for own in ["status.json", "status.json.tmp", "print_agent-error.log"] {
+            for own in [
+                "status.json",
+                "status.json.tmp",
+                "print_agent-error.log",
+                "print-journal.jsonl",
+                "print-journal.jsonl.tmp",
+            ] {
                 std::fs::write(dir.join(own), b"x").unwrap();
             }
             // what somebody else keeps there (a server database, say) is not ours to delete
@@ -4308,7 +4373,13 @@ mod tests {
                 b"precious",
                 "{os:?}"
             );
-            for own in ["status.json", "status.json.tmp", "print_agent-error.log"] {
+            for own in [
+                "status.json",
+                "status.json.tmp",
+                "print_agent-error.log",
+                "print-journal.jsonl",
+                "print-journal.jsonl.tmp",
+            ] {
                 assert!(!dir.join(own).exists(), "{os:?}: {own}");
             }
             assert!(!fx.layout.dir.exists(), "{os:?}");
