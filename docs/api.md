@@ -24,6 +24,7 @@ Token comparison is constant-time (`hmac.compare_digest`).
 |---|---|---|
 | `GET /` | none | Web dashboard (static bundle embedded in the binary; data fetched with the token) |
 | `GET /health` | none | Liveness check, plus whether this server offers `signup` and `password_reset` |
+| `GET /openapi.json` | none | The [OpenAPI 3.1 description](#machine-readable-api) of this API: static, the same on every server |
 | `GET /metrics` | client (`Look`) | Prometheus text: job counts by state, agent/printer liveness |
 | `POST /jobs` | client (`Submit`) | Submit a job → `{job_id}` |
 | `GET\|POST /labels`, `GET\|PUT\|DELETE /labels/{id}` | client (`Look` to read, `Edit` to write) | [Label templates](labels.md): where the content sits on a label; jobs of type `label_*` render through them |
@@ -664,6 +665,28 @@ provider (via a small adapter) moves an org onto one. `GET /plans` lists the cat
 checkout link already carrying the caller's org id. Root can also set `plan` on `PUT /orgs/{id}`
 by hand, and `DELETE /orgs/{id}` removes a tenant that leaves. Unconfigured ⇒ off, which is the
 self-hosted default. Full contract: **[billing.md](billing.md)**.
+
+## Machine-readable API
+
+`GET /openapi.json` (and `HEAD`) answers the OpenAPI 3.1 description of every route in this
+file, without a credential. It is one static file, `crates/server/openapi.json`, compiled into the
+binary: the same bytes on every server and every host, no `servers` entry, no deployment data and no
+server version. `info.version` is the version of the description itself and changes only when the
+description does. It leaves out the operator routes (`/operator/**`), the dashboard and the
+[PrintNode-compatible shapes](printnode-compat.md) an `Authorization: Basic` header switches to.
+
+Every operation starts its description with who may call it, lists the scope words of the keys that may in
+`security` (empty where no key can: root, a session) and names its roles in `x-roles` (`none`: no credential; `any`: any valid one;
+`client`, `manage`, `root`, `session`, `agent`, `code` (a pairing code), `hmac` (a signed webhook),
+`cloudprnt` (a key in the Basic user name) and `cloudprnt-key` (a key in the path)) and the [key rights](#key-rights) it needs in
+`x-rights`. Response objects are closed (`additionalProperties: false`), so a field the server
+starts to send fails the contract test until the file lists it. A request that is refused for a
+missing right is `403`; the `/agent/*` routes stay `401`.
+
+The types of the typed JavaScript client in [clients/js](../clients/js/README.md) are generated from this file; the client itself is hand-written.
+`npx @redocly/cli lint crates/server/openapi.json` finds it valid. It reports only that no `servers` are
+listed (deliberate: the document is the same on every host) and that `/health` and `/openapi.json` have
+no `4XX` response (they never answer one).
 
 ## Metrics
 

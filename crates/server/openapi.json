@@ -1,0 +1,7314 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "printpapi API",
+    "version": "1.1.1",
+    "description": "The public JSON API of printpapi, source available (Elastic License 2.0). Authentication is a bearer token. An Authorization: Basic header switches the same server to PrintNode-compatible shapes, which this document does not describe: see docs/printnode-compat.md in the repository. Operator routes (/operator/**) are not part of this document. Each operation names its roles in x-roles and the key rights it needs in x-rights (docs/api.md, Key rights).",
+    "license": {
+      "name": "Elastic License 2.0",
+      "identifier": "Elastic-2.0"
+    }
+  },
+  "tags": [
+    {
+      "name": "client",
+      "description": "Print jobs, printers, labels, receipts, orders."
+    },
+    {
+      "name": "account",
+      "description": "Logins, users, orgs, keys, pairing codes."
+    },
+    {
+      "name": "agent",
+      "description": "What the agent next to the printers calls. Outbound only."
+    },
+    {
+      "name": "webhooks",
+      "description": "Callbacks from Shopify and the payment provider."
+    },
+    {
+      "name": "cloudprnt",
+      "description": "Star CloudPRNT printers poll here themselves."
+    }
+  ],
+  "paths": {
+    "/health": {
+      "get": {
+        "tags": [
+          "client"
+        ],
+        "operationId": "getHealth",
+        "summary": "Liveness and sign-in options",
+        "x-roles": [
+          "none"
+        ],
+        "x-rights": [],
+        "security": [],
+        "responses": {
+          "200": {
+            "description": "The server is up.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Health"
+                }
+              }
+            }
+          }
+        },
+        "description": "No credential needed."
+      }
+    },
+    "/openapi.json": {
+      "get": {
+        "tags": [
+          "client"
+        ],
+        "operationId": "getOpenapi",
+        "summary": "This document",
+        "description": "No credential needed. Static, unauthenticated, the same bytes on every request. info.version is the version of the description, not of the server.",
+        "x-roles": [
+          "none"
+        ],
+        "x-rights": [],
+        "security": [],
+        "responses": {
+          "200": {
+            "description": "The OpenAPI 3.1 document.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/metrics": {
+      "get": {
+        "tags": [
+          "client"
+        ],
+        "operationId": "getMetrics",
+        "summary": "Prometheus text",
+        "x-roles": [
+          "client"
+        ],
+        "x-rights": [
+          "Look"
+        ],
+        "security": [
+          {
+            "bearerAuth": [
+              "full",
+              "print",
+              "read"
+            ]
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Prometheus text format 0.0.4: printpapi_jobs{state}, printpapi_agents_online, printpapi_agents_total, printpapi_printers_total.",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "No credential, or one that does not resolve.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "A known key whose rights do not allow this (this key's rights (read) do not allow this).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "description": "Key right Look (scopes: full, print, read), or the root token or a session."
+      }
+    },
+    "/jobs": {
+      "get": {
+        "tags": [
+          "client"
+        ],
+        "operationId": "listJobs",
+        "summary": "Recent jobs",
+        "description": "Key right Look (scopes: full, print, read), or the root token or a session. Always the newest 50. A print key sees only the jobs it submitted.",
+        "x-roles": [
+          "client"
+        ],
+        "x-rights": [
+          "Look"
+        ],
+        "security": [
+          {
+            "bearerAuth": [
+              "full",
+              "print",
+              "read"
+            ]
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The jobs, newest first.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/JobList"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "No credential, or one that does not resolve.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "A known key whose rights do not allow this (this key's rights (read) do not allow this).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "tags": [
+          "client"
+        ],
+        "operationId": "submitJob",
+        "summary": "Submit a print job",
+        "description": "Key right Submit (scopes: full, print), or the root token or a session. Ten types: raw_base64, pdf_base64, raw_uri, pdf_uri, raw_uri_post, pdf_uri_post, label_uri, label_base64, label_text, receipt. Never send a PDF to a label printer. Retry with the same idempotency_key: it returns the original job_id.",
+        "x-roles": [
+          "client"
+        ],
+        "x-rights": [
+          "Submit"
+        ],
+        "security": [
+          {
+            "bearerAuth": [
+              "full",
+              "print"
+            ]
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/JobRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "The job is queued (or the idempotency_key found the original).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/JobCreated"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "A field is wrong, the printer is unknown, or options on a raw job or a ZPL printer.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "No credential, or one that does not resolve.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "402": {
+            "description": "The monthly job quota is spent.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Org locked, or the key may not submit.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "A request with this idempotency_key is still in progress, retry shortly.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "502": {
+            "description": "The URL could not be fetched: error starts with \"downstream:\".",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Too many downloads in flight for this org, or receipt rendering is busy.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/jobs/{id}": {
+      "get": {
+        "tags": [
+          "client"
+        ],
+        "operationId": "getJob",
+        "summary": "One job",
+        "x-roles": [
+          "client"
+        ],
+        "x-rights": [
+          "Look"
+        ],
+        "security": [
+          {
+            "bearerAuth": [
+              "full",
+              "print",
+              "read"
+            ]
+          }
+        ],
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "description": "Job id.",
+            "schema": {
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The job state.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/JobStatus"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "No credential, or one that does not resolve.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "A known key whose rights do not allow this (this key's rights (read) do not allow this).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Unknown job, another org's job, or (print key) not its own.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "description": "Key right Look (scopes: full, print, read), or the root token or a session."
+      },
+      "delete": {
+        "tags": [
+          "client"
+        ],
+        "operationId": "cancelJob",
+        "summary": "Cancel a queued job",
+        "x-roles": [
+          "client"
+        ],
+        "x-rights": [
+          "Submit"
+        ],
+        "security": [
+          {
+            "bearerAuth": [
+              "full",
+              "print"
+            ]
+          }
+        ],
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "description": "Job id.",
+            "schema": {
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Cancelled.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CancelResult"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "No credential, or one that does not resolve.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "A known key whose rights do not allow this (this key's rights (read) do not allow this).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Unknown or not visible.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Already claimed or finished.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "description": "Key right Submit (scopes: full, print), or the root token or a session."
+      }
+    },
+    "/jobs/{id}/preview": {
+      "get": {
+        "tags": [
+          "client"
+        ],
+        "operationId": "getJobPreview",
+        "summary": "A receipt job as it was printed (PNG)",
+        "description": "The root token or a session only; no API key can call it, not even a full one. Root or a session only. 404 while the operator API is on.",
+        "x-roles": [
+          "manage"
+        ],
+        "x-rights": [],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "description": "Job id.",
+            "schema": {
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "A PNG, never cached.",
+            "content": {
+              "image/png": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "The receipt prints nothing on a PDF printer.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "No credential, or one that does not resolve.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Unknown, not a receipt, or its content is gone.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Preview is busy, try again shortly.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/printers": {
+      "get": {
+        "tags": [
+          "client"
+        ],
+        "operationId": "listPrinters",
+        "summary": "Printers",
+        "x-roles": [
+          "client"
+        ],
+        "x-rights": [
+          "Look"
+        ],
+        "security": [
+          {
+            "bearerAuth": [
+              "full",
+              "print",
+              "read"
+            ]
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Registered printers.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PrinterList"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "No credential, or one that does not resolve.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "A known key whose rights do not allow this (this key's rights (read) do not allow this).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "description": "Key right Look (scopes: full, print, read), or the root token or a session."
+      }
+    },
+    "/computers": {
+      "get": {
+        "tags": [
+          "client"
+        ],
+        "operationId": "listComputers",
+        "summary": "Computers (agents)",
+        "x-roles": [
+          "client"
+        ],
+        "x-rights": [
+          "Computers"
+        ],
+        "security": [
+          {
+            "bearerAuth": [
+              "full",
+              "agent",
+              "print",
+              "read"
+            ]
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Registered agents.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ComputerList"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "No credential, or one that does not resolve.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "A known key whose rights do not allow this (this key's rights (read) do not allow this).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "description": "Key right Computers (scopes: full, agent, print, read), or the root token or a session."
+      }
+    },
+    "/plans": {
+      "get": {
+        "tags": [
+          "client"
+        ],
+        "operationId": "listPlans",
+        "summary": "The plan catalogue",
+        "x-roles": [
+          "client"
+        ],
+        "x-rights": [
+          "Look"
+        ],
+        "security": [
+          {
+            "bearerAuth": [
+              "full",
+              "print",
+              "read"
+            ]
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Plans, empty when billing is off.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PlanList"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "No credential, or one that does not resolve.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "A known key whose rights do not allow this (this key's rights (read) do not allow this).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "description": "Key right Look (scopes: full, print, read), or the root token or a session."
+      }
+    },
+    "/me": {
+      "get": {
+        "tags": [
+          "client"
+        ],
+        "operationId": "getMe",
+        "summary": "Who this credential is",
+        "x-roles": [
+          "any"
+        ],
+        "x-rights": [],
+        "security": [
+          {
+            "bearerAuth": [
+              "full",
+              "agent",
+              "cloudprnt",
+              "print",
+              "read"
+            ]
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The caller.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Me"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "No credential, or one that does not resolve.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "description": "Any valid credential: the root token, a session or a key of any scope."
+      }
+    },
+    "/orders": {
+      "post": {
+        "tags": [
+          "client"
+        ],
+        "operationId": "printOrder",
+        "summary": "Print an order as a packing slip",
+        "x-roles": [
+          "client"
+        ],
+        "x-rights": [
+          "Submit"
+        ],
+        "security": [
+          {
+            "bearerAuth": [
+              "full",
+              "print"
+            ]
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/OrderRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "The packing slip is queued.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/JobCreated"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid order, unknown printer or a raw-only printer.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "No credential, or one that does not resolve.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "402": {
+            "description": "The monthly job quota is spent.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Org locked, or the key may not submit.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "description": "Key right Submit (scopes: full, print), or the root token or a session."
+      }
+    },
+    "/receipts/preview": {
+      "post": {
+        "tags": [
+          "client"
+        ],
+        "operationId": "previewReceipt",
+        "summary": "Draw a receipt as a PNG",
+        "x-roles": [
+          "client"
+        ],
+        "x-rights": [
+          "Submit"
+        ],
+        "security": [
+          {
+            "bearerAuth": [
+              "full",
+              "print"
+            ]
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ReceiptPreviewRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "A PNG, never cached.",
+            "content": {
+              "image/png": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid receipt or profile.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "No credential, or one that does not resolve.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "A known key whose rights do not allow this (this key's rights (read) do not allow this).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Preview is busy, try again shortly.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "description": "Key right Submit (scopes: full, print), or the root token or a session."
+      }
+    },
+    "/printers/{id}/receipt-profile": {
+      "get": {
+        "tags": [
+          "client"
+        ],
+        "operationId": "getReceiptProfile",
+        "summary": "A printer's receipt profile",
+        "x-roles": [
+          "client"
+        ],
+        "x-rights": [
+          "Look"
+        ],
+        "security": [
+          {
+            "bearerAuth": [
+              "full",
+              "print",
+              "read"
+            ]
+          }
+        ],
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "description": "Printer id.",
+            "schema": {
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The stored profile, or the defaults.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ReceiptProfileAnswer"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "A CloudPRNT device.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "No credential, or one that does not resolve.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "A known key whose rights do not allow this (this key's rights (read) do not allow this).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Unknown or foreign printer.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "description": "Key right Look (scopes: full, print, read), or the root token or a session."
+      },
+      "put": {
+        "tags": [
+          "client"
+        ],
+        "operationId": "putReceiptProfile",
+        "summary": "Replace a printer's receipt profile",
+        "x-roles": [
+          "client"
+        ],
+        "x-rights": [
+          "Edit"
+        ],
+        "security": [
+          {
+            "bearerAuth": [
+              "full"
+            ]
+          }
+        ],
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "description": "Printer id.",
+            "schema": {
+              "type": "integer"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ReceiptProfile"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "The stored profile.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ReceiptProfileAnswer"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid profile, or a CloudPRNT device.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "No credential, or one that does not resolve.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "A known key whose rights do not allow this (this key's rights (read) do not allow this).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Unknown or foreign printer.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "description": "Key right Edit (scopes: full), or the root token or a session."
+      },
+      "delete": {
+        "tags": [
+          "client"
+        ],
+        "operationId": "deleteReceiptProfile",
+        "summary": "Back to the default profile",
+        "x-roles": [
+          "client"
+        ],
+        "x-rights": [
+          "Edit"
+        ],
+        "security": [
+          {
+            "bearerAuth": [
+              "full"
+            ]
+          }
+        ],
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "description": "Printer id.",
+            "schema": {
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The defaults apply again.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Ok"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "A CloudPRNT device.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "No credential, or one that does not resolve.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "A known key whose rights do not allow this (this key's rights (read) do not allow this).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Unknown or foreign printer.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "description": "Key right Edit (scopes: full), or the root token or a session."
+      }
+    },
+    "/labels": {
+      "get": {
+        "tags": [
+          "client"
+        ],
+        "operationId": "listLabels",
+        "summary": "Label templates",
+        "x-roles": [
+          "client"
+        ],
+        "x-rights": [
+          "Look"
+        ],
+        "security": [
+          {
+            "bearerAuth": [
+              "full",
+              "print",
+              "read"
+            ]
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Templates sorted by name.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LabelList"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "No credential, or one that does not resolve.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "A known key whose rights do not allow this (this key's rights (read) do not allow this).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "description": "Key right Look (scopes: full, print, read), or the root token or a session."
+      },
+      "post": {
+        "tags": [
+          "client"
+        ],
+        "operationId": "createLabel",
+        "summary": "Create a label template",
+        "x-roles": [
+          "client"
+        ],
+        "x-rights": [
+          "Edit"
+        ],
+        "security": [
+          {
+            "bearerAuth": [
+              "full"
+            ]
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/LabelSpec"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "The stored template.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LabelTemplate"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid template.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "No credential, or one that does not resolve.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "A known key whose rights do not allow this (this key's rights (read) do not allow this).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "label template name already in use.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "description": "Key right Edit (scopes: full), or the root token or a session."
+      }
+    },
+    "/labels/{id}": {
+      "get": {
+        "tags": [
+          "client"
+        ],
+        "operationId": "getLabel",
+        "summary": "One label template",
+        "x-roles": [
+          "client"
+        ],
+        "x-rights": [
+          "Look"
+        ],
+        "security": [
+          {
+            "bearerAuth": [
+              "full",
+              "print",
+              "read"
+            ]
+          }
+        ],
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "description": "Template id.",
+            "schema": {
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The template.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LabelTemplate"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "No credential, or one that does not resolve.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "A known key whose rights do not allow this (this key's rights (read) do not allow this).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Unknown or foreign.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "description": "Key right Look (scopes: full, print, read), or the root token or a session."
+      },
+      "put": {
+        "tags": [
+          "client"
+        ],
+        "operationId": "updateLabel",
+        "summary": "Replace a label template",
+        "x-roles": [
+          "client"
+        ],
+        "x-rights": [
+          "Edit"
+        ],
+        "security": [
+          {
+            "bearerAuth": [
+              "full"
+            ]
+          }
+        ],
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "description": "Template id.",
+            "schema": {
+              "type": "integer"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/LabelSpec"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "The stored template.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LabelTemplate"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid template.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "No credential, or one that does not resolve.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "A known key whose rights do not allow this (this key's rights (read) do not allow this).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Unknown or foreign.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "label template name already in use.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "description": "Key right Edit (scopes: full), or the root token or a session."
+      },
+      "delete": {
+        "tags": [
+          "client"
+        ],
+        "operationId": "deleteLabel",
+        "summary": "Delete a label template",
+        "x-roles": [
+          "client"
+        ],
+        "x-rights": [
+          "Edit"
+        ],
+        "security": [
+          {
+            "bearerAuth": [
+              "full"
+            ]
+          }
+        ],
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "description": "Template id.",
+            "schema": {
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Deleted.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Ok"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "No credential, or one that does not resolve.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "A known key whose rights do not allow this (this key's rights (read) do not allow this).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Unknown or foreign.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "description": "Key right Edit (scopes: full), or the root token or a session."
+      }
+    },
+    "/login": {
+      "post": {
+        "tags": [
+          "account"
+        ],
+        "operationId": "login",
+        "summary": "E-mail and password to a session",
+        "x-roles": [
+          "none"
+        ],
+        "x-rights": [],
+        "security": [],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "email": {
+                    "type": "string"
+                  },
+                  "password": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "email",
+                  "password"
+                ]
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "A session token, valid 30 days.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Session"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Bad body.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "invalid credentials.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Too many failed logins, try again later.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "description": "No credential needed."
+      }
+    },
+    "/signup": {
+      "post": {
+        "tags": [
+          "account"
+        ],
+        "operationId": "signup",
+        "summary": "Self-serve org, first account and session",
+        "x-roles": [
+          "none"
+        ],
+        "x-rights": [],
+        "security": [],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "email": {
+                    "type": "string"
+                  },
+                  "password": {
+                    "type": "string"
+                  },
+                  "org_name": {
+                    "type": "string"
+                  },
+                  "accept_terms": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "email",
+                  "password"
+                ]
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "A session, as login.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Session"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid e-mail or password, or accept_terms required.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Signup is disabled on this server.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Email already registered, or the terms changed (reload).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Too many signups, try again later.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "description": "No credential needed."
+      }
+    },
+    "/password/reset": {
+      "post": {
+        "tags": [
+          "account"
+        ],
+        "operationId": "requestPasswordReset",
+        "summary": "Mail a one-shot reset token",
+        "description": "No credential needed. Always 200, whether or not the address has an account.",
+        "x-roles": [
+          "none"
+        ],
+        "x-rights": [],
+        "security": [],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "email": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "email"
+                ]
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Done (the same answer for an unknown address).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Ok"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "The body is no JSON object.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Too many reset requests, try again later.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/password/reset/confirm": {
+      "post": {
+        "tags": [
+          "account"
+        ],
+        "operationId": "confirmPasswordReset",
+        "summary": "Spend a reset token",
+        "x-roles": [
+          "none"
+        ],
+        "x-rights": [],
+        "security": [],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "token": {
+                    "type": "string"
+                  },
+                  "password": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "token",
+                  "password"
+                ]
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "The password is set and every browser is logged out.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Ok"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid or expired token, or a bad password.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "description": "No credential needed."
+      }
+    },
+    "/logout": {
+      "post": {
+        "tags": [
+          "account"
+        ],
+        "operationId": "logout",
+        "summary": "End this session",
+        "x-roles": [
+          "session"
+        ],
+        "x-rights": [],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Logged out.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Ok"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "No credential, or one that does not resolve.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "description": "A session only."
+      }
+    },
+    "/me/password": {
+      "put": {
+        "tags": [
+          "account"
+        ],
+        "operationId": "changePassword",
+        "summary": "Change the password",
+        "x-roles": [
+          "session"
+        ],
+        "x-rights": [],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "current": {
+                    "type": "string"
+                  },
+                  "new": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "current",
+                  "new"
+                ]
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Changed; every session of the user ends.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Ok"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "The new password is too short or too long.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "No credential, or one that does not resolve.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "description": "A session only."
+      }
+    },
+    "/users": {
+      "get": {
+        "tags": [
+          "account"
+        ],
+        "operationId": "listUsers",
+        "summary": "Users of the org",
+        "x-roles": [
+          "manage"
+        ],
+        "x-rights": [],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The users (root: all orgs).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UserList"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "No credential, or one that does not resolve.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "description": "The root token or a session only; no API key can call it, not even a full one."
+      },
+      "post": {
+        "tags": [
+          "account"
+        ],
+        "operationId": "createUser",
+        "summary": "Add a user to the caller's org",
+        "x-roles": [
+          "manage"
+        ],
+        "x-rights": [],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "email": {
+                    "type": "string"
+                  },
+                  "password": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "email",
+                  "password"
+                ]
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "The user.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UserCreated"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid e-mail or password, or root without an org.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "No credential, or one that does not resolve.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Email already registered.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "description": "The root token or a session only; no API key can call it, not even a full one."
+      }
+    },
+    "/users/{id}": {
+      "delete": {
+        "tags": [
+          "account"
+        ],
+        "operationId": "deleteUser",
+        "summary": "Remove an account",
+        "x-roles": [
+          "manage"
+        ],
+        "x-rights": [],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "description": "User id.",
+            "schema": {
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Removed.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Ok"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Your own account, or an org's last one.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "No credential, or one that does not resolve.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Unknown or foreign user.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "description": "The root token or a session only; no API key can call it, not even a full one."
+      }
+    },
+    "/orgs/{id}/users": {
+      "post": {
+        "tags": [
+          "account"
+        ],
+        "operationId": "createOrgUser",
+        "summary": "Create an org's first user",
+        "x-roles": [
+          "root"
+        ],
+        "x-rights": [],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "description": "Org id.",
+            "schema": {
+              "type": "integer"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "email": {
+                    "type": "string"
+                  },
+                  "password": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "email",
+                  "password"
+                ]
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "The user.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UserCreated"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid e-mail or password.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "No credential, or one that does not resolve.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Unknown org.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Email already registered.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "description": "The root token only."
+      }
+    },
+    "/orgs": {
+      "get": {
+        "tags": [
+          "account"
+        ],
+        "operationId": "listOrgs",
+        "summary": "All orgs",
+        "x-roles": [
+          "root"
+        ],
+        "x-rights": [],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The orgs.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OrgList"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "No credential, or one that does not resolve.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "description": "The root token only."
+      },
+      "post": {
+        "tags": [
+          "account"
+        ],
+        "operationId": "createOrg",
+        "summary": "Create an org",
+        "x-roles": [
+          "root"
+        ],
+        "x-rights": [],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "name": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "name"
+                ]
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "The org.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OrgCreated"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "name required.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "No credential, or one that does not resolve.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "description": "The root token only."
+      }
+    },
+    "/orgs/{id}": {
+      "get": {
+        "tags": [
+          "account"
+        ],
+        "operationId": "getOrg",
+        "summary": "One org's settings, plan and usage",
+        "x-roles": [
+          "manage"
+        ],
+        "x-rights": [],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "description": "Org id.",
+            "schema": {
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The org.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OrgDetail"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "No credential, or one that does not resolve.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Unknown or foreign org.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "description": "The root token or a session only; no API key can call it, not even a full one."
+      },
+      "put": {
+        "tags": [
+          "account"
+        ],
+        "operationId": "updateOrg",
+        "summary": "Change an org's settings",
+        "description": "The root token or a session only; no API key can call it, not even a full one. job_quota and plan are root only (403 for a session).",
+        "x-roles": [
+          "manage"
+        ],
+        "x-rights": [],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "description": "Org id.",
+            "schema": {
+              "type": "integer"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/OrgUpdate"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "What was applied.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OrgUpdated"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid value, or nothing to update.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "No credential, or one that does not resolve.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "job_quota or plan from a session.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Unknown or foreign org.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "tags": [
+          "account"
+        ],
+        "operationId": "deleteOrg",
+        "summary": "Remove an org and everything in it",
+        "x-roles": [
+          "root"
+        ],
+        "x-rights": [],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "description": "Org id.",
+            "schema": {
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Removed.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Ok"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "The default org cannot be removed.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "No credential, or one that does not resolve.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Unknown org.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "description": "The root token only."
+      }
+    },
+    "/apikeys": {
+      "get": {
+        "tags": [
+          "account"
+        ],
+        "operationId": "listApiKeys",
+        "summary": "Issued keys",
+        "x-roles": [
+          "manage"
+        ],
+        "x-rights": [],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The keys, never their secrets.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiKeyList"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "No credential, or one that does not resolve.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "description": "The root token or a session only; no API key can call it, not even a full one."
+      },
+      "post": {
+        "tags": [
+          "account"
+        ],
+        "operationId": "createApiKey",
+        "summary": "Issue a client key",
+        "x-roles": [
+          "manage"
+        ],
+        "x-rights": [],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "requestBody": {
+          "required": false,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/KeyRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "The key, shown once.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/KeyIssued"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Bad label, scope or org_id.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "No credential, or one that does not resolve.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "description": "The root token or a session only; no API key can call it, not even a full one."
+      }
+    },
+    "/apikeys/{id}": {
+      "put": {
+        "tags": [
+          "account"
+        ],
+        "operationId": "updateApiKey",
+        "summary": "Change a key's rights",
+        "x-roles": [
+          "manage"
+        ],
+        "x-rights": [],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "description": "Key id.",
+            "schema": {
+              "type": "integer"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "scope": {
+                    "type": "string",
+                    "enum": [
+                      "full",
+                      "agent",
+                      "cloudprnt",
+                      "print",
+                      "read"
+                    ]
+                  }
+                },
+                "required": [
+                  "scope"
+                ]
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "The new scope.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/KeyUpdated"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Not one of the five scope words, or it would break a cloudprnt- computer.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "No credential, or one that does not resolve.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Unknown, revoked or foreign key.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "description": "The root token or a session only; no API key can call it, not even a full one."
+      },
+      "delete": {
+        "tags": [
+          "account"
+        ],
+        "operationId": "revokeApiKey",
+        "summary": "Revoke a key",
+        "x-roles": [
+          "manage"
+        ],
+        "x-rights": [],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "description": "Key id.",
+            "schema": {
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Revoked.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Ok"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "No credential, or one that does not resolve.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Unknown or foreign key.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "description": "The root token or a session only; no API key can call it, not even a full one."
+      }
+    },
+    "/pairing": {
+      "get": {
+        "tags": [
+          "account"
+        ],
+        "operationId": "listPairingCodes",
+        "summary": "Pairing codes of the org",
+        "x-roles": [
+          "manage"
+        ],
+        "x-rights": [],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Newest first, never the code itself.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PairingList"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "No credential, or one that does not resolve.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "description": "The root token or a session only; no API key can call it, not even a full one."
+      },
+      "post": {
+        "tags": [
+          "account"
+        ],
+        "operationId": "createPairingCode",
+        "summary": "Make a one-time pairing code",
+        "description": "The root token or a session only; no API key can call it, not even a full one. Manage only: a machine key always gets 401. The code is shown once and works once for 30 minutes.",
+        "x-roles": [
+          "manage"
+        ],
+        "x-rights": [],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "requestBody": {
+          "required": false,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PairingRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "The code, shown once.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PairingCreated"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Bad computer_id or org_id, or a CloudPRNT device.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "No credential, or one that does not resolve.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Unknown or foreign device.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Too many open pairing codes.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/pairing/{id}": {
+      "delete": {
+        "tags": [
+          "account"
+        ],
+        "operationId": "cancelPairingCode",
+        "summary": "Cancel an unused code",
+        "x-roles": [
+          "manage"
+        ],
+        "x-rights": [],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "description": "Pairing id.",
+            "schema": {
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Cancelled.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Ok"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "No credential, or one that does not resolve.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Unknown, used or foreign.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "description": "The root token or a session only; no API key can call it, not even a full one."
+      }
+    },
+    "/support-access": {
+      "get": {
+        "tags": [
+          "account"
+        ],
+        "operationId": "getSupportAccess",
+        "summary": "Support access grants of the org",
+        "x-roles": [
+          "manage"
+        ],
+        "x-rights": [],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "org",
+            "in": "query",
+            "required": false,
+            "description": "Root only: the org to read.",
+            "schema": {
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The grants (empty while no operator token is set).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SupportAccess"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "org must be a number.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "No credential, or one that does not resolve.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Another org's grants.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Unknown org.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "description": "The root token or a session only; no API key can call it, not even a full one."
+      }
+    },
+    "/agent/pair": {
+      "post": {
+        "tags": [
+          "agent"
+        ],
+        "operationId": "agentPair",
+        "summary": "Spend a pairing code for an agent-only key",
+        "description": "A pairing code in the body; no key. No credential: the code is one. Throttled per client address.",
+        "x-roles": [
+          "code"
+        ],
+        "x-rights": [],
+        "security": [],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AgentPairRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "The key, shown once.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AgentPaired"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Bad code or name.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Pairing code is wrong, expired or already used.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "A device with this name already exists.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Too many pairing attempts, try again later.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/agent/register": {
+      "post": {
+        "tags": [
+          "agent"
+        ],
+        "operationId": "agentRegister",
+        "summary": "Declare a computer and its printers",
+        "x-roles": [
+          "agent"
+        ],
+        "x-rights": [
+          "Agent"
+        ],
+        "security": [
+          {
+            "bearerAuth": [
+              "full",
+              "agent"
+            ]
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AgentRegisterRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Ids of the computer and its printers.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AgentRegistered"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Bad body.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unknown key, or a key whose rights lack agent (the message says which).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Agent key already in use.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "description": "Key right Agent (scopes: full, agent), the root token, or a key an agent has registered with."
+      }
+    },
+    "/agent/jobs": {
+      "get": {
+        "tags": [
+          "agent"
+        ],
+        "operationId": "agentClaimJob",
+        "summary": "Long-poll for a job",
+        "description": "Key right Agent (scopes: full, agent), the root token, or a key an agent has registered with. Waits up to the poll window. Send X-Printapi-Features: job-uid to get job_uid.",
+        "x-roles": [
+          "agent"
+        ],
+        "x-rights": [
+          "Agent"
+        ],
+        "security": [
+          {
+            "bearerAuth": [
+              "full",
+              "agent"
+            ]
+          }
+        ],
+        "parameters": [
+          {
+            "name": "X-Printapi-Features",
+            "in": "header",
+            "required": false,
+            "description": "A comma list; job-uid adds job_uid to the answer.",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "A job for this agent.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AgentJob"
+                }
+              }
+            }
+          },
+          "204": {
+            "description": "No job within the window."
+          },
+          "401": {
+            "description": "No credential, or one that does not resolve.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/agent/jobs/{id}/payload": {
+      "get": {
+        "tags": [
+          "agent"
+        ],
+        "operationId": "agentPayload",
+        "summary": "Download a job's bytes",
+        "x-roles": [
+          "agent"
+        ],
+        "x-rights": [
+          "Agent"
+        ],
+        "security": [
+          {
+            "bearerAuth": [
+              "full",
+              "agent"
+            ]
+          }
+        ],
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "description": "Job id.",
+            "schema": {
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The bytes to print.",
+            "content": {
+              "application/octet-stream": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "No credential, or one that does not resolve.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not this agent's job.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "description": "Key right Agent (scopes: full, agent), the root token, or a key an agent has registered with."
+      }
+    },
+    "/agent/jobs/{id}/result": {
+      "post": {
+        "tags": [
+          "agent"
+        ],
+        "operationId": "agentResult",
+        "summary": "Report the outcome of a claimed job",
+        "x-roles": [
+          "agent"
+        ],
+        "x-rights": [
+          "Agent"
+        ],
+        "security": [
+          {
+            "bearerAuth": [
+              "full",
+              "agent"
+            ]
+          }
+        ],
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "description": "Job id.",
+            "schema": {
+              "type": "integer"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AgentResultRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Recorded.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Ok"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Bad body.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "No credential, or one that does not resolve.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not this agent's job, or job_uid is another job's.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "description": "Key right Agent (scopes: full, agent), the root token, or a key an agent has registered with."
+      }
+    },
+    "/agent/results": {
+      "post": {
+        "tags": [
+          "agent"
+        ],
+        "operationId": "agentLateResult",
+        "summary": "Deliver a result late, by job id and job_uid",
+        "x-roles": [
+          "agent"
+        ],
+        "x-rights": [
+          "Agent"
+        ],
+        "security": [
+          {
+            "bearerAuth": [
+              "full",
+              "agent"
+            ]
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AgentLateResultRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "The state of the job now, null when this agent has no such job.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AgentLateResultAnswer"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "job_id and job_uid required.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "No credential, or one that does not resolve.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "description": "Key right Agent (scopes: full, agent), the root token, or a key an agent has registered with."
+      }
+    },
+    "/integrations/shopify/orders": {
+      "post": {
+        "tags": [
+          "webhooks"
+        ],
+        "operationId": "shopifyOrder",
+        "summary": "Shopify order webhook",
+        "description": "A signed webhook call: the HMAC signature is the credential. No Authorization header: the org comes from the key in the URL, authenticity from the HMAC of the raw body (X-Shopify-Hmac-Sha256).",
+        "x-roles": [
+          "hmac"
+        ],
+        "x-rights": [
+          "Submit"
+        ],
+        "security": [],
+        "parameters": [
+          {
+            "name": "key",
+            "in": "query",
+            "required": true,
+            "description": "A client key.",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "printer_id",
+            "in": "query",
+            "required": true,
+            "description": "A PDF printer.",
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "name": "X-Shopify-Hmac-Sha256",
+            "in": "header",
+            "required": true,
+            "description": "Base64 HMAC-SHA256 of the raw body.",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "X-Shopify-Shop-Domain",
+            "in": "header",
+            "required": false,
+            "description": "The shop.",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "description": "A Shopify order."
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Queued (a redelivery returns the original job).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/JobCreated"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Bad json, missing printer_id, or no shopify_secret for the org.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unknown key, or a bad signature.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "402": {
+            "description": "Quota spent.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The key may not submit, or the org is locked.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/billing/webhook": {
+      "post": {
+        "tags": [
+          "webhooks"
+        ],
+        "operationId": "billingWebhook",
+        "summary": "The payment provider's callback",
+        "description": "A signed webhook call: the HMAC signature is the credential. Signed with a shared secret over the raw body (X-Signature). 503 while billing is not configured, before the signature is looked at.",
+        "x-roles": [
+          "hmac"
+        ],
+        "x-rights": [],
+        "security": [],
+        "parameters": [
+          {
+            "name": "X-Signature",
+            "in": "header",
+            "required": true,
+            "description": "HMAC of the raw body.",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/BillingEvent"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "The org is on that plan now.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BillingApplied"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Not JSON, or the event is invalid.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "bad signature.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "unknown org.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Billing is not configured on this server.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/cloudprnt": {
+      "post": {
+        "tags": [
+          "cloudprnt"
+        ],
+        "operationId": "cloudprntPoll",
+        "summary": "The printer polls",
+        "x-roles": [
+          "cloudprnt"
+        ],
+        "x-rights": [
+          "CloudPrnt"
+        ],
+        "security": [
+          {
+            "cloudprntBasic": [
+              "full",
+              "cloudprnt"
+            ]
+          }
+        ],
+        "requestBody": {
+          "required": false,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CloudprntPoll"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Whether a job is ready.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CloudprntOffer"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Bad body, or mac required.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unknown key in the Basic user name.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The key lacks the cloudprnt right.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "description": "Key right CloudPrnt (scopes: full, cloudprnt): the client key is the Basic user name."
+      },
+      "get": {
+        "tags": [
+          "cloudprnt"
+        ],
+        "operationId": "cloudprntFetch",
+        "summary": "The printer downloads the job",
+        "x-roles": [
+          "cloudprnt"
+        ],
+        "x-rights": [
+          "CloudPrnt"
+        ],
+        "security": [
+          {
+            "cloudprntBasic": [
+              "full",
+              "cloudprnt"
+            ]
+          }
+        ],
+        "parameters": [
+          {
+            "name": "mac",
+            "in": "query",
+            "required": true,
+            "description": "The printer MAC address.",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "type",
+            "in": "query",
+            "required": false,
+            "description": "One of: application/vnd.star.starprnt, application/vnd.star.starprntcore, application/vnd.star.line, application/vnd.star.linematrix, application/vnd.star.raster, text/plain.",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "token",
+            "in": "query",
+            "required": false,
+            "description": "The jobToken of the offer.",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The job bytes, repeated per copy, in the media type the printer asked for (default application/vnd.star.starprnt).",
+            "content": {
+              "application/vnd.star.starprnt": {
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "application/vnd.star.starprntcore": {
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "application/vnd.star.line": {
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "application/vnd.star.linematrix": {
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "application/vnd.star.raster": {
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "mac required.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unknown key in the Basic user name.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The key lacks the cloudprnt right.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "no job.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "415": {
+            "description": "The media type cannot be served.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "description": "Key right CloudPrnt (scopes: full, cloudprnt): the client key is the Basic user name."
+      },
+      "delete": {
+        "tags": [
+          "cloudprnt"
+        ],
+        "operationId": "cloudprntConfirm",
+        "summary": "The printer confirms the job",
+        "x-roles": [
+          "cloudprnt"
+        ],
+        "x-rights": [
+          "CloudPrnt"
+        ],
+        "security": [
+          {
+            "cloudprntBasic": [
+              "full",
+              "cloudprnt"
+            ]
+          }
+        ],
+        "parameters": [
+          {
+            "name": "mac",
+            "in": "query",
+            "required": true,
+            "description": "The printer MAC address.",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "code",
+            "in": "query",
+            "required": false,
+            "description": "The printer status code.",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Confirmed, no body."
+          },
+          "400": {
+            "description": "mac required.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unknown key in the Basic user name.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The key lacks the cloudprnt right.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "description": "Key right CloudPrnt (scopes: full, cloudprnt): the client key is the Basic user name."
+      }
+    },
+    "/cloudprnt/{key}": {
+      "post": {
+        "tags": [
+          "cloudprnt"
+        ],
+        "operationId": "cloudprntPollWithKey",
+        "summary": "The printer polls",
+        "x-roles": [
+          "cloudprnt-key"
+        ],
+        "x-rights": [
+          "CloudPrnt"
+        ],
+        "security": [],
+        "parameters": [
+          {
+            "name": "key",
+            "in": "path",
+            "required": true,
+            "description": "A client key with the cloudprnt right.",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": false,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CloudprntPoll"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Whether a job is ready.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CloudprntOffer"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Bad body, or mac required.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unknown key.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The key lacks the cloudprnt right.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "description": "Key right CloudPrnt (scopes: full, cloudprnt): the client key is in the path."
+      },
+      "get": {
+        "tags": [
+          "cloudprnt"
+        ],
+        "operationId": "cloudprntFetchWithKey",
+        "summary": "The printer downloads the job",
+        "x-roles": [
+          "cloudprnt-key"
+        ],
+        "x-rights": [
+          "CloudPrnt"
+        ],
+        "security": [],
+        "parameters": [
+          {
+            "name": "key",
+            "in": "path",
+            "required": true,
+            "description": "A client key with the cloudprnt right.",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "mac",
+            "in": "query",
+            "required": true,
+            "description": "The printer MAC address.",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "type",
+            "in": "query",
+            "required": false,
+            "description": "One of: application/vnd.star.starprnt, application/vnd.star.starprntcore, application/vnd.star.line, application/vnd.star.linematrix, application/vnd.star.raster, text/plain.",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "token",
+            "in": "query",
+            "required": false,
+            "description": "The jobToken of the offer.",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The job bytes, repeated per copy, in the media type the printer asked for (default application/vnd.star.starprnt).",
+            "content": {
+              "application/vnd.star.starprnt": {
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "application/vnd.star.starprntcore": {
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "application/vnd.star.line": {
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "application/vnd.star.linematrix": {
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "application/vnd.star.raster": {
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "mac required.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unknown key.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The key lacks the cloudprnt right.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "no job.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "415": {
+            "description": "The media type cannot be served.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "description": "Key right CloudPrnt (scopes: full, cloudprnt): the client key is in the path."
+      },
+      "delete": {
+        "tags": [
+          "cloudprnt"
+        ],
+        "operationId": "cloudprntConfirmWithKey",
+        "summary": "The printer confirms the job",
+        "x-roles": [
+          "cloudprnt-key"
+        ],
+        "x-rights": [
+          "CloudPrnt"
+        ],
+        "security": [],
+        "parameters": [
+          {
+            "name": "key",
+            "in": "path",
+            "required": true,
+            "description": "A client key with the cloudprnt right.",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "mac",
+            "in": "query",
+            "required": true,
+            "description": "The printer MAC address.",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "code",
+            "in": "query",
+            "required": false,
+            "description": "The printer status code.",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Confirmed, no body."
+          },
+          "400": {
+            "description": "mac required.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unknown key.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The key lacks the cloudprnt right.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "description": "Key right CloudPrnt (scopes: full, cloudprnt): the client key is in the path."
+      }
+    }
+  },
+  "components": {
+    "securitySchemes": {
+      "bearerAuth": {
+        "type": "http",
+        "scheme": "bearer",
+        "description": "The bootstrap token, an issued key or a session token."
+      },
+      "cloudprntBasic": {
+        "type": "http",
+        "scheme": "basic",
+        "description": "A Star printer that can only send a user name: the client key is the user name, the password stays empty."
+      }
+    },
+    "schemas": {
+      "ErrorBody": {
+        "type": "object",
+        "properties": {
+          "error": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "error"
+        ],
+        "additionalProperties": false
+      },
+      "Ok": {
+        "type": "object",
+        "properties": {
+          "ok": {
+            "type": "boolean",
+            "enum": [
+              true
+            ]
+          }
+        },
+        "required": [
+          "ok"
+        ],
+        "additionalProperties": false
+      },
+      "Health": {
+        "type": "object",
+        "description": "Liveness plus what the sign-in screen needs.",
+        "properties": {
+          "ok": {
+            "type": "boolean",
+            "enum": [
+              true
+            ]
+          },
+          "signup": {
+            "type": "string",
+            "enum": [
+              "open",
+              "closed"
+            ]
+          },
+          "password_reset": {
+            "type": "boolean"
+          },
+          "terms": {
+            "$ref": "#/components/schemas/Terms"
+          }
+        },
+        "required": [
+          "ok",
+          "signup",
+          "password_reset"
+        ],
+        "additionalProperties": false
+      },
+      "Terms": {
+        "type": "object",
+        "description": "Present only while the operator requires consent at signup.",
+        "properties": {
+          "version": {
+            "type": "string"
+          },
+          "terms_url": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "dpa_url": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "privacy_url": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "version",
+          "terms_url",
+          "dpa_url",
+          "privacy_url"
+        ],
+        "additionalProperties": false
+      },
+      "JobCreated": {
+        "type": "object",
+        "properties": {
+          "job_id": {
+            "type": "integer"
+          }
+        },
+        "required": [
+          "job_id"
+        ],
+        "additionalProperties": false
+      },
+      "CancelResult": {
+        "type": "object",
+        "properties": {
+          "ok": {
+            "type": "boolean",
+            "enum": [
+              true
+            ]
+          },
+          "state": {
+            "type": "string",
+            "enum": [
+              "cancelled"
+            ]
+          }
+        },
+        "required": [
+          "ok",
+          "state"
+        ],
+        "additionalProperties": false
+      },
+      "JobState": {
+        "type": "string",
+        "enum": [
+          "queued",
+          "claimed",
+          "done",
+          "failed",
+          "cancelled"
+        ]
+      },
+      "JobStatus": {
+        "type": "object",
+        "description": "One job (GET /jobs/{id} carries no id: it is the one you asked for).",
+        "properties": {
+          "state": {
+            "$ref": "#/components/schemas/JobState"
+          },
+          "error": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "printer_id": {
+            "type": "integer"
+          },
+          "created_at": {
+            "type": "number"
+          },
+          "finished_at": {
+            "type": [
+              "number",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "state",
+          "error",
+          "printer_id",
+          "created_at",
+          "finished_at"
+        ],
+        "additionalProperties": false
+      },
+      "JobRow": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "integer"
+          },
+          "printer_id": {
+            "type": "integer"
+          },
+          "printer_name": {
+            "type": "string"
+          },
+          "agent_name": {
+            "type": "string"
+          },
+          "title": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "state": {
+            "$ref": "#/components/schemas/JobState"
+          },
+          "type": {
+            "type": "string"
+          },
+          "mode": {
+            "type": "string",
+            "enum": [
+              "raw",
+              "pdf"
+            ]
+          },
+          "error": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "created_at": {
+            "type": "number"
+          },
+          "finished_at": {
+            "type": [
+              "number",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "id",
+          "printer_id",
+          "printer_name",
+          "agent_name",
+          "title",
+          "state",
+          "type",
+          "mode",
+          "error",
+          "created_at",
+          "finished_at"
+        ],
+        "additionalProperties": false
+      },
+      "JobList": {
+        "type": "object",
+        "description": "The newest 50 jobs, newest first.",
+        "properties": {
+          "jobs": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/JobRow"
+            }
+          }
+        },
+        "required": [
+          "jobs"
+        ],
+        "additionalProperties": false
+      },
+      "Printer": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "integer"
+          },
+          "name": {
+            "type": "string"
+          },
+          "agent_id": {
+            "type": "integer"
+          },
+          "agent_name": {
+            "type": "string"
+          },
+          "can_pdf": {
+            "type": "boolean"
+          },
+          "created_at": {
+            "type": "number"
+          },
+          "capabilities": {
+            "description": "What the agent reported at registration (papers, bins, duplex, color), or null. Free-form."
+          },
+          "online": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "id",
+          "name",
+          "agent_id",
+          "agent_name",
+          "can_pdf",
+          "created_at",
+          "capabilities",
+          "online"
+        ],
+        "additionalProperties": false
+      },
+      "PrinterList": {
+        "type": "object",
+        "properties": {
+          "printers": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Printer"
+            }
+          }
+        },
+        "required": [
+          "printers"
+        ],
+        "additionalProperties": false
+      },
+      "Computer": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "integer"
+          },
+          "name": {
+            "type": "string"
+          },
+          "last_seen_at": {
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "created_at": {
+            "type": "number"
+          },
+          "printers": {
+            "type": "integer"
+          },
+          "online": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "id",
+          "name",
+          "last_seen_at",
+          "created_at",
+          "printers",
+          "online"
+        ],
+        "additionalProperties": false
+      },
+      "ComputerList": {
+        "type": "object",
+        "properties": {
+          "computers": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Computer"
+            }
+          }
+        },
+        "required": [
+          "computers"
+        ],
+        "additionalProperties": false
+      },
+      "Me": {
+        "type": "object",
+        "description": "Who the credential is. scope only for a key that is not full; email and user_id only for a session.",
+        "properties": {
+          "kind": {
+            "type": "string",
+            "enum": [
+              "root",
+              "session",
+              "key"
+            ]
+          },
+          "org_id": {
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "scope": {
+            "type": "string",
+            "enum": [
+              "agent",
+              "cloudprnt",
+              "print",
+              "read",
+              "unknown"
+            ]
+          },
+          "email": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "user_id": {
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "kind",
+          "org_id"
+        ],
+        "additionalProperties": false
+      },
+      "Plan": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "jobs": {
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "price": {
+            "description": "Free-form display value, passed through as configured."
+          },
+          "checkout_url": {
+            "description": "The provider payment link for the caller org, as configured."
+          }
+        },
+        "required": [
+          "id",
+          "name",
+          "jobs",
+          "price",
+          "checkout_url"
+        ],
+        "additionalProperties": false
+      },
+      "PlanList": {
+        "type": "object",
+        "properties": {
+          "plans": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Plan"
+            }
+          },
+          "current": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "plans",
+          "current"
+        ],
+        "additionalProperties": false
+      },
+      "JobOptions": {
+        "type": "object",
+        "description": "Print options of a PDF job. Unknown keys or invalid values are a 400.",
+        "properties": {
+          "duplex": {
+            "type": "string",
+            "enum": [
+              "long-edge",
+              "short-edge",
+              "one-sided"
+            ]
+          },
+          "paper": {
+            "type": "string"
+          },
+          "bin": {
+            "type": "string"
+          },
+          "color": {
+            "type": "boolean"
+          },
+          "pages": {
+            "type": "string"
+          },
+          "orientation": {
+            "type": "string",
+            "enum": [
+              "auto",
+              "portrait",
+              "landscape"
+            ]
+          }
+        },
+        "required": [],
+        "additionalProperties": false
+      },
+      "RawBase64Job": {
+        "type": "object",
+        "description": "Raw bytes, never given options.",
+        "properties": {
+          "type": {
+            "type": "string",
+            "enum": [
+              "raw_base64"
+            ]
+          },
+          "printer_id": {
+            "type": "integer",
+            "description": "The printer id from GET /printers."
+          },
+          "title": {
+            "type": "string"
+          },
+          "copies": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 100
+          },
+          "callback_url": {
+            "type": "string",
+            "description": "http(s) only: the server POSTs the outcome here."
+          },
+          "idempotency_key": {
+            "type": "string",
+            "maxLength": 128,
+            "description": "Resubmitting a key in the same org returns the original job_id and prints nothing extra."
+          },
+          "expire_after": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 2592000,
+            "description": "Seconds until the job is failed with error \"expired\" instead of printed."
+          },
+          "content": {
+            "type": "string",
+            "description": "Base64 bytes (ZPL, ESC/POS)."
+          }
+        },
+        "required": [
+          "printer_id",
+          "type",
+          "content"
+        ]
+      },
+      "PdfBase64Job": {
+        "type": "object",
+        "properties": {
+          "type": {
+            "type": "string",
+            "enum": [
+              "pdf_base64"
+            ]
+          },
+          "printer_id": {
+            "type": "integer",
+            "description": "The printer id from GET /printers."
+          },
+          "title": {
+            "type": "string"
+          },
+          "copies": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 100
+          },
+          "callback_url": {
+            "type": "string",
+            "description": "http(s) only: the server POSTs the outcome here."
+          },
+          "idempotency_key": {
+            "type": "string",
+            "maxLength": 128,
+            "description": "Resubmitting a key in the same org returns the original job_id and prints nothing extra."
+          },
+          "expire_after": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 2592000,
+            "description": "Seconds until the job is failed with error \"expired\" instead of printed."
+          },
+          "content": {
+            "type": "string",
+            "description": "Base64 PDF."
+          },
+          "options": {
+            "$ref": "#/components/schemas/JobOptions"
+          }
+        },
+        "required": [
+          "printer_id",
+          "type",
+          "content"
+        ]
+      },
+      "RawUriJob": {
+        "type": "object",
+        "properties": {
+          "type": {
+            "type": "string",
+            "enum": [
+              "raw_uri"
+            ]
+          },
+          "printer_id": {
+            "type": "integer",
+            "description": "The printer id from GET /printers."
+          },
+          "title": {
+            "type": "string"
+          },
+          "copies": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 100
+          },
+          "callback_url": {
+            "type": "string",
+            "description": "http(s) only: the server POSTs the outcome here."
+          },
+          "idempotency_key": {
+            "type": "string",
+            "maxLength": 128,
+            "description": "Resubmitting a key in the same org returns the original job_id and prints nothing extra."
+          },
+          "expire_after": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 2592000,
+            "description": "Seconds until the job is failed with error \"expired\" instead of printed."
+          },
+          "url": {
+            "type": "string",
+            "description": "http(s) URL the server fetches."
+          }
+        },
+        "required": [
+          "printer_id",
+          "type",
+          "url"
+        ]
+      },
+      "PdfUriJob": {
+        "type": "object",
+        "properties": {
+          "type": {
+            "type": "string",
+            "enum": [
+              "pdf_uri"
+            ]
+          },
+          "printer_id": {
+            "type": "integer",
+            "description": "The printer id from GET /printers."
+          },
+          "title": {
+            "type": "string"
+          },
+          "copies": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 100
+          },
+          "callback_url": {
+            "type": "string",
+            "description": "http(s) only: the server POSTs the outcome here."
+          },
+          "idempotency_key": {
+            "type": "string",
+            "maxLength": 128,
+            "description": "Resubmitting a key in the same org returns the original job_id and prints nothing extra."
+          },
+          "expire_after": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 2592000,
+            "description": "Seconds until the job is failed with error \"expired\" instead of printed."
+          },
+          "url": {
+            "type": "string",
+            "description": "http(s) URL the server fetches."
+          },
+          "options": {
+            "$ref": "#/components/schemas/JobOptions"
+          }
+        },
+        "required": [
+          "printer_id",
+          "type",
+          "url"
+        ]
+      },
+      "RawUriPostJob": {
+        "type": "object",
+        "properties": {
+          "type": {
+            "type": "string",
+            "enum": [
+              "raw_uri_post"
+            ]
+          },
+          "printer_id": {
+            "type": "integer",
+            "description": "The printer id from GET /printers."
+          },
+          "title": {
+            "type": "string"
+          },
+          "copies": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 100
+          },
+          "callback_url": {
+            "type": "string",
+            "description": "http(s) only: the server POSTs the outcome here."
+          },
+          "idempotency_key": {
+            "type": "string",
+            "maxLength": 128,
+            "description": "Resubmitting a key in the same org returns the original job_id and prints nothing extra."
+          },
+          "expire_after": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 2592000,
+            "description": "Seconds until the job is failed with error \"expired\" instead of printed."
+          },
+          "url": {
+            "type": "string",
+            "description": "http(s) URL the server fetches."
+          },
+          "json": {
+            "description": "Any JSON value, POSTed to url as it is; the response bytes are queued. Absent: an empty object."
+          }
+        },
+        "required": [
+          "printer_id",
+          "type",
+          "url"
+        ]
+      },
+      "PdfUriPostJob": {
+        "type": "object",
+        "properties": {
+          "type": {
+            "type": "string",
+            "enum": [
+              "pdf_uri_post"
+            ]
+          },
+          "printer_id": {
+            "type": "integer",
+            "description": "The printer id from GET /printers."
+          },
+          "title": {
+            "type": "string"
+          },
+          "copies": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 100
+          },
+          "callback_url": {
+            "type": "string",
+            "description": "http(s) only: the server POSTs the outcome here."
+          },
+          "idempotency_key": {
+            "type": "string",
+            "maxLength": 128,
+            "description": "Resubmitting a key in the same org returns the original job_id and prints nothing extra."
+          },
+          "expire_after": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 2592000,
+            "description": "Seconds until the job is failed with error \"expired\" instead of printed."
+          },
+          "url": {
+            "type": "string",
+            "description": "http(s) URL the server fetches."
+          },
+          "json": {
+            "description": "Any JSON value, POSTed to url as it is; the response bytes are queued. Absent: an empty object."
+          },
+          "options": {
+            "$ref": "#/components/schemas/JobOptions"
+          }
+        },
+        "required": [
+          "printer_id",
+          "type",
+          "url"
+        ]
+      },
+      "LabelUriJob": {
+        "type": "object",
+        "description": "The server fetches an image and renders it through the template. options: accepted when the printer takes PDF, 400 on a ZPL printer.",
+        "properties": {
+          "type": {
+            "type": "string",
+            "enum": [
+              "label_uri"
+            ]
+          },
+          "printer_id": {
+            "type": "integer",
+            "description": "The printer id from GET /printers."
+          },
+          "title": {
+            "type": "string"
+          },
+          "copies": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 100
+          },
+          "callback_url": {
+            "type": "string",
+            "description": "http(s) only: the server POSTs the outcome here."
+          },
+          "idempotency_key": {
+            "type": "string",
+            "maxLength": 128,
+            "description": "Resubmitting a key in the same org returns the original job_id and prints nothing extra."
+          },
+          "expire_after": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 2592000,
+            "description": "Seconds until the job is failed with error \"expired\" instead of printed."
+          },
+          "url": {
+            "type": "string",
+            "description": "http(s) URL the server fetches."
+          },
+          "template": {
+            "type": [
+              "string",
+              "integer"
+            ],
+            "description": "A label template name or its integer id."
+          },
+          "options": {
+            "$ref": "#/components/schemas/JobOptions"
+          }
+        },
+        "required": [
+          "printer_id",
+          "type",
+          "url",
+          "template"
+        ]
+      },
+      "LabelBase64Job": {
+        "type": "object",
+        "description": "options: accepted when the printer takes PDF, 400 on a ZPL printer.",
+        "properties": {
+          "type": {
+            "type": "string",
+            "enum": [
+              "label_base64"
+            ]
+          },
+          "printer_id": {
+            "type": "integer",
+            "description": "The printer id from GET /printers."
+          },
+          "title": {
+            "type": "string"
+          },
+          "copies": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 100
+          },
+          "callback_url": {
+            "type": "string",
+            "description": "http(s) only: the server POSTs the outcome here."
+          },
+          "idempotency_key": {
+            "type": "string",
+            "maxLength": 128,
+            "description": "Resubmitting a key in the same org returns the original job_id and prints nothing extra."
+          },
+          "expire_after": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 2592000,
+            "description": "Seconds until the job is failed with error \"expired\" instead of printed."
+          },
+          "content": {
+            "type": "string",
+            "description": "Base64 GIF, PNG or JPEG."
+          },
+          "template": {
+            "type": [
+              "string",
+              "integer"
+            ],
+            "description": "A label template name or its integer id."
+          },
+          "options": {
+            "$ref": "#/components/schemas/JobOptions"
+          }
+        },
+        "required": [
+          "printer_id",
+          "type",
+          "content",
+          "template"
+        ]
+      },
+      "LabelTextJob": {
+        "type": "object",
+        "description": "options: accepted when the printer takes PDF, 400 on a ZPL printer.",
+        "properties": {
+          "type": {
+            "type": "string",
+            "enum": [
+              "label_text"
+            ]
+          },
+          "printer_id": {
+            "type": "integer",
+            "description": "The printer id from GET /printers."
+          },
+          "title": {
+            "type": "string"
+          },
+          "copies": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 100
+          },
+          "callback_url": {
+            "type": "string",
+            "description": "http(s) only: the server POSTs the outcome here."
+          },
+          "idempotency_key": {
+            "type": "string",
+            "maxLength": 128,
+            "description": "Resubmitting a key in the same org returns the original job_id and prints nothing extra."
+          },
+          "expire_after": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 2592000,
+            "description": "Seconds until the job is failed with error \"expired\" instead of printed."
+          },
+          "text": {
+            "type": "string",
+            "maxLength": 500
+          },
+          "template": {
+            "type": [
+              "string",
+              "integer"
+            ],
+            "description": "A label template name or its integer id."
+          },
+          "options": {
+            "$ref": "#/components/schemas/JobOptions"
+          }
+        },
+        "required": [
+          "printer_id",
+          "type",
+          "text",
+          "template"
+        ]
+      },
+      "ReceiptJob": {
+        "type": "object",
+        "description": "options: accepted when the output is a PDF, 400 for ESC/POS.",
+        "properties": {
+          "type": {
+            "type": "string",
+            "enum": [
+              "receipt"
+            ]
+          },
+          "printer_id": {
+            "type": "integer",
+            "description": "The printer id from GET /printers."
+          },
+          "title": {
+            "type": "string"
+          },
+          "copies": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 100
+          },
+          "callback_url": {
+            "type": "string",
+            "description": "http(s) only: the server POSTs the outcome here."
+          },
+          "idempotency_key": {
+            "type": "string",
+            "maxLength": 128,
+            "description": "Resubmitting a key in the same org returns the original job_id and prints nothing extra."
+          },
+          "expire_after": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 2592000,
+            "description": "Seconds until the job is failed with error \"expired\" instead of printed."
+          },
+          "receipt": {
+            "$ref": "#/components/schemas/ReceiptDocument"
+          },
+          "options": {
+            "$ref": "#/components/schemas/JobOptions"
+          }
+        },
+        "required": [
+          "printer_id",
+          "type",
+          "receipt"
+        ]
+      },
+      "JobRequest": {
+        "description": "The body of POST /jobs: one of ten types, told apart by type.",
+        "oneOf": [
+          {
+            "$ref": "#/components/schemas/RawBase64Job"
+          },
+          {
+            "$ref": "#/components/schemas/PdfBase64Job"
+          },
+          {
+            "$ref": "#/components/schemas/RawUriJob"
+          },
+          {
+            "$ref": "#/components/schemas/PdfUriJob"
+          },
+          {
+            "$ref": "#/components/schemas/RawUriPostJob"
+          },
+          {
+            "$ref": "#/components/schemas/PdfUriPostJob"
+          },
+          {
+            "$ref": "#/components/schemas/LabelUriJob"
+          },
+          {
+            "$ref": "#/components/schemas/LabelBase64Job"
+          },
+          {
+            "$ref": "#/components/schemas/LabelTextJob"
+          },
+          {
+            "$ref": "#/components/schemas/ReceiptJob"
+          }
+        ]
+      },
+      "ReceiptCell": {
+        "type": "object",
+        "properties": {
+          "text": {
+            "type": "string",
+            "maxLength": 4000
+          },
+          "align": {
+            "type": "string",
+            "enum": [
+              "left",
+              "center",
+              "right"
+            ]
+          },
+          "bold": {
+            "type": "boolean"
+          },
+          "width": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 100
+          }
+        },
+        "required": [
+          "text"
+        ],
+        "additionalProperties": false
+      },
+      "ReceiptText": {
+        "type": "object",
+        "properties": {
+          "type": {
+            "type": "string",
+            "enum": [
+              "text"
+            ]
+          },
+          "text": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 4000
+          },
+          "align": {
+            "type": "string",
+            "enum": [
+              "left",
+              "center",
+              "right"
+            ]
+          },
+          "bold": {
+            "type": "boolean"
+          },
+          "size": {
+            "oneOf": [
+              {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 8
+              },
+              {
+                "type": "array",
+                "items": {
+                  "type": "integer",
+                  "minimum": 1,
+                  "maximum": 8
+                }
+              }
+            ],
+            "description": "1 to 8, or [w, h]."
+          }
+        },
+        "required": [
+          "type",
+          "text"
+        ],
+        "additionalProperties": false
+      },
+      "ReceiptColumns": {
+        "type": "object",
+        "description": "2 to 6 cells.",
+        "properties": {
+          "type": {
+            "type": "string",
+            "enum": [
+              "columns"
+            ]
+          },
+          "cells": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ReceiptCell"
+            }
+          },
+          "size": {
+            "oneOf": [
+              {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 8
+              },
+              {
+                "type": "array",
+                "items": {
+                  "type": "integer",
+                  "minimum": 1,
+                  "maximum": 8
+                }
+              }
+            ],
+            "description": "1 to 8, or [w, h]."
+          }
+        },
+        "required": [
+          "type",
+          "cells"
+        ],
+        "additionalProperties": false
+      },
+      "ReceiptDivider": {
+        "type": "object",
+        "properties": {
+          "type": {
+            "type": "string",
+            "enum": [
+              "divider"
+            ]
+          },
+          "char": {
+            "type": "string",
+            "description": "Exactly one printable character."
+          }
+        },
+        "required": [
+          "type"
+        ],
+        "additionalProperties": false
+      },
+      "ReceiptImage": {
+        "type": "object",
+        "properties": {
+          "type": {
+            "type": "string",
+            "enum": [
+              "image"
+            ]
+          },
+          "content": {
+            "type": "string",
+            "description": "Base64 GIF, PNG or JPEG."
+          },
+          "align": {
+            "type": "string",
+            "enum": [
+              "left",
+              "center",
+              "right"
+            ]
+          },
+          "width_percent": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 100
+          },
+          "dither": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "type",
+          "content"
+        ],
+        "additionalProperties": false
+      },
+      "ReceiptQr": {
+        "type": "object",
+        "properties": {
+          "type": {
+            "type": "string",
+            "enum": [
+              "qr"
+            ]
+          },
+          "data": {
+            "type": "string",
+            "minLength": 1
+          },
+          "ec": {
+            "type": "string",
+            "enum": [
+              "L",
+              "M",
+              "Q",
+              "H"
+            ]
+          },
+          "size": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 16
+          },
+          "align": {
+            "type": "string",
+            "enum": [
+              "left",
+              "center",
+              "right"
+            ]
+          }
+        },
+        "required": [
+          "type",
+          "data"
+        ],
+        "additionalProperties": false
+      },
+      "ReceiptBarcode": {
+        "type": "object",
+        "properties": {
+          "type": {
+            "type": "string",
+            "enum": [
+              "barcode"
+            ]
+          },
+          "format": {
+            "type": "string",
+            "enum": [
+              "code128",
+              "ean13"
+            ]
+          },
+          "data": {
+            "type": "string"
+          },
+          "height": {
+            "type": "integer",
+            "minimum": 24,
+            "maximum": 240
+          },
+          "size": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 6
+          },
+          "text": {
+            "type": "boolean"
+          },
+          "align": {
+            "type": "string",
+            "enum": [
+              "left",
+              "center",
+              "right"
+            ]
+          }
+        },
+        "required": [
+          "type",
+          "format",
+          "data"
+        ],
+        "additionalProperties": false
+      },
+      "ReceiptFeed": {
+        "type": "object",
+        "properties": {
+          "type": {
+            "type": "string",
+            "enum": [
+              "feed"
+            ]
+          },
+          "lines": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 20
+          }
+        },
+        "required": [
+          "type"
+        ],
+        "additionalProperties": false
+      },
+      "ReceiptCut": {
+        "type": "object",
+        "properties": {
+          "type": {
+            "type": "string",
+            "enum": [
+              "cut"
+            ]
+          }
+        },
+        "required": [
+          "type"
+        ],
+        "additionalProperties": false
+      },
+      "ReceiptDrawer": {
+        "type": "object",
+        "properties": {
+          "type": {
+            "type": "string",
+            "enum": [
+              "drawer"
+            ]
+          },
+          "pin": {
+            "type": "integer",
+            "enum": [
+              2,
+              5
+            ]
+          }
+        },
+        "required": [
+          "type"
+        ],
+        "additionalProperties": false
+      },
+      "ReceiptElement": {
+        "description": "One element of a receipt, told apart by type.",
+        "oneOf": [
+          {
+            "$ref": "#/components/schemas/ReceiptText"
+          },
+          {
+            "$ref": "#/components/schemas/ReceiptColumns"
+          },
+          {
+            "$ref": "#/components/schemas/ReceiptDivider"
+          },
+          {
+            "$ref": "#/components/schemas/ReceiptImage"
+          },
+          {
+            "$ref": "#/components/schemas/ReceiptQr"
+          },
+          {
+            "$ref": "#/components/schemas/ReceiptBarcode"
+          },
+          {
+            "$ref": "#/components/schemas/ReceiptFeed"
+          },
+          {
+            "$ref": "#/components/schemas/ReceiptCut"
+          },
+          {
+            "$ref": "#/components/schemas/ReceiptDrawer"
+          }
+        ]
+      },
+      "ReceiptDocument": {
+        "type": "object",
+        "description": "A receipt: see docs/receipts.md for the limits.",
+        "properties": {
+          "content": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ReceiptElement"
+            },
+            "description": "1 to 500 elements."
+          },
+          "cut": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "content"
+        ],
+        "additionalProperties": false
+      },
+      "ReceiptProfile": {
+        "type": "object",
+        "description": "How receipts to one printer are laid out. A PUT replaces the whole profile: omitted fields take the defaults.",
+        "properties": {
+          "paper_mm": {
+            "type": "integer",
+            "enum": [
+              58,
+              80
+            ]
+          },
+          "width_dots": {
+            "type": "integer",
+            "minimum": 192,
+            "maximum": 640
+          },
+          "codepage": {
+            "type": "string",
+            "enum": [
+              "raster",
+              "cp1252"
+            ]
+          },
+          "codepage_number": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 255
+          },
+          "cut": {
+            "type": "string",
+            "enum": [
+              "partial",
+              "full",
+              "none"
+            ]
+          },
+          "output": {
+            "type": "string",
+            "enum": [
+              "auto",
+              "escpos"
+            ]
+          }
+        },
+        "required": [],
+        "additionalProperties": false
+      },
+      "ReceiptProfileAnswer": {
+        "type": "object",
+        "properties": {
+          "printer_id": {
+            "type": "integer"
+          },
+          "stored": {
+            "type": "boolean"
+          },
+          "profile": {
+            "$ref": "#/components/schemas/ReceiptProfileStored"
+          }
+        },
+        "required": [
+          "printer_id",
+          "stored",
+          "profile"
+        ],
+        "additionalProperties": false
+      },
+      "ReceiptProfileStored": {
+        "type": "object",
+        "description": "A profile as the server reports it: every field present.",
+        "properties": {
+          "paper_mm": {
+            "type": "integer",
+            "enum": [
+              58,
+              80
+            ]
+          },
+          "width_dots": {
+            "type": "integer"
+          },
+          "codepage": {
+            "type": "string",
+            "enum": [
+              "raster",
+              "cp1252"
+            ]
+          },
+          "codepage_number": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 255
+          },
+          "cut": {
+            "type": "string",
+            "enum": [
+              "partial",
+              "full",
+              "none"
+            ]
+          },
+          "output": {
+            "type": "string",
+            "enum": [
+              "auto",
+              "escpos"
+            ]
+          }
+        },
+        "required": [
+          "paper_mm",
+          "width_dots",
+          "codepage",
+          "codepage_number",
+          "cut",
+          "output"
+        ],
+        "additionalProperties": false
+      },
+      "ReceiptPreviewRequest": {
+        "type": "object",
+        "description": "printer_id (its stored profile) or profile, not both.",
+        "properties": {
+          "receipt": {
+            "$ref": "#/components/schemas/ReceiptDocument"
+          },
+          "printer_id": {
+            "type": "integer"
+          },
+          "profile": {
+            "$ref": "#/components/schemas/ReceiptProfile"
+          }
+        },
+        "required": [
+          "receipt"
+        ]
+      },
+      "LabelSpec": {
+        "type": "object",
+        "description": "A label template. Unknown fields are a 400.",
+        "properties": {
+          "name": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 64
+          },
+          "content": {
+            "type": "string",
+            "enum": [
+              "image",
+              "text"
+            ]
+          },
+          "label_mm": {
+            "type": "object",
+            "properties": {
+              "w": {
+                "type": "number"
+              },
+              "h": {
+                "type": "number"
+              }
+            },
+            "required": [
+              "w",
+              "h"
+            ],
+            "additionalProperties": false
+          },
+          "dpi": {
+            "type": "integer",
+            "minimum": 100,
+            "maximum": 600
+          },
+          "rotate": {
+            "type": "integer",
+            "enum": [
+              0,
+              90,
+              180,
+              270
+            ]
+          },
+          "crop_percent": {
+            "type": "object",
+            "properties": {
+              "t": {
+                "type": "number"
+              },
+              "r": {
+                "type": "number"
+              },
+              "b": {
+                "type": "number"
+              },
+              "l": {
+                "type": "number"
+              }
+            },
+            "required": [
+              "t",
+              "r",
+              "b",
+              "l"
+            ],
+            "additionalProperties": false
+          },
+          "place_mm": {
+            "type": "object",
+            "properties": {
+              "x": {
+                "type": "number"
+              },
+              "y": {
+                "type": "number"
+              },
+              "w": {
+                "type": "number"
+              },
+              "h": {
+                "type": "number"
+              }
+            },
+            "required": [
+              "x",
+              "y",
+              "w",
+              "h"
+            ],
+            "additionalProperties": false
+          },
+          "text": {
+            "type": "object",
+            "properties": {
+              "wrap_chars": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 200
+              },
+              "lines_per_label": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 200
+              }
+            },
+            "additionalProperties": false,
+            "description": "Either field may be left out (it is then 0)."
+          },
+          "zpl_darkness": {
+            "type": "integer",
+            "minimum": -30,
+            "maximum": 30
+          },
+          "size_ref": {
+            "type": "string",
+            "maxLength": 64
+          }
+        },
+        "required": [
+          "name",
+          "content",
+          "label_mm",
+          "dpi",
+          "rotate",
+          "crop_percent",
+          "place_mm"
+        ]
+      },
+      "LabelTemplate": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "integer"
+          },
+          "name": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 64
+          },
+          "content": {
+            "type": "string",
+            "enum": [
+              "image",
+              "text"
+            ]
+          },
+          "label_mm": {
+            "type": "object",
+            "properties": {
+              "w": {
+                "type": "number"
+              },
+              "h": {
+                "type": "number"
+              }
+            },
+            "required": [
+              "w",
+              "h"
+            ],
+            "additionalProperties": false
+          },
+          "dpi": {
+            "type": "integer",
+            "minimum": 100,
+            "maximum": 600
+          },
+          "rotate": {
+            "type": "integer",
+            "enum": [
+              0,
+              90,
+              180,
+              270
+            ]
+          },
+          "crop_percent": {
+            "type": "object",
+            "properties": {
+              "t": {
+                "type": "number"
+              },
+              "r": {
+                "type": "number"
+              },
+              "b": {
+                "type": "number"
+              },
+              "l": {
+                "type": "number"
+              }
+            },
+            "required": [
+              "t",
+              "r",
+              "b",
+              "l"
+            ],
+            "additionalProperties": false
+          },
+          "place_mm": {
+            "type": "object",
+            "properties": {
+              "x": {
+                "type": "number"
+              },
+              "y": {
+                "type": "number"
+              },
+              "w": {
+                "type": "number"
+              },
+              "h": {
+                "type": "number"
+              }
+            },
+            "required": [
+              "x",
+              "y",
+              "w",
+              "h"
+            ],
+            "additionalProperties": false
+          },
+          "text": {
+            "type": "object",
+            "properties": {
+              "wrap_chars": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 200
+              },
+              "lines_per_label": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 200
+              }
+            },
+            "required": [
+              "wrap_chars",
+              "lines_per_label"
+            ],
+            "additionalProperties": false
+          },
+          "zpl_darkness": {
+            "type": "integer",
+            "minimum": -30,
+            "maximum": 30
+          },
+          "size_ref": {
+            "type": "string",
+            "maxLength": 64
+          },
+          "created_at": {
+            "type": "number"
+          },
+          "updated_at": {
+            "type": "number"
+          }
+        },
+        "required": [
+          "id",
+          "name",
+          "content",
+          "label_mm",
+          "dpi",
+          "rotate",
+          "crop_percent",
+          "place_mm",
+          "text",
+          "created_at",
+          "updated_at"
+        ],
+        "additionalProperties": false
+      },
+      "LabelList": {
+        "type": "object",
+        "properties": {
+          "templates": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/LabelTemplate"
+            }
+          }
+        },
+        "required": [
+          "templates"
+        ],
+        "additionalProperties": false
+      },
+      "Session": {
+        "type": "object",
+        "properties": {
+          "token": {
+            "type": "string"
+          },
+          "expires_at": {
+            "type": "number"
+          },
+          "org_id": {
+            "type": "integer"
+          },
+          "user_id": {
+            "type": "integer"
+          },
+          "email": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "token",
+          "expires_at",
+          "org_id",
+          "user_id",
+          "email"
+        ],
+        "additionalProperties": false
+      },
+      "User": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "integer"
+          },
+          "org_id": {
+            "type": "integer"
+          },
+          "email": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "created_at": {
+            "type": "number"
+          }
+        },
+        "required": [
+          "id",
+          "org_id",
+          "email",
+          "created_at"
+        ],
+        "additionalProperties": false
+      },
+      "UserList": {
+        "type": "object",
+        "properties": {
+          "users": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/User"
+            }
+          }
+        },
+        "required": [
+          "users"
+        ],
+        "additionalProperties": false
+      },
+      "UserCreated": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "integer"
+          },
+          "email": {
+            "type": "string"
+          },
+          "org_id": {
+            "type": "integer"
+          }
+        },
+        "required": [
+          "id",
+          "email",
+          "org_id"
+        ],
+        "additionalProperties": false
+      },
+      "OrgCreated": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "integer"
+          },
+          "name": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "name"
+        ],
+        "additionalProperties": false
+      },
+      "OrgSummary": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "integer"
+          },
+          "name": {
+            "type": "string"
+          },
+          "event_url": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "shopify_secret_set": {
+            "type": "boolean"
+          },
+          "job_quota": {
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "plan": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "created_at": {
+            "type": "number"
+          }
+        },
+        "required": [
+          "id",
+          "name",
+          "event_url",
+          "shopify_secret_set",
+          "job_quota",
+          "plan",
+          "created_at"
+        ],
+        "additionalProperties": false
+      },
+      "OrgList": {
+        "type": "object",
+        "properties": {
+          "orgs": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/OrgSummary"
+            }
+          }
+        },
+        "required": [
+          "orgs"
+        ],
+        "additionalProperties": false
+      },
+      "OrgDetail": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "integer"
+          },
+          "name": {
+            "type": "string"
+          },
+          "event_url": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "shopify_secret_set": {
+            "type": "boolean"
+          },
+          "job_quota": {
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "plan": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "jobs_this_month": {
+            "type": "integer"
+          },
+          "created_at": {
+            "type": "number"
+          }
+        },
+        "required": [
+          "id",
+          "name",
+          "event_url",
+          "shopify_secret_set",
+          "job_quota",
+          "plan",
+          "jobs_this_month",
+          "created_at"
+        ],
+        "additionalProperties": false
+      },
+      "OrgUpdate": {
+        "type": "object",
+        "description": "Any of the fields; at least one.",
+        "properties": {
+          "event_url": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "http(s) URL, or null to clear."
+          },
+          "shopify_secret": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "null clears it."
+          },
+          "job_quota": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "description": "Root only."
+          },
+          "plan": {
+            "type": "string",
+            "description": "Root only: a plan id of the catalogue."
+          }
+        },
+        "required": []
+      },
+      "OrgUpdated": {
+        "type": "object",
+        "description": "ok, plus the fields that were applied.",
+        "properties": {
+          "ok": {
+            "type": "boolean",
+            "enum": [
+              true
+            ]
+          },
+          "event_url": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "job_quota": {
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "plan": {
+            "type": "string"
+          },
+          "shopify_secret_set": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "ok"
+        ],
+        "additionalProperties": false
+      },
+      "ApiKey": {
+        "type": "object",
+        "description": "scope is left out for a full key.",
+        "properties": {
+          "id": {
+            "type": "integer"
+          },
+          "org_id": {
+            "type": "integer"
+          },
+          "label": {
+            "type": "string"
+          },
+          "active": {
+            "type": "integer",
+            "description": "1 active, 0 revoked."
+          },
+          "created_at": {
+            "type": "number"
+          },
+          "scope": {
+            "type": "string",
+            "enum": [
+              "agent",
+              "cloudprnt",
+              "print",
+              "read",
+              "unknown"
+            ]
+          }
+        },
+        "required": [
+          "id",
+          "org_id",
+          "label",
+          "active",
+          "created_at"
+        ],
+        "additionalProperties": false
+      },
+      "ApiKeyList": {
+        "type": "object",
+        "properties": {
+          "keys": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ApiKey"
+            }
+          }
+        },
+        "required": [
+          "keys"
+        ],
+        "additionalProperties": false
+      },
+      "KeyIssued": {
+        "type": "object",
+        "description": "scope only when it is not full.",
+        "properties": {
+          "id": {
+            "type": "integer"
+          },
+          "label": {
+            "type": "string"
+          },
+          "org_id": {
+            "type": [
+              "integer",
+              "string"
+            ],
+            "description": "As the caller wrote it."
+          },
+          "key": {
+            "type": "string",
+            "description": "Shown once."
+          },
+          "scope": {
+            "type": "string",
+            "enum": [
+              "agent",
+              "cloudprnt",
+              "print",
+              "read"
+            ]
+          }
+        },
+        "required": [
+          "id",
+          "label",
+          "org_id",
+          "key"
+        ],
+        "additionalProperties": false
+      },
+      "KeyRequest": {
+        "type": "object",
+        "properties": {
+          "label": {
+            "type": "string"
+          },
+          "org_id": {
+            "type": [
+              "integer",
+              "string"
+            ]
+          },
+          "scope": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "enum": [
+              "full",
+              "agent",
+              "cloudprnt",
+              "print",
+              "read",
+              null
+            ],
+            "description": "Absent or null is full."
+          }
+        },
+        "required": []
+      },
+      "KeyUpdated": {
+        "type": "object",
+        "properties": {
+          "ok": {
+            "type": "boolean",
+            "enum": [
+              true
+            ]
+          },
+          "scope": {
+            "type": "string",
+            "enum": [
+              "full",
+              "agent",
+              "cloudprnt",
+              "print",
+              "read"
+            ]
+          }
+        },
+        "required": [
+          "ok",
+          "scope"
+        ],
+        "additionalProperties": false
+      },
+      "OldKey": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "integer"
+          },
+          "label": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "label"
+        ],
+        "additionalProperties": false
+      },
+      "PairingInfo": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "integer"
+          },
+          "org_id": {
+            "type": "integer"
+          },
+          "computer_id": {
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "computer_name": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "created_at": {
+            "type": "number"
+          },
+          "expires_at": {
+            "type": "number"
+          },
+          "used_at": {
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "device_name": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "key_id": {
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "state": {
+            "type": "string",
+            "enum": [
+              "open",
+              "expired",
+              "fetched",
+              "registered",
+              "connected",
+              "revoked"
+            ]
+          },
+          "old_key": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/OldKey"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "required": [
+          "id",
+          "org_id",
+          "computer_id",
+          "computer_name",
+          "created_at",
+          "expires_at",
+          "used_at",
+          "device_name",
+          "key_id",
+          "state",
+          "old_key"
+        ],
+        "additionalProperties": false
+      },
+      "PairingList": {
+        "type": "object",
+        "properties": {
+          "codes": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/PairingInfo"
+            }
+          }
+        },
+        "required": [
+          "codes"
+        ],
+        "additionalProperties": false
+      },
+      "PairingCreated": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "integer"
+          },
+          "code": {
+            "type": "string",
+            "description": "XXXX-XXXX-XXXX, shown once."
+          },
+          "expires_at": {
+            "type": "number"
+          },
+          "server_url": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "computer_id": {
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "computer_name": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "old_key": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/OldKey"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "required": [
+          "id",
+          "code",
+          "expires_at",
+          "server_url",
+          "computer_id",
+          "computer_name",
+          "old_key"
+        ],
+        "additionalProperties": false
+      },
+      "PairingRequest": {
+        "type": "object",
+        "properties": {
+          "computer_id": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "description": "Reconnect: pair this device again."
+          },
+          "org_id": {
+            "type": [
+              "integer",
+              "string"
+            ]
+          }
+        },
+        "required": []
+      },
+      "AgentPairRequest": {
+        "type": "object",
+        "properties": {
+          "code": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 200
+          }
+        },
+        "required": [
+          "code",
+          "name"
+        ]
+      },
+      "AgentPaired": {
+        "type": "object",
+        "properties": {
+          "key": {
+            "type": "string",
+            "description": "The new agent-only key, shown once."
+          },
+          "name": {
+            "type": "string"
+          },
+          "org": {
+            "type": "string"
+          },
+          "created_by": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "replaces": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "key",
+          "name",
+          "org",
+          "created_by",
+          "replaces"
+        ],
+        "additionalProperties": false
+      },
+      "SupportGrant": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "integer"
+          },
+          "reason": {
+            "type": "string"
+          },
+          "granted_at": {
+            "type": "number"
+          },
+          "expires_at": {
+            "type": "number"
+          },
+          "ended_at": {
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "active": {
+            "type": "boolean"
+          },
+          "listed_job_ids": {
+            "type": "array",
+            "items": {
+              "type": "integer"
+            }
+          },
+          "opened_job_ids": {
+            "type": "array",
+            "items": {
+              "type": "integer"
+            }
+          }
+        },
+        "required": [
+          "id",
+          "reason",
+          "granted_at",
+          "expires_at",
+          "ended_at",
+          "active",
+          "listed_job_ids",
+          "opened_job_ids"
+        ],
+        "additionalProperties": false
+      },
+      "SupportAccess": {
+        "type": "object",
+        "properties": {
+          "enabled": {
+            "type": "boolean"
+          },
+          "grants": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/SupportGrant"
+            }
+          }
+        },
+        "required": [
+          "enabled",
+          "grants"
+        ],
+        "additionalProperties": false
+      },
+      "PrinterDecl": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "can_pdf": {
+            "type": "boolean"
+          },
+          "capabilities": {
+            "description": "Free-form: papers, bins, duplex, color."
+          }
+        },
+        "required": [
+          "name"
+        ]
+      },
+      "AgentRegisterRequest": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "printers": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/PrinterDecl"
+            }
+          }
+        },
+        "required": [
+          "name"
+        ]
+      },
+      "AgentRegistered": {
+        "type": "object",
+        "properties": {
+          "computer_id": {
+            "type": "integer"
+          },
+          "printer_ids": {
+            "type": "object",
+            "additionalProperties": {
+              "type": "integer"
+            },
+            "description": "Printer name to printer id."
+          }
+        },
+        "required": [
+          "computer_id",
+          "printer_ids"
+        ],
+        "additionalProperties": false
+      },
+      "AgentJob": {
+        "type": "object",
+        "properties": {
+          "job_id": {
+            "type": "integer"
+          },
+          "printer_id": {
+            "type": "integer"
+          },
+          "mode": {
+            "type": "string",
+            "enum": [
+              "raw",
+              "pdf"
+            ]
+          },
+          "copies": {
+            "type": "integer"
+          },
+          "options": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/JobOptions"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "job_uid": {
+            "type": "string",
+            "description": "Only with the request header X-Printapi-Features: job-uid."
+          }
+        },
+        "required": [
+          "job_id",
+          "printer_id",
+          "mode",
+          "copies",
+          "options"
+        ],
+        "additionalProperties": false
+      },
+      "AgentResultRequest": {
+        "type": "object",
+        "description": "The outcome of a claimed job.",
+        "properties": {
+          "ok": {
+            "type": "boolean"
+          },
+          "error": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "job_uid": {
+            "type": "string"
+          }
+        },
+        "required": []
+      },
+      "AgentLateResultRequest": {
+        "type": "object",
+        "properties": {
+          "job_id": {
+            "type": "integer"
+          },
+          "job_uid": {
+            "type": "string"
+          },
+          "ok": {
+            "type": "boolean"
+          },
+          "error": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "job_id",
+          "job_uid"
+        ]
+      },
+      "AgentLateResultAnswer": {
+        "type": "object",
+        "properties": {
+          "ok": {
+            "type": "boolean",
+            "enum": [
+              true
+            ]
+          },
+          "state": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/JobState"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "required": [
+          "ok",
+          "state"
+        ],
+        "additionalProperties": false
+      },
+      "OrderRequest": {
+        "type": "object",
+        "properties": {
+          "printer_id": {
+            "type": "integer",
+            "description": "Must take PDF."
+          },
+          "order": {
+            "type": "object",
+            "description": "The order (docs/ecommerce.md), or a raw store payload when format is set."
+          },
+          "format": {
+            "type": "string",
+            "enum": [
+              "shopify",
+              "woocommerce"
+            ]
+          },
+          "title": {
+            "type": "string"
+          },
+          "copies": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 100
+          },
+          "callback_url": {
+            "type": "string"
+          },
+          "idempotency_key": {
+            "type": "string",
+            "maxLength": 128
+          },
+          "expire_after": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 2592000
+          }
+        },
+        "required": [
+          "printer_id",
+          "order"
+        ]
+      },
+      "BillingEvent": {
+        "type": "object",
+        "description": "The provider event (org_id or email, plan, status).",
+        "properties": {
+          "org_id": {
+            "type": [
+              "integer",
+              "string"
+            ]
+          },
+          "email": {
+            "type": "string"
+          },
+          "plan": {
+            "type": "string"
+          },
+          "status": {
+            "type": "string"
+          }
+        },
+        "required": []
+      },
+      "BillingApplied": {
+        "type": "object",
+        "properties": {
+          "ok": {
+            "type": "boolean",
+            "enum": [
+              true
+            ]
+          },
+          "org_id": {
+            "type": "integer"
+          },
+          "plan": {
+            "type": "string"
+          },
+          "job_quota": {
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "ok",
+          "org_id",
+          "plan",
+          "job_quota"
+        ],
+        "additionalProperties": false
+      },
+      "CloudprntPoll": {
+        "type": "object",
+        "description": "The poll body of the Star CloudPRNT protocol; other fields are ignored.",
+        "properties": {
+          "printerMAC": {
+            "type": "string"
+          },
+          "printingInProgress": {
+            "type": "boolean"
+          },
+          "statusCode": {
+            "type": "string"
+          },
+          "clientAction": {
+            "description": "Sent by the printer, ignored."
+          }
+        },
+        "required": []
+      },
+      "CloudprntOffer": {
+        "type": "object",
+        "properties": {
+          "jobReady": {
+            "type": "boolean"
+          },
+          "mediaTypes": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "jobToken": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "jobReady"
+        ],
+        "additionalProperties": false
+      }
+    }
+  }
+}

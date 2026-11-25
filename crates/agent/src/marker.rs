@@ -15,6 +15,7 @@
 use std::io::Read;
 use std::path::Path;
 
+pub use crate::brand::valid_brand_id;
 use crate::update::Version;
 
 /// More than this is not a marker.
@@ -35,17 +36,6 @@ pub struct Marker {
     /// The version of the agent that was installed or last updated. `None`: unknown.
     pub version: Option<String>,
     pub brand: BrandMark,
-}
-
-/// A brand id: `^[a-z][a-z0-9-]{1,30}$`, and neither `printpapi` nor `stock`.
-pub fn valid_brand_id(id: &str) -> bool {
-    let b = id.as_bytes();
-    (2..=31).contains(&b.len())
-        && b[0].is_ascii_lowercase()
-        && b.iter()
-            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || *c == b'-')
-        && id != "printpapi"
-        && id != "stock"
 }
 
 /// Read the content of a marker. Never fails: what cannot be read is [`BrandMark::Unreadable`].
@@ -133,6 +123,47 @@ pub fn read_text(path: &Path) -> Option<Vec<u8>> {
         .read_to_end(&mut bytes)
         .ok()?;
     Some(bytes)
+}
+
+/// The text of `old_text` with its `brand` line set to `id` (in place when there is one, else after
+/// the other lines), every other line kept. Line ends become LF.
+pub fn with_brand(old_text: &str, id: &str) -> String {
+    let line = format!("brand={id}");
+    let mut out: Vec<String> = Vec::new();
+    let mut done = false;
+    for old in old_text.lines() {
+        let old = old.trim_end_matches('\r');
+        if old.trim().is_empty() {
+            continue;
+        }
+        if old
+            .split_once('=')
+            .is_some_and(|(k, _)| k.trim() == "brand")
+        {
+            if !done {
+                out.push(line.clone());
+                done = true;
+            }
+        } else {
+            out.push(old.to_string());
+        }
+    }
+    if !done {
+        out.push(line);
+    }
+    out.join("\n") + "\n"
+}
+
+/// May a setup of the brand `this` (`None`: the stock build) install over an installation that
+/// the marker says was made by `installed`? A stock installation can be taken over by any build
+/// (adoption); a brand's installation only by the same brand; an unreadable marker by nobody.
+/// Removing and restarting do not ask: a machine must always be cleanable.
+pub fn may_replace(installed: &BrandMark, this: Option<&str>) -> bool {
+    match installed {
+        BrandMark::Stock => true,
+        BrandMark::Brand(id) => this == Some(id.as_str()),
+        BrandMark::Unreadable => false,
+    }
 }
 
 /// The marker at `path`, `None` when there is no regular file.
@@ -226,6 +257,47 @@ mod tests {
             with_version("version=1.0.0\nversion=2.0.0\n", "3.7.0"),
             "version=3.7.0\n"
         );
+    }
+
+    #[test]
+    fn with_brand_sets_the_line_and_keeps_every_other_one() {
+        assert_eq!(
+            with_brand("version=3.7.0\n", "acme"),
+            "version=3.7.0\nbrand=acme\n"
+        );
+        assert_eq!(with_brand("", "acme"), "brand=acme\n");
+        assert_eq!(
+            with_brand("version=3.7.0\r\nbrand=old\r\nfuture=1\r\n", "acme"),
+            "version=3.7.0\nbrand=acme\nfuture=1\n"
+        );
+        assert_eq!(with_brand("brand=a1\nbrand=a2\n", "acme"), "brand=acme\n");
+        // what it writes reads back
+        let m = parse(with_brand("version=3.7.0\n", "acme").as_bytes());
+        assert_eq!(m.brand, BrandMark::Brand("acme".into()));
+        assert_eq!(m.version.as_deref(), Some("3.7.0"));
+    }
+
+    #[test]
+    fn who_may_replace_whom() {
+        let acme = BrandMark::Brand("acme".into());
+        // (installed, this build, allowed)
+        let table: [(&BrandMark, Option<&str>, bool); 8] = [
+            (&BrandMark::Stock, None, true),
+            (&BrandMark::Stock, Some("acme"), true),
+            (&acme, Some("acme"), true),
+            (&acme, None, false),
+            (&acme, Some("other"), false),
+            (&BrandMark::Unreadable, None, false),
+            (&BrandMark::Unreadable, Some("acme"), false),
+            (&BrandMark::Stock, Some("other"), true),
+        ];
+        for (installed, this, ok) in table {
+            assert_eq!(
+                may_replace(installed, this),
+                ok,
+                "{installed:?} over {this:?}"
+            );
+        }
     }
 
     #[test]

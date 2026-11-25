@@ -47,6 +47,9 @@ up and prints it: documents **and** label printers (Zebra/ZPL, Bixolon, thermal)
   **monthly job quota** ([docs](docs/api.md#quotas)), a **retention period** for job data
   ([docs](docs/server.md#retention)), and **plans + a signed billing webhook** that
   works with any payment provider ([docs](docs/billing.md))
+- **OpenAPI 3.1 description** at `GET /openapi.json` and a **typed JavaScript client** with no
+  runtime dependency and retries that cannot print twice ([docs](docs/api.md#machine-readable-api),
+  [client](clients/js/README.md); not published to npm yet)
 - Fleet monitoring: `GET /computers` + online/offline webhooks, Prometheus `/metrics`
 - Retry-safe submits (`idempotency_key`) and job deadlines (`expire_after`)
 - **Key rights**: a key can be Everything, Agent only, CloudPRNT only, Print only (sees just its own
@@ -106,7 +109,8 @@ can also install the agent silently on many PCs, one key and one file per PC
 desktop. The setup also installs a tray icon with a settings window
 ([docs](docs/agent.md#tray-icon-and-settings)). The agent and the icon can update themselves from a
 signed file, in one click or at night, and go back to the old version when the new one does not
-connect ([docs](docs/agent.md#updates)). Every setup download is Beta until someone has run
+connect ([docs](docs/agent.md#updates)). An IT provider that runs printpapi for one client can build the
+setup under its own name ([docs](docs/white-label.md)). Every setup download is Beta until someone has run
 it by hand. It is not code-signed yet, so the system warns first, and Smart App Control / WDAC block
 it: use the Python agent there ([docs](docs/agent.md#locked-down-windows)). Or by hand:
 

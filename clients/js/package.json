@@ -1,0 +1,47 @@
+{
+  "name": "@printpapi/client",
+  "version": "3.6.0",
+  "description": "A typed client for the printpapi HTTP API. No runtime dependencies.",
+  "license": "SEE LICENSE IN LICENSE",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/LukiPrince/printpapi.git",
+    "directory": "clients/js"
+  },
+  "type": "module",
+  "main": "./build/src/index.js",
+  "types": "./build/src/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./build/src/index.d.ts",
+      "import": "./build/src/index.js"
+    }
+  },
+  "files": [
+    "build/src",
+    "README.md",
+    "LICENSE"
+  ],
+  "sideEffects": false,
+  "engines": {
+    "node": ">=20"
+  },
+  "keywords": [
+    "printpapi",
+    "print",
+    "printing",
+    "zpl",
+    "receipt",
+    "label"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json && tsc -p tsconfig.test.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.test.json --noEmit",
+    "gen-types": "node scripts/gen-types.mjs",
+    "test": "npm run build && node --test build/test/*.test.js"
+  },
+  "devDependencies": {
+    "@types/node": "^20.19.0",
+    "typescript": "^5.9.3"
+  }
+}

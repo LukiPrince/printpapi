@@ -63,6 +63,28 @@ jobs:
           python-version: "3.12"
       - run: cargo build --release --locked -p printpapi-server
       - run: python tools/parity/parity.py --rust target/release/printpapi
+      # The JavaScript client (clients/js) against the release binary just built. Node 22 builds and
+      # runs everything; Node 20 (the oldest the package supports) runs the built tests again.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: client tests (Node 22)
+        working-directory: clients/js
+        env:
+          PRINTAPI_BIN: ${{ github.workspace }}/target/release/printpapi
+        run: |
+          npm ci
+          npm run build
+          npm test
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: client tests (Node 20)
+        working-directory: clients/js
+        shell: bash
+        env:
+          PRINTAPI_BIN: ${{ github.workspace }}/target/release/printpapi
+        run: node --test build/test/*.test.js
 
   # Installs the agent for real on a throwaway runner (the runners are fresh VMs with admin rights),
   # through the same subcommands the setup uses, and removes it again. Covers the install plans,
@@ -153,6 +175,51 @@ jobs:
         working-directory: crates/setup
       - run: cargo test --locked
         working-directory: crates/setup
+      # White-label brands (docs/white-label.md), steps in this job so that no new check name appears.
+      # bash on every system: $PWD is an absolute path of the kind the build script wants.
+      # The example brand is built and tested the way a provider does it, and its own test has to
+      # have run (a build that quietly was not branded would pass everything else).
+      - name: example brand, test and clippy
+        shell: bash
+        working-directory: crates/setup
+        run: |
+          set -euo pipefail
+          export PRINTPAPI_BRAND_DIR="$PWD/brands/example"
+          export TAURI_CONFIG="$(cat brands/example/tauri.conf.json)"
+          log="$(mktemp)"
+          cargo test --locked 2>&1 | tee "$log"
+          grep -q 'example_brand_is_compiled_in ... ok' "$log"
+          cargo clippy --locked -- -D warnings
+      # A brand that breaks the rules must stop the build, with every fault named.
+      - name: invalid brand must fail
+        shell: bash
+        working-directory: crates/setup
+        run: |
+          set -u
+          export PRINTPAPI_BRAND_DIR="$PWD/brands/invalid-example"
+          export TAURI_CONFIG="$(cat brands/invalid-example/tauri.conf.json)"
+          log="$(mktemp)"
+          if cargo check --locked > "$log" 2>&1; then
+            echo "the invalid brand was accepted"; exit 1
+          fi
+          cat "$log"
+          grep -q 'unknown key "powered_by"' "$log"
+          grep -q 'tray-offline.png must be 64x64' "$log"
+          grep -q '"identifier" is not allowed' "$log"
+      # A brand's Tauri config without the brand folder would be a stock build under a brand's name.
+      - name: brand config without the brand folder must fail
+        shell: bash
+        working-directory: crates/setup
+        run: |
+          set -u
+          unset PRINTPAPI_BRAND_DIR
+          export TAURI_CONFIG="$(cat brands/example/tauri.conf.json)"
+          log="$(mktemp)"
+          if cargo check --locked > "$log" 2>&1; then
+            echo "a brand config without the brand folder was accepted"; exit 1
+          fi
+          cat "$log"
+          grep -q 'PRINTPAPI_BRAND_DIR is not set' "$log"
       # The .msi (Windows only, steps in this job so that no new check name appears): build it twice
       # (every build gets a new ProductCode, so the second is a real upgrade of the first) and
       # install, repair, upgrade and remove it for real on this throwaway runner

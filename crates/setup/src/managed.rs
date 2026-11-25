@@ -124,6 +124,8 @@ pub trait Host {
     /// Where the failure log goes; `None` when there is no such place.
     fn log_dir(&self) -> Option<PathBuf>;
     fn default_name(&self) -> String;
+    /// The brand id of this program (`None`: the stock build).
+    fn brand_id(&self) -> Option<String>;
     /// The status file of the agent as it is now (`None`: no file, or not a regular file).
     fn status(&self) -> Option<StatusSeen>;
     /// Seconds since 1970.
@@ -485,6 +487,26 @@ fn flag_present(host: &dyn Host) -> bool {
         .is_some_and(|d| std::fs::symlink_metadata(d.join(FLAG)).is_ok_and(|m| m.is_file()))
 }
 
+/// Did another build than this program install the agent here (a white-label build took the
+/// machine over, or the marker cannot be read)? The .msi custom actions run unattended, so they
+/// leave such an agent alone: a refresh would be refused by the install (`other_brand`) and fail
+/// the upgrade with 1603, and a removal would take away an agent the .msi did not make.
+fn belongs_to_another_build(host: &dyn Host, l: &Layout) -> bool {
+    marker::read(&l.marker)
+        .is_some_and(|m| !marker::may_replace(&m.brand, host.brand_id().as_deref()))
+}
+
+/// A removal is the stricter case: it leaves an agent alone only when its marker names another
+/// brand. A marker nobody can read is no proof that the stock .msi did not make the agent, and a
+/// machine must stay cleanable (the window's Remove works the same way for any marker).
+fn taken_over_by_another_brand(host: &dyn Host, l: &Layout) -> bool {
+    marker::read(&l.marker).is_some_and(
+        |m| matches!(&m.brand, marker::BrandMark::Brand(id) if host.brand_id().as_deref() != Some(id)),
+    )
+}
+
+const ANOTHER_BUILD: &str = "The agent here was set up by another build of this program (a white-label setup took the machine over, or its marker cannot be read): left alone.";
+
 fn remove_flag(host: &dyn Host) {
     if let Ok(dir) = host.own_dir() {
         let _ = std::fs::remove_file(dir.join(FLAG));
@@ -499,6 +521,10 @@ fn refresh(host: &dyn Host) -> Result<(), String> {
         return Ok(());
     }
     let l = host.layout();
+    if belongs_to_another_build(host, &l) {
+        note(host, Command::Refresh.word(), ANOTHER_BUILD);
+        return Ok(());
+    }
     let installed = marker::read(&l.marker).and_then(|m| m.version);
     if crate::updates::installed_is_newer(installed.as_deref(), env!("CARGO_PKG_VERSION")) {
         note(
@@ -536,7 +562,8 @@ fn refresh(host: &dyn Host) -> Result<(), String> {
     ran
 }
 
-/// Removing the .msi removes the agent it installed, and only that one.
+/// Removing the .msi removes the agent it installed, and only that one (not one that a brand's
+/// build took over).
 fn uninstall(host: &dyn Host) -> Result<(), String> {
     if !flag_present(host) {
         return Ok(());
@@ -549,6 +576,11 @@ fn uninstall(host: &dyn Host) -> Result<(), String> {
             Command::Uninstall.word(),
             "There is no agent of the setup on this machine: left alone.",
         );
+        return Ok(());
+    }
+    if taken_over_by_another_brand(host, &host.layout()) {
+        remove_flag(host);
+        note(host, Command::Uninstall.word(), ANOTHER_BUILD);
         return Ok(());
     }
     let staging = host
@@ -676,6 +708,10 @@ impl Host for Machine {
         default_device_name()
     }
 
+    fn brand_id(&self) -> Option<String> {
+        crate::brand::current().map(|b| b.id.clone())
+    }
+
     fn status(&self) -> Option<StatusSeen> {
         read_status_file(&self.layout().status_dir.join("status.json"))
     }
@@ -790,6 +826,8 @@ mod tests {
         staging_fails: bool,
         tray_fails: bool,
         log: Option<PathBuf>,
+        /// The brand id of the build that runs (`None`: the stock program).
+        brand: Option<String>,
         runs: RefCell<Vec<Run>>,
         replies: RefCell<VecDeque<Reply>>,
         /// How many looks at the status file find the agent printing (`u32::MAX`: always).
@@ -832,6 +870,7 @@ mod tests {
                 staging_fails: false,
                 tray_fails: false,
                 log: Some(p.join("log")),
+                brand: None,
                 runs: RefCell::new(Vec::new()),
                 replies: RefCell::new(VecDeque::new()),
                 printing_looks: Cell::new(0),
@@ -967,6 +1006,9 @@ mod tests {
         }
         fn default_name(&self) -> String {
             "FAKE-NAME".into()
+        }
+        fn brand_id(&self) -> Option<String> {
+            self.brand.clone()
         }
         fn status(&self) -> Option<StatusSeen> {
             self.looks.set(self.looks.get() + 1);
@@ -1775,6 +1817,42 @@ mod tests {
         }
     }
 
+    /// A machine that the stock .msi was deployed to and that a white-label build then took over:
+    /// the flag file is still there, the marker names the brand.
+    fn taken_over_by(h: &Fake, marker: &[u8]) {
+        std::fs::write(h.flag(), b"").unwrap();
+        std::fs::create_dir_all(&h.layout.dir).unwrap();
+        std::fs::write(&h.layout.marker, marker).unwrap();
+    }
+
+    #[test]
+    fn a_refresh_leaves_an_agent_of_another_build_alone_and_succeeds() {
+        // otherwise the install answers other_brand, the custom action (Return="check") fails
+        // with 1603 and every later .msi upgrade rolls back
+        for marker in [&b"version=3.6.0\nbrand=acme\n"[..], b"\xff\xfe junk"] {
+            let h = Fake::new(Installed::Managed);
+            taken_over_by(&h, marker);
+            execute(&h, &Command::Refresh).unwrap();
+            assert!(h.runs.borrow().is_empty());
+            assert!(h.logged().contains("another build"), "{}", h.logged());
+            assert!(
+                h.flag().is_file(),
+                "the flag stays: the person may take the machine back"
+            );
+        }
+        // the build of that brand itself refreshes
+        let mut h = Fake::new(Installed::Managed);
+        h.brand = Some("acme".into());
+        taken_over_by(&h, b"version=0.0.1\nbrand=acme\n");
+        execute(&h, &Command::Refresh).unwrap();
+        assert_eq!(h.commands(), ["install"]);
+        // a stock marker is the stock build's own
+        let h = Fake::new(Installed::Managed);
+        taken_over_by(&h, b"version=0.0.1\n");
+        execute(&h, &Command::Refresh).unwrap();
+        assert_eq!(h.commands(), ["install"]);
+    }
+
     #[test]
     fn a_refresh_never_downgrades_an_installed_agent_and_says_so() {
         let h = Fake::new(Installed::Managed);
@@ -1822,6 +1900,33 @@ mod tests {
         execute(&h, &Command::Uninstall).unwrap();
         assert_eq!(h.commands(), ["uninstall"]);
         assert!(!h.flag().exists());
+    }
+
+    #[test]
+    fn removing_the_msi_does_not_remove_an_agent_that_another_build_took_over() {
+        let h = Fake::new(Installed::Managed);
+        taken_over_by(&h, b"version=3.6.0\nbrand=acme\n");
+        execute(&h, &Command::Uninstall).unwrap();
+        assert!(h.runs.borrow().is_empty(), "the agent is not removed");
+        assert!(!h.flag().exists(), "the flag has nothing left to say");
+        assert!(h.logged().contains("another build"), "{}", h.logged());
+        // a marker nobody can read is not known to be a brand's: the .msi that wrote the flag
+        // still cleans the machine it installed (a refresh stays refused, see the next test)
+        let h = Fake::new(Installed::Managed);
+        taken_over_by(&h, b"\xff\xfe junk");
+        execute(&h, &Command::Uninstall).unwrap();
+        assert_eq!(h.commands(), ["uninstall"]);
+        assert!(!h.flag().exists());
+        // the build of that brand removes its own, and a stock marker is the stock build's
+        let mut h = Fake::new(Installed::Managed);
+        h.brand = Some("acme".into());
+        taken_over_by(&h, b"brand=acme\n");
+        execute(&h, &Command::Uninstall).unwrap();
+        assert_eq!(h.commands(), ["uninstall"]);
+        let h = Fake::new(Installed::Managed);
+        taken_over_by(&h, b"version=3.6.0\n");
+        execute(&h, &Command::Uninstall).unwrap();
+        assert_eq!(h.commands(), ["uninstall"]);
     }
 
     #[test]

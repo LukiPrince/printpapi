@@ -1,7 +1,7 @@
 // printpapi — self-hosted PrintNode alternative. Elastic License 2.0 (see LICENSE).
 "use client";
 
-import { useState } from "react";
+import { createContext, useContext, useState } from "react";
 import { setup, toSetupError, type ConfigPatch, type Platform } from "./api";
 import { errorText, logLocation } from "./model";
 import { Button } from "@/components/ui/button";
@@ -16,12 +16,22 @@ export type Run =
   | { at: "failed"; message: string };
 
 /**
+ * Called when a change reached the installed agent, whatever happens after it (the wait for the
+ * agent's next contact may run out). Home reads who installed the agent again: every install this
+ * window starts stages its brand, so a take-over may have happened without the button for it.
+ */
+const InstallChanged = createContext<() => void>(() => undefined);
+export const InstallChangedProvider = InstallChanged.Provider;
+export const useInstallChanged = () => useContext(InstallChanged);
+
+/**
  * A change of the installed agent: one administrator prompt, then the wait for the agent's next
  * contact. The settings that change something share it (Advanced, SumatraPDF).
  */
 export function useApplyPatch(onDone: () => void) {
   const [run, setRun] = useState<Run>({ at: "idle" });
   const [baseline, setBaseline] = useState<number | null>(null);
+  const installChanged = useInstallChanged();
 
   /** True when the agent reported in again. */
   async function wait(since: number): Promise<boolean> {
@@ -47,6 +57,7 @@ export function useApplyPatch(onDone: () => void) {
       await before?.();
       const since = await setup.applyPatch(patch);
       setBaseline(since);
+      installChanged();
       return await wait(since);
     } catch (e) {
       setRun({ at: "failed", message: errorText(toSetupError(e)) });

@@ -52,6 +52,22 @@ fn six_keys(app: &App) -> Vec<(&'static str, String)> {
     out
 }
 
+/// `GET /openapi.json` needs no right: every key, an unknown one and no credential get the same file.
+#[test]
+fn the_openapi_document_needs_no_right() {
+    let app = App::new();
+    let want = app.call("GET", "/openapi.json").send();
+    assert_eq!(want.status, 200);
+    for (word, key) in six_keys(&app) {
+        let r = app.call("GET", "/openapi.json").bearer(&key).send();
+        assert_eq!((r.status, &r.body), (200, &want.body), "{word}");
+    }
+    assert_eq!(
+        app.call("GET", "/openapi.json").basic("k-full").send().body,
+        want.body
+    );
+}
+
 fn denied_text(scope: &str) -> String {
     format!("this key's rights ({scope}) do not allow this")
 }

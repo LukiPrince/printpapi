@@ -21,6 +21,7 @@ use printpapi_agent::config::{
 };
 use printpapi_agent::discover::discover;
 use printpapi_agent::install::{self, Installed, Layout, Os};
+use printpapi_agent::marker::{self, BrandMark};
 use printpapi_agent::pair::{self, PairError, Pairing};
 use printpapi_agent::proc::{Cmd, Runner, run_command_with};
 use printpapi_agent::{Platform, setup};
@@ -243,14 +244,31 @@ fn os_name(os: Os) -> &'static str {
 
 /// The word of the contract for what is on this machine. Where the setup cannot install at all
 /// (`supported` is false: Linux without systemd) nothing is looked for.
-fn install_state(supported: bool, detect: impl FnOnce() -> Installed) -> &'static str {
+///
+/// An agent that this setup installed (`managed`) is looked at once more: who made it?
+/// `installed` is the brand its marker names, `this` the brand of this build (`None`: stock).
+/// - `other_brand`: this build may not replace it (a stock window over a brand's install, one
+///   brand over another, a marker nobody can read, which is no proof of who made the agent). A
+///   stock marker is `managed` or `adoptable`. The window offers removal only.
+/// - `adoptable`: a brand's build over a stock install. One button takes it over.
+/// - `managed`: the same maker, or a marker that cannot be looked at.
+fn install_state(
+    supported: bool,
+    detect: impl FnOnce() -> Installed,
+    installed: impl FnOnce() -> Option<BrandMark>,
+    this: Option<&str>,
+) -> &'static str {
     if !supported {
         return "unsupported";
     }
     match detect() {
         Installed::None => "none",
-        Installed::Managed => "managed",
         Installed::Foreign => "foreign",
+        Installed::Managed => match installed() {
+            Some(mark) if !marker::may_replace(&mark, this) => "other_brand",
+            Some(mark) if this.is_some_and(|id| mark != BrandMark::Brand(id.into())) => "adoptable",
+            _ => "managed",
+        },
     }
 }
 
@@ -450,9 +468,13 @@ pub fn get_platform() -> &'static str {
 #[tauri::command(async)]
 pub fn detect_install() -> &'static str {
     let os = Os::host();
-    install_state(install::supported(os), || {
-        install::detect(os, &layout(), &install::system_dir(), &runner())
-    })
+    let this = crate::brand::current().map(|b| b.id.as_str());
+    install_state(
+        install::supported(os),
+        || install::detect(os, &layout(), &install::system_dir(), &runner()),
+        || marker::read(&layout().marker).map(|m| m.brand),
+        this,
+    )
 }
 
 #[tauri::command(async)]
@@ -460,9 +482,35 @@ pub fn default_name() -> String {
     setup::default_device_name()
 }
 
+/// Does this address need the person's confirmation (plain http outside the private network)? A
+/// brand's fixed server comes first: a link to another server is refused here, not asked about, so
+/// nobody is offered "Use it anyway" for an address the setup would refuse afterwards.
+fn needs_insecure_confirm_in(
+    brand: Option<&crate::brand::Brand>,
+    url: &str,
+) -> Result<bool, SetupError> {
+    crate::brand::enforce_server(brand, url)?;
+    Ok(setup::needs_insecure_confirm(url))
+}
+
 #[tauri::command(async)]
-pub fn needs_insecure_confirm(url: String) -> bool {
-    setup::needs_insecure_confirm(&url)
+pub fn needs_insecure_confirm(url: String) -> Result<bool, SetupError> {
+    needs_insecure_confirm_in(crate::brand::current(), &url)
+}
+
+/// `check_connection` without the state. A brand's fixed server is checked before the first
+/// call. Returns the address as it was normalised, and whether the device name exists.
+fn check_connection_in(
+    brand: Option<&crate::brand::Brand>,
+    http: &dyn printpapi_agent::client::Http,
+    server_url: &str,
+    api_key: &str,
+    name: &str,
+) -> Result<(String, bool), SetupError> {
+    let server_url = setup::normalize_server_url(server_url)?;
+    crate::brand::enforce_server(brand, &server_url)?;
+    let exists = setup::check_connection(http, &server_url, api_key, name)?;
+    Ok((server_url, exists))
 }
 
 #[tauri::command(async)]
@@ -472,10 +520,15 @@ pub fn check_connection(
     api_key: String,
     name: String,
 ) -> Result<bool, SetupError> {
-    let server_url = setup::normalize_server_url(&server_url)?;
     let settings = HttpSettings::default();
     let client = Client::new(&settings);
-    let exists = setup::check_connection(&client, &server_url, &api_key, &name)?;
+    let (server_url, exists) = check_connection_in(
+        crate::brand::current(),
+        &client,
+        &server_url,
+        &api_key,
+        &name,
+    )?;
     lock(&state).conn = Some(Conn {
         server_url,
         api_key,
@@ -510,7 +563,15 @@ pub fn pair(
 ) -> Result<PairedView, SetupError> {
     let settings = HttpSettings::default();
     let client = Client::new(&settings);
-    let (mut view, conn) = pair_with(&client, settings, &server_url, &code, &name, insecure_ok)?;
+    let (mut view, conn) = pair_in(
+        crate::brand::current(),
+        &client,
+        settings,
+        &server_url,
+        &code,
+        &name,
+        insecure_ok,
+    )?;
     let mut guard = lock(&state);
     guard.conn = None;
     guard.paired = Some(conn);
@@ -518,6 +579,21 @@ pub fn pair(
     guard.paired_id = guard.pair_seq;
     view.pair_id = guard.paired_id;
     Ok(view)
+}
+
+/// `pair_with` behind the fixed-server check of a brand: before the address is reached, before
+/// the person is asked about plain http and before the code is spent.
+fn pair_in(
+    brand: Option<&crate::brand::Brand>,
+    http: &dyn printpapi_agent::client::Http,
+    settings: HttpSettings,
+    server_url: &str,
+    code: &str,
+    name: &str,
+    insecure_ok: bool,
+) -> Result<(PairedView, Conn), SetupError> {
+    crate::brand::enforce_server(brand, server_url)?;
+    pair_with(http, settings, server_url, code, name, insecure_ok)
 }
 
 /// The creator's address as the window shows it, and whether anything in it was spelled out.
@@ -853,7 +929,9 @@ fn apply_in(
 // ponytail: on Windows the running exe is compared as the system reports it, which is the long
 // path the installer wrote; a window started through an 8.3 short path of the install folder
 // would be taken for a copy. Ceiling: the window ends with the install then (taskkill by image).
+#[allow(clippy::too_many_arguments)] // the machine's facts, injected one by one for the tests
 fn stage_own_tray_with(
+    brand: Option<&crate::brand::Brand>,
     os: Os,
     exe: &Path,
     appimage: Option<&OsStr>,
@@ -862,6 +940,7 @@ fn stage_own_tray_with(
     dir: &Path,
     run: &Runner,
 ) -> Result<bool, SetupError> {
+    crate::brand::stage_brand(brand, dir)?;
     let resolve = |p: &Path| {
         if cfg!(windows) {
             p.to_path_buf()
@@ -882,9 +961,13 @@ fn stage_own_tray_with(
         .map_err(|e| SetupError::io("cannot prepare the tray icon", e))
 }
 
+/// Stage what the install needs from this program: the tray (whether one was staged is the
+/// answer) and, for a branded build, `brand.json`, which names the brand in the marker. The apply
+/// commands and the .msi refresh all come through here.
 pub(crate) fn stage_own_tray(dir: &Path) -> Result<bool, SetupError> {
     let exe = std::env::current_exe().map_err(|e| SetupError::io("cannot find this program", e))?;
     stage_own_tray_with(
+        crate::brand::current(),
         Os::host(),
         &exe,
         std::env::var_os("APPIMAGE").as_deref(),
@@ -928,6 +1011,17 @@ fn window_elevator() -> impl Fn(&Path, &[&OsStr]) -> Result<(), Elevate> {
     |agent, args| elevate_keeping_window(&elevate::run, std::process::id(), agent, args)
 }
 
+/// Whatever came into the request, a brand with a fixed server installs for that server only.
+fn enforce_fixed_server(
+    brand: Option<&crate::brand::Brand>,
+    request: &ApplyRequest,
+) -> Result<(), SetupError> {
+    match &request.server_url {
+        Some(url) => crate::brand::enforce_server(brand, url),
+        None => Ok(()),
+    }
+}
+
 #[tauri::command(async)]
 pub fn apply(state: Shared, mut request: ApplyRequest) -> Result<f64, SetupError> {
     // an installed agent that is newer than this program is not put back by accident
@@ -937,6 +1031,7 @@ pub fn apply(state: Shared, mut request: ApplyRequest) -> Result<f64, SetupError
         check_confirmed(&request, guard.paired_id)?;
         fill_paired(&mut request, guard.paired.as_ref())?;
     }
+    enforce_fixed_server(crate::brand::current(), &request)?;
     let (agent, dir) = staged(&state)?;
     let tray_staged = stage_own_tray(&dir)?;
     let elevate = window_elevator();
@@ -1321,19 +1416,58 @@ mod tests {
 
     #[test]
     fn detection_maps_to_the_words_of_the_contract() {
-        assert_eq!(install_state(true, || Installed::None), "none");
-        assert_eq!(install_state(true, || Installed::Managed), "managed");
-        assert_eq!(install_state(true, || Installed::Foreign), "foreign");
+        let state = |detect: Installed, mark: Option<BrandMark>, this: Option<&str>| {
+            install_state(true, || detect, || mark, this)
+        };
+        assert_eq!(state(Installed::None, None, None), "none");
+        assert_eq!(
+            state(Installed::Managed, Some(BrandMark::Stock), None),
+            "managed"
+        );
+        assert_eq!(state(Installed::Foreign, None, None), "foreign");
         assert_eq!(os_name(Os::Linux), "linux");
+    }
+
+    #[test]
+    fn who_made_the_installed_agent_decides_between_managed_adoptable_and_other_brand() {
+        let acme = || Some(BrandMark::Brand("acme".into()));
+        let stock = || Some(BrandMark::Stock);
+        let bad = || Some(BrandMark::Unreadable);
+        let state = |mark: Option<BrandMark>, this: Option<&str>| {
+            install_state(true, || Installed::Managed, || mark, this)
+        };
+        // stock over stock (and an install that has no marker to look at): as before
+        assert_eq!(state(stock(), None), "managed");
+        assert_eq!(state(None, None), "managed");
+        assert_eq!(state(None, Some("acme")), "managed");
+        // the same brand
+        assert_eq!(state(acme(), Some("acme")), "managed");
+        // a brand over a stock install: one button takes it over
+        assert_eq!(state(stock(), Some("acme")), "adoptable");
+        // a stock window over a brand's install, one brand over another, a marker nobody can read
+        assert_eq!(state(acme(), None), "other_brand");
+        assert_eq!(state(acme(), Some("other")), "other_brand");
+        assert_eq!(state(bad(), None), "other_brand");
+        assert_eq!(state(bad(), Some("acme")), "other_brand");
+        // only an install that the setup made is looked at
+        let none = install_state(true, || Installed::None, acme, None);
+        assert_eq!(none, "none");
+        let foreign = install_state(true, || Installed::Foreign, acme, Some("other"));
+        assert_eq!(foreign, "foreign");
     }
 
     #[test]
     fn where_the_setup_cannot_install_nothing_is_looked_for() {
         let asked = Cell::new(false);
-        let word = install_state(false, || {
-            asked.set(true);
-            Installed::Managed
-        });
+        let word = install_state(
+            false,
+            || {
+                asked.set(true);
+                Installed::Managed
+            },
+            || None,
+            None,
+        );
         assert_eq!(word, "unsupported");
         assert!(!asked.get(), "the machine must not be probed");
     }
@@ -2090,18 +2224,171 @@ mod tests {
         let run: Runner = Rc::new(|_| panic!("nothing is run"));
         let l = install::layout(Os::Windows, Path::new("C:\\Program Files"));
         let installed_exe = Path::new("C:\\Program Files\\printpapi-agent\\printpapi-tray.exe");
-        let staged =
-            stage_own_tray_with(Os::Windows, installed_exe, None, None, &l, tmp.path(), &run)
-                .unwrap();
+        let staged = stage_own_tray_with(
+            None,
+            Os::Windows,
+            installed_exe,
+            None,
+            None,
+            &l,
+            tmp.path(),
+            &run,
+        )
+        .unwrap();
         assert!(!staged);
         assert!(names_in(tmp.path()).is_empty());
         // a copy somewhere else is offered, and the install replaces the installed one with it
         let elsewhere = tmp.path().join("printpapi-setup.exe");
         std::fs::write(&elsewhere, b"exe").unwrap();
         assert!(
-            stage_own_tray_with(Os::Windows, &elsewhere, None, None, &l, tmp.path(), &run).unwrap()
+            stage_own_tray_with(
+                None,
+                Os::Windows,
+                &elsewhere,
+                None,
+                None,
+                &l,
+                tmp.path(),
+                &run
+            )
+            .unwrap()
         );
         assert_eq!(std::fs::read(tmp.path().join("tray")).unwrap(), b"exe");
+    }
+
+    // ---- a brand with a fixed server: the wiring of the commands
+
+    const FIXED: &str = "https://print.acme.example";
+
+    #[test]
+    fn a_fixed_server_is_checked_before_any_call_of_the_connection_check() {
+        let brand = crate::brand::acme();
+        let http = Recorder {
+            urls: Default::default(),
+            paired_key: None,
+        };
+        let e = check_connection_in(
+            Some(&brand),
+            &http,
+            "https://print.other.example",
+            KEY,
+            "pc",
+        )
+        .unwrap_err();
+        assert_eq!(e.code, "server_fixed");
+        assert!(http.urls.borrow().is_empty(), "{:?}", http.urls);
+        // the fixed server itself (any case, trailing slash) is reached (the recorder answers 401
+        // for the key), and a stock build is free to ask any server
+        let e = check_connection_in(
+            Some(&brand),
+            &http,
+            "HTTPS://Print.Acme.example/",
+            KEY,
+            "pc",
+        )
+        .unwrap_err();
+        assert_eq!(e.code, "bad_key");
+        let reached = http.urls.borrow().len();
+        assert!(reached > 0);
+        let e =
+            check_connection_in(None, &http, "https://print.other.example", KEY, "pc").unwrap_err();
+        assert_eq!(e.code, "bad_key");
+        assert!(http.urls.borrow().len() > reached);
+    }
+
+    #[test]
+    fn a_fixed_server_comes_before_the_question_about_plain_http() {
+        let brand = crate::brand::acme();
+        // another server, plain http: refused as server_fixed, no "use it anyway"
+        let e = needs_insecure_confirm_in(Some(&brand), "http://evil.example").unwrap_err();
+        assert_eq!(e.code, "server_fixed");
+        let e = needs_insecure_confirm_in(Some(&brand), "https://print.other.example").unwrap_err();
+        assert_eq!(e.code, "server_fixed");
+        // the fixed server is asked about as before (it is https here), and stock is unchanged
+        assert!(!needs_insecure_confirm_in(Some(&brand), FIXED).unwrap());
+        assert!(needs_insecure_confirm_in(None, "http://evil.example").unwrap());
+        let mut plain = crate::brand::acme();
+        plain.server = Some("http://print.acme.example".into());
+        assert!(needs_insecure_confirm_in(Some(&plain), "http://print.acme.example").unwrap());
+    }
+
+    #[test]
+    fn a_fixed_server_is_checked_before_the_address_is_reached_and_the_code_spent() {
+        let brand = crate::brand::acme();
+        let http = Recorder {
+            urls: Default::default(),
+            paired_key: Some("k".repeat(30).leak()),
+        };
+        // plain http to another server: refused as server_fixed, not asked about as insecure
+        for other in ["https://print.other.example", "http://print.other.example"] {
+            let e = pair_in(
+                Some(&brand),
+                &http,
+                HttpSettings::default(),
+                other,
+                "7K3M-Q2ZD-9XHT",
+                "pc",
+                false,
+            )
+            .err()
+            .expect("refused");
+            assert_eq!(e.code, "server_fixed", "{other}");
+        }
+        assert!(http.urls.borrow().is_empty(), "{:?}", http.urls);
+        let (view, _) = pair_in(
+            Some(&brand),
+            &http,
+            HttpSettings::default(),
+            FIXED,
+            "7K3M-Q2ZD-9XHT",
+            "pc",
+            false,
+        )
+        .ok()
+        .expect("paired");
+        assert_eq!(view.server_url, FIXED);
+        assert_eq!(http.urls.borrow().len(), 3);
+    }
+
+    #[test]
+    fn an_apply_request_for_another_server_is_refused_under_a_fixed_server() {
+        let brand = crate::brand::acme();
+        let e = enforce_fixed_server(Some(&brand), &by_address("https://print.other.example"))
+            .unwrap_err();
+        assert_eq!(e.code, "server_fixed");
+        enforce_fixed_server(Some(&brand), &by_address(FIXED)).unwrap();
+        enforce_fixed_server(None, &by_address("https://print.other.example")).unwrap();
+        // a request without an address (printers only) has nothing to enforce
+        let mut no_server = by_address(FIXED);
+        no_server.server_url = None;
+        enforce_fixed_server(Some(&brand), &no_server).unwrap();
+    }
+
+    #[test]
+    fn a_brand_is_staged_with_the_tray_and_a_stock_build_stages_no_brand_file() {
+        let brand = crate::brand::acme();
+        let tmp = tempfile::tempdir().unwrap();
+        let run: Runner = Rc::new(|_| panic!("nothing is run"));
+        let l = install::layout(Os::Windows, Path::new("C:\\Program Files"));
+        let exe = tmp.path().join("printpapi-setup.exe");
+        std::fs::write(&exe, b"exe").unwrap();
+        stage_own_tray_with(
+            Some(&brand),
+            Os::Windows,
+            &exe,
+            None,
+            None,
+            &l,
+            tmp.path(),
+            &run,
+        )
+        .unwrap();
+        let staged: Value =
+            serde_json::from_slice(&std::fs::read(tmp.path().join("brand.json")).unwrap()).unwrap();
+        assert_eq!(staged, json!({"id": "acme", "name": "Acme Print"}));
+        let stock = tempfile::tempdir().unwrap();
+        stage_own_tray_with(None, Os::Windows, &exe, None, None, &l, stock.path(), &run).unwrap();
+        assert!(!stock.path().join("brand.json").exists());
     }
 
     // ---- the SumatraPDF download

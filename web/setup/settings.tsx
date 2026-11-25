@@ -14,8 +14,8 @@ import {
   Trash2,
 } from "lucide-react";
 import { setup, toSetupError, type AgentStatus, type Existing, type PairingView, type Platform, type UpdateInfo } from "./api";
-import { errorText, olderCardShown, updateAvailable, type Hold } from "./model";
-import { Shell, type NavItem } from "./bits";
+import { errorText, installHereInfo, olderCardShown, updateAvailable, type Hold } from "./model";
+import { Notice, Shell, type NavItem } from "./bits";
 import { Wizard } from "./wizard";
 import { Overview } from "./settings-overview";
 import { PrintersSection } from "./settings-printers";
@@ -24,7 +24,10 @@ import { AdvancedSection } from "./settings-advanced";
 import { LogSection } from "./settings-log";
 import { RemoveSection, RestartSection, SumatraSection } from "./settings-actions";
 import { UpdatesSection } from "./settings-updates";
+import { RunNotice, useApplyPatch } from "./settings-apply";
+import { Button } from "@/components/ui/button";
 import { OlderCard } from "./older-card";
+import { useBrand } from "./brand";
 import { usePairingLink } from "./use-pairing-link";
 
 const SECTIONS: (NavItem & { windowsOnly?: boolean })[] = [
@@ -107,10 +110,70 @@ function known(status: AgentStatus | null): Existing {
 type Flow = { kind: "printers" | "connection"; existing: Existing; link?: PairingView };
 
 /**
+ * This program is newer than the installed agent: one click installs this program's version over
+ * it (the same change as "Install from this setup" in Updates, which a brand does not have).
+ */
+function InstallHere({
+  info,
+  platform,
+  onStart,
+  onChanged,
+}: {
+  info: UpdateInfo;
+  platform: Platform;
+  /** The button was clicked: the owner keeps this notice on screen from now on. */
+  onStart: () => void;
+  onChanged: () => void;
+}) {
+  const { run, busy, apply, keepWaiting } = useApplyPatch(onChanged);
+  return (
+    <Notice tone="info">
+      <p>
+        This program ({info.own}) is newer than the installed agent ({info.installed}).
+      </p>
+      <RunNotice
+        run={run}
+        platform={platform}
+        onKeepWaiting={() => keepWaiting()}
+        doneText={`Version ${info.own} is installed from this setup. The agent is running.`}
+      />
+      {/* a retry after a failure; not while it runs and not once it is over */}
+      {(run.at === "idle" || run.at === "failed") && (
+        <Button
+          type="button"
+          variant="outline"
+          size="sm"
+          className="mt-2"
+          disabled={busy}
+          onClick={() => {
+            onStart();
+            void apply({});
+          }}
+        >
+          Install {info.own} from this setup
+        </Button>
+      )}
+    </Notice>
+  );
+}
+
+/**
  * The window of an agent that is installed: its state and the settings that matter, in sections.
  * Looking needs no administrator rights; each change asks for them once.
  */
-export function Settings({ platform, onRemoved }: { platform: Platform; onRemoved: () => void }) {
+export function Settings({
+  platform,
+  onRemoved,
+  top,
+}: {
+  platform: Platform;
+  onRemoved: () => void;
+  /** Shown above the section, whichever it is (the offer to take over a stock install). */
+  top?: React.ReactNode;
+}) {
+  const { brand } = useBrand();
+  // a white-label build has no updates: no section, no line in the overview
+  const sections = SECTIONS.filter((s) => (!s.windowsOnly || platform === "windows") && !(brand && s.id === "updates"));
   const { status, error, refresh } = useStatus();
   const { info, setInfo, refresh: refreshInfo } = useUpdateInfo();
   const [section, setSection] = useState("overview");
@@ -120,14 +183,19 @@ export function Settings({ platform, onRemoved }: { platform: Platform; onRemove
   // What the window keeps on screen while an install it started runs: the poll reads the new
   // marker half way through, and swapping the screen would drop the notice of how it ended.
   const [hold, setHold] = useState<Hold>(null);
+  // What the notice of "Install X from this setup" showed when its button was clicked: the install
+  // writes its marker half way through, and the notice must outlive the poll that reads it.
+  const [hereInfo, setHereInfo] = useState<UpdateInfo | null>(null);
   // the section the command line asked for (the tray's "Updates…"), taken once
   useEffect(() => {
     void setup.startSection().then(
       (s) => {
-        if (s && SECTIONS.some((x) => x.id === s)) setSection(s);
+        if (s && sections.some((x) => x.id === s)) setSection(s);
       },
       () => undefined,
     );
+    // read once at the start, with the sections of that moment
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
   // the printer steps and the connection step of the setup, started from what is known now
   const [flow, setFlow] = useState<Flow | null>(null);
@@ -139,6 +207,8 @@ export function Settings({ platform, onRemoved }: { platform: Platform; onRemove
       setFlow({ kind: "connection", existing: known(status), link });
     }
   }, flow === null && status !== null);
+
+  const shown = installHereInfo(brand !== null, top !== undefined, info, hereInfo);
 
   // An installed agent that is newer than this program: nothing here may change it by accident.
   if (info && olderCardShown(info, installedHere, hold)) {
@@ -171,13 +241,32 @@ export function Settings({ platform, onRemoved }: { platform: Platform; onRemove
     );
   }
 
-  const items = SECTIONS.filter((s) => !s.windowsOnly || platform === "windows");
   return (
-    <Shell nav={{ label: "Settings sections", items, current: section, onSelect: setSection }}>
-      {section === "overview" && (
-        <Overview status={status} error={error} update={info && updateAvailable(info) ? info : null} onUpdates={() => setSection("updates")} />
+    <Shell nav={{ label: "Settings sections", items: sections, current: section, onSelect: setSection }}>
+      {top}
+      {/* A brand has no Updates section, and running a newer build of it is how it is rolled out:
+          the one button of that section that is no update check stays. Not next to the take-over
+          offer, whose button does the same. */}
+      {shown && (
+        <InstallHere
+          info={shown}
+          platform={platform}
+          onStart={() => setHereInfo(shown)}
+          onChanged={() => {
+            void refresh();
+            void refreshInfo();
+          }}
+        />
       )}
-      {section === "updates" && (
+      {section === "overview" && (
+        <Overview
+          status={status}
+          error={error}
+          update={!brand && info && updateAvailable(info) ? info : null}
+          onUpdates={() => setSection("updates")}
+        />
+      )}
+      {section === "updates" && !brand && (
         <UpdatesSection
           info={info}
           status={status}

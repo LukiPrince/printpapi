@@ -67,6 +67,15 @@ v1 is deliberately small (see [CONTRIBUTING.md](../CONTRIBUTING.md) for the YAGN
   key: the setup window, `printpapi-agent pair` and plain `curl` fetch an agent-only key; Reconnect gives a
   device a new key and keeps its name and printer ids, and the old machine's last result is still
   recorded. See [agent.md](agent.md#connect-with-a-link-or-a-code) and [api.md](api.md#pairing-a-device).
+- ~~**White-label builds**~~ ✅ (not checked on real machines) an IT provider who runs printpapi for one
+  identified client builds the setup and tray program under their own name, icon and tray images, with an
+  optional default or fixed server; the licence notices stay. See [white-label.md](white-label.md).
+
+- ~~**OpenAPI description and a JavaScript client**~~ ✅ `GET /openapi.json` describes every public route
+  (ten job types, the rights each route needs, closed response objects); `clients/js` is a typed
+  client with no runtime dependency, whose types are generated from that file, with retries that cannot print twice.
+  The npm package name and its first publication are the maintainer's to decide. See
+  [api.md](api.md#machine-readable-api) and [clients/js](../clients/js/README.md).
 
 ## v2 candidates
 

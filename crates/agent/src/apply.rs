@@ -10,6 +10,11 @@
 //! nightly task, timer or job. Both have three words so that every older agent answers them with
 //! usage and exit 2 (its parser takes two or four).
 //!
+//! `install` refuses (code `other_brand`, nothing changed) to replace an installation that a
+//! white-label setup made, unless it is that brand's setup (see [`marker::may_replace`]); a
+//! branded window stages `brand.json` (`{"id", "name"}`), which names the brand in the marker and
+//! the Linux menu entries.
+//!
 //! `install` also takes an optional `tray` (the tray icon program, on macOS an `.app` folder) and,
 //! instead of a whole `agent.ini`, an optional `patch.json` that it merges into the installed
 //! `agent.ini` itself, so a change needs the key neither in the window nor in a second prompt.
@@ -32,6 +37,7 @@ use std::process::ExitCode;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
+use crate::brand::{self, StagedBrand};
 use crate::client::{Client, DownloadFn, Http, HttpError, http_status};
 use crate::config::{
     Config, HttpSettings, Printer, apply_patch, decode_ini, parse_patch, parse_printers,
@@ -72,6 +78,10 @@ pub enum ApplyError {
     System(String),
     /// A refusal or failure of an update, with the code the window reads (see `update`).
     Coded(&'static str, String),
+    /// The installation was made by another build of this program (another white-label brand, which
+    /// a stock setup or a different brand may not replace): the id of its brand, `None` when the
+    /// marker cannot be read. Nothing was changed.
+    OtherBrand(Option<String>),
 }
 
 impl ApplyError {
@@ -84,6 +94,7 @@ impl ApplyError {
             ApplyError::Unreachable(_) => "unreachable",
             ApplyError::System(_) => "system",
             ApplyError::Coded(code, _) => code,
+            ApplyError::OtherBrand(_) => "other_brand",
         }
     }
 }
@@ -106,6 +117,13 @@ impl fmt::Display for ApplyError {
             ),
             ApplyError::Unreachable(m) => write!(f, "The server could not be reached: {m}"),
             ApplyError::System(m) | ApplyError::Coded(_, m) => f.write_str(m),
+            ApplyError::OtherBrand(Some(id)) => write!(
+                f,
+                "The agent on this computer was set up by another build of this program ({id}), so this setup does not replace it. Run the setup it came from, or remove the installed agent first."
+            ),
+            ApplyError::OtherBrand(None) => f.write_str(
+                "The agent on this computer has a marker that this setup cannot read, so it does not replace it. Remove the installed agent first.",
+            ),
         }
     }
 }
@@ -222,6 +240,8 @@ struct Staged {
     printers: Vec<Printer>,
     sumatra: Option<Vec<u8>>,
     tray: Option<TrayStaged>,
+    /// The brand of the window that staged this install (`brand.json`), `None` for the stock build.
+    brand: Option<StagedBrand>,
     /// The key came out of the installed `api_key_dpapi` (a patch that does not name a new one),
     /// so the file must stay sealed or the change must not happen.
     was_sealed: bool,
@@ -415,6 +435,7 @@ fn read_staged(staging: &Path, env: &Env, sumatra_sha: &str) -> Result<Staged, A
         Err(_) => None,
     };
     let tray = staged_tray(staging, env.os)?;
+    let brand = staged_brand(staging)?;
     Ok(Staged {
         text,
         base,
@@ -424,8 +445,43 @@ fn read_staged(staging: &Path, env: &Env, sumatra_sha: &str) -> Result<Staged, A
         printers,
         sumatra,
         tray,
+        brand,
         was_sealed,
     })
+}
+
+/// `brand.json` of the staging folder: only a branded window writes one. Absent means the stock
+/// build. The file is untrusted like everything in the folder, so it is read by the rules of
+/// [`brand::parse_staged`]: a name with a newline in it never reaches a `.desktop` file.
+fn staged_brand(staging: &Path) -> Result<Option<StagedBrand>, ApplyError> {
+    let path = staging.join("brand.json");
+    if std::fs::symlink_metadata(&path).is_err() {
+        return Ok(None);
+    }
+    let bytes = std::fs::read(&path).map_err(|e| bad(format!("brand.json cannot be read: {e}")))?;
+    brand::parse_staged(&bytes).map(Some).map_err(bad)
+}
+
+/// The guard of an install: an installation that a brand made is replaced only by a setup of that
+/// brand, an unreadable marker by nobody (`marker::may_replace`). No marker, no guard. This is
+/// accident prevention, not a border: the staging folder is writable by the user who started the
+/// setup (an unsigned setup is an admin-run exe anyway), and a released stock setup of 3.3 to 3.6
+/// does not ask. Remove and restart do not ask either, so a machine can always be cleaned.
+// ponytail: accident prevention, not a boundary. Ceiling: released setups 3.3 to 3.6 do not ask and
+// replace a branded install (the window then offers "Take over"); a brand-specific marker file
+// name would stop them and is documented in docs/white-label.md, not built.
+fn check_brand(l: &Layout, staged: &Staged) -> Result<(), ApplyError> {
+    let Some(installed) = marker::read(&l.marker) else {
+        return Ok(());
+    };
+    let this = staged.brand.as_ref().map(|b| b.id.as_str());
+    if marker::may_replace(&installed.brand, this) {
+        return Ok(());
+    }
+    Err(ApplyError::OtherBrand(match installed.brand {
+        marker::BrandMark::Brand(id) => Some(id),
+        _ => None,
+    }))
 }
 
 /// `create_dir_all` for a folder the whole system walks through (the install folder, the autostart
@@ -664,6 +720,8 @@ fn apply_with(staging: &Path, env: &Env, sumatra_sha: &str) -> Result<Baselines,
     // held until this function returns: no update, uninstall or second install runs meanwhile.
     // Only when the lock file exists (an installation made before the updater has none).
     let _lock = update::lock_if_exists(env)?;
+    // before the key is sealed, the server is asked or anything is stopped
+    check_brand(l, &staged)?;
     // Before the server and every stop command, so a refusal changes nothing. An install is the
     // only place that seals: every first install, reinstall and change of the settings ends here.
     let key_sealed = match keystore::seal(&staged.text, env.keystore.as_ref()) {
@@ -787,17 +845,17 @@ fn replace_install(
     }
     write_ini(env, &staged.text)?;
     // The marker before the autostart file: a run that dies in between is found as ours next time.
-    // It says which version this is. Lines it already has (a brand) stay, unless it is unreadable.
+    // It says which version this is and, for a branded setup, which brand. Other lines it already
+    // has stay (the guard has refused an unreadable one and a marker of another brand).
     let old_marker = marker::read_text(&l.marker)
         .and_then(|b| String::from_utf8(b).ok())
-        .filter(|t| marker::parse(t.as_bytes()).brand != marker::BrandMark::Unreadable)
         .unwrap_or_default();
-    place_file(
-        &l.marker,
-        marker::with_version(&old_marker, env.version).as_bytes(),
-        0o644,
-    )
-    .map_err(|e| system("cannot write the marker", e))?;
+    let mut text = marker::with_version(&old_marker, env.version);
+    if let Some(brand) = &staged.brand {
+        text = marker::with_brand(&text, &brand.id);
+    }
+    place_file(&l.marker, text.as_bytes(), 0o644)
+        .map_err(|e| system("cannot write the marker", e))?;
     if let Some(parent) = l.autostart.parent() {
         create_dirs(parent).map_err(|e| system("cannot create the autostart folder", e))?;
     }
@@ -806,7 +864,7 @@ fn replace_install(
     // the agent writes its status and log there from its first second
     prepare_status_dir(env)?;
     if let Some(tray) = &staged.tray {
-        install_tray(env, tray)?;
+        install_tray(env, tray, staged.brand.as_ref())?;
     }
     // The old agent is stopped by now. Its long-poll bumped last_seen_at until then, so the value
     // the window compares against is read here, not before. A failing read keeps the first one.
@@ -1260,7 +1318,12 @@ fn remove_status_dir(dir: &Path) -> std::io::Result<()> {
 }
 
 /// The tray icon: the program, its autostart for all users and, on Linux, the menu entry.
-fn install_tray(env: &Env, tray: &TrayStaged) -> Result<(), ApplyError> {
+fn install_tray(
+    env: &Env,
+    tray: &TrayStaged,
+    brand: Option<&StagedBrand>,
+) -> Result<(), ApplyError> {
+    let entry_name = brand.map_or(install::STOCK_ENTRY_NAME, |b| b.name.as_str());
     let l = &env.layout;
     match tray {
         TrayStaged::File(bytes) => {
@@ -1295,9 +1358,12 @@ fn install_tray(env: &Env, tray: &TrayStaged) -> Result<(), ApplyError> {
     let files = [
         (
             l.tray_autostart.as_ref(),
-            install::tray_autostart_file(env.os, l),
+            install::tray_autostart_file_named(env.os, l, entry_name),
         ),
-        (l.app_entry.as_ref(), Some(install::app_entry_file(l))),
+        (
+            l.app_entry.as_ref(),
+            Some(install::app_entry_file_named(l, entry_name)),
+        ),
     ];
     for (path, bytes) in files {
         let (Some(path), Some(bytes)) = (path, bytes) else {
@@ -5472,23 +5538,197 @@ X-Via = proxy
     }
 
     #[test]
-    fn a_reinstall_keeps_the_other_lines_of_the_marker_and_replaces_an_unreadable_one() {
+    fn a_reinstall_keeps_the_other_lines_of_the_marker() {
         let fx = Fixture::new(Os::Linux);
         std::fs::create_dir_all(&fx.layout.dir).unwrap();
         std::fs::write(&fx.layout.marker, "version=3.3.0\nbrand=acme\nfuture=1\n").unwrap();
+        fx.stage_brand("acme", "Acme Print");
         apply(&fx.staging, &fx.env()).unwrap();
         assert_eq!(
             std::fs::read_to_string(&fx.layout.marker).unwrap(),
             "version=3.6.0\nbrand=acme\nfuture=1\n"
         );
-        // a marker that cannot be read is not copied
-        fx.after_an_elevated_install();
-        std::fs::write(&fx.layout.marker, b"\xff\xfe junk").unwrap();
+        // a stock marker with a line of a later release
+        let fx = Fixture::new(Os::Linux);
+        std::fs::create_dir_all(&fx.layout.dir).unwrap();
+        std::fs::write(&fx.layout.marker, "future=1\n").unwrap();
         apply(&fx.staging, &fx.env()).unwrap();
         assert_eq!(
             std::fs::read_to_string(&fx.layout.marker).unwrap(),
-            "version=3.6.0\n"
+            "version=3.6.0\nfuture=1\n"
         );
+    }
+
+    // ---- brand: the marker names the brand, and one brand does not replace another ----
+
+    impl Fixture {
+        /// What a branded window stages next to the settings.
+        fn stage_brand(&self, id: &str, name: &str) {
+            let json = json!({"id": id, "name": name}).to_string();
+            std::fs::write(self.staging.join("brand.json"), json).unwrap();
+        }
+
+        fn unstage_brand(&self) {
+            let _ = std::fs::remove_file(self.staging.join("brand.json"));
+        }
+
+        fn marker_text(&self) -> String {
+            std::fs::read_to_string(&self.layout.marker).unwrap()
+        }
+    }
+
+    #[test]
+    fn the_stock_marker_has_no_brand_line_and_a_brand_marker_has_its_id() {
+        let fx = Fixture::new(Os::Linux);
+        apply(&fx.staging, &fx.env()).unwrap();
+        assert_eq!(fx.marker_text(), "version=3.6.0\n");
+        assert!(!fx.marker_text().contains("brand"));
+        let fx = Fixture::new(Os::Linux);
+        fx.stage_brand("acme", "Acme Print");
+        apply(&fx.staging, &fx.env()).unwrap();
+        assert_eq!(fx.marker_text(), "version=3.6.0\nbrand=acme\n");
+        let m = marker::read(&fx.layout.marker).unwrap();
+        assert_eq!(m.brand, marker::BrandMark::Brand("acme".into()));
+    }
+
+    #[test]
+    fn a_stock_setup_over_a_brand_install_is_refused_before_anything_happens() {
+        let fx = Fixture::new(Os::Linux);
+        fx.stage_brand("acme", "Acme Print");
+        apply(&fx.staging, &fx.env()).unwrap();
+        fx.after_an_elevated_install();
+        fx.unstage_brand();
+        fx.events.borrow_mut().clear();
+        let before_ini = std::fs::read(&fx.layout.ini).unwrap();
+        let e = apply(&fx.staging, &fx.env()).unwrap_err();
+        assert_eq!(e, ApplyError::OtherBrand(Some("acme".into())));
+        assert_eq!(e.code(), "other_brand");
+        assert!(e.to_string().contains("acme"), "{e}");
+        // no register call, no command: the machine and the server are as they were
+        assert!(fx.events().is_empty(), "{:?}", fx.events());
+        assert_eq!(fx.marker_text(), "version=3.6.0\nbrand=acme\n");
+        assert_eq!(std::fs::read(&fx.layout.ini).unwrap(), before_ini);
+    }
+
+    #[test]
+    fn another_brand_is_refused_the_same_brand_and_adoption_work() {
+        let fx = Fixture::new(Os::Linux);
+        fx.stage_brand("acme", "Acme Print");
+        apply(&fx.staging, &fx.env()).unwrap();
+        fx.after_an_elevated_install();
+        // B over A
+        fx.stage_brand("other", "Other Print");
+        fx.events.borrow_mut().clear();
+        assert_eq!(
+            apply(&fx.staging, &fx.env()),
+            Err(ApplyError::OtherBrand(Some("acme".into())))
+        );
+        assert!(fx.events().is_empty());
+        assert_eq!(fx.marker_text(), "version=3.6.0\nbrand=acme\n");
+        // A over A
+        fx.stage_brand("acme", "Acme Print");
+        apply(&fx.staging, &fx.env()).unwrap();
+        assert_eq!(fx.marker_text(), "version=3.6.0\nbrand=acme\n");
+        // a brand over a stock install takes it over
+        let fx = Fixture::new(Os::Linux);
+        apply(&fx.staging, &fx.env()).unwrap();
+        fx.after_an_elevated_install();
+        fx.stage_brand("acme", "Acme Print");
+        apply(&fx.staging, &fx.env()).unwrap();
+        assert_eq!(fx.marker_text(), "version=3.6.0\nbrand=acme\n");
+    }
+
+    #[test]
+    fn a_marker_that_cannot_be_read_is_replaced_by_nobody() {
+        for brand in [false, true] {
+            let fx = Fixture::new(Os::Linux);
+            std::fs::create_dir_all(&fx.layout.dir).unwrap();
+            std::fs::write(&fx.layout.marker, b"\xff\xfe junk").unwrap();
+            if brand {
+                fx.stage_brand("acme", "Acme Print");
+            }
+            let e = apply(&fx.staging, &fx.env()).unwrap_err();
+            assert_eq!(e, ApplyError::OtherBrand(None), "{brand}");
+            assert!(e.to_string().contains("cannot read"), "{e}");
+            assert!(fx.events().is_empty(), "{brand}");
+            assert_eq!(std::fs::read(&fx.layout.marker).unwrap(), b"\xff\xfe junk");
+        }
+    }
+
+    #[test]
+    fn remove_and_restart_ask_for_no_brand_whatever_the_marker_says() {
+        for content in [
+            &b"\xff\xfe junk"[..],
+            b"version=3.6.0\nbrand=acme\n",
+            b"nonsense",
+        ] {
+            let fx = Fixture::new(Os::Linux);
+            apply(&fx.staging, &fx.env()).unwrap();
+            std::fs::write(&fx.layout.marker, content).unwrap();
+            restart(&fx.env()).expect("restart");
+            remove(&fx.env()).expect("remove");
+            assert!(!fx.layout.marker.exists());
+        }
+    }
+
+    #[test]
+    fn a_staged_brand_that_is_not_what_a_window_writes_is_refused_before_anything_happens() {
+        for text in [
+            r#"{"id":"acme","name":"Acme\nPrint"}"#,
+            r#"{"id":"Acme","name":"Acme"}"#,
+            r#"{"id":"acme"}"#,
+            r#"{"id":"acme","name":"Acme","x":1}"#,
+            "not json",
+        ] {
+            let fx = Fixture::new(Os::Linux);
+            std::fs::write(fx.staging.join("brand.json"), text).unwrap();
+            let e = apply(&fx.staging, &fx.env()).unwrap_err();
+            assert_eq!(e.code(), "bad_staging", "{text}");
+            assert!(fx.events().is_empty(), "{text}");
+            assert!(!fx.layout.dir.exists(), "{text}");
+        }
+        // a folder or a link where the file belongs
+        let fx = Fixture::new(Os::Linux);
+        std::fs::create_dir(fx.staging.join("brand.json")).unwrap();
+        assert_eq!(
+            apply(&fx.staging, &fx.env()).unwrap_err().code(),
+            "bad_staging"
+        );
+    }
+
+    #[test]
+    fn the_linux_menu_entry_carries_the_brand_name_only_with_a_staged_brand() {
+        for (brand, name) in [
+            (false, "Name=printpapi Agent\n"),
+            (true, "Name=Acme Print\n"),
+        ] {
+            let fx = Fixture::new(Os::Linux);
+            fx.stage_tray(b"tray program");
+            if brand {
+                fx.stage_brand("acme", "Acme Print");
+            }
+            apply(&fx.staging, &fx.env()).unwrap();
+            for path in [
+                fx.layout.app_entry.as_ref().unwrap(),
+                fx.layout.tray_autostart.as_ref().unwrap(),
+            ] {
+                let text = std::fs::read_to_string(path).unwrap();
+                assert!(text.contains(name), "{brand}: {text}");
+            }
+        }
+    }
+
+    #[test]
+    fn an_empty_patch_with_a_brand_takes_a_stock_install_over_and_keeps_agent_ini() {
+        let fx = Fixture::new(Os::Linux);
+        apply(&fx.staging, &fx.env()).unwrap();
+        fx.after_an_elevated_install();
+        let ini = std::fs::read_to_string(&fx.layout.ini).unwrap();
+        fx.stage_patch("{}");
+        fx.stage_brand("acme", "Acme Print");
+        apply(&fx.staging, &fx.env()).unwrap();
+        assert_eq!(fx.marker_text(), "version=3.6.0\nbrand=acme\n");
+        assert_eq!(std::fs::read_to_string(&fx.layout.ini).unwrap(), ini);
     }
 
     #[test]

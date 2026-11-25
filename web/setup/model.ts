@@ -70,17 +70,48 @@ export function pairingFields(view: PairingView | null): { code: string; server:
   return { code: view.code, server: view.serverUrl, askServer: view.serverUrl === null };
 }
 
+/** What of a white-label brand the server field needs. */
+export type BrandServer = { server: string | null; serverFixed: boolean };
+
 /**
  * What the Server address field starts with: what the person typed before, else the installed
- * agent's address. The connection a pairing made names the server of a link, so it never seeds a
- * field: coming back to the step and typing another code must not inherit that address.
+ * agent's address, else the default server of a brand. The connection a pairing made names the
+ * server of a link, so it never seeds a field: coming back to the step and typing another code must
+ * not inherit that address.
+ *
+ * A brand with a fixed server always starts with that server, whatever is installed: an adopted
+ * install that points elsewhere can then change to the fixed one and never sticks on a read-only
+ * wrong value. `||` (not `??`) because an installed agent that is not running hands over an empty
+ * address, and the next step needs a non-empty one.
  */
 export function startServer(
   initial: { serverUrl: string; paired?: unknown } | null,
   replacing: { serverUrl: string } | null,
+  brand: BrandServer | null = null,
 ): string {
-  if (initial && !initial.paired) return initial.serverUrl;
-  return replacing?.serverUrl ?? "";
+  if (brand?.serverFixed && brand.server) return brand.server;
+  const own = initial && !initial.paired ? initial.serverUrl : (replacing?.serverUrl ?? "");
+  return own || brand?.server || "";
+}
+
+/** The line under a server field that a brand has fixed; null when the field is free. */
+export function fixedServerHint(brand: BrandServer | null): string | null {
+  return brand?.serverFixed && brand.server ? `This setup connects to ${brand.server} only.` : null;
+}
+
+/**
+ * `data:image/png;base64,...` for the raw bytes of a PNG. The shell sends the bytes and no address:
+ * a `blob:` address is outside the content security policy of the window, and the shell has no
+ * base64 encoder. `btoa` takes a string, so the bytes go in chunks (a spread of a whole file
+ * overflows the call stack).
+ */
+export function pngDataUri(bytes: ArrayBuffer | Uint8Array): string {
+  const view = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes);
+  let text = "";
+  for (let at = 0; at < view.length; at += 0x8000) {
+    text += String.fromCharCode(...view.subarray(at, at + 0x8000));
+  }
+  return `data:image/png;base64,${btoa(text)}`;
 }
 
 /** What the second confirmation shows, from what the server said about the code. */
@@ -437,6 +468,23 @@ export function olderCardShown(info: UpdateInfo | null, installedHere: boolean, 
   if (hold === "card") return true;
   if (hold === "section") return false;
   return info !== null && installedIsNewer(info) && !installedHere;
+}
+
+/**
+ * The notice of a brand that offers "Install X from this setup" (a brand has no Updates section),
+ * or null. `held` is what the notice showed when its button was clicked: the install writes its
+ * marker half way through, so the next poll reads installed == own, and the notice must still
+ * say how the run ended (a reason, a retry, the wait for the agent). No offer while the take-over
+ * offer is on screen, whose button does the same.
+ */
+export function installHereInfo(
+  brand: boolean,
+  hasTakeOver: boolean,
+  info: UpdateInfo | null,
+  held: UpdateInfo | null,
+): UpdateInfo | null {
+  if (held) return held;
+  return brand && !hasTakeOver && info && ownIsNewer(info) && info.installed !== null ? info : null;
 }
 
 /** The mode was changed to one that looks, and the agent still says off: its update_url is no folder. */

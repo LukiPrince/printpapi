@@ -5,6 +5,7 @@ import { Check, CircleAlert, CircleCheck, Info, PowerOff, TriangleAlert, type Lu
 import { Barcode, Logo } from "@/components/brand";
 import { cn } from "@/lib/utils";
 import type { AgentStatus } from "./api";
+import { BrandFooter, BrandMark, useBrand } from "./brand";
 import { pathParts, statusWord } from "./model";
 
 // The breakpoint is 700px, not Tailwind's md (768px): the setup window is a fixed 760px wide and
@@ -27,13 +28,18 @@ export function Shell({
   nav?: { label: string; items: NavItem[]; current: string; onSelect: (id: string) => void };
   children: React.ReactNode;
 }) {
+  const { brand, icon } = useBrand();
   return (
     <div className="min-h-svh min-[700px]:grid min-[700px]:grid-cols-[13rem_minmax(0,1fr)]">
       <aside className="flex flex-col gap-4 bg-sidebar px-4 py-5 text-sidebar-foreground min-[700px]:sticky min-[700px]:top-0 min-[700px]:h-svh">
-        <div className="flex items-center gap-2.5 px-1">
-          <Logo className="size-7" />
-          <span className="font-mono text-base font-bold tracking-tight text-white">printpapi</span>
-        </div>
+        {brand ? (
+          <BrandMark brand={brand} icon={icon} />
+        ) : (
+          <div className="flex items-center gap-2.5 px-1">
+            <Logo className="size-7" />
+            <span className="font-mono text-base font-bold tracking-tight text-white">printpapi</span>
+          </div>
+        )}
         <Barcode className="mx-1 h-3.5 text-white/30" />
         {steps && (
           <ol
@@ -93,6 +99,7 @@ export function Shell({
             </ul>
           </nav>
         )}
+        {brand && <BrandFooter brand={brand} />}
       </aside>
       <main className="px-4 py-6 min-[700px]:px-8 min-[700px]:py-8">
         <div className="mx-auto max-w-xl space-y-4">{children}</div>

@@ -672,11 +672,26 @@ fn desktop_exec_quote(arg: &str) -> String {
     out
 }
 
+/// What the Linux menu entry and the autostart entry of the stock build are called.
+pub const STOCK_ENTRY_NAME: &str = "printpapi Agent";
+
 /// A Desktop Entry file that runs the tray program with `extra` arguments, and `lines` after the
-/// last key.
-fn desktop_entry(l: &Layout, extra: &str, lines: &str) -> Vec<u8> {
+/// last key. `name` is the product name of a brand (`brand::valid_name`: ASCII, no control
+/// character, backslash or percent), written by root: anything else becomes the stock name. The
+/// stock build keeps its own comment; a brand's comment does not repeat the name.
+fn desktop_entry(l: &Layout, name: &str, extra: &str, lines: &str) -> Vec<u8> {
+    let name = if crate::brand::valid_name(name) {
+        name
+    } else {
+        STOCK_ENTRY_NAME
+    };
+    let comment = if name == STOCK_ENTRY_NAME {
+        "printpapi agent status and settings"
+    } else {
+        "Agent status and settings"
+    };
     format!(
-        "[Desktop Entry]\nType=Application\nName=printpapi Agent\nComment=printpapi agent status and settings\nExec={}{extra}\nTerminal=false\n{lines}",
+        "[Desktop Entry]\nType=Application\nName={name}\nComment={comment}\nExec={}{extra}\nTerminal=false\n{lines}",
         desktop_exec_quote(&s(&l.tray))
     )
     .into_bytes()
@@ -708,9 +723,15 @@ fn tray_launchd_plist(l: &Layout) -> String {
 /// The bytes of the file at `layout.tray_autostart`: the Linux autostart entry or the macOS
 /// LaunchAgent. `None` on Windows, which uses [`tray_register_cmds`].
 pub fn tray_autostart_file(os: Os, l: &Layout) -> Option<Vec<u8>> {
+    tray_autostart_file_named(os, l, STOCK_ENTRY_NAME)
+}
+
+/// [`tray_autostart_file`] with the product name of a brand on Linux (the macOS file and the
+/// Windows run value carry no name).
+pub fn tray_autostart_file_named(os: Os, l: &Layout, name: &str) -> Option<Vec<u8>> {
     match os {
         Os::Windows => None,
-        Os::Linux => Some(desktop_entry(l, " --tray", "")),
+        Os::Linux => Some(desktop_entry(l, name, " --tray", "")),
         Os::Macos => Some(tray_launchd_plist(l).into_bytes()),
     }
 }
@@ -724,8 +745,15 @@ pub fn tray_autostart_file(os: Os, l: &Layout) -> Option<Vec<u8>> {
 /// https://specifications.freedesktop.org/desktop-entry/latest/exec-variables.html
 /// https://specifications.freedesktop.org/shared-mime-info/latest-single/ (x-scheme-handler)
 pub fn app_entry_file(l: &Layout) -> Vec<u8> {
+    app_entry_file_named(l, STOCK_ENTRY_NAME)
+}
+
+/// [`app_entry_file`] with the product name of a brand: only `Name=` and `Comment=` differ, the
+/// link handler lines stay (`printpapi` is the scheme of every build).
+pub fn app_entry_file_named(l: &Layout, name: &str) -> Vec<u8> {
     desktop_entry(
         l,
+        name,
         " %u",
         &format!("MimeType=x-scheme-handler/{};\n", crate::pair::SCHEME),
     )
@@ -2068,6 +2096,70 @@ mod tests {
             auto.contains("Exec=\"/opt/my dir/printpapi-tray\" --tray\n"),
             "{auto}"
         );
+    }
+
+    #[test]
+    fn the_stock_menu_and_autostart_entries_are_pinned_byte_for_byte() {
+        let l = linux();
+        assert_eq!(
+            String::from_utf8(tray_autostart_file(Os::Linux, &l).unwrap()).unwrap(),
+            "[Desktop Entry]\nType=Application\nName=printpapi Agent\nComment=printpapi agent status and settings\nExec=\"/opt/printpapi-agent/printpapi-tray\" --tray\nTerminal=false\n"
+        );
+        assert_eq!(
+            String::from_utf8(app_entry_file(&l)).unwrap(),
+            "[Desktop Entry]\nType=Application\nName=printpapi Agent\nComment=printpapi agent status and settings\nExec=\"/opt/printpapi-agent/printpapi-tray\" %u\nTerminal=false\nMimeType=x-scheme-handler/printpapi;\n"
+        );
+        // the old functions are the named ones with the stock name
+        assert_eq!(
+            tray_autostart_file(Os::Linux, &l),
+            tray_autostart_file_named(Os::Linux, &l, STOCK_ENTRY_NAME)
+        );
+        assert_eq!(
+            app_entry_file(&l),
+            app_entry_file_named(&l, STOCK_ENTRY_NAME)
+        );
+    }
+
+    #[test]
+    fn a_brand_name_is_written_once_and_adds_no_line() {
+        let l = linux();
+        let auto =
+            String::from_utf8(tray_autostart_file_named(Os::Linux, &l, "Acme Print").unwrap())
+                .unwrap();
+        let entry = String::from_utf8(app_entry_file_named(&l, "Acme Print")).unwrap();
+        for text in [&auto, &entry] {
+            assert_eq!(text.matches("Acme Print").count(), 1, "{text}");
+            assert!(text.contains("\nName=Acme Print\n"), "{text}");
+            assert!(!text.contains("printpapi Agent"), "{text}");
+        }
+        // the same lines as the stock file, except Name and Comment
+        let stock = String::from_utf8(app_entry_file(&l)).unwrap();
+        let lines = |t: &str| t.lines().map(str::to_string).collect::<Vec<_>>();
+        let (a, b) = (lines(&stock), lines(&entry));
+        assert_eq!(a.len(), b.len());
+        for (x, y) in a.iter().zip(&b) {
+            if !x.starts_with("Name=") && !x.starts_with("Comment=") {
+                assert_eq!(x, y);
+            }
+        }
+        assert!(entry.contains("MimeType=x-scheme-handler/printpapi;\n"));
+        // the macOS file and the Windows run value carry no name
+        assert_eq!(
+            tray_autostart_file_named(Os::Macos, &mac(), "Acme Print"),
+            tray_autostart_file(Os::Macos, &mac())
+        );
+        assert_eq!(
+            tray_autostart_file_named(Os::Windows, &win_layout("C:\\PF"), "Acme Print"),
+            None
+        );
+    }
+
+    #[test]
+    fn a_name_that_is_not_a_valid_product_name_never_reaches_the_file() {
+        let l = linux();
+        for bad in ["Acme\nExec=evil", "Acme\\Print", "Acme%f", "", "Acme\u{0}"] {
+            assert_eq!(app_entry_file_named(&l, bad), app_entry_file(&l), "{bad:?}");
+        }
     }
 
     /// Desktop Entry spec, "The Exec key": an argument with a space is in double quotes, and

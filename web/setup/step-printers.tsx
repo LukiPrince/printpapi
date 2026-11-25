@@ -21,6 +21,7 @@ import {
   needsSumatra,
 } from "./model";
 import { Actions, Notice } from "./bits";
+import { useBrand } from "./brand";
 
 const KINDS = {
   raw: { label: "Raw (ZPL, ESC/POS)", help: "For Zebra and receipt printers. Not for DYMO or Brother QL." },
@@ -52,6 +53,7 @@ export function StepPrinters({
   onCancel?: () => void;
   onNext: () => void;
 }) {
+  const { brand } = useBrand();
   const [adding, setAdding] = useState(false);
   const [netName, setNetName] = useState("");
   const [netIp, setNetIp] = useState("");
@@ -110,7 +112,7 @@ export function StepPrinters({
   return (
     <Card>
       <CardHeader>
-        <CardTitle>Which printers should printpapi use?</CardTitle>
+        <CardTitle>Which printers should {brand?.name ?? "printpapi"} use?</CardTitle>
         <CardDescription>Choose at least one. You can change this later.</CardDescription>
       </CardHeader>
       <CardContent className="space-y-3">

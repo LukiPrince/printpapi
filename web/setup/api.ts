@@ -7,7 +7,27 @@ import { invoke } from "@tauri-apps/api/core";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 
 export type Platform = "windows" | "macos" | "linux";
-export type InstallState = "none" | "managed" | "foreign" | "unsupported";
+/**
+ * What is on this machine. `other_brand`: an install that this build may not replace (a stock window
+ * over a white-label install, one brand over another, a marker nobody can read); only removal is
+ * offered. `adoptable`: a white-label build over a stock install, which one button takes over.
+ */
+export type InstallState = "none" | "managed" | "foreign" | "unsupported" | "other_brand" | "adoptable";
+/** What the shell tells the window about the brand of a white-label build (crates/setup/src/brand.rs). */
+export type BrandView = {
+  id: string;
+  name: string;
+  client: string;
+  server: string | null;
+  /** The window connects to `server` only. */
+  serverFixed: boolean;
+  /** There is a support page; `openSupport` opens it (the address itself stays in the shell). */
+  hasSupport: boolean;
+  /** The version of this program, for the notice. */
+  version: string;
+  /** The licence notice of a modified build, written by the shell, never by the brand. */
+  notice: string;
+};
 export type FoundPrinter = { name: string; per_user: boolean; usable: boolean };
 export type PrinterChoice = { name: string; pdf: boolean; target: string | null; locked: boolean };
 /** What is known of the connection of an installed agent (from its status file). */
@@ -155,6 +175,16 @@ export const setup = {
   openInstalled: () => call<void>("open_installed"),
   /** The section the command line asked for (--section), or null. */
   startSection: () => call<string | null>("start_section"),
+  /** The brand of this build; null for the stock build. */
+  getBrand: () => call<BrandView | null>("get_brand"),
+  /** The raw bytes of the brand's icon.png (the shell sends them as an ArrayBuffer). */
+  brandIcon: () => call<ArrayBuffer>("brand_icon"),
+  /** The whole LICENSE text of a branded build; empty for the stock build. */
+  licenseText: () => call<string>("license_text"),
+  /** Opens the support page of the brand in the browser. */
+  openSupport: () => call<void>("open_support"),
+  /** Shows the window, which a branded build starts hidden until the brand is rendered. */
+  showWindow: () => call<void>("show_window"),
   /**
    * Closes the window, and with it the program. Needs `core:window:allow-close` in
    * crates/setup/capabilities/default.json (https://v2.tauri.app/learn/window-customization/).

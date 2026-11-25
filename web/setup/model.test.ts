@@ -1,7 +1,7 @@
 // printpapi — self-hosted PrintNode alternative. Elastic License 2.0 (see LICENSE).
 import test from "node:test";
 import assert from "node:assert/strict";
-import { DEFAULT_RAW_PORT, addNetworkPrinter, startServer, canLeavePrinters, canSwitchOn, canTest, connectMayHelp, errorText, pairingFields, pairingResult, formEdited, formFromLink, formServer, sameOrigin, fromFound, lastJobText, logLocation, keepsOldName, needsNewName, needsSumatra, patchFor, pathParts, returnsToConnect, statusWord, timeoutProblem, MODES, NEEDS_CONNECTED, UPDATE_URL_TEXT, autoLine, goBackNote, goBackPatch, installedIsNewer, isNewer, modePatch, modeStillOff, olderCardShown, ownIsNewer, updateAvailable, updateErrorText, updateLine } from "./model.ts";
+import { DEFAULT_RAW_PORT, addNetworkPrinter, fixedServerHint, pngDataUri, startServer, canLeavePrinters, canSwitchOn, canTest, connectMayHelp, errorText, pairingFields, pairingResult, formEdited, formFromLink, formServer, sameOrigin, fromFound, lastJobText, logLocation, keepsOldName, needsNewName, needsSumatra, patchFor, pathParts, returnsToConnect, statusWord, timeoutProblem, MODES, NEEDS_CONNECTED, UPDATE_URL_TEXT, autoLine, goBackNote, goBackPatch, installedIsNewer, isNewer, modePatch, modeStillOff, installHereInfo, olderCardShown, ownIsNewer, updateAvailable, updateErrorText, updateLine } from "./model.ts";
 import type { FoundPrinter, PrinterChoice, UpdateInfo } from "./api.ts";
 
 const choice = (over: Partial<PrinterChoice> = {}): PrinterChoice => ({
@@ -351,6 +351,23 @@ test("a card or a section that started an install stays on screen until it is do
   assert.ok(!olderCardShown(newer, false, "section"));
 });
 
+test("the notice that installs this brand's newer build stays until the person has seen the end", () => {
+  const older = info({ own: "3.8.0", installed: "3.7.0" });
+  const same = info({ own: "3.8.0", installed: "3.8.0" });
+  // a brand over an older agent, no take-over offer: the notice
+  assert.equal(installHereInfo(true, false, older, null), older);
+  // not for a stock window, not next to the take-over offer, not without an agent, not when equal
+  assert.equal(installHereInfo(false, false, older, null), null);
+  assert.equal(installHereInfo(true, true, older, null), null);
+  assert.equal(installHereInfo(true, false, info({ own: "3.8.0", installed: null }), null), null);
+  assert.equal(installHereInfo(true, false, same, null), null);
+  assert.equal(installHereInfo(true, false, null, null), null);
+  // the install was started from it: the marker is new half way through (the poll reads
+  // installed == own), and the notice of how the run ended stays, with what it was opened with
+  assert.equal(installHereInfo(true, false, same, older), older);
+  assert.equal(installHereInfo(true, false, null, older), older);
+});
+
 test("a mode that was chosen and is still off says why", () => {
   assert.ok(modeStillOff("notify", "off"));
   assert.ok(modeStillOff("auto", "off"));
@@ -531,4 +548,57 @@ test("a second link replaces the first with its own server", () => {
   const second = formFromLink(first, { serverUrl: "https://print.example.com", code: "BBBB-BBBB-BBBB" });
   assert.equal(formServer(second), "https://print.example.com");
   assert.equal(second.text, "BBBB-BBBB-BBBB");
+});
+
+test("the first server a form shows: stock as it was, a brand's default after what is known, a fixed one always", () => {
+  const typed = { serverUrl: "https://typed.example" };
+  const paired = { serverUrl: "https://link.example", paired: {} };
+  const installed = { serverUrl: "https://installed.example" };
+  const free = { server: "https://default.example", serverFixed: false };
+  const fixed = { server: "https://fixed.example", serverFixed: true };
+  // stock: unchanged
+  assert.equal(startServer(null, null), "");
+  assert.equal(startServer(typed, null), "https://typed.example");
+  assert.equal(startServer(typed, installed), "https://typed.example");
+  assert.equal(startServer(paired, installed), "https://installed.example");
+  assert.equal(startServer(paired, null), "");
+  assert.equal(startServer(null, installed), "https://installed.example");
+  assert.equal(startServer(null, null, null), "");
+  // a brand with a default server that is not fixed: after what is typed or installed
+  assert.equal(startServer(null, null, free), "https://default.example");
+  assert.equal(startServer(typed, null, free), "https://typed.example");
+  assert.equal(startServer(null, installed, free), "https://installed.example");
+  assert.equal(startServer(paired, null, free), "https://default.example");
+  // an installed agent that is not running hands over an empty address: the default fills it
+  assert.equal(startServer(null, { serverUrl: "" }, free), "https://default.example");
+  assert.equal(startServer({ serverUrl: "" }, null, free), "https://default.example");
+  // a brand without a server changes nothing
+  assert.equal(startServer(null, installed, { server: null, serverFixed: false }), "https://installed.example");
+  // fixed: always the fixed server, also over a different installed or typed one and with no input
+  assert.equal(startServer(null, null, fixed), "https://fixed.example");
+  assert.equal(startServer(null, installed, fixed), "https://fixed.example");
+  assert.equal(startServer(typed, installed, fixed), "https://fixed.example");
+  assert.equal(startServer(null, { serverUrl: "" }, fixed), "https://fixed.example");
+  // a fixed brand without a server cannot happen (the build refuses it) and does not pin anything
+  assert.equal(startServer(null, installed, { server: null, serverFixed: true }), "https://installed.example");
+});
+
+test("the hint under a fixed server field names the server", () => {
+  assert.equal(fixedServerHint(null), null);
+  assert.equal(fixedServerHint({ server: "https://a.example", serverFixed: false }), null);
+  assert.equal(fixedServerHint({ server: null, serverFixed: true }), null);
+  assert.equal(
+    fixedServerHint({ server: "https://a.example", serverFixed: true }),
+    "This setup connects to https://a.example only.",
+  );
+});
+
+test("the icon bytes become a PNG data address, also past the size of one chunk", () => {
+  assert.equal(pngDataUri(new Uint8Array([137, 80, 78, 71])), "data:image/png;base64,iVBORw==");
+  assert.equal(pngDataUri(new Uint8Array([137, 80, 78, 71]).buffer), "data:image/png;base64,iVBORw==");
+  const big = new Uint8Array(0x8000 * 3 + 5).map((_, n) => n % 251);
+  const uri = pngDataUri(big);
+  const back = Uint8Array.from(atob(uri.slice("data:image/png;base64,".length)), (c) => c.charCodeAt(0));
+  assert.deepEqual(back, big);
+  assert.equal(pngDataUri(new Uint8Array(0)), "data:image/png;base64,");
 });

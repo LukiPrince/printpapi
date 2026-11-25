@@ -1,0 +1,8 @@
+{
+  "id": "example",
+  "name": "Example Print",
+  "client": "Example Client GmbH",
+  "server": "https://print.example.com",
+  "server_fixed": false,
+  "support_url": "https://example.com/support"
+}

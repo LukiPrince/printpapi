@@ -1,0 +1,103 @@
+# Publishes the JavaScript client (clients/js) to npm. Started by hand, never by a push: the package
+# name is a placeholder until the maintainer has chosen it and set up the npm side (docs: AGENTS.md,
+# Client). Two jobs, so the job that holds the id-token runs no build and no dependency: "build" has no
+# id-token, builds, tests and packs the tarball; "publish" has it, downloads that tarball and publishes it
+# as it is. No NPM_TOKEN: npm trusted publishing
+# (OIDC) needs npm 11.5.1 or newer and Node 22.14 or newer (the publish job uses the npm that comes with Node 24,
+# 11.19.1 at the time of writing, and stops if it is older than 11.5.1; it installs nothing), and the package's trusted-publisher
+# settings must allow a direct `npm publish` (configurations made after 2026-09-03 default to
+# `npm stage publish`; then use that command here). Sources: npm "Trusted publishing" documentation.
+name: publish-client
+
+on:
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Pack and check, but do not publish"
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Only from a version tag
+        run: |
+          case "${GITHUB_REF}" in
+            refs/tags/v*) ;;
+            *) echo "run this from a v* tag, not ${GITHUB_REF}"; exit 1 ;;
+          esac
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release --locked -p printpapi-server
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+      - name: The package version is the tag
+        working-directory: clients/js
+        run: |
+          v=$(node -p "require('./package.json').version")
+          if [ "v$v" != "${GITHUB_REF_NAME}" ]; then
+            echo "package.json says $v, the tag is ${GITHUB_REF_NAME}"; exit 1
+          fi
+      - name: Build and test
+        working-directory: clients/js
+        env:
+          PRINTAPI_BIN: ${{ github.workspace }}/target/release/printpapi
+        run: |
+          npm ci
+          npm run build
+          npm test
+      - name: Pack what would be published
+        working-directory: clients/js
+        run: |
+          mkdir -p "$RUNNER_TEMP/pack"
+          npm pack --pack-destination "$RUNNER_TEMP/pack"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: client-package
+          path: ${{ runner.temp }}/pack/*.tgz
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write # npm trusted publishing: the job proves who it is, there is no stored token
+    steps:
+      - name: Only from a version tag
+        run: |
+          case "${GITHUB_REF}" in
+            refs/tags/v*) ;;
+            *) echo "run this from a v* tag, not ${GITHUB_REF}"; exit 1 ;;
+          esac
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24 # its bundled npm is the one that publishes: nothing is installed here
+          registry-url: https://registry.npmjs.org
+      - name: The bundled npm can publish with trusted publishing
+        run: |
+          v=$(npm --version)
+          node -e 'const [a, b, c] = process.argv[1].split(".").map(Number); process.exit(a > 11 || (a === 11 && (b > 5 || (b === 5 && c >= 1))) ? 0 : 1)' "$v" \
+            || { echo "npm $v is older than 11.5.1"; exit 1; }
+      # The tarball the build job packed: this job checks out nothing, builds nothing and installs no
+      # package, so no dependency's code runs while it holds the id-token (npm itself is the one that
+      # comes with Node).
+      - uses: actions/download-artifact@v4
+        with:
+          name: client-package
+          path: package
+      - name: Publish
+        env:
+          DRY_RUN: ${{ inputs.dry_run }}
+        run: |
+          if [ "$DRY_RUN" = "true" ]; then
+            npm publish ./package/*.tgz --access public --dry-run
+          else
+            npm publish ./package/*.tgz --access public
+          fi

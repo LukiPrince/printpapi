@@ -28,6 +28,8 @@ use tauri::image::Image;
 use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
 use tauri::tray::{TrayIcon, TrayIconBuilder};
 
+use crate::brand::{self, Brand};
+
 /// A status file that was not written for this long means the agent is not running: the agent
 /// rewrites it every 30 s from a thread of its own, whatever its main thread is doing. An `online`
 /// agent that has not made contact with the server for this long is shown as offline.
@@ -38,11 +40,11 @@ const MAX_STATUS_BYTES: u64 = 64 * 1024;
 const POLL: Duration = Duration::from_secs(5);
 /// How long a starting icon waits for the lock of an old one: a [`POLL`] and a margin.
 pub const LOCK_WAIT: Duration = Duration::from_secs(8);
-/// What the tooltip says first; with the status line (at most [`LINE_MAX`] characters) it stays
-/// below the 127 characters a Windows tooltip holds.
+/// The longest status line. The tooltip starts with the product name and ": " (see
+/// `brand::tooltip_prefix`), and with this line it stays below the 127 characters a Windows
+/// tooltip holds: `printpapi_agent::brand::NAME_MAX` is what is left for the name.
 /// https://learn.microsoft.com/en-us/windows/win32/api/shellapi/ns-shellapi-notifyicondataw
-const TOOLTIP_PREFIX: &str = "printpapi Agent: ";
-const LINE_MAX: usize = 100;
+pub(crate) const LINE_MAX: usize = 100;
 const OPEN_TIMEOUT_SECS: u64 = 15;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -173,11 +175,8 @@ pub fn dashboard_url(text: Option<&str>) -> Option<String> {
 // ponytail: `xdg-open` is found through PATH, because its place differs between distributions and
 // the icon runs as the user, who could set their own PATH anyway. Ceiling: none that matters.
 pub fn open_url_cmd(os: Os, sys: &Path, url: &str) -> Option<Cmd> {
-    let rest = strip_scheme(url)?;
-    let bad = |c: char| {
-        c.is_whitespace() || c.is_control() || matches!(c, '"' | '\\' | '<' | '>' | '^' | '|' | '`')
-    };
-    if rest.is_empty() || rest.starts_with(['/', '?', '#']) || url.chars().any(bad) {
+    // the rule is the brand module's, so that the support link of a brand follows the same one
+    if !printpapi_agent::brand::valid_http_url(url) {
         return None;
     }
     let program = match os {
@@ -267,11 +266,16 @@ pub fn literal_menu_text(text: &str) -> String {
     text.replace('&', "&&")
 }
 
-fn icon_bytes(state: TrayState) -> &'static [u8] {
-    match state {
-        TrayState::Online => include_bytes!("../icons/tray-online.png"),
-        TrayState::Offline => include_bytes!("../icons/tray-offline.png"),
-        TrayState::NotRunning => include_bytes!("../icons/tray-stopped.png"),
+/// The icon of a state: the brand's three images, or the stock ones. The three differ in colour and
+/// in the badge, and the status line says it in words (menu and tooltip).
+pub(crate) fn icon_bytes(brand: Option<&Brand>, state: TrayState) -> &'static [u8] {
+    match (brand, state) {
+        (Some(b), TrayState::Online) => b.tray.online,
+        (Some(b), TrayState::Offline) => b.tray.offline,
+        (Some(b), TrayState::NotRunning) => b.tray.stopped,
+        (None, TrayState::Online) => include_bytes!("../icons/tray-online.png"),
+        (None, TrayState::Offline) => include_bytes!("../icons/tray-offline.png"),
+        (None, TrayState::NotRunning) => include_bytes!("../icons/tray-stopped.png"),
     }
 }
 
@@ -502,35 +506,60 @@ pub fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
     #[cfg(target_os = "macos")]
     app.set_activation_policy(tauri::ActivationPolicy::Accessory);
 
+    let brand = brand::current();
     let line = MenuItem::with_id(app, "status", "Agent is not running", false, None::<&str>)?;
     let settings = MenuItem::with_id(app, "settings", "Settings…", true, None::<&str>)?;
-    let updates = MenuItem::with_id(app, "updates", "Updates…", true, None::<&str>)?;
+    // a branded build has no updates: no item, and no look below
+    let updates = brand::updates_enabled(brand)
+        .then(|| MenuItem::with_id(app, "updates", "Updates…", true, None::<&str>))
+        .transpose()?;
     let dashboard = MenuItem::with_id(app, "dashboard", "Open dashboard", false, None::<&str>)?;
     let quit = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
-    let menu = Menu::with_items(
-        app,
-        &[
-            &line,
-            &PredefinedMenuItem::separator(app)?,
-            &settings,
-            &updates,
-            &dashboard,
-            &PredefinedMenuItem::separator(app)?,
-            &quit,
-        ],
-    )?;
+    let menu = Menu::new(app)?;
+    menu.append(&line)?;
+    menu.append(&PredefinedMenuItem::separator(app)?)?;
+    menu.append(&settings)?;
+    if let Some(updates) = &updates {
+        menu.append(updates)?;
+    }
+    menu.append(&dashboard)?;
+    if brand.is_some_and(|b| b.support_url.is_some()) {
+        menu.append(&MenuItem::with_id(
+            app,
+            "support",
+            "Support…",
+            true,
+            None::<&str>,
+        )?)?;
+    }
+    menu.append(&PredefinedMenuItem::separator(app)?)?;
+    // the licence notice of a modified build: a disabled line, as the status line is
+    if let Some(text) = brand::tray_notice(brand) {
+        menu.append(&MenuItem::with_id(
+            app,
+            "notice",
+            text,
+            false,
+            None::<&str>,
+        )?)?;
+    }
+    menu.append(&quit)?;
+    let prefix = brand::tooltip_prefix(brand);
     // the address of "Open dashboard": the last server the status file named
     let address: Arc<Mutex<Option<String>>> = Arc::default();
     let for_menu = Arc::clone(&address);
     let built = build_guarded(|| {
         TrayIconBuilder::with_id("printpapi-agent")
-            .icon(Image::from_bytes(icon_bytes(TrayState::NotRunning))?)
-            .tooltip(format!("{TOOLTIP_PREFIX}Agent is not running"))
+            .icon(Image::from_bytes(icon_bytes(brand, TrayState::NotRunning))?)
+            .tooltip(format!("{prefix}Agent is not running"))
             .menu(&menu)
             .show_menu_on_left_click(true)
             .on_menu_event(move |app, event| match event.id.as_ref() {
                 "settings" => open_settings(None),
                 "updates" => open_settings(Some("updates")),
+                "support" => {
+                    let _ = brand::open_support();
+                }
                 "dashboard" => open_dashboard(
                     for_menu
                         .lock()
@@ -557,8 +586,10 @@ pub fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
         }
     };
     let handle = app.handle().clone();
-    std::thread::spawn(move || watch(&handle, &tray, &line, &dashboard, &address));
-    std::thread::spawn(move || look_for_updates(&updates));
+    std::thread::spawn(move || watch(&handle, &tray, &line, &dashboard, &address, &prefix));
+    if let Some(updates) = updates {
+        std::thread::spawn(move || look_for_updates(&updates));
+    }
     Ok(())
 }
 
@@ -590,6 +621,7 @@ fn watch(
     line: &MenuItem<tauri::Wry>,
     dashboard: &MenuItem<tauri::Wry>,
     address: &Mutex<Option<String>>,
+    prefix: &str,
 ) {
     let path = status_path();
     let program = install::layout(Os::host(), &install::program_files()).tray;
@@ -634,10 +666,10 @@ fn watch(
         let now_shown = (state, text_line, can_open);
         if shown.as_ref() != Some(&now_shown) {
             let (state, text_line, can_open) = &now_shown;
-            if let Ok(image) = Image::from_bytes(icon_bytes(*state)) {
+            if let Ok(image) = Image::from_bytes(icon_bytes(brand::current(), *state)) {
                 let _ = tray.set_icon(Some(image));
             }
-            let _ = tray.set_tooltip(Some(format!("{TOOLTIP_PREFIX}{text_line}")));
+            let _ = tray.set_tooltip(Some(format!("{prefix}{text_line}")));
             let _ = line.set_text(literal_menu_text(text_line));
             let _ = dashboard.set_enabled(*can_open);
             shown = Some(now_shown);
@@ -668,6 +700,38 @@ mod tests {
             "null",
             "https://print.example.com",
         )
+    }
+
+    #[test]
+    fn the_tooltip_budget_holds_for_the_longest_brand_name() {
+        // product name + ": " + status line must fit the 127 units of a Windows tooltip, with a
+        // few left for status text outside the BMP (a character that counts twice)
+        const { assert!(printpapi_agent::brand::NAME_MAX + 2 + LINE_MAX <= 127 - 5) };
+    }
+
+    #[test]
+    fn a_brand_has_its_own_icons_and_the_stock_ones_stay_the_stock_files() {
+        let brand = crate::brand::Brand::from_json(
+            r#"{"id":"acme","name":"Acme","client":"A"}"#,
+            b"icon",
+            crate::brand::TrayImages {
+                online: b"on",
+                offline: b"off",
+                stopped: b"stop",
+            },
+        )
+        .unwrap();
+        assert_eq!(icon_bytes(Some(&brand), TrayState::Online), b"on");
+        assert_eq!(icon_bytes(Some(&brand), TrayState::Offline), b"off");
+        assert_eq!(icon_bytes(Some(&brand), TrayState::NotRunning), b"stop");
+        assert_eq!(
+            icon_bytes(None, TrayState::NotRunning),
+            include_bytes!("../icons/tray-stopped.png")
+        );
+        assert_eq!(
+            icon_bytes(None, TrayState::Offline),
+            include_bytes!("../icons/tray-offline.png")
+        );
     }
 
     #[test]
