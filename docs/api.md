@@ -16,7 +16,7 @@ All endpoints speak JSON over HTTP. Authentication is a bearer token:
 - *root* — the bootstrap `PRINTAPI_TOKEN` only (orgs, and the first user of an org)
 - *agent* — the per-agent key (bound to the agent name on first contact)
 
-Token comparison is constant-time (`hmac.compare_digest`).
+Token comparison is constant-time.
 
 ## Endpoints
 
@@ -33,7 +33,7 @@ Token comparison is constant-time (`hmac.compare_digest`).
 | `POST /orders` | client (`Submit`) | Render an order as a packing slip and print it → `{job_id}` ([e-commerce](ecommerce.md)) |
 | `POST /integrations/shopify/orders` | HMAC + key (`Submit`) | Shopify order webhook (key in the URL, signature in the header) |
 | `GET /jobs` | client (`Look`) | Recent job history. With [retention](server.md#retention) set, old jobs lose payload and title (`title` is `null`), and rows from before the current month disappear after at least 7 days |
-| `GET /jobs/{id}` | client (`Look`) | One job's state: `queued` \| `claimed` \| `done` \| `failed` \| `cancelled` |
+| `GET /jobs/{id}` | client (`Look`) | One job's state: `queued` \| `claimed` \| `done` \| `failed` \| `cancelled`, plus [`maybe_printed`](#did-it-print) when that is open |
 | `GET /jobs/{id}/preview` | manage | The [receipt](receipts.md#the-preview-of-a-job-in-the-history) of a job as it was printed, a PNG. `404` while the operator API is on |
 | `DELETE /jobs/{id}` | client (`Submit`) | Cancel a still-`queued` job (`409` once claimed, `404` if unknown) |
 | `GET /printers` | client (`Look`) | Registered printers + online/offline + capabilities |
@@ -119,7 +119,8 @@ A scope this version does not know (a newer server wrote it) allows nothing, `GE
   `401`. Otherwise the report would be refused, the job requeued and printed twice. A result the
   agent kept in its [journal](agent.md#the-print-journal) needs the right: `POST /agent/results` is `401` for a
   narrowed key, and the agent sends it when the right is back. A revoked key
-  gets nothing, and a CloudPRNT device has no such exception (no key is bound to a device): take the
+  gets nothing, with one exception: for five minutes after a [takeover](#pairing-a-device) the
+  device's old key may still report `ok: true` for a job it had claimed. A CloudPRNT device has no such exception (no key is bound to a device): take the
   key out of the printer before you narrow or revoke it, or a job it is printing at that moment can
   print again later.
 - **Own jobs.** A `print` key sees and cancels only the jobs submitted with that key, on both API
@@ -159,7 +160,7 @@ What a key without the right gets:
 | Shopify webhook | `401` | `403`, before the signature is checked |
 | CloudPRNT | `401` | `403`, and nothing is enrolled |
 | `POST /agent/register` | `401` | `401` with a message naming the rights needed |
-| other `/agent/*` | `401` | `401` |
+| other `/agent/*` | `401` (except the late `ok: true` of a taken-over key, see [Pairing](#pairing-a-device)) | `401` |
 | `/apikeys`, `/users`, `/orgs`, `/support-access`, `/pairing`, `/jobs/{id}/preview` | `401` | `401` (no key may) |
 | `POST /agent/pair` | no key is read; a wrong code is `401` | no key is read |
 
@@ -275,8 +276,9 @@ named by `template` (its name or its integer id). Templates, errors and examples
 that the server renders for the printer: ESC/POS bytes for a raw printer, and a PDF for a printer that
 takes one unless its receipt profile says `output: escpos`. Elements, limits, the profile and the
 preview are in [receipts.md](receipts.md). `copies` repeats the whole stream, the drawer kick
-included. A receipt with images takes one of 4 render slots of its own and answers `503` `receipt
-rendering is busy, try again later` when none frees within about two seconds. It also counts against
+included. A receipt with images takes one of 4 render slots of its own (where the per-org limit applies, one
+org renders at most 2 of them at once) and answers `503` `receipt rendering is busy, try again
+later` when none frees within about two seconds. It also counts against
 the per-org limit of downloads in flight above (when that applies, a fifth one answers the same `503`
 at once, without waiting) and holds its `idempotency_key` while it renders (a concurrent request with
 the same new key answers `409`). A receipt without images does neither. A CloudPRNT printer is
@@ -299,8 +301,9 @@ Set `callback_url` on a job and the server POSTs this JSON once the job reaches 
   was lost, so it retries). Make your handler idempotent — dedupe on `job_id` + `state`.
 - **A `done` can follow a `failed`.** A job the reaper failed (`retry limit exceeded`, `expired`,
   `retention`) becomes `done` when its agent delivers the result late (see [Job lifecycle](#job-lifecycle)),
-  and the webhook fires again with `done`. A client that resubmits on `failed` can print twice;
-  wait a while, or check `GET /jobs/{id}` first.
+  and the webhook fires again with `done`. A client that resubmits on `failed` can print twice, so look
+  at [`maybe_printed`](#did-it-print) first: it is in the payload (`"maybe_printed": true`) exactly when that
+  `done` is still possible or the paper may be out.
 - The payload is **unsigned** and the URL is fetched server-side (`http(s)` only) — same trust model
   as the `*_uri` content types. Point it at a trusted endpoint.
 
@@ -379,7 +382,6 @@ Rules:
 **Existing installs need no migration** — everything already lives in org `1`, root behaves as
 before, and every issued key resolves to org `1`.
 
-Deliberately out of scope for now (`# ponytail:` in the code): billing, quotas, and org deletion.
 A *full* key that an agent holds doubles as its org's client key; issue an `agent` key per machine
 to keep a lost machine's blast radius to that machine.
 
@@ -407,7 +409,8 @@ curl -s -X POST localhost:3460/agent/pair -d '{"code":"7K3M-Q2ZD-9XHT","name":"w
   key must not issue itself a successor. `org_id` works as on `POST /apikeys`: a session names its own
   org or none (`400 org_id not allowed`), root defaults to org 1 (`400 unknown org`). The answer is
   `Cache-Control: no-store`. `server_url` is `PUBLIC_URL` or `null`, never taken from the `Host` header.
-  At most 20 unused codes per org (`429 too many open pairing codes`).
+  At most 20 unused codes per org (`429 too many open pairing codes`) and at most 200 codes per org
+  in 24 hours, used ones included (`429 too many pairing codes today, try again later`).
 - **The code.** 12 symbols of `0123456789ABCDEFGHJKMNPQRSTVWXYZ` (60 bits), written `XXXX-XXXX-XXXX`.
   Typing it reads case, spaces and dashes loosely, `O` as `0` and `I`/`L` as `1`. Only the sha256
   of the code is stored, as with every credential. Because 60 bits can be tried on a GPU in days
@@ -487,7 +490,8 @@ working until the new one runs.
   its `last_seen_at` and the flags of its printers (`can_pdf`, capabilities) alone: the old agent
   still prints, and a flag changed early could send a PDF to a label printer. Printers the device does
   not have yet are added, and no job can be queued for them until the swap (`400 unknown printer`).
-  Until then they are left out of the printer lists, the counts and the PrintNode list; the operator
+  Until then they are left out of the printer lists, the counts, the PrintNode list and the receipt
+  profile routes (`404`); the operator
   API's org detail shows them with `state: "pending"`.
   Registering again with the same key gives the same answer. A reconnect key registers **only under
   the name of its device**: another name is `401` (otherwise it would enrol a second device while the
@@ -552,7 +556,7 @@ What holds:
   manages; a session has no scope, and there is no role column and no roles.
 - **Sessions expire** after 30 days and can be ended early (`POST /logout`, or the reaper once
   expired). Tokens are stored sha256-hashed, like every other credential here.
-- **Passwords** are `scrypt` hashes (stdlib, salted per user), minimum 8 characters. Changing a
+- **Passwords** are `scrypt` hashes (salted per user), minimum 8 characters. Changing a
   password deletes that user's sessions — a stolen session dies with the password it came from.
 - **Login is throttled** per e-mail (10 failures / 15 minutes → `429`), and a wrong address costs
   the same time as a wrong password, so the endpoint does not enumerate accounts.
@@ -734,6 +738,21 @@ fails. Two things on the server make that safe:
   A job that printed for longer than the reaper's five minutes is therefore finished, not printed
   again. A job the reaper had failed becomes `done` and its [webhook](#webhooks) fires again with that
   state. `cancelled` stays: somebody decided that.
+
+### Did it print?
+
+`GET /jobs/{id}`, the rows of `GET /jobs` and the [webhook](#webhooks) carry `"maybe_printed": true` on a
+`failed` or `cancelled` job that an agent had and never reported on. The field is only there when it is true.
+The dashboard's history marks such a job **May have printed**.
+
+| job | `maybe_printed` | what to do |
+|---|---|---|
+| `failed` or `cancelled`, no field | absent | no hand-out is open: either no agent ever had the job, or the agent reported the failure (`error` says what happened; with `copies`, some may be out). Sending it again is your decision alone |
+| `expired`, `retention` or cancelled after an agent had it, `retry limit exceeded`, `org locked` while an agent had it, or a second attempt that failed after a first one nobody answered | `true` | the paper may be out. Look, or wait: when the agent reports late, a `failed` job becomes `done` and the field is gone |
+
+It says "may": a hand-out whose answer got lost on the way to the agent counts as well, although nothing
+printed. The legacy Python agent and Rust agents before this version do not report late, so with them
+the field stays.
 
 A job with `expire_after` whose deadline passes is never handed to an agent (the claim query skips
 it) and is failed with `error: "expired"` by the same reaper — a terminal state, so its webhook

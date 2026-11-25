@@ -5,7 +5,9 @@ mod common;
 
 use base64::{Engine, engine::general_purpose::STANDARD as B64};
 use common::*;
-use printpapi_server::server::{PREVIEWS_PER_SERVER, RECEIPT_SLOTS, RENDER_SLOTS};
+use printpapi_server::server::{
+    PREVIEWS_PER_SERVER, RECEIPT_SLOTS, RECEIPT_SLOTS_PER_ORG, RENDER_SLOTS,
+};
 use printpapi_server::store::{self, DEFAULT_ORG};
 use serde_json::{Value, json};
 use std::time::{Duration, Instant};
@@ -333,6 +335,82 @@ fn a_locked_org_gets_no_receipt() {
 }
 
 // --- 35, 36 slots -----------------------------------------------------------------------------------
+
+#[test]
+fn one_org_cannot_hold_every_image_receipt_slot_where_the_org_cap_applies() {
+    // a receipt that renders an image and then fails (a QR too long, say) costs no quota, so an
+    // org could repeat it for ever and keep all four slots busy for everybody else; its own
+    // receipts over the limit wait like the pool and then answer 503
+    const { assert!(RECEIPT_SLOTS_PER_ORG < RECEIPT_SLOTS) };
+    let f = fixture_with(|c| c.signup_open = true);
+    let other = create_org(&f.app.db, "Other");
+    add_key(&f.app.db, "two", "k2", other);
+    let theirs = register(&f.app.db, "pc2", "ak2", &[decl("Z", false)], other);
+    let held: Vec<_> = (0..RECEIPT_SLOTS_PER_ORG)
+        .map(|_| {
+            f.app
+                .state
+                .try_receipt_org_slot(DEFAULT_ORG)
+                .unwrap()
+                .unwrap()
+        })
+        .collect();
+    let started = Instant::now();
+    let (code, v) = job(&f, "Z", with_image());
+    assert_eq!(code, 503, "{v}");
+    assert!(
+        started.elapsed() >= Duration::from_millis(1500),
+        "the org's own limit waits like the pool: {:?}",
+        started.elapsed()
+    );
+    // a receipt without an image and another org are not affected
+    assert_eq!(job(&f, "Z", text("plain")).0, 200);
+    let (code, v) = f.app.post(
+        "/jobs",
+        Some("k2"),
+        json!({"printer_id": theirs.pid("Z"), "type": "receipt", "receipt": with_image()}),
+    );
+    assert_eq!(code, 200, "{v}");
+    drop(held);
+    assert_eq!(job(&f, "Z", with_image()).0, 200);
+    // the slot of a finished request is back
+    assert_eq!(f.app.state.receipt_org_in_flight(DEFAULT_ORG), 0);
+}
+
+#[test]
+fn an_image_receipt_over_the_org_limit_waits_for_its_own_slot_to_free() {
+    // three receipts at once (kitchen, bar, customer copy) are ordinary traffic, not an attack
+    let f = fixture_with(|c| c.signup_open = true);
+    let held: Vec<_> = (0..RECEIPT_SLOTS_PER_ORG)
+        .map(|_| {
+            f.app
+                .state
+                .try_receipt_org_slot(DEFAULT_ORG)
+                .unwrap()
+                .unwrap()
+        })
+        .collect();
+    std::thread::scope(|s| {
+        s.spawn(|| {
+            std::thread::sleep(Duration::from_millis(300));
+            drop(held);
+        });
+        let (code, v) = job(&f, "Z", with_image());
+        assert_eq!(code, 200, "{v}");
+    });
+    assert_eq!(f.app.state.receipt_org_in_flight(DEFAULT_ORG), 0);
+}
+
+#[test]
+fn without_the_org_cap_an_org_may_use_every_image_receipt_slot() {
+    // a self-hosted box has one org: it keeps all four
+    let f = fixture();
+    let held: Vec<_> = (0..RECEIPT_SLOTS_PER_ORG)
+        .map(|_| f.app.state.try_receipt_org_slot(DEFAULT_ORG).unwrap())
+        .collect();
+    assert!(held.iter().all(Option::is_none));
+    assert_eq!(job(&f, "Z", with_image()).0, 200);
+}
 
 #[test]
 fn image_receipts_wait_for_a_slot_and_fail_with_503_when_none_frees() {

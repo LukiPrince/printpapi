@@ -50,6 +50,9 @@ up and prints it: documents **and** label printers (Zebra/ZPL, Bixolon, thermal)
 - **OpenAPI 3.1 description** at `GET /openapi.json` and a **typed JavaScript client** with no
   runtime dependency and retries that cannot print twice ([docs](docs/api.md#machine-readable-api),
   [client](clients/js/README.md); not published to npm yet)
+- **Agent skill** for AI coding agents (Claude Code and others): `npx skills add LukiPrince/printpapi --skill printpapi`
+  installs [one file](skills/printpapi/SKILL.md) that states the client API correctly, so the agent
+  does not guess; a test keeps it in step with the server
 - Fleet monitoring: `GET /computers` + online/offline webhooks, Prometheus `/metrics`
 - Retry-safe submits (`idempotency_key`) and job deadlines (`expire_after`)
 - **Key rights**: a key can be Everything, Agent only, CloudPRNT only, Print only (sees just its own
@@ -159,7 +162,8 @@ v3 (Rust) against v2.5.1 (the last Python server), measured with
 A waiting agent is woken the moment its job is queued (Python polled the database once a second
 per waiting agent). Submit and cycle throughput are bound by the disk: every job state is
 committed durably (`synchronous=FULL`, like v2.5.1), so both servers wait for the same fsyncs. The
-server binary is ~8 MB with the dashboard embedded; the agent is ~2.6 MB.
+numbers are from v3.0.0; the Windows release builds of this version are 10 MB for the server (the
+dashboard embedded) and 3.2 MB for the agent.
 
 ## Why not QZ Tray or PrintNode?
 
@@ -202,7 +206,9 @@ sponsored by PrintNode.*
 | [Label templates](docs/labels.md) | size and position of images and text on a label, rendered by the server to PDF or ZPL |
 | [Receipts](docs/receipts.md) | a JSON document rendered to ESC/POS for a receipt printer (or to a PDF), with a preview, printer profiles, limits and errors |
 | [Recipes](docs/recipes.md) | print from n8n, Zapier, Make, curl in one HTTP node |
+| [Agent skill](skills/printpapi/SKILL.md) | one file that teaches an AI coding agent the client API: which payload for which printer, retry-safe submits, errors |
 | [E-commerce](docs/ecommerce.md) | WooCommerce plugin, Shopify webhook, `POST /orders` |
+| [White-label builds](docs/white-label.md) | an IT provider's own name, icon and default server for the setup and tray program |
 | [Billing](docs/billing.md) | plans, checkout links, the signed provider webhook, org deletion |
 | [Operator API](docs/operator.md) | for a hosted deployment: a service token, the audit log, reads and writes (quota, lock, create, delete, reset mail, key revoke, time-limited support access the customer can see, live settings) a separate console uses |
 | [Migration](docs/migration.md) | upgrading from v2 (Python) to v3 (Rust): server, agents, changed defaults, rollback |
@@ -222,7 +228,7 @@ Contributions welcome, see [CONTRIBUTING.md](CONTRIBUTING.md).
 - ❌ Offering it to the public as your own hosted or managed print service. That is the part the
   author intends to offer.
 
-Two scope notes:
+Three scope notes:
 
 - **Everything up to and including v1.4.0 was released under the MIT License and stays MIT**
   ([docs/licenses/MIT-until-v1.4.0.txt](docs/licenses/MIT-until-v1.4.0.txt)). The current license

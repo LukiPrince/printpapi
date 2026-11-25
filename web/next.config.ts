@@ -13,6 +13,7 @@ const DEV_API = process.env.PRINTPAPI_ORIGIN ?? "http://127.0.0.1:3460";
 const API_PATHS = [
   "/health", "/metrics", "/printers", "/computers", "/jobs", "/apikeys", "/orgs",
   "/me", "/login", "/logout", "/signup", "/password", "/plans", "/receipts",
+  "/pairing", "/support-access",
 ];
 
 // PRINTPAPI_DEMO=1 (npm run build:demo) builds the static demo into out-demo/. The module specifier

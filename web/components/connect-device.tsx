@@ -307,12 +307,12 @@ function ConnectDialog({
             PUBLIC_URL.
           </p>
         ) : (
-          <Tabs defaultValue="app">
+          <Tabs defaultValue="app" className="min-w-0">
             <TabsList>
               <TabsTrigger value="app">Setup app</TabsTrigger>
               <TabsTrigger value="terminal">Terminal</TabsTrigger>
             </TabsList>
-            <TabsContent value="app" className="space-y-3 pt-2">
+            <TabsContent value="app" className="min-w-0 space-y-3 pt-2">
               <p className="text-sm text-muted-foreground">
                 Paste this link into the setup app, or open it on the computer.
               </p>
@@ -334,8 +334,8 @@ function ConnectDialog({
                 <span className="text-xs text-muted-foreground">Works where printpapi is already installed.</span>
               </div>
             </TabsContent>
-            <TabsContent value="terminal" className="space-y-3 pt-2">
-              <pre className="overflow-x-auto rounded bg-muted p-3 font-mono text-xs">
+            <TabsContent value="terminal" className="min-w-0 space-y-3 pt-2">
+              <pre className="max-w-full overflow-x-auto rounded bg-muted p-3 font-mono text-xs">
                 {TERMINAL_COMMANDS.unix}
                 {"  # Linux, macOS\n"}
                 {TERMINAL_COMMANDS.windows}

@@ -66,6 +66,11 @@ jobs:
   publish:
     needs: build
     runs-on: ubuntu-latest
+    # npm trusted publishing matches this job's environment name when the package settings name one:
+    # enter `npm-publish` there. The environment (required reviewer, deployments limited to tags v*) is
+    # the gate a pushed copy of this file cannot remove; the guards inside the file can be edited by
+    # anybody who can push.
+    environment: npm-publish
     permissions:
       contents: read
       id-token: write # npm trusted publishing: the job proves who it is, there is no stored token

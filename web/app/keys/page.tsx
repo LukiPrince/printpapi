@@ -249,18 +249,28 @@ export default function KeysPage() {
                 <TableRow>
                   <TableHead>Label</TableHead>
                   <TableHead>Rights</TableHead>
-                  <TableHead>Created</TableHead>
-                  <TableHead>Status</TableHead>
+                  <TableHead className="hidden sm:table-cell">Created</TableHead>
+                  <TableHead className="hidden sm:table-cell">Status</TableHead>
                   <TableHead className="text-right">Actions</TableHead>
                 </TableRow>
               </TableHeader>
               <TableBody>
                 {(keys ?? []).map((k) => (
                   <TableRow key={k.id}>
-                    <TableCell className="font-medium">{k.label}</TableCell>
-                    <TableCell>{scopeLabel(k.scope)}</TableCell>
-                    <TableCell className="text-muted-foreground">{fmtTime(k.created_at)}</TableCell>
-                    <TableCell>
+                    <TableCell className="font-medium whitespace-normal [overflow-wrap:anywhere]">
+                      {k.label}
+                      {/* the Status column is hidden on a phone: a revoked key still says so */}
+                      {!k.active && (
+                        <Badge variant="outline" className="ml-2 sm:hidden">
+                          revoked
+                        </Badge>
+                      )}
+                    </TableCell>
+                    <TableCell className="whitespace-normal">{scopeLabel(k.scope)}</TableCell>
+                    <TableCell className="hidden text-muted-foreground sm:table-cell">
+                      {fmtTime(k.created_at)}
+                    </TableCell>
+                    <TableCell className="hidden sm:table-cell">
                       <Badge variant={k.active ? "secondary" : "outline"}>
                         {k.active ? "active" : "revoked"}
                       </Badge>
@@ -268,13 +278,19 @@ export default function KeysPage() {
                     <TableCell className="text-right">
                       {k.active ? (
                         <div className="flex justify-end gap-2">
-                        <Button variant="outline" size="sm" onClick={() => openRights(k)}>
-                          <ShieldCheck /> Rights
+                        <Button
+                          variant="outline"
+                          size="sm"
+                          aria-label="Rights"
+                          title="Rights"
+                          onClick={() => openRights(k)}
+                        >
+                          <ShieldCheck /> <span className="hidden sm:inline">Rights</span>
                         </Button>
                         <AlertDialog>
                           <AlertDialogTrigger asChild>
-                            <Button variant="destructive" size="sm">
-                              <ShieldOff /> Revoke
+                            <Button variant="destructive" size="sm" aria-label="Revoke" title="Revoke">
+                              <ShieldOff /> <span className="hidden sm:inline">Revoke</span>
                             </Button>
                           </AlertDialogTrigger>
                           <AlertDialogContent>

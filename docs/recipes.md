@@ -3,6 +3,10 @@
 printpapi's API is one `POST /jobs` with a JSON body, so **any tool that can make an HTTP request
 can print** — n8n, Zapier, Make, Power Automate, a cron job, your backend. No SDK, no plugin.
 
+Building this with an AI coding agent? Install the [printpapi skill](../skills/printpapi/SKILL.md)
+(`npx skills add LukiPrince/printpapi --skill printpapi`): it holds the payload rules below, so the
+agent does not guess them.
+
 Two things first:
 
 1. **A client API key** — dashboard → *API keys* → *New key* with the rights **Print only** (or
@@ -62,8 +66,10 @@ tab does that while you type. See [receipts.md](receipts.md).
 
 Two fields worth setting on every automated job:
 
-- **`idempotency_key`** — order webhooks get redelivered. With a stable key (the order id) a
-  resubmit returns the original `job_id` and prints nothing extra.
+- **`idempotency_key`** — order webhooks get redelivered. With one key per document (the order id
+  plus the document, prefixed per integration) a resubmit returns the original `job_id` and prints
+  nothing extra. Never one key for two documents of an order: the second would be answered with
+  the first one's job and not printed.
 - **`expire_after`** — seconds. If the warehouse PC is offline, a shipping label from three hours
   ago should fail, not print at midnight.
 
@@ -86,7 +92,7 @@ Body (expressions in `{{ }}` as usual):
   "type": "pdf_uri",
   "url": "{{ $json.label_url }}",
   "title": "Order {{ $json.order_number }}",
-  "idempotency_key": "order-{{ $json.id }}",
+  "idempotency_key": "n8n-order-{{ $json.id }}-label",
   "expire_after": 3600
 }
 ```
@@ -110,7 +116,7 @@ Action → **Webhooks by Zapier** → *Custom Request* (a Premium app; needs a p
 
   ```json
   {"printer_id": 2, "type": "pdf_uri", "url": "{{label_url}}",
-   "title": "Order {{order_number}}", "idempotency_key": "order-{{order_id}}"}
+   "title": "Order {{order_number}}", "idempotency_key": "zapier-order-{{order_id}}-label"}
   ```
 
 *POST* (instead of *Custom Request*) also works — set *Payload Type* to `json` and add the
@@ -153,7 +159,9 @@ the outcome, pick one:
 
 - **Poll** `GET /jobs/{id}` until `state` is `done` / `failed` / `cancelled`. A job that failed with
   `retry limit exceeded`, `expired` or `retention` can still become `done` when its agent delivers
-  the result late ([api.md](api.md#job-lifecycle)), so do not resubmit on `failed` at once.
+  the result late ([api.md](api.md#job-lifecycle)). `maybe_printed: true` on the job says when that is
+  possible: look or wait before you send it again. Without the field no hand-out is open
+  ([api.md](api.md#did-it-print)).
 - **Webhook**: set `callback_url` on the job and the server POSTs the outcome to you once
   (at-least-once — dedupe on `job_id` + `state`). See [api.md](api.md#webhooks).
 - **Fleet health**: `GET /computers` tells you whether the agent is even online, and an org's

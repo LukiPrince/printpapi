@@ -19,6 +19,8 @@ export embedded into the server binary.
   `git config core.hooksPath tools/githooks` is set in that clone. CI's `docs` job runs the same
   check on its checked-out commit: relative links and anchors that resolve to files in git, setup
   file names, source-available wording (never "open source").
+  `skills/printpapi/SKILL.md` is the agent skill for the client API: change it with any API change
+  (routes, job types, limits, errors); `tools/docs/test_skill.py` fails on drift.
 - **Licensing.** New Rust files start with
   `// printpapi — self-hosted PrintNode alternative. Elastic License 2.0 (see LICENSE).`
   `integrations/woocommerce/` is GPL-2.0-or-later. Never re-license a file without reading
@@ -105,7 +107,8 @@ cargo build -p printpapi-server && cd clients/js && npm ci && npm test   # the J
   scheduler, systemd or launchd.
 - The agent key at rest (`keystore.rs`): on Windows a setup install stores it as `api_key_dpapi`
   (DPAPI machine scope, SHA-256 in front). A non-empty plain `api_key` always wins, `seal_key = no`
-  opts out, only `install` seals (the agent never writes `agent.ini`), and a key that cannot be
+  opts out, only `install` and `printpapi-agent pair` seal (the running agent never writes `agent.ini`),
+  `unprotect-key` writes it back as plain text, and a key that cannot be
   read makes a setup-installed agent wait and report `key_unreadable` instead of exiting.
   `read-config` exports `[headers]` only, never the key or the blob.
 - **Signed updates** (`crates/agent/src/update.rs`, the module doc has the steps). The elevated
@@ -114,7 +117,9 @@ cargo build -p printpapi-server && cd clients/js && npm ci && npm test   # the J
   the rights or the status folder. The public keys are in `crates/agent/update-keys.txt` (committed,
   one hex key per line, built in with `include_str!`): no environment variable, no runtime override.
   The Cargo feature `update-test-key` adds the public half of the committed test seed and shortens the
-  health wait; only the CI smoke build enables it, `release.yml` never does. Do not commit a private key.
+  health wait; only the CI smoke build enables it, `release.yml` never does (`tools/docs/test_update_test_key.py` and a
+  test in `update.rs` keep it so: no key whose seed is in the repository is trusted by a default build).
+  Do not commit a private key.
 - **A new admin command line is at least three words long, the known first word included**
   (`restart --update-from <dir>`, `restart --update now`). Every released agent (3.3.0 to 3.6.0) answers a known first word with exactly
   three arguments with usage and exit 2 and does nothing, so a new form that is two or four words
@@ -205,7 +210,10 @@ cargo build -p printpapi-server && cd clients/js && npm ci && npm test   # the J
 
 - `@printpapi/client` is a placeholder name; the maintainer decides the package name and the first
   publication. `.github/workflows/publish-client.yml` is started by hand, never by a push, and was never
-  run. Nothing in the repository runs `npm publish`.
+  run. Nothing in the repository runs `npm publish`. Its publish job (the only one with the npm
+  id-token) runs in the GitHub environment `npm-publish`: the owner creates it (required reviewer,
+  deployments limited to tags `v*`) next to `release-signing` and enters the same name as the
+  Environment name in the npm trusted-publisher settings.
 - ESM, `fetch` only, **no runtime dependency**; devDependencies are `typescript` and `@types/node` and
   nothing else. `src/` builds with no Node types (`tsconfig.json`, `types: []`), so it stays usable in a
   browser; the tests and `testkit/` use Node (`tsconfig.test.json`).

@@ -7,8 +7,8 @@ mod common;
 use common::*;
 use printpapi_server::auth::{self, Scope};
 use printpapi_server::store::{
-    self, CreatePairing, DEFAULT_ORG, Db, LATE_RESULT_S, PAIRING_GRACE_S, PAIRING_MAX_OPEN,
-    PAIRING_TTL_S, Redeem,
+    self, CreatePairing, DEFAULT_ORG, Db, LATE_RESULT_S, PAIRING_GRACE_S, PAIRING_MAX_DAILY,
+    PAIRING_MAX_OPEN, PAIRING_TTL_S, Redeem,
 };
 use rusqlite::params;
 use serde_json::{Value, json};
@@ -303,6 +303,72 @@ fn a_second_code_for_a_device_replaces_the_first_unused_one() {
 }
 
 #[test]
+fn used_codes_count_against_a_daily_cap_per_org() {
+    // a redeemed code is no longer open, so the open cap alone left a loop of "make a code, redeem
+    // it" unbounded: one pairing row and one key per round, for 24 h and for good
+    let db = mem();
+    let other = create_org(&db, "Other");
+    for n in 0..PAIRING_MAX_DAILY as u32 {
+        let code = code_n(n);
+        assert!(
+            matches!(
+                create(&db, DEFAULT_ORG, None, &code, T + f64::from(n)),
+                CreatePairing::Created { .. }
+            ),
+            "{n}"
+        );
+        assert!(matches!(
+            redeem(
+                &db,
+                &code,
+                &format!("pc{n}"),
+                &format!("k{n}"),
+                T + f64::from(n)
+            ),
+            Redeem::Paired { .. }
+        ));
+    }
+    let late = T + f64::from(PAIRING_MAX_DAILY as u32);
+    assert_eq!(
+        create(&db, DEFAULT_ORG, None, &code_n(9000), late),
+        CreatePairing::TooManyToday
+    );
+    // another org has its own count
+    assert!(matches!(
+        create(&db, other, None, &code_n(9001), late),
+        CreatePairing::Created { .. }
+    ));
+    // the rows age out of the count after a day
+    assert!(matches!(
+        create(&db, DEFAULT_ORG, None, &code_n(9002), T + 86_400.0 + 1.0),
+        CreatePairing::Created { .. }
+    ));
+}
+
+#[test]
+fn every_lookup_of_a_pairing_row_has_an_index() {
+    // POST /agent/results and /agent/jobs/{id}/result with any bearer reach late_result_open before
+    // the body is read: a scan there is an unauthenticated cost under the one database lock
+    let db = mem();
+    let indexed: Vec<String> = db
+        .with(|c| {
+            c.prepare(
+                "SELECT sql FROM sqlite_master WHERE type='index' AND tbl_name='pairing_codes'",
+            )?
+            .query_map([], |r| r.get::<_, Option<String>>(0))?
+            .filter_map(|r| r.transpose())
+            .collect::<rusqlite::Result<_>>()
+        })
+        .unwrap();
+    let all = indexed.join("\n");
+    for col in ["old_key_hash", "key_id", "agent_id", "org_id"] {
+        assert!(all.contains(col), "no index on {col}: {all}");
+    }
+    let plan = db.with(store::explain_late_result_open).unwrap().join("\n");
+    assert!(plan.contains("SEARCH") && !plan.contains("SCAN"), "{plan}");
+}
+
+#[test]
 fn the_twenty_first_open_code_is_refused_per_org() {
     let db = mem();
     let other = create_org(&db, "Other");
@@ -373,6 +439,71 @@ fn a_reconnect_key_registers_without_changing_the_device() {
     // twice is the same
     assert_eq!(reg_at(&db, "office-pc", "new-key", &declared, T + 200.0), r);
     assert_eq!(sql_one::<i64>(&db, "SELECT COUNT(*) FROM printers"), 3);
+}
+
+#[test]
+fn a_pending_printer_is_unknown_to_the_gate_and_the_receipt_profile_until_the_swap() {
+    let db = mem();
+    let dev = device(&db);
+    reconnect(&db, &dev);
+    let r = reg_at(&db, "office-pc", "new-key", &[decl("Z", false)], T + 100.0);
+    let zid = r["printers"]["Z"].as_i64().unwrap();
+    let get = |db: &Db| {
+        db.with(|c| store::get_printer(c, &json!(zid), None))
+            .unwrap()
+    };
+    assert!(get(&db).is_none(), "a pending printer is not found");
+    let profile = printpapi_server::receipt::parse_profile(&serde_json::Map::new()).unwrap();
+    assert!(
+        !db.with(|c| store::put_receipt_profile(c, zid, None, &profile))
+            .unwrap()
+    );
+    assert!(
+        !db.with(|c| store::delete_receipt_profile(c, zid, None))
+            .unwrap()
+    );
+    assert_eq!(take(&db, "new-key", T + 200.0), Some(dev.computer_id));
+    assert!(get(&db).is_some());
+    assert!(
+        db.with(|c| store::put_receipt_profile(c, zid, None, &profile))
+            .unwrap()
+    );
+}
+
+#[test]
+fn the_clean_up_keeps_a_pending_printer_that_has_a_job() {
+    // after a downgrade to 3.6.0 (which does not read the state column) a job may be queued for it
+    let db = mem();
+    let dev = device(&db);
+    reconnect(&db, &dev);
+    let r = reg_at(&db, "office-pc", "new-key", &[decl("Z", false)], T + 100.0);
+    let zid = r["printers"]["Z"].as_i64().unwrap();
+    db.with(|c| {
+        c.execute(
+            "INSERT INTO jobs(org_id, user_id, printer_id, agent_id, type, mode, payload, created_at) \
+             VALUES(?,1,?,?,'raw_base64','raw',x'78',?)",
+            params![DEFAULT_ORG, zid, dev.computer_id, T],
+        )
+    })
+    .unwrap();
+    // the key is revoked: nothing waits for a takeover any more
+    db.with(|c| {
+        c.execute(
+            "UPDATE api_keys SET active=0 WHERE key_hash=?",
+            [store::hash_key("new-key")],
+        )
+    })
+    .unwrap();
+    db.with(|c| store::purge_pairings(c, Some(T + 200.0)))
+        .unwrap();
+    assert_eq!(
+        sql_one::<i64>(
+            &db,
+            &format!("SELECT COUNT(*) FROM printers WHERE id={zid}")
+        ),
+        1,
+        "a printer with a job stays"
+    );
 }
 
 #[test]
@@ -848,12 +979,17 @@ fn purge_revokes_a_never_registered_key_after_24_hours_and_keeps_the_rest() {
 fn the_clean_up_of_pending_printers_reads_the_waiting_devices_once() {
     // a check per pending printer would scan the whole pairing table for each of them (50,000
     // printers and 10,000 rows took 13 s under the one database lock): no correlated subquery
+    // on it
     let db = mem();
     let plan = db
         .with(store::explain_drop_orphan_pending_printers)
         .unwrap()
         .join("\n");
-    assert!(!plan.contains("CORRELATED"), "{plan}");
+    // the one correlated check is whether the printer has a job, an index search
+    assert_eq!(plan.matches("CORRELATED").count(), 1, "{plan}");
+    assert!(plan.contains("COVERING INDEX jobs_printer"), "{plan}");
+    let scans: Vec<&str> = plan.lines().filter(|l| l.starts_with("SCAN")).collect();
+    assert_eq!(scans, ["SCAN printers"], "{plan}");
 }
 
 #[test]
@@ -979,6 +1115,62 @@ fn delete_org_removes_its_pairing_codes() {
     create(&db, DEFAULT_ORG, None, "AAAA-BBBB-CCCC", T);
     assert!(db.with(|c| store::delete_org(c, org)).unwrap());
     assert_eq!(sql_one::<i64>(&db, "SELECT COUNT(*) FROM pairing_codes"), 1);
+}
+
+#[test]
+fn a_plain_delete_of_an_org_takes_its_pairing_codes_with_it() {
+    // 3.6.0 deletes an org without knowing the table; orgs.id is reused, so a code that outlived
+    // its org would be valid in the next org with the same id. The trigger does it under any binary.
+    let db = mem();
+    let org = create_org(&db, "Gone");
+    create(&db, org, None, CODE, T);
+    create(&db, DEFAULT_ORG, None, "AAAA-BBBB-CCCC", T);
+    db.with(|c| c.execute("DELETE FROM orgs WHERE id=?", [org]))
+        .unwrap();
+    assert_eq!(sql_one::<i64>(&db, "SELECT COUNT(*) FROM pairing_codes"), 1);
+    assert_eq!(
+        sql_one::<i64>(&db, "SELECT COUNT(*) FROM pairing_codes WHERE org_id=1"),
+        1
+    );
+}
+
+#[test]
+fn the_start_shows_a_pending_printer_that_an_older_server_gave_a_job() {
+    // 3.6.0 does not read `state`: it listed the pending printer and took a job for it. This
+    // server never queues one for a pending printer, so such a row was used and must be shown again.
+    let db = mem();
+    let dev = device(&db);
+    reconnect(&db, &dev);
+    let r = reg_at(
+        &db,
+        "office-pc",
+        "new-key",
+        &[decl("Z", false), decl("Y", false)],
+        T + 100.0,
+    );
+    let zid = r["printers"]["Z"].as_i64().unwrap();
+    db.with(|c| {
+        c.execute(
+            "INSERT INTO jobs(org_id, user_id, printer_id, agent_id, type, mode, payload, created_at) \
+             VALUES(?,1,?,?,'raw_base64','raw',x'78',?)",
+            params![DEFAULT_ORG, zid, dev.computer_id, T],
+        )
+    })
+    .unwrap();
+    assert_eq!(printer_row(&db, "Z").2, "pending");
+    db.with(store::init_db).unwrap();
+    assert_eq!(printer_row(&db, "Z").2, "active");
+    assert_eq!(
+        printer_row(&db, "Y").2,
+        "pending",
+        "one without a job waits"
+    );
+    let pid = json!(zid);
+    assert!(
+        db.with(|c| store::get_printer(c, &pid, None))
+            .unwrap()
+            .is_some()
+    );
 }
 
 #[test]

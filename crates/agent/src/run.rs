@@ -205,6 +205,40 @@ fn job_id_text(v: &Value) -> Result<String, String> {
     }
 }
 
+/// A lost connection or a `5xx`; "payload larger than N MB" and a `4xx` will not change by asking again.
+fn transient(e: &HttpError) -> bool {
+    match e {
+        HttpError::Os(m) => http_status(e).map_or(m.starts_with("connection failed"), |s| s >= 500),
+        HttpError::Value(_) => false,
+    }
+}
+
+/// The payload download. Nothing has been handed to a printer yet, so asking again cannot print
+/// twice: a lost connection or a 5xx (a server restart, a proxy's 503) is tried again after the
+/// pauses the report uses (1, 2, 4, 8 s) instead of ending the job as failed for good. A 4xx or a
+/// reply that is not what we asked for is final.
+fn fetch_payload(
+    http: &dyn Http,
+    url: &str,
+    key: &str,
+    sleep: Sleep,
+) -> Result<Option<Vec<u8>>, HttpError> {
+    const TRIES: u32 = 5;
+    for i in 0..TRIES {
+        match http.get_bytes(url, key) {
+            Err(e @ HttpError::Os(_)) if i + 1 < TRIES && transient(&e) => {
+                err_line(&format!(
+                    "payload download failed (try {}/{TRIES}): {e}",
+                    i + 1
+                ));
+                sleep(1u64 << i);
+            }
+            other => return other,
+        }
+    }
+    unreachable!("the last try returns above")
+}
+
 /// Everything after the job is claimed and before its result is reported; any `Err` becomes the
 /// failure text the server shows.
 /// `sent` counts the copies that were handed over without an error, whatever happens later.
@@ -217,12 +251,17 @@ fn execute(
     printers: &PrinterMap,
     http: &dyn Http,
     fns: &Fns,
+    sleep: Sleep,
     sent: &mut u32,
 ) -> Result<(), String> {
-    let payload = http
-        .get_bytes(&format!("{base}/agent/jobs/{job_id}/payload"), key)
-        .map_err(|e| e.to_string())?
-        .ok_or("job payload is empty (server returned 204)")?;
+    let payload = fetch_payload(
+        http,
+        &format!("{base}/agent/jobs/{job_id}/payload"),
+        key,
+        sleep,
+    )
+    .map_err(|e| e.to_string())?
+    .ok_or("job payload is empty (server returned 204)")?;
     let printer_id = &job["printer_id"];
     let printer = printers
         .get(printer_id)
@@ -516,7 +555,17 @@ pub fn run_once_with(
     }
     claimed();
     let mut sent = 0;
-    let outcome = execute(&job, &job_id, base, key, printers, http, fns, &mut sent);
+    let outcome = execute(
+        &job,
+        &job_id,
+        base,
+        key,
+        printers,
+        http,
+        fns,
+        report_sleep,
+        &mut sent,
+    );
     let (ok, error) = match &outcome {
         Ok(()) => (true, None),
         Err(e) => (false, Some(e.as_str())),
@@ -612,6 +661,8 @@ mod tests {
     struct FakeHttp {
         poll_result: Option<Value>,
         payload: Option<Vec<u8>>,
+        /// Answers of the next payload downloads, before `payload` applies.
+        payload_script: RefCell<VecDeque<Result<Option<Vec<u8>>, HttpError>>>,
         posts: RefCell<Vec<(String, Value)>>,
         post_script: RefCell<VecDeque<Result<Option<Value>, HttpError>>>,
         post_default: Result<Option<Value>, HttpError>,
@@ -622,6 +673,7 @@ mod tests {
             FakeHttp {
                 poll_result,
                 payload: Some(payload.to_vec()),
+                payload_script: RefCell::new(VecDeque::new()),
                 posts: RefCell::new(Vec::new()),
                 post_script: RefCell::new(VecDeque::new()),
                 post_default: Ok(Some(json!({"ok": true}))),
@@ -644,7 +696,10 @@ mod tests {
             Ok(self.poll_result.clone())
         }
         fn get_bytes(&self, _: &str, _: &str) -> Result<Option<Vec<u8>>, HttpError> {
-            Ok(self.payload.clone())
+            match self.payload_script.borrow_mut().pop_front() {
+                Some(r) => r,
+                None => Ok(self.payload.clone()),
+            }
         }
         fn post(&self, url: &str, _: &str, body: &Value) -> Result<Option<Value>, HttpError> {
             self.posts
@@ -1133,6 +1188,79 @@ mod tests {
         )
         .unwrap();
         assert_eq!(http.last_post().1["ok"], json!(false));
+    }
+
+    #[test]
+    fn a_payload_download_cut_off_by_a_restart_or_a_503_is_asked_for_again() {
+        let job = json!({"job_id": 4, "printer_id": 1, "mode": "raw"});
+        let http = FakeHttp::new(Some(job), b"DATA");
+        *http.payload_script.borrow_mut() = VecDeque::from([
+            Err(HttpError::Os(
+                "connection failed: io: Peer disconnected".into(),
+            )),
+            Err(HttpError::Os("server returned 503".into())),
+        ]);
+        let waits = std::rc::Rc::new(RefCell::new(Vec::new()));
+        let printed = std::rc::Rc::new(RefCell::new(0));
+        let n = printed.clone();
+        let mut fns = Fns::refusing();
+        fns.raw = Box::new(move |_, _| {
+            *n.borrow_mut() += 1;
+            Ok(())
+        });
+        once(
+            "http://x",
+            "k",
+            &pm(1, entry("Z", false, "Z")),
+            &http,
+            &fns,
+            &*collect(&waits),
+        )
+        .unwrap();
+        assert_eq!(*waits.borrow(), vec![1, 2]);
+        assert_eq!(*printed.borrow(), 1, "printed once");
+        assert_eq!(http.last_post().1["ok"], json!(true));
+    }
+
+    #[test]
+    fn a_payload_download_that_keeps_failing_ends_the_job_and_a_4xx_is_not_retried() {
+        let job = json!({"job_id": 4, "printer_id": 1, "mode": "raw"});
+        let p = pm(1, entry("Z", false, "Z"));
+        let http = FakeHttp::new(Some(job.clone()), b"DATA");
+        *http.payload_script.borrow_mut() = (0..9)
+            .map(|_| Err(HttpError::Os("server returned 503".into())))
+            .collect();
+        let waits = std::rc::Rc::new(RefCell::new(Vec::new()));
+        once(
+            "http://x",
+            "k",
+            &p,
+            &http,
+            &Fns::refusing(),
+            &*collect(&waits),
+        )
+        .unwrap();
+        assert_eq!(*waits.borrow(), vec![1, 2, 4, 8], "five tries, four pauses");
+        let (_, body) = http.last_post();
+        assert_eq!(body["ok"], json!(false));
+        assert!(body["error"].as_str().unwrap().contains("503"), "{body}");
+        // a 404 or 403 and a payload over the cap are final
+        for text in ["server returned 404", "payload larger than 128 MB"] {
+            let http = FakeHttp::new(Some(job.clone()), b"DATA");
+            *http.payload_script.borrow_mut() = VecDeque::from([Err(HttpError::Os(text.into()))]);
+            let waits = std::rc::Rc::new(RefCell::new(Vec::new()));
+            once(
+                "http://x",
+                "k",
+                &p,
+                &http,
+                &Fns::refusing(),
+                &*collect(&waits),
+            )
+            .unwrap();
+            assert!(waits.borrow().is_empty(), "{text}");
+            assert_eq!(http.last_post().1["ok"], json!(false));
+        }
     }
 
     // --- register with retry (unattended remote machines) ---

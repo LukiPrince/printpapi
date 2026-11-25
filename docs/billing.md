@@ -89,9 +89,9 @@ would have no cap (same rule as `job_quota`). The dashboard shows those buttons 
 ## 4. When a customer leaves
 
 `DELETE /orgs/{id}` (root only) removes the org and everything in it — jobs, printers, agents,
-keys, accounts and their sessions. There is no undo and no soft delete; it is the "forget me"
-button. `DEFAULT_ORG` (id 1) is refused, because an agent presenting an unknown key still enrolls
-there.
+keys, label templates, receipt profiles, accounts and their sessions. There is no undo and no soft delete; it is the "forget me"
+button. `DEFAULT_ORG` (id 1) is refused: it is the org the root token, agents enrolled under v2 and,
+with `PRINTAPI_OPEN_ENROLLMENT=1`, unknown keys enroll into.
 
 ## Environment
 

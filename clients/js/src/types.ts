@@ -43,6 +43,8 @@ export interface JobStatus {
   printer_id: number;
   created_at: number;
   finished_at: number | null;
+  /** Only sent when true. The job ended without done although an agent had it and never reported: it may be on paper, and a late result can still turn a failed one into done. Absent on a failed or cancelled job: the server knows of no unanswered hand-out. */
+  maybe_printed?: boolean;
 }
 
 export interface JobRow {
@@ -57,6 +59,8 @@ export interface JobRow {
   error: string | null;
   created_at: number;
   finished_at: number | null;
+  /** Only sent when true. The job ended without done although an agent had it and never reported: it may be on paper, and a late result can still turn a failed one into done. Absent on a failed or cancelled job: the server knows of no unanswered hand-out. */
+  maybe_printed?: boolean;
 }
 
 /** The newest 50 jobs, newest first. */

@@ -203,7 +203,10 @@ agent is connected and not printing, swaps the two program files by renaming the
 the way the Restart section does, and waits up to five minutes for the new version to report in
 twice with the same process. If it does not, the old files are renamed back (this needs no network)
 and the old agent is started again. The result says which: "Version 3.7.0 did not connect, so 3.6.0
-was put back. It is running again." Only the two program files and the marker change: `agent.ini`,
+was put back. It is running again." If the old tray program cannot be renamed back, the old agent still
+starts and the text ends "... It is running again. Run the setup again to put the tray program back."
+The old tray program stays under `.printpapi-tray.old` and the next update puts it back before it
+clears anything. Only the two program files and the marker change: `agent.ini`,
 the service unit or task, the rights and the status folder stay as they were. The last attempt is
 in `update-state.json` in the install folder (no secrets): `message` is the sentence the window shows,
 `detail` the reason behind it (for example why the new agent did not connect), which the Windows
@@ -285,6 +288,20 @@ and name it `SumatraPDF.exe`. Any other file, a newer version too, fails the who
 printing from this install: its `|pdf` printers need SumatraPDF from somewhere else, next to
 `printpapi-agent.exe`. There is no pairing code and no key in a property, on the command line or in
 a log.
+
+**A PC that was reconnected cannot be upgraded with `AGENT_INI` any more.** Once a PC got a new key
+from a pairing code (the setup window's Reconnect, or `printpapi-agent pair`), its installed
+`agent.ini` holds that key, sealed, and the key of your prepared file belongs to no device any more:
+the install registers it under the PC's name, the server answers `401`, and `msiexec` ends with 1603
+on every retry (the running agent stays as it is). The line in `printpapi-managed.log` gives the server's refusal and this case as one
+possibility: "... If this PC was reconnected with a pairing code (Reconnect), upgrade without
+AGENT_INI ...". A key that was revoked, a Print only key, a mistyped key or a new key in the file
+under the name of an old one ends in the same line (the install registers first, so a key that was
+revoked in the meantime fails the same way, and `unprotect-key` would yield that revoked key too):
+check the key on the Keys page first. If the PC was reconnected, push the next upgrade without
+`AGENT_INI` (a major upgrade then keeps every setting and the key), or run
+[`unprotect-key`](#going-back-to-an-older-version-or-to-the-python-agent) on that PC and copy the key
+from its `agent.ini` into the prepared file.
 
 **Protect the file.** Until the install has read it, the key is in it as plain text, and the
 install trusts what it finds. Make the folder where a standard user cannot make anything,
@@ -492,7 +509,8 @@ terminal](#pair-from-the-terminal) works through it; the setup window also needs
 
 For a machine without a screen, a Python agent or a locked-down Windows, the same code works
 without the window. `printpapi-agent pair` is part of the agent (an agent as new as the server;
-an older one just starts and ignores the word). Run it in the agent's folder, with administrator
+an older one just starts and ignores the word), so a locked-down Windows PC, which refuses to start
+the unsigned exe, uses the `curl.exe` recipe further down instead. Run it in the agent's folder, with administrator
 rights or `sudo` where that folder is not yours (the setup's install: `/opt/printpapi-agent`,
 `C:\Program Files\printpapi-agent`):
 
@@ -558,8 +576,20 @@ Invoke-RestMethod https://print.example.com/agent/pair -Method Post -UseBasicPar
 `-OutFile` keeps the access list of the file that exists. Copy the `key` from `pairing.json` into the
 `api_key` line of `agent.ini`, delete `pairing.json`, and start the agent **within 24 hours**, or
 the key is revoked. For a Reconnect code the reply says `"replaces": true` and the name of the
-device; use that name in `agent.ini`: the server refuses that key under any other name. `Invoke-RestMethod` does not work in PowerShell's
-ConstrainedLanguage mode (WDAC): use the `pair` command or the Python agent's own machine.
+device; use that name in `agent.ini`: the server refuses that key under any other name. 
+
+`Invoke-RestMethod` does not work in PowerShell's ConstrainedLanguage mode (WDAC), and the
+`pair` command is part of the unsigned `printpapi-agent.exe`, which such a PC refuses to start. There,
+use the `curl.exe` that comes with Windows (Microsoft-signed), in a folder only administrators can
+read, with the body in a file (`{"code":"7K3M-Q2ZD-9XHT","name":"warehouse-pc"}` as `body.json`). Keep
+the quotes around `"@body.json"`: PowerShell reads a bare `@body` as splatting and refuses the line.
+
+```powershell
+curl.exe -sS https://print.example.com/agent/pair -H "Content-Type: application/json" -o pairing.json --data-binary "@body.json"
+```
+
+Delete `body.json` and, after copying the key, `pairing.json`. Or redeem the code on another
+computer and copy the key over.
 
 ### Where the key is stored
 
@@ -569,7 +599,7 @@ installed:
 | Installed | The key is in `agent.ini` as | Who can read the file |
 |---|---|---|
 | Windows, with the setup app | `api_key_dpapi`: encrypted with DPAPI, machine scope (this version and later) | SYSTEM and Administrators |
-| By hand on any system, and the Python agent | `api_key`, plain text | what you set; a manual install keeps its plain `api_key` and the agent never rewrites the file |
+| By hand on any system, and the Python agent | `api_key`, plain text | what you set; a manual install keeps its plain `api_key`, and the running agent never rewrites the file (only `printpapi-agent pair`, which you run yourself, does) |
 | Linux, with the setup app | `api_key`, plain text | `root` and the service user (`root:printpapi-agent`, mode 0640) |
 | macOS, with the setup app | `api_key`, plain text | `root` (mode 0600) |
 
@@ -587,10 +617,11 @@ page.
 **How to see whether the key is stored encrypted.** `agent.ini` (as an administrator) has an
 `api_key_dpapi` line and no `api_key` line. If encrypting fails when the setup installs over a file
 that was not encrypted yet (rare), the install carries on with the plain `api_key` under the same
-rights rather than fail on a print station. A file that was encrypted becomes plain text in three
+rights rather than fail on a print station. A file that was encrypted becomes plain text in these
 cases only: you run `unprotect-key` (below), the file says `seal_key = no` (at the next change in
-Settings), or you type a new key in Settings, Connection and Windows cannot encrypt it. In the last
-case the install still goes through, with the new key as plain text; the `api_key_dpapi` line tells
+Settings or the next `pair`), you type a new key in Settings, Connection and Windows cannot encrypt
+it, or you run `printpapi-agent pair` and Windows cannot encrypt the new key (the command says so in
+one line). In the last two cases the install or the pairing still goes through, with the new key as plain text; the `api_key_dpapi` line tells
 you which state the file is in. A change of the printers or the timeout never does this: if the key
 cannot be encrypted again, nothing is changed.
 
@@ -601,10 +632,12 @@ cannot be encrypted again, nothing is changed.
 - `seal_key = no` in `[agent]` (also `false`, `off` or `0`) keeps the setup from encrypting the key
   again. An existing `api_key_dpapi` is still read. A change in Settings never sets or removes this
   line; `unprotect-key` (below) sets it.
-- Every install and every change in Settings encrypts the key again, unless `seal_key = no` is
-  set. An agent that was installed by an earlier version has its key encrypted at the next change
+- Every install, every change in Settings and every `printpapi-agent pair` on a setup install encrypts the key again, unless `seal_key = no` is
+  set or, for `pair`, Windows cannot encrypt it. An agent that was installed by an earlier version has its key encrypted at the next change
   or update; the key, the device and the printer ids stay the same.
-- The agent itself never writes `agent.ini`. Settings shows the header values by having an
+- The running agent never writes `agent.ini`; the setup's install does, and so does
+  `printpapi-agent pair` when you run it (it seals the key the same way on a setup install).
+  Settings shows the header values by having an
   elevated command copy only the `[headers]` into the working folder, never the key.
 
 **Linux and macOS keep the file.** On Linux a key sealed to the host would need `systemd-creds`
@@ -976,6 +1009,10 @@ memory only, which a restart loses. The journal is never put into the temp folde
 - A power cut can lose labels that were handed over but still waited in the spooler, the CUPS queue
   or a printer's buffer. "Printed" means "handed over without an error", for the journal as it
   always did for `done`.
+- A payload download that fails five times in a row (a server that stays away for about 15 seconds
+  after it handed the job out): the job ends as failed and prints nothing; the same
+  `idempotency_key` returns that job, so submit it again with a new one. One lost connection or one
+  `5xx` is asked for again and costs nothing.
 - A lost journal: a folder that cannot be written followed by a restart, a full disk followed by a
   restart, the agent removed and installed again.
 - An old server (it hands out no identity) and the legacy Python agent.

@@ -172,6 +172,31 @@ fn the_document_is_a_well_formed_openapi_3_1_description() {
 }
 
 #[test]
+fn the_pairing_429_names_both_limits() {
+    // an API consumer that reads 429 as "cancel open codes" has to be told about the daily limit
+    let d = doc();
+    let text = d["paths"]["/pairing"]["post"]["responses"]["429"]["description"]
+        .as_str()
+        .unwrap();
+    assert!(text.contains("20") && text.contains("200"), "{text}");
+    assert!(text.contains("24 hours"), "{text}");
+}
+
+#[test]
+fn maybe_printed_is_an_optional_boolean_of_a_job() {
+    let d = doc();
+    for name in ["JobStatus", "JobRow"] {
+        let s = &d["components"]["schemas"][name];
+        assert_eq!(
+            s["properties"]["maybe_printed"]["type"], "boolean",
+            "{name}"
+        );
+        let required = s["required"].as_array().unwrap();
+        assert!(!required.contains(&Value::from("maybe_printed")), "{name}");
+    }
+}
+
+#[test]
 fn every_ref_resolves_and_every_security_name_is_declared() {
     let d = doc();
     let mut refs = Vec::new();
@@ -382,6 +407,33 @@ fn who_may_call(op: &Value) -> String {
         "cloudprnt-key" => format!("{key}: the client key is in the path."),
         other => panic!("role {other}"),
     }
+}
+
+/// The report of a printed job is the call a gateway in front of the server must not refuse: the
+/// exceptions the server makes (docs/api.md, "A job already handed out") are in the description, or a
+/// gateway that maps the scopes requeues the job and it prints twice.
+#[test]
+fn the_agent_routes_name_the_callers_the_server_lets_in_besides_the_agent_scopes() {
+    let d = doc();
+    let text = |path: &str, m: &str| {
+        d["paths"][path][m]["description"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    };
+    let payload = text("/agent/jobs/{id}/payload", "get");
+    assert!(payload.contains("lost the Agent right"), "{payload}");
+    assert!(payload.contains("claimed"), "{payload}");
+    let result = text("/agent/jobs/{id}/result", "post");
+    assert!(result.contains("lost the Agent right"), "{result}");
+    assert!(result.contains("five minutes"), "{result}");
+    let results = text("/agent/results", "post");
+    assert!(results.contains("five minutes"), "{results}");
+    assert!(results.contains("ok: true"), "{results}");
+    assert!(
+        results.contains("401"),
+        "a narrowed key is refused here: {results}"
+    );
 }
 
 #[test]

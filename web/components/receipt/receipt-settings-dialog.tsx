@@ -40,7 +40,9 @@ export function ReceiptSettingsDialog({
         <DialogHeader>
           <DialogTitle>Receipt settings</DialogTitle>
           <DialogDescription>
-            How receipts are laid out for {printer.name}. A change applies to the next receipt.
+            How receipts are laid out for {printer.name}. A change applies to the next receipt. Only for a
+            receipt printer (ESC/POS) or a printer that takes PDF: the test receipt is no label, and a label
+            printer needs ZPL.
           </DialogDescription>
         </DialogHeader>
         <Settings printer={printer} onDone={() => onOpenChange(false)} />

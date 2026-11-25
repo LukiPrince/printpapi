@@ -493,6 +493,7 @@ fn overview_reflects_data() {
     });
     let failed = enqueue(&app.db, pid, b"x", |j| j.org_id = Some(org));
     let _queued = enqueue(&app.db, pid, b"x", |j| j.org_id = Some(org));
+    stamp_in_order(&app.db, &[done, failed, _queued]);
     claim(&app.db, reg.computer_id);
     finish(&app.db, done, reg.computer_id, true, None);
     claim(&app.db, reg.computer_id);

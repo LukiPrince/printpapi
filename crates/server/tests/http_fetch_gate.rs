@@ -7,7 +7,7 @@ use base64::{Engine, engine::general_purpose::STANDARD as B64};
 use common::*;
 use printpapi_server::dispatch::Fetcher;
 use printpapi_server::server::Config;
-use printpapi_server::store::DEFAULT_ORG;
+use printpapi_server::store::{self, DEFAULT_ORG};
 use serde_json::{Value, json};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
@@ -105,6 +105,58 @@ fn an_unknown_or_foreign_printer_answers_400_without_fetching() {
         assert!(err_of(&v).starts_with("unknown printer: "), "{v}");
     }
     assert_eq!(fetched(&app), 0);
+}
+
+#[test]
+fn a_pending_printer_answers_400_without_fetching_and_has_no_receipt_profile() {
+    // the printer a Reconnect key declared is "pending" until the new agent's first poll
+    let (app, _pid) = app_with_printer();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs_f64();
+    let agent = app
+        .db
+        .with(|c| {
+            c.query_row("SELECT id FROM agents WHERE name='pc'", [], |r| {
+                r.get::<_, i64>(0)
+            })
+        })
+        .unwrap();
+    app.db
+        .with(|c| {
+            store::create_pairing(
+                c,
+                DEFAULT_ORG,
+                Some(agent),
+                None,
+                "AAAA-BBBB-CCCC",
+                Some(now),
+            )
+        })
+        .unwrap();
+    app.db
+        .with(|c| store::redeem_pairing(c, "AAAA-BBBB-CCCC", "pc", "new-key", Some(now)))
+        .unwrap();
+    let reg = app
+        .db
+        .with(|c| {
+            store::register_agent_at(c, "pc", "new-key", &[decl("N", false)], DEFAULT_ORG, now)
+        })
+        .unwrap();
+    let pending = reg.printer_ids["N"].as_i64().unwrap();
+    for ty in ["raw_uri", "raw_uri_post", "pdf_uri", "pdf_uri_post"] {
+        let (code, v) = app.post(
+            "/jobs",
+            Some("k1"),
+            json!({"printer_id": pending, "type": ty, "url": "https://x/a", "json": {}}),
+        );
+        assert_eq!(code, 400, "{ty}: {v}");
+        assert!(err_of(&v).starts_with("unknown printer: "), "{v}");
+    }
+    assert_eq!(fetched(&app), 0);
+    let (code, _) = app.get(&format!("/printers/{pending}/receipt-profile"), Some("k1"));
+    assert_eq!(code, 404);
 }
 
 #[test]

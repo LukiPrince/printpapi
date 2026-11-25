@@ -1,7 +1,7 @@
 // printpapi — self-hosted PrintNode alternative. Elastic License 2.0 (see LICENSE).
 import test from "node:test";
 import assert from "node:assert/strict";
-import { DEFAULT_RAW_PORT, addNetworkPrinter, fixedServerHint, pngDataUri, startServer, canLeavePrinters, canSwitchOn, canTest, connectMayHelp, errorText, pairingFields, pairingResult, formEdited, formFromLink, formServer, sameOrigin, fromFound, lastJobText, logLocation, keepsOldName, needsNewName, needsSumatra, patchFor, pathParts, returnsToConnect, statusWord, timeoutProblem, MODES, NEEDS_CONNECTED, UPDATE_URL_TEXT, autoLine, goBackNote, goBackPatch, installedIsNewer, isNewer, modePatch, modeStillOff, installHereInfo, olderCardShown, ownIsNewer, updateAvailable, updateErrorText, updateLine } from "./model.ts";
+import { DEFAULT_RAW_PORT, addNetworkPrinter, fixedServerHint, pngDataUri, startServer, canLeavePrinters, canSwitchOn, canTest, connectMayHelp, errorText, pairingFields, pairingResult, formEdited, formFromLink, formServer, sameOrigin, fromFound, lastJobText, logLocation, keepsOldName, needsNewName, needsSumatra, patchFor, pathParts, returnsToConnect, statusWord, timeoutProblem, MODES, NEEDS_CONNECTED, UPDATE_URL_TEXT, autoLine, goBackNote, goBackPatch, installedIsNewer, isNewer, modePatch, modeStillOff, installHereInfo, installHereShown, olderCardShown, ownIsNewer, updateAvailable, updateErrorText, updateLine } from "./model.ts";
 import type { FoundPrinter, PrinterChoice, UpdateInfo } from "./api.ts";
 
 const choice = (over: Partial<PrinterChoice> = {}): PrinterChoice => ({
@@ -366,6 +366,16 @@ test("the notice that installs this brand's newer build stays until the person h
   // installed == own), and the notice of how the run ended stays, with what it was opened with
   assert.equal(installHereInfo(true, false, same, older), older);
   assert.equal(installHereInfo(true, false, null, older), older);
+});
+
+test("the notice of an install from this setup comes back only with something to say", () => {
+  // before a click: only while the offer stands
+  assert.equal(installHereShown("idle", true), true);
+  assert.equal(installHereShown("idle", false), false);
+  // a screen of the window (a wizard) unmounted the notice after the install: it comes back idle
+  // with the held info while installed == own, and must say nothing and offer nothing
+  // while a run is on screen, or ended with a failure, the notice stays whatever the poll reads
+  for (const at of ["applying", "waiting", "done", "slow", "failed"] as const) assert.equal(installHereShown(at, false), true);
 });
 
 test("a mode that was chosen and is still off says why", () => {

@@ -325,6 +325,7 @@ fn five_jobs(db: &Db) -> (Registered, [i64; 5]) {
     let ids: Vec<i64> = (0..5)
         .map(|_| enqueue_receipt(db, a, None, None, Some(DOC)).job_id)
         .collect();
+    stamp_in_order(db, &ids);
     let [scrub, delete, finished, claimed, queued] = [ids[0], ids[1], ids[2], ids[3], ids[4]];
     // the first two and the last are finished; the claimed one stays claimed
     let c1 = claim(db, reg.computer_id).unwrap().job_id;
@@ -336,6 +337,35 @@ fn five_jobs(db: &Db) -> (Registered, [i64; 5]) {
     let c4 = claim(db, reg.computer_id).unwrap().job_id;
     assert_eq!([c1, c2, c3, c4], [scrub, delete, finished, claimed]);
     (reg, [scrub, delete, finished, claimed, queued])
+}
+
+/// The claim order is `created_at, id`, the wall clock: with the clock stepped back between two
+/// enqueues the younger row is claimed first. That is the product's order and stays; a fixture
+/// that needs insert order sets `created_at` itself (`stamp_in_order`).
+#[test]
+fn claim_follows_created_at_and_stamp_in_order_makes_a_fixture_independent_of_the_clock() {
+    let db = mem();
+    let reg = register(&db, "pc", "ak", &[decl("A", false)], DEFAULT_ORG);
+    let a = reg.pid("A");
+    let first = enqueue_receipt(&db, a, None, None, Some(DOC)).job_id;
+    let second = enqueue_receipt(&db, a, None, None, Some(DOC)).job_id;
+    // the clock stepped back between the two enqueues
+    db.with(|c| {
+        c.execute(
+            "UPDATE jobs SET created_at=created_at+100 WHERE id=?",
+            [first],
+        )
+        .unwrap();
+    });
+    assert_eq!(claim(&db, reg.computer_id).unwrap().job_id, second);
+    finish(&db, second, reg.computer_id, true, None);
+    // the fixture sets the order itself, whatever the clock did
+    stamp_in_order(&db, &[first, second]);
+    let created = |id: i64| -> f64 {
+        db.with(|c| c.query_row("SELECT created_at FROM jobs WHERE id=?", [id], |r| r.get(0)))
+            .unwrap()
+    };
+    assert!(created(first) < created(second));
 }
 
 #[test]

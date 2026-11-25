@@ -102,6 +102,8 @@ asks again about every second, with the same key, for up to 130 s, and this does
 **To retry after an error yourself**, call `submit` again with the key the error carries:
 
 ```ts
+import { Printpapi, PrintpapiError } from "@printpapi/client";
+
 try {
   await printpapi.jobs.submit(job);
 } catch (e) {
@@ -115,7 +117,8 @@ try {
 An aborted or timed-out request does not stop the server's work, so this is the only safe way. The key
 is kept for as long as the job row exists ([API](https://github.com/LukiPrince/printpapi/blob/main/docs/api.md#submitting-a-job)). A job the server
 gave up on can still become `done` later when the agent delivers its result late, and its webhook
-fires again: do not resubmit on `failed` before you have looked at the job.
+fires again: `job.maybe_printed === true` says that this is possible (an agent had the job and never
+reported), so look or wait before you resubmit. Servers up to 3.6.0 never send the field.
 
 ## Timeouts
 
@@ -126,7 +129,9 @@ call overrides both; a value that is not a finite number means no timer. `jobs.w
 minutes (`timeoutMs`) with kind `timeout`, even while the server hangs; it polls about every 500 ms, growing
 by 1.5 up to 5 s. When its last pause is over, or the deadline cuts a poll after an earlier poll got an
 answer, it asks once more (at most 2 s, no repeats), so a job that ended meanwhile is returned and
-`timeoutMs: 0` checks once. A `timeoutMs` that is not a number
+`timeoutMs: 0` checks once. If that last request gets no answer about the job (the connection is
+refused or lost, `503`, `502`, `429`), `wait` ends with kind `timeout` and the last state it saw in `body`, not
+with that error; `not_found`, `unauthorized` and `forbidden` are still thrown as they are. A `timeoutMs` that is not a number
 means no deadline, an `intervalMs` that is not a positive finite number means 500 ms. A `signal` that is
 already aborted rejects at once with `attempts: 0`.
 

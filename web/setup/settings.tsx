@@ -14,7 +14,7 @@ import {
   Trash2,
 } from "lucide-react";
 import { setup, toSetupError, type AgentStatus, type Existing, type PairingView, type Platform, type UpdateInfo } from "./api";
-import { errorText, installHereInfo, olderCardShown, updateAvailable, type Hold } from "./model";
+import { errorText, installHereInfo, installHereShown, olderCardShown, updateAvailable, type Hold } from "./model";
 import { Notice, Shell, type NavItem } from "./bits";
 import { Wizard } from "./wizard";
 import { Overview } from "./settings-overview";
@@ -116,21 +116,29 @@ type Flow = { kind: "printers" | "connection"; existing: Existing; link?: Pairin
 function InstallHere({
   info,
   platform,
+  offered,
   onStart,
   onChanged,
 }: {
   info: UpdateInfo;
   platform: Platform;
+  /** The live state still makes the offer: without it, a notice that comes back idle says nothing. */
+  offered: boolean;
   /** The button was clicked: the owner keeps this notice on screen from now on. */
   onStart: () => void;
   onChanged: () => void;
 }) {
   const { run, busy, apply, keepWaiting } = useApplyPatch(onChanged);
+  // held across a screen of the window (a wizard) that unmounted this notice after the install
+  if (!installHereShown(run.at, offered)) return null;
   return (
     <Notice tone="info">
-      <p>
-        This program ({info.own}) is newer than the installed agent ({info.installed}).
-      </p>
+      {/* the offer's sentence: not once the install ran, when the installed agent is this program's version */}
+      {(run.at === "idle" || run.at === "failed") && (
+        <p>
+          This program ({info.own}) is newer than the installed agent ({info.installed}).
+        </p>
+      )}
       <RunNotice
         run={run}
         platform={platform}
@@ -251,6 +259,7 @@ export function Settings({
         <InstallHere
           info={shown}
           platform={platform}
+          offered={installHereInfo(brand !== null, top !== undefined, info, null) !== null}
           onStart={() => setHereInfo(shown)}
           onChanged={() => {
             void refresh();

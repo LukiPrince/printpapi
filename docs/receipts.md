@@ -253,7 +253,7 @@ different.
 
 `POST /receipts/preview` (right `Submit`) draws a receipt as a PNG and prints nothing. The body is
 `{"receipt": {...}, "printer_id": 3}` (the stored profile of that printer), or `{"receipt": {...},
-"profile": {...}}`, or just the receipt (the defaults). Both a printer and a profile is `400`; an
+"profile": {...}}`, or just `{"receipt": {...}}` (the defaults). Both a printer and a profile is `400`; an
 unknown or foreign printer is `400` `unknown printer: 3`. It spends no quota and creates no job.
 
 ```bash
@@ -294,7 +294,11 @@ receipt with images has to decode them, which can take tens of megabytes, so tho
 4 slots of their own (labels have theirs, so neither blocks the other). A receipt waits up to about
 two seconds for a slot and then answers `503` `receipt rendering is busy, try again later`. An image
 receipt also counts against the org's limit of downloads in flight (see `PRINTAPI_FETCHES_PER_ORG` in
-[server.md](server.md)) and holds its `idempotency_key` while it renders: a second request with the
+[server.md](server.md)) and, where that limit applies, one org renders at most 2 of the 4 at once
+(a third receipt of the org waits for one of its own two slots inside the same two seconds, so
+three receipts sent together, kitchen, bar and customer copy, all print, and one org still cannot
+keep the pool busy for the others).
+It holds its `idempotency_key` while it renders: a second request with the
 same new key at that moment answers `409` (`a request with this idempotency_key is still in
 progress, retry shortly`) and returns the job when you retry. A previously submitted key returns
 the original job at once, without rendering.

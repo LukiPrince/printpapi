@@ -421,7 +421,7 @@ pub enum Right {
     Look,
     /// Submit and cancel jobs (Bearer API, orders, Shopify, PrintNode).
     Submit,
-    /// Write label templates (and, later, receipt profiles).
+    /// Write label templates and receipt profiles.
     Edit,
     /// Enrol a computer, poll for its jobs, download and report them.
     Agent,

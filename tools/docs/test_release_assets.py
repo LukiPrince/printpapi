@@ -185,3 +185,131 @@ def test_a_listed_file_without_a_build_and_a_built_file_without_an_entry_are_pro
     # deleting the entry of a file that cannot be built keeps the check green, as the checklist says
     assert problems(built - {"printpapi-setup-linux-x86_64.rpm"}, WORKFLOW_SAMPLE, {"printpapi-setup-linux-x86_64.rpm"}) == []
     assert len(problems(built - {"printpapi-setup-linux-x86_64.rpm"}, WORKFLOW_SAMPLE, set())) == 1
+
+
+# --- the agent and server archives ----------------------------------------------------------------
+
+PACKAGE_LOOP = "for pkg in agent server; do"
+ZIP_LINE = 'then 7z a -tzip "$d.zip" "$d"'
+TAR_LINE = 'tar -czf "$d.tar.gz" "$d"'
+PYTHON_ZIP = "printpapi-agent-python.zip"
+# any archive name of the agent or the server, spelt right or not: a name that release.yml does not
+# build is a 404 for the reader
+ARCHIVE = re.compile(r"printpapi-(?:agent|server)-[A-Za-z0-9_-]+\.(?:zip|tar\.gz)")
+# the downloads page also writes a name as its platform part only: <code>-linux-aarch64</code>
+PLATFORM_ONLY = re.compile(r"<code[^>]*>-([A-Za-z0-9_]+-[A-Za-z0-9_]+)(?:\.zip|\.tar\.gz)?</code>")
+
+
+def build_job(text: str) -> str:
+    m = re.search(r"^  build:\n(.*?)(?=^  [a-z][\w-]*:\n|\Z)", text, flags=re.S | re.M)
+    if not m:
+        raise AssertionError("release.yml has no build job")
+    return m.group(1)
+
+
+def archives(text: str) -> set[str]:
+    """What the `build` job packs (`printpapi-agent-<name>.zip|tar.gz`, the same for the server, per
+    matrix row) and the Python agent's zip. The package step is read, not assumed: the loop over agent
+    and server, the zip of the Windows rows and the tar.gz of the others must all be there."""
+    job = build_job(text)
+    for needed in (PACKAGE_LOOP, ZIP_LINE, TAR_LINE):
+        assert needed in job, f"the package step of release.yml no longer has `{needed}`"
+    out = set()
+    for name in matrix_names(job):
+        ext = "zip" if name.startswith("windows") else "tar.gz"
+        out |= {f"printpapi-{pkg}-{name}.{ext}" for pkg in ("agent", "server")}
+    assert f"dist/{PYTHON_ZIP}" in text, "release.yml no longer builds the Python agent's zip"
+    return out | {PYTHON_ZIP}
+
+
+def platforms(text: str) -> set[str]:
+    return set(matrix_names(build_job(text)))
+
+
+def named_archives(page: str) -> set[str]:
+    return set(ARCHIVE.findall(page))
+
+
+def named_platforms(page: str) -> set[str]:
+    return set(PLATFORM_ONLY.findall(page))
+
+
+# Where archives are named: README, the docs and the downloads page. README.md, docs/server.md and
+# docs/migration.md write the server and agent archives only as printpapi-server-<platform>, so
+# nothing is compared there today; a full name added to them is.
+NAMING_FILES = ("README.md", "docs/agent.md", "docs/server.md", "docs/migration.md", "web/app/downloads/page.tsx")
+
+PACKAGE_SAMPLE = """
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - { os: a, target: t, name: windows-x86_64, exe: .exe }
+          - { os: b, target: u, name: linux-aarch64, exe: "" }
+    steps:
+      - run: |
+          for pkg in agent server; do
+            mkdir -p "$d"
+          done
+          for d in printpapi-agent-${{ matrix.name }} printpapi-server-${{ matrix.name }}; do
+            if [ "${{ runner.os }}" = "Windows" ]; then 7z a -tzip "$d.zip" "$d" >/dev/null
+            else tar -czf "$d.tar.gz" "$d"; fi
+          done
+  publish:
+    steps:
+      - run: zip -qr ../dist/printpapi-agent-python.zip x
+"""
+
+
+def test_the_archives_are_read_from_the_package_step():
+    assert archives(PACKAGE_SAMPLE) == {
+        "printpapi-agent-windows-x86_64.zip",
+        "printpapi-server-windows-x86_64.zip",
+        "printpapi-agent-linux-aarch64.tar.gz",
+        "printpapi-server-linux-aarch64.tar.gz",
+        "printpapi-agent-python.zip",
+    }
+
+
+def test_a_changed_package_step_is_noticed():
+    for old, new in (
+        (PACKAGE_LOOP, "for pkg in agent; do"),
+        (ZIP_LINE, 'then 7z a -t7z "$d.7z" "$d"'),
+        (TAR_LINE, 'tar -cJf "$d.tar.xz" "$d"'),
+    ):
+        try:
+            archives(PACKAGE_SAMPLE.replace(old, new))
+        except AssertionError:
+            continue
+        raise AssertionError(f"changing `{old}` was not noticed")
+
+
+def test_a_misspelt_archive_name_is_found():
+    page = "<code>printpapi-server-linux-arm64.tar.gz</code> and printpapi-agent-windows-x64.zip"
+    assert named_archives(page) == {"printpapi-server-linux-arm64.tar.gz", "printpapi-agent-windows-x64.zip"}
+    assert named_archives(page) - archives(PACKAGE_SAMPLE) == named_archives(page)
+    assert named_platforms('<code class="x">-linux-arm64</code>, <code>-windows-aarch64.zip</code>') == {
+        "linux-arm64",
+        "windows-aarch64",
+    }
+
+
+def test_the_archives_the_docs_and_the_downloads_page_name_are_built():
+    text = WORKFLOW.read_text(encoding="utf-8")
+    built = archives(text)
+    assert "printpapi-agent-windows-x86_64.zip" in built and "printpapi-server-linux-aarch64.tar.gz" in built
+    named, parts = set(), set()
+    for rel in NAMING_FILES:
+        page = (ROOT / rel).read_text(encoding="utf-8")
+        named |= named_archives(page)
+        parts |= named_platforms(page)
+    assert named, "no archive is named anywhere: the pattern is stale"
+    assert not (named - built), f"named but not built: {sorted(named - built)}"
+    assert parts, "the downloads page names no platform: the pattern is stale"
+    assert not (parts - platforms(text)), f"platform named but not built: {sorted(parts - platforms(text))}"
+    # the docs name every agent archive
+    docs = (ROOT / "docs" / "agent.md").read_text(encoding="utf-8")
+    for archive in sorted(built):
+        if archive.startswith("printpapi-agent-"):
+            assert archive in docs, f"docs/agent.md does not name {archive}"

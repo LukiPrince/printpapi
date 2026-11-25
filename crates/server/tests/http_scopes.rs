@@ -1002,6 +1002,8 @@ fn a_job_in_flight_can_be_finished_after_the_key_was_narrowed() {
     let pid = printer_of(&register_http(&app, "kf", "pc"));
     let j1 = job_id(&app.post("/jobs", Some("t"), job_body(pid)).1);
     let j2 = job_id(&app.post("/jobs", Some("t"), job_body(pid)).1);
+    // claims follow created_at, which is the wall clock: pin the order, a clock step back swaps it
+    stamp_in_order(&app.db, &[j1, j2]);
     let r = app.agent("GET", "/agent/jobs", "kf", None);
     assert_eq!(r.json()["job_id"].as_i64(), Some(j1));
     let put = |scope: &str| {

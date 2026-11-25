@@ -215,7 +215,7 @@ function PrinterCard({ printer, onPrinted }: { printer: PrinterT; onPrinted: () 
           variant="outline"
           size="icon-sm"
           aria-label="Receipt settings"
-          title="Receipt settings"
+          title="Receipt settings (for receipt printers; a label printer needs ZPL)"
           onClick={() => setSettings(true)}
         >
           <Receipt />

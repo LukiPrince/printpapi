@@ -76,6 +76,10 @@ v1 is deliberately small (see [CONTRIBUTING.md](../CONTRIBUTING.md) for the YAGN
   client with no runtime dependency, whose types are generated from that file, with retries that cannot print twice.
   The npm package name and its first publication are the maintainer's to decide. See
   [api.md](api.md#machine-readable-api) and [clients/js](../clients/js/README.md).
+- ~~**Agent skill**~~ ✅ one file, [`skills/printpapi/SKILL.md`](../skills/printpapi/SKILL.md), tells an AI coding
+  agent how to use the client API (payload per printer, retry-safe keys, webhooks, errors);
+  `npx skills add LukiPrince/printpapi --skill printpapi` installs it, and `tools/docs/test_skill.py` keeps it
+  in step with the server.
 
 ## v2 candidates
 
@@ -144,9 +148,9 @@ order of pull:
     See [receipts.md](receipts.md). Left open: **verification on real 58 and 80 mm printers**, images
     by URL, a per-job profile override, stored receipt templates, Star output.
 12. **Code-signed Windows agent installer** — the one blocker that needs a certificate, not code.
-13. **Opt-in: reject unknown keys on `/agent/register`.** Today an unrecognised bearer enrolls into
-    the default org - harmless on a LAN, but anyone who can reach `/agent/*` from outside can add
-    agents and printers there. Until then, exposing `/agent/*` needs an auth proxy in front.
+13. ~~**Reject unknown keys on `/agent/register`**~~ ✅ **shipped in v3** — an unrecognised bearer is
+    `401`; only a key an agent already holds keeps working, and `PRINTAPI_OPEN_ENROLLMENT=1` brings
+    the v2 rule back. See [api.md](api.md#multi-tenancy).
 14. **Fair image rendering between orgs.** `RENDER_SLOTS` is one global cap of 4, so a single org
     can hold every slot and others get a `503` until one frees up. Only matters on a shared server
     with tenants. Fix in two steps: cap each org at 2 of the 4 slots, then let a job wait up to

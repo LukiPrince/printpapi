@@ -2344,7 +2344,6 @@ mod tests {
             "pc",
             false,
         )
-        .ok()
         .expect("paired");
         assert_eq!(view.server_url, FIXED);
         assert_eq!(http.urls.borrow().len(), 3);
@@ -2576,7 +2575,6 @@ mod tests {
             "pc",
             true,
         )
-        .ok()
         .expect("paired");
         assert_eq!(
             *http.urls.borrow(),
@@ -2663,10 +2661,12 @@ mod tests {
 
     #[test]
     fn the_install_takes_only_the_pairing_the_window_confirmed() {
-        let mut s = AppState::default();
-        s.paired = Some(paired_conn());
-        s.pair_seq = 2;
-        s.paired_id = 2;
+        let s = AppState {
+            paired: Some(paired_conn()),
+            pair_seq: 2,
+            paired_id: 2,
+            ..Default::default()
+        };
         let named = |id: Option<u64>| {
             let mut r = by_address("https://print.example.com");
             r.pair_id = id;
@@ -2701,7 +2701,6 @@ mod tests {
             "pc",
             false,
         )
-        .ok()
         .expect("paired");
         assert!(!view.created_by_escaped && view.created_by.is_none());
         assert_eq!(shown_creator(None), (None, false));
