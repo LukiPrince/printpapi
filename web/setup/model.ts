@@ -487,6 +487,16 @@ export function installHereInfo(
   return brand && !hasTakeOver && info && ownIsNewer(info) && info.installed !== null ? info : null;
 }
 
+/**
+ * Whether the notice of "Install X from this setup" is on screen. `offered` is whether the live
+ * state still makes the offer (this program newer than the installed agent). The notice is kept
+ * across the install that was started from it, but not when it comes back idle after a screen of
+ * the window replaced it: held, it would offer the install again over the agent that has it.
+ */
+export function installHereShown(run: "idle" | "applying" | "waiting" | "done" | "slow" | "failed", offered: boolean): boolean {
+  return run !== "idle" || offered;
+}
+
 /** The mode was changed to one that looks, and the agent still says off: its update_url is no folder. */
 export function modeStillOff(asked: UpdateMode, now: UpdateInfo["mode"]): boolean {
   return asked !== "off" && now === "off";

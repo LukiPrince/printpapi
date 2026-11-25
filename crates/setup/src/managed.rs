@@ -49,6 +49,9 @@ const LOG_DIR_ENV: &str = "PRINTPAPI_MANAGED_LOG_DIR";
 /// minutes the update of the window waits, `update::QUIET_WAIT_SECS`).
 const QUIET_WAIT_SECS: u64 = 120;
 const KEY_IN_USE: &str = "The key is already used by another PC: one key per PC";
+/// An upgrade with `AGENT_INI` of a PC that a pairing code reconnected: its agent.ini holds the new
+/// key, and the prepared file's old key meets the name of the same device.
+const NAME_TAKEN_UPGRADE: &str = "If this PC was reconnected with a pairing code (Reconnect), upgrade without AGENT_INI, or take the key out with unprotect-key (docs/agent.md).";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Command {
@@ -442,7 +445,15 @@ fn install(host: &dyn Host, arg: &Path) -> Result<(), String> {
             }
             run_elevated(&|a, args| host.elevate(a, args), &agent, &dir, "install")
                 .map(|_| ())
-                .map_err(|e| describe(&e, key))
+                .map_err(|e| {
+                    if e.code == "name_taken" && before == Installed::Managed {
+                        // a 401 has several causes (a revoked or exchanged key, a name of another
+                        // key, a Print only key): the agent's sentence stays, Reconnect is one more
+                        format!("{} {NAME_TAKEN_UPGRADE}", describe(&e, key))
+                    } else {
+                        describe(&e, key)
+                    }
+                })
         });
     // the file holds the key: gone whatever happened
     let _ = std::fs::remove_file(&staged_ini);
@@ -1727,6 +1738,38 @@ mod tests {
         let e = execute(&h, &install_of(&dir)).unwrap_err();
         assert_eq!(e, "The key is already used by another PC: one key per PC");
         assert!(h.logged().contains("one key per PC"));
+    }
+
+    #[test]
+    fn an_upgrade_that_meets_a_taken_name_says_the_pc_was_reconnected() {
+        // the device got another key by a pairing code (Reconnect), sealed in its agent.ini: the
+        // key of the prepared file registers under the same name and the server refuses it
+        let h = Fake::new(Installed::Managed);
+        h.install_dir_with("[agent]\nname = shop\n");
+        h.reply(failed(
+            "name_taken",
+            "The server refused this key. Either the key was revoked or is not meant for agents, or this device name belongs to a different key.",
+            false,
+        ));
+        let dir = h.prepared("SHOP-PC.ini", &ini("name = shop\n"));
+        let e = execute(&h, &install_of(&dir)).unwrap_err();
+        // the real causes stay in the line, Reconnect is named as one possibility
+        assert!(
+            e.starts_with("The server refused this key. Either the key was revoked"),
+            "{e}"
+        );
+        assert!(e.ends_with(NAME_TAKEN_UPGRADE), "{e}");
+        assert!(
+            e.contains("If this PC was reconnected") && e.contains("without AGENT_INI"),
+            "{e}"
+        );
+        assert!(h.logged().contains("without AGENT_INI"), "{}", h.logged());
+        // a first install keeps the agent's own words
+        let h = Fake::new(Installed::None);
+        h.reply(failed("name_taken", "The server refused this key.", false));
+        let dir = h.prepared("SHOP-PC.ini", &ini("name = a\n"));
+        let e = execute(&h, &install_of(&dir)).unwrap_err();
+        assert_eq!(e, "The server refused this key.");
     }
 
     #[test]

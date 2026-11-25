@@ -3,17 +3,18 @@
 import { useEffect, useMemo, useState } from "react";
 import { AnimatePresence, motion } from "motion/react";
 import { toast } from "sonner";
-import { ChevronRight, History, Loader2, Pause, Play, Receipt, Search, X } from "lucide-react";
+import { AlertTriangle, ChevronRight, History, Loader2, Pause, Play, Receipt, Search, X } from "lucide-react";
 import { usePoll } from "@/hooks/use-poll";
 import { ApiError, cancelJob, getJobPreview, getSupportAccess, listJobs, type Job, type JobState } from "@/lib/api";
 import { JOB_STATES, STATE_ORDER } from "@/lib/job-state";
+import { maybePrintedNote } from "@/lib/maybe-printed";
 import { showReceiptFailure } from "@/lib/receipt";
 import { fmtAgo, fmtDuration, fmtTime } from "@/lib/format";
 import { Card, CardContent } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Skeleton } from "@/components/ui/skeleton";
-import { EmptyState, PulseDot, StatusBadge } from "@/components/bits";
+import { EmptyState, Note, PulseDot, StatusBadge } from "@/components/bits";
 import { cn } from "@/lib/utils";
 
 export default function HistoryPage() {
@@ -165,6 +166,16 @@ export default function HistoryPage() {
                     <span className="min-w-0 flex-1 truncate text-sm">
                       {job.title || <span className="text-muted-foreground">untitled</span>}
                     </span>
+                    {job.maybe_printed && (
+                      <span
+                        className="flex shrink-0 items-center gap-1 text-xs"
+                        style={{ color: "var(--state-queued)" }}
+                        title="May have printed"
+                      >
+                        <AlertTriangle className="size-3.5" aria-hidden />
+                        <span className="sr-only sm:not-sr-only">May have printed</span>
+                      </span>
+                    )}
                     <span className="hidden w-40 shrink-0 truncate font-mono text-xs text-muted-foreground md:block">
                       {job.printer_name}
                     </span>
@@ -204,6 +215,11 @@ export default function HistoryPage() {
                               >
                                 {job.error}
                               </dd>
+                            </div>
+                          )}
+                          {job.maybe_printed && (
+                            <div className="sm:col-span-2">
+                              <Note tone="warn">May have printed: {maybePrintedNote(job)}</Note>
                             </div>
                           )}
                           {job.type === "receipt" && canShow && (

@@ -1006,6 +1006,67 @@ fn a_put_back_that_fails_inside_the_swap_is_the_not_running_case() {
     assert!(!has(&sim.log(), "systemctl restart"), "{:?}", sim.log());
 }
 
+#[test]
+fn a_tray_that_cannot_be_put_back_does_not_keep_the_restored_agent_from_starting() {
+    let sim = ready_to_install(Os::Linux);
+    // once the new agent is in place: the prepared new tray goes away (so it cannot be put in
+    // place) and so does the aside copy of the old tray (so it cannot be put back either)
+    let (binary, tray) = (sim.layout.binary.clone(), sim.layout.tray.clone());
+    *sim.on_sleep.borrow_mut() = Some(Box::new(move |_| {
+        if std::fs::read(&binary).is_ok_and(|b| b == NEW_AGENT) {
+            let name = tray.file_name().unwrap().to_string_lossy().into_owned();
+            let _ = std::fs::remove_file(leftover_of(&tray));
+            let _ = std::fs::remove_file(tray.with_file_name(format!(".{name}.old")));
+        }
+    }));
+    let e = error(staged(&sim));
+    let text = e.to_string();
+    assert_eq!(e.code(), "rolled_back", "{text}");
+    assert!(
+        text.contains("cannot put the new printpapi-tray in place"),
+        "{text}"
+    );
+    assert!(
+        text.contains("printpapi-tray could not be put back"),
+        "{text}"
+    );
+    assert!(!text.contains("The agent is not running"), "{text}");
+    // what is left to do is said: the tray and the settings window are gone until then
+    assert!(
+        text.ends_with("It is running again. Run the setup again to put the tray program back."),
+        "{text}"
+    );
+    // the old agent is back and was started again
+    assert_eq!(sim.binary(), OLD_AGENT);
+    let starts = sim
+        .log()
+        .iter()
+        .filter(|l| l.contains("systemctl restart"))
+        .count();
+    assert_eq!(
+        starts,
+        2,
+        "the new agent, then the old one: {:?}",
+        sim.log()
+    );
+}
+
+#[test]
+fn the_next_update_puts_a_missing_tray_back_from_its_aside_copy_before_it_clears_leftovers() {
+    // a tray that could not be put back leaves its only copy in .printpapi-tray.old and no tray:
+    // the next update must not delete that copy and then finish without a tray
+    let sim = Sim::new(Os::Linux);
+    let tray = sim.layout.tray.clone();
+    let name = tray.file_name().unwrap().to_string_lossy().into_owned();
+    let aside = tray.with_file_name(format!(".{name}.old"));
+    std::fs::rename(&tray, &aside).unwrap();
+    sim.stage(&sim.release("3.7.0", NEW_AGENT, Some(NEW_TRAY)));
+    staged(&sim).unwrap();
+    assert_eq!(sim.binary(), NEW_AGENT);
+    assert_eq!(sim.tray(), OLD_TRAY, "the old tray is back, not gone");
+    assert!(!aside.exists());
+}
+
 // ---- tries and the unattended run ----
 
 #[test]

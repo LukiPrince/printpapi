@@ -219,6 +219,8 @@ pub struct AppState {
     last_retention: Mutex<Option<f64>>,
     /// Payload fetches running now, per org (see `MAX_FETCHES_PER_ORG`).
     org_fetches: Mutex<std::collections::HashMap<i64, usize>>,
+    /// Image receipts rendering now, per org (see `RECEIPT_SLOTS_PER_ORG`).
+    org_receipts: Mutex<std::collections::HashMap<i64, usize>>,
     /// Idempotency keys whose payload is being fetched now, per org (see `KeyGuard`).
     keys_in_flight: Mutex<std::collections::HashSet<(i64, String)>>,
     /// A retention WAL truncate was blocked by a reader; the next pass retries it even if it
@@ -243,6 +245,12 @@ pub const RENDER_SLOTS: usize = 4;
 /// Image receipts rendering at once: a decode can take up to 64 MiB for the resize and a little
 /// less for the decoder, and the blocking pool has 512 threads, so it stays bounded.
 pub const RECEIPT_SLOTS: usize = 4;
+/// Image receipts one org may render at once where the org cap applies (`Config::fetch_cap`): a
+/// receipt that decodes its images and then fails (a QR code too long) costs no quota, so an org
+/// could otherwise repeat it and keep every slot busy for the others. A receipt over the limit
+/// waits for its own org's slot inside the same two seconds as for the pool. ponytail: a fixed half
+/// of the pool; an attacker with several orgs still shares the pool and gets 503 from it like anybody.
+pub const RECEIPT_SLOTS_PER_ORG: usize = 2;
 /// How long an image receipt waits for a slot before it answers 503, and how often it looks.
 /// ponytail: polling, no queue order.
 pub const RECEIPT_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
@@ -343,7 +351,78 @@ impl Drop for FetchGuard<'_> {
     }
 }
 
+/// Holds one of an org's image-receipt slots; dropping it gives the slot back.
+pub struct ReceiptOrgGuard<'a> {
+    state: &'a AppState,
+    org_id: i64,
+}
+
+impl Drop for ReceiptOrgGuard<'_> {
+    fn drop(&mut self) {
+        let mut map = self
+            .state
+            .org_receipts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(n) = map.get_mut(&self.org_id) {
+            *n -= 1;
+            if *n == 0 {
+                map.remove(&self.org_id);
+            }
+        }
+    }
+}
+
 impl AppState {
+    /// An image-receipt slot for `org_id`, or `None` when it already has `RECEIPT_SLOTS_PER_ORG`
+    /// running. Where the org cap does not apply (a self-hosted box) nothing is counted.
+    pub fn try_receipt_org_slot(&self, org_id: i64) -> Option<Option<ReceiptOrgGuard<'_>>> {
+        if self.cfg.fetch_cap() == 0 {
+            return Some(None);
+        }
+        let mut map = self
+            .org_receipts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let n = map.entry(org_id).or_insert(0);
+        if *n >= RECEIPT_SLOTS_PER_ORG {
+            return None;
+        }
+        *n += 1;
+        Some(Some(ReceiptOrgGuard {
+            state: self,
+            org_id,
+        }))
+    }
+
+    /// `try_receipt_org_slot`, trying every 25 ms until `deadline`: an org's third receipt at the
+    /// same moment (kitchen, bar, customer copy) is ordinary traffic and waits like the pool does.
+    pub fn enter_receipt_org_within(
+        &self,
+        org_id: i64,
+        deadline: std::time::Instant,
+    ) -> Option<Option<ReceiptOrgGuard<'_>>> {
+        loop {
+            if let Some(g) = self.try_receipt_org_slot(org_id) {
+                return Some(g);
+            }
+            if std::time::Instant::now() >= deadline {
+                return None;
+            }
+            std::thread::sleep(RECEIPT_POLL);
+        }
+    }
+
+    /// Image receipts `org_id` is rendering now. Only the tests look at it.
+    pub fn receipt_org_in_flight(&self, org_id: i64) -> usize {
+        self.org_receipts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&org_id)
+            .copied()
+            .unwrap_or(0)
+    }
+
     /// A download slot for `org_id`, or `None` when it already has `Config::fetch_cap` running.
     /// Without a cap nothing is counted.
     fn try_fetch_slot(&self, org_id: i64) -> Option<Option<FetchGuard<'_>>> {
@@ -471,6 +550,7 @@ impl AppState {
             previews: Mutex::new(std::collections::HashSet::new()),
             last_retention: Mutex::new(None),
             org_fetches: Mutex::new(std::collections::HashMap::new()),
+            org_receipts: Mutex::new(std::collections::HashMap::new()),
             keys_in_flight: Mutex::new(std::collections::HashSet::new()),
             wal_truncate_pending: std::sync::atomic::AtomicBool::new(false),
             started: std::time::Instant::now(),
@@ -1891,7 +1971,7 @@ impl Ctx<'_> {
     /// that an unknown printer never costs a render. The printer decides the output: ESC/POS bytes
     /// (mode raw) unless it takes PDF and its profile says `auto`, then a PDF (never to a raw
     /// printer: AGENTS.md pitfall 1). Receipts without images take no render slot; one with images
-    /// waits up to two seconds for one of `receipt_slots`, and counts against the org's download
+    /// waits up to two seconds for its org's slot and one of `receipt_slots`, and counts against the org's download
     /// cap and idempotency-key guard like a fetching job.
     fn receipt_payload(
         &self,
@@ -1928,11 +2008,22 @@ impl Ctx<'_> {
             Err(e) => return Err(e),
         };
         let data = {
+            // one deadline for both waits: the org's own limit, then the pool
+            let deadline = std::time::Instant::now() + RECEIPT_WAIT;
+            let _org_slot = if images {
+                Some(
+                    self.s
+                        .enter_receipt_org_within(printer.org_id, deadline)
+                        .ok_or_else(|| SubmitErr::Busy(RECEIPT_BUSY.into()))?,
+                )
+            } else {
+                None
+            };
             let _slot = if images {
                 Some(
                     self.s
                         .receipt_slots
-                        .enter_within(RECEIPT_WAIT)
+                        .enter_within(deadline.saturating_duration_since(std::time::Instant::now()))
                         .ok_or_else(|| SubmitErr::Busy(RECEIPT_BUSY.into()))?,
                 )
             } else {
@@ -3216,6 +3307,9 @@ impl Ctx<'_> {
             store::CreatePairing::TooMany => {
                 return Ok(jerr(429, "too many open pairing codes"));
             }
+            store::CreatePairing::TooManyToday => {
+                return Ok(jerr(429, "too many pairing codes today, try again later"));
+            }
             store::CreatePairing::UnknownDevice => return Ok(not_found()),
             store::CreatePairing::Unshowable(why) => return Ok(jerr(400, why)),
             store::CreatePairing::Cloudprnt => {
@@ -3585,7 +3679,8 @@ impl Ctx<'_> {
         }
         if let Some(oid) = id_of(t, "/orgs/", "") {
             // Root only, and never DEFAULT_ORG: an org holds other people's print history, and the
-            // default one is where an agent with an unknown key still lands.
+            // default one is where the root token, v2 agents and (with open enrollment) unknown
+            // keys enroll.
             gate!(self.admin());
             if oid == store::DEFAULT_ORG {
                 return Ok(jerr(400, "the default org cannot be removed"));
@@ -3707,8 +3802,11 @@ pub fn deliver_webhooks(
         Err(e) => return eprintln!("webhook dispatcher error: {e}"),
     };
     for job in jobs {
-        let payload = json!({ "job_id": job.job_id, "state": job.state, "error": job.error,
-                              "title": job.title, "printer_id": job.printer_id });
+        let mut payload = json!({ "job_id": job.job_id, "state": job.state, "error": job.error,
+                                  "title": job.title, "printer_id": job.printer_id });
+        if job.maybe_printed {
+            payload["maybe_printed"] = json!(true);
+        }
         // only a POST failure counts as a delivery failure
         let res = match post(&job.callback_url, &payload) {
             Err(e) => {

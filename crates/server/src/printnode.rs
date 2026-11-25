@@ -663,6 +663,7 @@ mod tests {
             error: Some("expired".into()),
             created_at: 10.25,
             finished_at: Some(0.0),
+            maybe_printed: false,
         }
     }
 

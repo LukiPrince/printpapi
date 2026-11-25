@@ -42,6 +42,8 @@ export type Job = {
   error: string | null;
   created_at: number;
   finished_at: number | null;
+  /** Only there when true: an agent had the job and never reported (docs/api.md, "Did it print?"). */
+  maybe_printed?: boolean;
 };
 
 /** The life of a pairing code (docs/api.md, "Pairing a device"). */

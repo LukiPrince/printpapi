@@ -418,6 +418,68 @@ fn a_late_ok_after_the_reaper_failed_the_job_fires_the_webhook_again_with_done()
     assert_eq!(states, ["failed", "done"]);
 }
 
+#[test]
+fn maybe_printed_is_sent_only_while_the_outcome_is_unknown() {
+    let app = App::new();
+    let (aid, pid) = agent_key(&app, "ak");
+    let cb = |j: &mut store::NewJob<'_>| j.callback_url = Some("https://hook.test/a".into());
+    let lost = enqueue(&app.db, pid, b"x", cb);
+    let uid = claim(&app.db, aid).unwrap().job_uid.unwrap();
+    reaper_pass(&app, store_now() + 1000.0);
+    let never = enqueue(&app.db, pid, b"y", cb);
+    app.db.with(|c| {
+        c.execute("UPDATE jobs SET expires_at=1", []).unwrap();
+        assert_eq!(store::expire_jobs(c, None).unwrap(), 2);
+    });
+    let posted = std::sync::Mutex::new(Vec::<Value>::new());
+    let post = |_: &str, v: &Value| {
+        posted.lock().unwrap().push(v.clone());
+        Ok(())
+    };
+    printpapi_server::server::deliver_webhooks(&app.db, &post, 5);
+
+    let keys = |v: &Value| -> Vec<String> { v.as_object().unwrap().keys().cloned().collect() };
+    const STATUS: [&str; 5] = ["state", "error", "printer_id", "created_at", "finished_at"];
+    const HOOK: [&str; 5] = ["job_id", "state", "error", "title", "printer_id"];
+    let status = |id: i64| app.get(&format!("/jobs/{id}"), Some("t")).1;
+
+    // handed out and never answered: said in the job, the list and the webhook, after today's fields
+    let j = status(lost);
+    assert_eq!(
+        (&j["error"], &j["maybe_printed"]),
+        (&json!("expired"), &json!(true))
+    );
+    assert_eq!(keys(&j), [&STATUS[..], &["maybe_printed"]].concat());
+    // never handed out: byte for byte what it was
+    assert_eq!(keys(&status(never)), STATUS);
+    let list = app.get("/jobs", Some("t")).1;
+    for row in list["jobs"].as_array().unwrap() {
+        let want = (row["id"] == lost).then_some(&json!(true)).cloned();
+        assert_eq!(row.get("maybe_printed").cloned(), want, "{row}");
+    }
+    let hook = |id: i64| -> Vec<Value> {
+        let sent = posted.lock().unwrap();
+        sent.iter().filter(|v| v["job_id"] == id).cloned().collect()
+    };
+    assert_eq!(
+        keys(&hook(lost)[0]),
+        [&HOOK[..], &["maybe_printed"]].concat()
+    );
+    assert_eq!(hook(lost)[0]["maybe_printed"], json!(true));
+    assert_eq!(keys(&hook(never)[0]), HOOK);
+    // the PrintNode shapes do not know it
+    let pn = app.pn("GET", "/printjobs", "t", None).1;
+    assert!(!pn.to_string().contains("maybe_printed"), "{pn}");
+
+    // the late result settles it
+    let body = json!({"job_id": lost, "job_uid": uid, "ok": true});
+    assert_eq!(late(&app, "ak", body).status, 200);
+    printpapi_server::server::deliver_webhooks(&app.db, &post, 5);
+    assert_eq!(keys(&status(lost)), STATUS);
+    assert_eq!(hook(lost)[1]["state"], "done");
+    assert_eq!(keys(&hook(lost)[1]), HOOK);
+}
+
 // --- the long poll over a real socket -----------------------------------------------------------
 
 /// One raw GET /agent/jobs: status and JSON body, with or without the features header.

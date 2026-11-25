@@ -43,7 +43,7 @@ export const NAV: NavItem[] = [
     label: "Print History",
     eyebrow: "Job queue",
     icon: History,
-    help: "The last 50 jobs. State runs queued → claimed → done/failed. Queued jobs can still be cancelled; once an agent claims one it is on its way to the printer.",
+    help: "The last 50 jobs. State runs queued → claimed → done/failed. Queued jobs can still be cancelled; once an agent claims one it is on its way to the printer. May have printed: an agent took the job and never reported, so check the paper before you send it again.",
   },
   {
     href: "/keys",

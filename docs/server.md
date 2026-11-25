@@ -29,7 +29,7 @@ Environment variables:
 |---|---|---|
 | `PRINTAPI_TOKEN` | *(required)* | Bootstrap/admin token — treat like a password |
 | `PRINT_DB` | `printpapi.db` | SQLite database path |
-| `PRINT_PORT` | `3460` | Listen port |
+| `PRINT_PORT` | `3460` | Listen port. The server listens on all IPv4 addresses of the machine and has no setting for the address. A reverse proxy does not change that: to keep the port off other networks use a firewall rule, or with Docker publish it on one address (`-p 127.0.0.1:3460:3460`) or not at all ([Behind a reverse proxy](#behind-a-reverse-proxy)) |
 | `LOG_REQUESTS` | *(off)* | Set to log every HTTP request |
 | `PRINTAPI_SIGNUP` | `closed` | `open` lets anyone create an org via `POST /signup` — for a hosted deployment, not a private box. `PRINTAPI_SIGNUP`, `PRINTAPI_SIGNUP_QUOTA`, `PRINTAPI_JOB_RETENTION_DAYS` and `PRINTAPI_TERMS_VERSION` (with its links) are start values: while `PRINTAPI_OPERATOR_TOKEN` is set, the operator console can override them at runtime ([live settings](operator.md#live-settings)). With the token set, any value other than `open` (`closed`, `CLOSED`, `off`, a typo) locks signup shut and no override can open it; blank means unset |
 | `PUBLIC_URL` | *(unset)* | This server's own address, e.g. `https://print.example`. Only then does a password-reset mail carry a link (see [api.md](api.md#password-reset)). It is also the address in a [pairing link](api.md#pairing-a-device) when the dashboard is opened under a local address (`localhost`); otherwise the link names the address the dashboard is opened under |
@@ -46,7 +46,7 @@ Environment variables:
 | `PRINTAPI_TERMS_VERSION` | *(unset: no consent asked)* | A non-empty version string of at most 100 characters without control characters, e.g. `2026-11-13`. Set: `POST /signup` must carry `accept_terms` equal to it, `GET /health` reports it with the links below, and the dashboard's sign-up form shows a checkbox for the terms and the data processing agreement. Each acceptance (org, user, version, time) is stored in the `terms_acceptances` table. See [Self-signup](api.md#self-signup). With signup open and no version, startup prints a warning |
 | `PRINTAPI_TERMS_URL` | *(required with the version)* | `http(s)` link to the terms. Anything else, or a version without it, stops the server at startup |
 | `PRINTAPI_DPA_URL`, `PRINTAPI_PRIVACY_URL` | *(unset)* | Optional `http(s)` links to the data processing agreement and the privacy policy, shown next to the checkbox. Anything else stops the server at startup |
-| `PRINTAPI_FETCHES_PER_ORG` | `4` with open signup or an [operator token](operator.md#hosted-mode), else `0` (no cap) | Payload downloads (`*_uri`, `*_uri_post`, `label_uri`) and [receipts with images](receipts.md#concurrent-image-receipts) one org may have in flight at once; the next one answers `503`. A non-negative integer, `0` = no cap; anything else stops the server at startup. Keeps one hosted tenant from using every download slot; a single-org box has no reason for it, since four hung upstream hosts would then block every other fetching job |
+| `PRINTAPI_FETCHES_PER_ORG` | `4` with open signup or an [operator token](operator.md#hosted-mode), else `0` (no cap) | Payload downloads (`*_uri`, `*_uri_post`, `label_uri`) and [receipts with images](receipts.md#concurrent-image-receipts) one org may have in flight at once; the next download answers `503` at once. An image receipt also renders at most 2 at a time per org and waits up to two seconds for the next one. A non-negative integer, `0` = no cap; anything else stops the server at startup. Keeps one hosted tenant from using every download slot; a single-org box has no reason for it, since four hung upstream hosts would then block every other fetching job |
 | `PRINTAPI_PRIVATE_URLS` | `deny` with open signup or an [operator token](operator.md#hosted-mode), else `allow` | `deny`: payload URLs (`*_uri`, `*_uri_post`), job `callback_url`s and org `event_url`s may only reach public addresses — no loopback, LAN, link-local/cloud-metadata or other private ranges, checked after DNS on every redirect hop. `allow`: anywhere (a self-hosted box fetching PDFs from an internal service). Set `deny` whenever people you do not trust get keys |
 | `PRINTAPI_TRUSTED_PROXIES` | *(unset: nobody)* | Comma-separated IPs or CIDRs (IPv4 and IPv6, e.g. `127.0.0.1,::1` or the one pinned proxy address `172.30.0.2` of the Compose example; list nothing wider) of the reverse proxies in front of printpapi. Only a request whose socket peer is listed has its `X-Forwarded-For` read: the rightmost entry that is not itself listed is the client, which the signup throttle (IPv6 per /64) and the `LOG_REQUESTS` line then use. Unset, the socket peer is the client, so behind a proxy every signup shares one throttle slot. An invalid entry stops the server at startup. See [Behind a reverse proxy](#behind-a-reverse-proxy) |
 | `PRINTAPI_OPEN_ENROLLMENT` | *(off)* | `1`: any Bearer value enrolls a new agent into the default org (the v2 rule). Off: a new agent needs an issued key or the root token |
@@ -58,11 +58,12 @@ PRINTAPI_TOKEN=change-me PRINT_DB=data/printpapi.db ./printpapi
 ```
 
 `printpapi --version` prints the version. An existing `printpapi.db` from the Python server
-(v2.5.1 or older) opens unchanged — the schema is the same, apart from a few additive indexes.
+(v2.5.1 or older) opens unchanged: the server only adds indexes, columns, tables and four cleanup triggers, never changes
+or drops one, and v2.5.1 does not read what it added ([going back](migration.md#going-back)).
 
 ### Upgrading from the Python server (v2.x)
 
-Same environment, same database, same API. The [migration guide](migration.md) walks through the
+Same environment, same database, same API (later 3.x versions add routes, fields and rights, and one behaviour changed: see [The API](migration.md#what-stays-the-same)). The [migration guide](migration.md) walks through the
 server and agent upgrade, the defaults that are stricter in v3 and how to roll back.
 
 ## Install
@@ -105,7 +106,10 @@ runs as root, as the Python image did, so an existing data volume stays writable
 
 `GET /` serves a static, secret-free React dashboard: a live overview (queue counters,
 job-outcome breakdown, activity feed), printers online/offline, searchable job history with
-cancel, one-click test print, API-key management, a **Team** page (add or remove the people who
+cancel, one-click test print, a **Print** page (a PDF, raw bytes such as ZPL, a URL, the test page, or a receipt with a live
+preview), a **Labels** page for [label templates](labels.md) (which also prints them), a **Devices** page (with **Connect device**
+and the receipt settings of a printer), a **Downloads** page for the setup app, API-key management with
+the rights of each key, a **Team** page (add or remove the people who
 may sign in, change your own password), a **Settings** page (this month's jobs against the org's
 quota, the agent-event URL, the Shopify webhook secret), agent install instructions, light/dark
 theme and a ⌘K command palette. You sign in with an account — creating one yourself where the

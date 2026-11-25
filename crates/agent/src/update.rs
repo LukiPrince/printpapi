@@ -834,6 +834,24 @@ pub fn leftovers_of(path: &Path) -> Vec<PathBuf> {
     out
 }
 
+/// When `path` is gone, the first aside copy (`.<name>.old`, `.old1` to `.old9`) takes its place.
+/// An earlier rollback that could not rename the old program back leaves it only there.
+fn restore_missing(env: &Env, path: &Path) {
+    if std::fs::symlink_metadata(path).is_ok() {
+        return;
+    }
+    let name = path.file_name().unwrap_or_default().to_string_lossy();
+    let asides =
+        std::iter::once(format!(".{name}.old")).chain((1..=9).map(|i| format!(".{name}.old{i}")));
+    for aside in asides.map(|a| path.with_file_name(a)) {
+        if std::fs::symlink_metadata(&aside).is_ok()
+            && retry(3, env.sleep, &mut || std::fs::rename(&aside, path)).is_ok()
+        {
+            return;
+        }
+    }
+}
+
 /// `<install folder>/update-state.json`
 pub fn state_path(l: &Layout) -> PathBuf {
     l.dir.join(STATE_NAME)
@@ -1447,6 +1465,11 @@ pub fn update(source: Source, env: &Env) -> Outcome {
         return Ok(None);
     }
     clean_prepared(env);
+    // a program that is missing (an earlier rollback could not rename it back) has its only copy in
+    // an aside name: put that back before the leftovers are cleared, never delete it
+    for p in [&l.binary, &l.tray] {
+        restore_missing(env, p);
+    }
     for p in [&l.binary, &l.tray] {
         for old in leftovers_of(p) {
             let _ = remove_tree(&old);
@@ -1648,8 +1671,15 @@ fn rollback(
     // Windows: the process of the new agent has to end before its file can be renamed
     let _ = stop_and_wait(env, plan);
     let mut failed_names: Vec<PathBuf> = Vec::new();
-    // a swap that was stuck half way is already a rename that failed
+    // a swap that was stuck half way is already a rename that failed. Only the program that is
+    // started decides: the agent swap is the first one, so when it is among `swaps` the stuck one
+    // was the tray, and the old agent can be put back and started as usual.
+    let mut tray_left: Option<String> = None;
     let mut rename_error: Option<String> = match why {
+        Cause::Stuck(_, left) if swaps.iter().any(|s| s.to == l.binary) => {
+            tray_left = Some(left.clone());
+            None
+        }
         Cause::Stuck(_, left) => Some(left.clone()),
         _ => None,
     };
@@ -1678,7 +1708,7 @@ fn rollback(
     let local = (env.now)();
     let mut started = false;
     let mut last_error = String::new();
-    // with a program that could not be put back there is nothing worth starting
+    // with no agent program to put back there is nothing worth starting
     let tries = if rename_error.is_some() {
         0
     } else {
@@ -1729,19 +1759,33 @@ fn rollback(
             detail.push(format!("version {new} did not connect: {w}"));
             format!("Version {new} did not connect, so {old} was put back.")
         }
-        (None, Cause::Step(w) | Cause::Stuck(w, _)) => {
+        (None, Cause::Step(w)) => {
             format!("Version {new} could not be installed ({w}), so {old} was put back.")
+        }
+        (None, Cause::Stuck(w, _)) => {
+            let left = tray_left.as_deref().unwrap_or_default();
+            format!(
+                "Version {new} could not be installed ({w}), so {old} was put back, but {left}."
+            )
         }
     };
     let tail = if rename_error.is_some() || !started {
         if !started && rename_error.is_none() {
             detail.push(format!("the old agent could not be started: {last_error}"));
         }
-        "The agent is not running. Run the setup again."
-    } else if connected {
-        "It is running again."
+        "The agent is not running. Run the setup again.".to_string()
     } else {
-        "It is running but has not connected yet; see the log."
+        let running = if connected {
+            "It is running again."
+        } else {
+            "It is running but has not connected yet; see the log."
+        };
+        // the tray and the settings window are gone until the setup puts them back
+        if tray_left.is_some() {
+            format!("{running} Run the setup again to put the tray program back.")
+        } else {
+            running.to_string()
+        }
     };
     for line in &detail {
         crate::err_line(line);
@@ -1844,6 +1888,67 @@ mod tests {
         let comments = "# comments only\n\n";
         assert!(keys_from(comments, false).unwrap().is_empty());
         assert_eq!(keys_from(comments, true).unwrap(), vec![TEST_PUBLIC]);
+    }
+
+    /// Every 32 byte string literal `b"..."` in the Rust sources of the repository (a seed is any 32
+    /// bytes, `from_seed_unchecked`): the seeds of the tests and of `examples/sign_update.rs`, which
+    /// anybody who reads the repository has.
+    fn committed_seeds() -> Vec<[u8; 32]> {
+        fn walk(dir: &Path, out: &mut Vec<[u8; 32]>) {
+            for entry in std::fs::read_dir(dir).unwrap().flatten() {
+                let path = entry.path();
+                let name = entry.file_name();
+                if path.is_dir() {
+                    if !["target", "node_modules", "web", ".git"].contains(&name.to_str().unwrap())
+                    {
+                        walk(&path, out);
+                    }
+                } else if path.extension().is_some_and(|e| e == "rs") {
+                    let text = std::fs::read_to_string(&path).unwrap();
+                    let bytes = text.as_bytes();
+                    let mut i = 0;
+                    while let Some(at) = text[i..].find("b\"") {
+                        let start = i + at + 2;
+                        let end = bytes[start..]
+                            .iter()
+                            .position(|&b| b == b'"' || b == b'\\' || b == b'\n')
+                            .map_or(bytes.len(), |p| start + p);
+                        if end - start == 32 && bytes[end] == b'"' {
+                            out.push(bytes[start..end].try_into().unwrap());
+                        }
+                        i = start;
+                    }
+                }
+            }
+        }
+        let mut seeds = Vec::new();
+        let crates = Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+        walk(&crates, &mut seeds);
+        seeds
+    }
+
+    /// The keys among `keys` that belong to a seed anybody can read in the repository.
+    fn keys_with_a_public_seed(keys: &[[u8; 32]]) -> Vec<[u8; 32]> {
+        let seeds = committed_seeds();
+        keys.iter()
+            .copied()
+            .filter(|k| seeds.iter().any(|s| public(s) == *k))
+            .collect()
+    }
+
+    #[test]
+    fn a_default_build_accepts_no_key_whose_seed_is_in_the_repository() {
+        // the scan is alive: it finds the seed of the test key, and flags a build that has the key
+        assert!(committed_seeds().contains(SEED));
+        assert_eq!(
+            keys_with_a_public_seed(&keys_from(KEY_FILE, true).unwrap()),
+            vec![TEST_PUBLIC]
+        );
+        // the committed file holds no such key, and a build without the feature trusts nothing else
+        assert!(keys_with_a_public_seed(&keys_from(KEY_FILE, false).unwrap()).is_empty());
+        if !cfg!(feature = "update-test-key") {
+            assert!(keys_with_a_public_seed(&keys()).is_empty());
+        }
     }
 
     #[test]

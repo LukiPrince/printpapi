@@ -2,7 +2,7 @@
   "openapi": "3.1.0",
   "info": {
     "title": "printpapi API",
-    "version": "1.1.1",
+    "version": "1.2.0",
     "description": "The public JSON API of printpapi, source available (Elastic License 2.0). Authentication is a bearer token. An Authorization: Basic header switches the same server to PrintNode-compatible shapes, which this document does not describe: see docs/printnode-compat.md in the repository. Operator routes (/operator/**) are not part of this document. Each operation names its roles in x-roles and the key rights it needs in x-rights (docs/api.md, Key rights).",
     "license": {
       "name": "Elastic License 2.0",
@@ -3017,7 +3017,7 @@
             }
           },
           "429": {
-            "description": "Too many open pairing codes.",
+            "description": "Too many open pairing codes (20), or too many codes in 24 hours (200, used ones included).",
             "content": {
               "application/json": {
                 "schema": {
@@ -3450,7 +3450,7 @@
             }
           }
         },
-        "description": "Key right Agent (scopes: full, agent), the root token, or a key an agent has registered with."
+        "description": "Key right Agent (scopes: full, agent), the root token, or a key an agent has registered with. The key of a computer that lost the Agent right (narrowed to read, print or cloudprnt) may still download the payload of a job that computer has claimed."
       }
     },
     "/agent/jobs/{id}/result": {
@@ -3537,7 +3537,7 @@
             }
           }
         },
-        "description": "Key right Agent (scopes: full, agent), the root token, or a key an agent has registered with."
+        "description": "Key right Agent (scopes: full, agent), the root token, or a key an agent has registered with. The key of a computer that lost the Agent right may still report a job that computer has claimed. For five minutes after a takeover (pairing) the key the device gave up may also report ok: true for a job it had claimed."
       }
     },
     "/agent/results": {
@@ -3603,7 +3603,7 @@
             }
           }
         },
-        "description": "Key right Agent (scopes: full, agent), the root token, or a key an agent has registered with."
+        "description": "Key right Agent (scopes: full, agent), the root token, or a key an agent has registered with. For five minutes after a takeover (pairing) the key the device gave up may report ok: true for a job it had claimed. A key narrowed below the Agent right gets 401 here."
       }
     },
     "/integrations/shopify/orders": {
@@ -4577,6 +4577,10 @@
               "number",
               "null"
             ]
+          },
+          "maybe_printed": {
+            "type": "boolean",
+            "description": "Only sent when true. The job ended without done although an agent had it and never reported: it may be on paper, and a late result can still turn a failed one into done. Absent on a failed or cancelled job: the server knows of no unanswered hand-out."
           }
         },
         "required": [
@@ -4636,6 +4640,10 @@
               "number",
               "null"
             ]
+          },
+          "maybe_printed": {
+            "type": "boolean",
+            "description": "Only sent when true. The job ended without done although an agent had it and never reported: it may be on paper, and a late result can still turn a failed one into done. Absent on a failed or cancelled job: the server knows of no unanswered hand-out."
           }
         },
         "required": [

@@ -22,6 +22,14 @@ test("llms.txt opens with the project name and a summary", () => {
   assert.match(read("llms.txt"), /^# printpapi\n\n> \S/);
 });
 
+test("llms.txt names the agent skill", () => {
+  assert.ok(
+    read("llms.txt").includes(
+      "https://raw.githubusercontent.com/LukiPrince/printpapi/main/skills/printpapi/SKILL.md",
+    ),
+  );
+});
+
 test("the IndexNow key file holds its own name", () => {
   const keys = readdirSync(dir).filter((n) => /^[0-9a-f]{32}\.txt$/.test(n));
   assert.equal(keys.length, 1);

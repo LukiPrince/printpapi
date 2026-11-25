@@ -602,3 +602,71 @@ describe("wait asks again when the deadline cuts a poll that has an answer behin
     }
   });
 });
+
+describe("wait ends with kind timeout at its deadline when the server gives no answer about the job", { timeout: 60_000 }, () => {
+  const down: [string, (res: import("node:http").ServerResponse) => void][] = [
+    ["503", (res) => { res.statusCode = 503; res.end("{}"); }],
+    ["a refused connection", (res) => { res.destroy(); }],
+    ["a 502", (res) => { res.statusCode = 502; res.end("{}"); }],
+    ["a 429", (res) => { res.statusCode = 429; res.end("{}"); }],
+  ];
+  for (const [name, bad] of down) {
+    it("queued, then " + name + " until the deadline: timeout, with the last known state", async () => {
+      let n = 0;
+      const t = await throwaway((_req, res) => {
+        res.setHeader("Content-Type", "application/json");
+        if (++n === 1) res.end('{"state": "queued"}');
+        else bad(res);
+      });
+      try {
+        // many retries: the deadline, not the end of the retries, is what stops the poll
+        const c = new Printpapi({ baseUrl: t.url, apiKey: "the-key-0123456", retries: 8 });
+        const e = await err(c.jobs.wait(1, { timeoutMs: 600, intervalMs: 100 }));
+        assert.equal(e.kind, "timeout");
+        assert.match(e.message, /still queued after 600 ms/);
+      } finally {
+        await t.close();
+      }
+    });
+  }
+
+  it("an answer about the job (not found, a bad key) is still thrown as it is", async () => {
+    for (const [status, kind] of [[404, "not_found"], [401, "unauthorized"]] as const) {
+      let n = 0;
+      const t = await throwaway((_req, res) => {
+        res.setHeader("Content-Type", "application/json");
+        if (++n === 1) res.end('{"state": "queued"}');
+        else {
+          res.statusCode = status;
+          res.end('{"error": "no"}');
+        }
+      });
+      try {
+        const c = new Printpapi({ baseUrl: t.url, apiKey: "the-key-0123456" });
+        const e = await err(c.jobs.wait(1, { timeoutMs: 300, intervalMs: 100 }));
+        assert.equal(e.kind, kind);
+      } finally {
+        await t.close();
+      }
+    }
+  });
+
+  for (const timeoutMs of [Number.NaN, Infinity, undefined]) {
+    it("a client timeoutMs of " + String(timeoutMs) + " still ends wait on a hanging server", async () => {
+      let n = 0;
+      const t = await throwaway((_req, res) => {
+        res.setHeader("Content-Type", "application/json");
+        if (++n === 1) res.end('{"state": "queued"}'); // then it hangs
+      });
+      try {
+        const c = new Printpapi({ baseUrl: t.url, apiKey: "the-key-0123456", ...(timeoutMs === undefined ? {} : { timeoutMs }) });
+        const started = Date.now();
+        const e = await err(c.jobs.wait(1, { timeoutMs: 500, intervalMs: 5000 }));
+        assert.equal(e.kind, "timeout");
+        assert.ok(Date.now() - started < 4000, "took " + (Date.now() - started) + " ms");
+      } finally {
+        await t.close();
+      }
+    });
+  }
+});

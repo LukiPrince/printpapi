@@ -271,6 +271,7 @@ pub struct PendingHook {
     pub error: Option<String>,
     pub title: Option<String>,
     pub printer_id: i64,
+    pub maybe_printed: bool,
 }
 
 /// `get_job` row — the exact body of `GET /jobs/{id}`.
@@ -281,6 +282,9 @@ pub struct JobStatus {
     pub printer_id: i64,
     pub created_at: f64,
     pub finished_at: Option<f64>,
+    /// See [`maybe_printed`]. Only sent when true: every other job reads as it always did.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub maybe_printed: bool,
 }
 
 /// `recent_jobs` row.
@@ -298,6 +302,9 @@ pub struct JobRow {
     pub error: Option<String>,
     pub created_at: f64,
     pub finished_at: Option<f64>,
+    /// See [`maybe_printed`]. Only sent when true.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub maybe_printed: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Default)]
@@ -461,6 +468,10 @@ CREATE TRIGGER IF NOT EXISTS job_receipts_gone AFTER DELETE ON jobs
   BEGIN DELETE FROM job_receipts WHERE job_id=OLD.id; END;
 CREATE TRIGGER IF NOT EXISTS receipt_profiles_gone AFTER DELETE ON printers
   BEGIN DELETE FROM receipt_profiles WHERE printer_id=OLD.id; END;
+-- orgs.id is reused after a delete, so a pairing code of a deleted org must not outlive it: an older
+-- binary (3.6.0 does not know the table) deletes the org and the trigger removes the codes.
+CREATE TRIGGER IF NOT EXISTS pairing_codes_gone AFTER DELETE ON orgs
+  BEGIN DELETE FROM pairing_codes WHERE org_id=OLD.id; END;
 ";
 
 const MIGRATIONS: &[&str] = &[
@@ -510,6 +521,14 @@ CREATE INDEX IF NOT EXISTS users_org ON users(org_id);
 CREATE INDEX IF NOT EXISTS terms_org ON terms_acceptances(org_id, accepted_at);
 -- the jobs one key submitted (a print key sees only those)
 CREATE INDEX IF NOT EXISTS jobs_api_key ON jobs(api_key_id, id) WHERE api_key_id IS NOT NULL;
+-- the clean-up of pending printers asks whether a printer has a job
+CREATE INDEX IF NOT EXISTS jobs_printer ON jobs(printer_id);
+-- pairing rows: the result routes look up a bearer's old key hash before they read the body (any
+-- bearer, no credential needed); the others are the takeover, the registration and the per-org counts
+CREATE INDEX IF NOT EXISTS pairing_old_key ON pairing_codes(old_key_hash) WHERE old_key_hash IS NOT NULL;
+CREATE INDEX IF NOT EXISTS pairing_key ON pairing_codes(key_id) WHERE key_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS pairing_agent ON pairing_codes(agent_id) WHERE agent_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS pairing_org ON pairing_codes(org_id, created_at);
 ";
 
 /// The oldest queued job of one agent that has not passed its deadline (`?1` agent, `?2` now).
@@ -528,7 +547,7 @@ const USAGE_SQL: &str = "SELECT COUNT(*) FROM jobs WHERE org_id=?1 AND created_a
 /// Terminal jobs with an undelivered callback under the attempt cap (`?1`), oldest first.
 /// ponytail: `INDEXED BY` because without ANALYZE statistics the planner cannot tell that the
 /// partial index `jobs_hooks` holds only the handful of undelivered rows and prefers a state scan.
-const HOOKS_SQL: &str = "SELECT id, callback_url, state, error, title, printer_id FROM jobs INDEXED BY jobs_hooks WHERE callback_url IS NOT NULL AND hook_delivered_at IS NULL AND hook_attempts < ?1 AND state IN ('done','failed','cancelled') ORDER BY id";
+const HOOKS_SQL: &str = "SELECT id, callback_url, state, error, title, printer_id, retries, claimed_at IS NOT NULL FROM jobs INDEXED BY jobs_hooks WHERE callback_url IS NOT NULL AND hook_delivered_at IS NULL AND hook_attempts < ?1 AND state IN ('done','failed','cancelled') ORDER BY id";
 
 const BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(5000);
 
@@ -618,6 +637,14 @@ pub fn init_db(conn: &Connection) -> Result<()> {
             params![DEFAULT_USER, DEFAULT_ORG, "default", now],
         )?;
     }
+    // A pending printer with a job was used by an older server (3.6.0 lists it and takes a job for it,
+    // it does not read `state`); this server never queues one for a pending printer. Show it again:
+    // hidden, its job would vanish from every list and a revoked key would take the row along.
+    tx.execute(
+        "UPDATE printers SET state='active' WHERE state='pending' \
+         AND EXISTS (SELECT 1 FROM jobs j WHERE j.printer_id = printers.id)",
+        [],
+    )?;
     tx.commit()?;
     Ok(())
 }
@@ -884,8 +911,8 @@ pub fn truncate_wal_logged(conn: &Connection, what: &str) -> bool {
 /// their sessions. False if there is no such org.
 ///
 /// No soft delete: a tenant that cancelled and asked to be forgotten is what this is for. The
-/// caller decides who may (root only) and protects DEFAULT_ORG — an agent presenting an unknown
-/// key still enrolls there.
+/// caller decides who may (root only) and protects DEFAULT_ORG — the root token, v2 agents and,
+/// with open enrollment, unknown keys enroll there.
 pub fn delete_org(conn: &Connection, org_id: i64) -> Result<bool> {
     let tx = begin(conn)?;
     let found = delete_org_tx(&tx, org_id)?;
@@ -1211,6 +1238,9 @@ pub const PAIRING_TTL_S: f64 = 1800.0;
 pub const PAIRING_GRACE_S: f64 = 86_400.0;
 /// Unused, unexpired codes per org.
 pub const PAIRING_MAX_OPEN: i64 = 20;
+/// Codes an org may make in 24 hours, used ones included. A redeemed code is no longer open, so
+/// `PAIRING_MAX_OPEN` alone let a loop of "make a code, redeem it" leave a row and a key per round.
+pub const PAIRING_MAX_DAILY: i64 = 200;
 /// How long after a takeover the old key's finished job is still accepted: the reaper's timeout
 /// (`http::reaper`), so a job the old machine printed is recorded before the server would requeue it.
 pub const LATE_RESULT_S: f64 = 300.0;
@@ -1235,6 +1265,8 @@ pub enum CreatePairing {
     },
     /// The org already has `PAIRING_MAX_OPEN` unused codes.
     TooMany,
+    /// The org made `PAIRING_MAX_DAILY` codes in the last 24 hours.
+    TooManyToday,
     /// No such device in this org.
     UnknownDevice,
     /// A Star printer connects by itself, there is nothing to pair.
@@ -1320,6 +1352,14 @@ pub fn create_pairing(
     )?;
     if open >= PAIRING_MAX_OPEN {
         return Ok(CreatePairing::TooMany);
+    }
+    let today: i64 = tx.query_row(
+        "SELECT COUNT(*) FROM pairing_codes WHERE org_id=? AND created_at > ?",
+        params![org_id, now - 86_400.0],
+        |r| r.get(0),
+    )?;
+    if today >= PAIRING_MAX_DAILY {
+        return Ok(CreatePairing::TooManyToday);
     }
     let expires_at = now + PAIRING_TTL_S;
     tx.execute(
@@ -1732,7 +1772,10 @@ fn drop_orphan_pending_printers(tx: &Transaction, key_id: Option<i64>) -> Result
 
 /// The devices that still wait for a takeover are one uncorrelated set, read once: a check per
 /// pending printer would scan every pairing row for each of them, under the one database lock.
+/// A printer that already has a job stays (a server taken back to 3.6.0 does not read `state` and
+/// may have queued one): dropping it would hide that job from every list.
 const DROP_ORPHAN_PENDING_SQL: &str = "DELETE FROM printers WHERE state='pending' \
+       AND NOT EXISTS (SELECT 1 FROM jobs j WHERE j.printer_id = printers.id) \
        AND (:kid IS NULL OR agent_id IN (SELECT agent_id FROM pairing_codes WHERE key_id=:kid)) \
        AND agent_id NOT IN (SELECT p.agent_id FROM pairing_codes p JOIN api_keys k ON k.id = p.key_id \
                              WHERE p.agent_id IS NOT NULL AND k.active=1 \
@@ -1787,14 +1830,21 @@ pub fn authenticate_poll(conn: &Connection, key: &str, now: Option<f64>) -> Resu
     }))
 }
 
+/// Served by `pairing_old_key` (the partial index needs the `IS NOT NULL` the query repeats).
+const LATE_RESULT_OPEN_SQL: &str = "SELECT 1 FROM pairing_codes WHERE old_key_hash=? \
+     AND old_key_hash IS NOT NULL AND taken_over_at > ? LIMIT 1";
+
+/// The query plan of the gate in front of the result routes (for the test that keeps it on an index).
+pub fn explain_late_result_open(conn: &Connection) -> Result<Vec<String>> {
+    explain(conn, LATE_RESULT_OPEN_SQL, params!["k", 0.0])
+}
+
 /// Whether `key` is the key a device gave up for another less than `LATE_RESULT_S` ago: the
 /// gate in front of the result routes, before the body is read.
 pub fn late_result_open(conn: &Connection, key: &str, now: Option<f64>) -> Result<bool> {
     let now = now.unwrap_or_else(crate::now);
     Ok(conn
-        .prepare_cached(
-            "SELECT 1 FROM pairing_codes WHERE old_key_hash=? AND taken_over_at > ? LIMIT 1",
-        )?
+        .prepare_cached(LATE_RESULT_OPEN_SQL)?
         .query_row(params![hash_key(key), now - LATE_RESULT_S], |_| Ok(()))
         .optional()?
         .is_some())
@@ -2371,7 +2421,7 @@ pub fn get_printer(
     Ok(conn
         .query_row(
             "SELECT id, name, org_id, agent_id, can_pdf FROM printers \
-             WHERE id=:pid AND (:org IS NULL OR org_id = :org)",
+             WHERE id=:pid AND state='active' AND (:org IS NULL OR org_id = :org)",
             named_params! {":pid": pid, ":org": org_id},
             |r| {
                 Ok(PrinterRef {
@@ -2904,6 +2954,18 @@ pub fn cancel_job(conn: &Connection, job_id: i64, org_id: Option<i64>) -> Result
     })
 }
 
+/// A job that ended without `done` although an agent had it and never said what became of it: it
+/// may be on paper, and a late result can still make it `done`. Derived, nothing stored: every
+/// requeue (`retries`) is a hand-out without an answer, and `claimed_at` is NULL in a queued job, so
+/// a cancelled job that still has one was cancelled by an operator lock while an agent had it.
+fn maybe_printed(state: &str, error: Option<&str>, retries: i64, handed_out: bool) -> bool {
+    match state {
+        "failed" => retries > 0 || error == Some("retry limit exceeded"),
+        "cancelled" => retries > 0 || handed_out,
+        _ => false,
+    }
+}
+
 /// Jobs in a terminal state with a callback_url, not yet delivered, under the attempt cap.
 /// State-based (not transition-hooked), so every terminal path — agent report, cancel, reaper —
 /// is covered without touching the mutators.
@@ -2912,11 +2974,14 @@ pub fn cancel_job(conn: &Connection, job_id: i64, org_id: Option<i64>) -> Result
 pub fn pending_webhooks(conn: &Connection, max_attempts: i64) -> Result<Vec<PendingHook>> {
     let mut stmt = conn.prepare_cached(HOOKS_SQL)?;
     let rows = stmt.query_map([max_attempts], |r| {
+        let state: String = r.get(2)?;
+        let error: Option<String> = r.get(3)?;
         Ok(PendingHook {
             job_id: r.get(0)?,
             callback_url: r.get(1)?,
-            state: r.get(2)?,
-            error: r.get(3)?,
+            maybe_printed: maybe_printed(&state, error.as_deref(), r.get(6)?, r.get(7)?),
+            state,
+            error,
             title: r.get(4)?,
             printer_id: r.get(5)?,
         })
@@ -2955,13 +3020,17 @@ pub fn bump_webhook_attempt(conn: &Connection, job_id: i64, state: &str) -> Resu
 pub fn get_job(conn: &Connection, job_id: i64, org_id: Option<i64>) -> Result<Option<JobStatus>> {
     Ok(conn
         .query_row(
-            "SELECT state, error, printer_id, created_at, finished_at FROM jobs \
+            "SELECT state, error, printer_id, created_at, finished_at, retries, \
+             claimed_at IS NOT NULL FROM jobs \
              WHERE id=:jid AND (:org IS NULL OR org_id = :org)",
             named_params! {":jid": job_id, ":org": org_id},
             |r| {
+                let state: String = r.get(0)?;
+                let error: Option<String> = r.get(1)?;
                 Ok(JobStatus {
-                    state: r.get(0)?,
-                    error: r.get(1)?,
+                    maybe_printed: maybe_printed(&state, error.as_deref(), r.get(5)?, r.get(6)?),
+                    state,
+                    error,
                     printer_id: r.get(2)?,
                     created_at: r.get(3)?,
                     finished_at: r.get(4)?,
@@ -2972,16 +3041,19 @@ pub fn get_job(conn: &Connection, job_id: i64, org_id: Option<i64>) -> Result<Op
 }
 
 fn job_row(r: &Row<'_>) -> rusqlite::Result<JobRow> {
+    let state: String = r.get(5)?;
+    let error: Option<String> = r.get(8)?;
     Ok(JobRow {
+        maybe_printed: maybe_printed(&state, error.as_deref(), r.get(11)?, r.get(12)?),
         id: r.get(0)?,
         printer_id: r.get(1)?,
         printer_name: r.get(2)?,
         agent_name: r.get(3)?,
         title: r.get(4)?,
-        state: r.get(5)?,
+        state,
         type_: r.get(6)?,
         mode: r.get(7)?,
-        error: r.get(8)?,
+        error,
         created_at: r.get(9)?,
         finished_at: r.get(10)?,
     })
@@ -2998,8 +3070,8 @@ pub fn recent_jobs(
 ) -> Result<Vec<JobRow>> {
     let mut sql = String::from(
         "SELECT j.id, j.printer_id, p.name AS printer_name, a.name AS agent_name, j.title, \
-         j.state, j.type, j.mode, j.error, j.created_at, j.finished_at \
-         FROM jobs j JOIN printers p ON p.id = j.printer_id \
+         j.state, j.type, j.mode, j.error, j.created_at, j.finished_at, j.retries, \
+         j.claimed_at IS NOT NULL FROM jobs j JOIN printers p ON p.id = j.printer_id \
          JOIN agents a ON a.id = j.agent_id \
          WHERE (?1 IS NULL OR j.org_id = ?1)",
     );
@@ -3368,11 +3440,11 @@ fn profile_of(text: &str) -> rusqlite::Result<crate::receipt::Profile> {
         .and_then(|m| crate::receipt::parse_profile(m).map_err(bad_receipt))
 }
 
-/// Whether printer `id` exists (in `org`, unless root).
+/// Whether printer `id` exists and is active (in `org`, unless root): a pending printer is unknown.
 fn printer_visible(conn: &Connection, id: i64, org: Option<i64>) -> Result<bool> {
     Ok(conn
         .query_row(
-            "SELECT 1 FROM printers WHERE id=:id AND (:org IS NULL OR org_id=:org)",
+            "SELECT 1 FROM printers WHERE id=:id AND state='active' AND (:org IS NULL OR org_id=:org)",
             named_params! {":id": id, ":org": org},
             |_| Ok(()),
         )
@@ -4800,6 +4872,31 @@ mod tests {
         enq_with(conn, pid, payload, |_| {})
     }
 
+    /// Sets `created_at` so that the jobs claim in the order given, whatever the wall clock did
+    /// between the `enq` calls (the claim order is `created_at, id`): the earliest value they have
+    /// plus 10 microseconds per place, so they do not move in time.
+    fn stamp_in_order(conn: &Connection, jobs: &[i64]) {
+        let ids = jobs
+            .iter()
+            .map(i64::to_string)
+            .collect::<Vec<_>>()
+            .join(",");
+        let base: f64 = conn
+            .query_row(
+                &format!("SELECT MIN(created_at) FROM jobs WHERE id IN ({ids})"),
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        for (i, id) in jobs.iter().enumerate() {
+            conn.execute(
+                "UPDATE jobs SET created_at=? WHERE id=?",
+                params![base + 1e-5 * i as f64, id],
+            )
+            .unwrap();
+        }
+    }
+
     fn state_of(conn: &Connection, jid: i64) -> String {
         q(conn, "SELECT state FROM jobs WHERE id=?", [jid])
     }
@@ -5325,6 +5422,7 @@ mod tests {
         let claimed = enq(&conn, id_of(&r, "Z"), b"a");
         let queued = enq(&conn, id_of(&r, "Z"), b"b");
         let foreign = enq(&conn, id_of(&other, "O"), b"c");
+        stamp_in_order(&conn, &[claimed, queued, foreign]);
         claim_job(&conn, r.computer_id, None).unwrap();
         claim_job(&conn, other.computer_id, None).unwrap();
         assert_eq!(state_of(&conn, claimed), "claimed");
@@ -5357,6 +5455,7 @@ mod tests {
         );
         // a revoked key gets nothing, not even for a job that is claimed at that moment
         let again = enq(&conn, id_of(&r, "Z"), b"d");
+        stamp_in_order(&conn, &[queued, again]);
         assert_eq!(
             claim_job(&conn, r.computer_id, None)
                 .unwrap()
@@ -5920,6 +6019,141 @@ mod tests {
         assert_eq!(hooks.len(), 1);
         assert_eq!((hooks[0].job_id, hooks[0].state.as_str()), (jid, "done"));
         assert_eq!(hooks[0].error, None);
+    }
+
+    /// `maybe_printed` as every reader reports it; they must agree.
+    fn maybe(conn: &Connection, jid: i64) -> bool {
+        let one = get_job(conn, jid, None).unwrap().unwrap().maybe_printed;
+        let row = &recent_jobs(conn, 50, None, Some(&[jid])).unwrap()[0];
+        assert_eq!(row.maybe_printed, one);
+        let hooks = pending_webhooks(conn, 5).unwrap();
+        if let Some(h) = hooks.iter().find(|h| h.job_id == jid) {
+            assert_eq!(h.maybe_printed, one);
+        }
+        one
+    }
+
+    #[test]
+    fn maybe_printed_means_handed_out_and_never_answered() {
+        // one queued job with a callback; `requeue` hands it out and lets the reaper take it back
+        let fresh = || {
+            let conn = db();
+            let r = reg(&conn, "w", "k", &[("Z", false)]);
+            let jid = enq_with(&conn, id_of(&r, "Z"), b"a", |j| {
+                j.callback_url = Some("https://h/a".into())
+            });
+            (conn, r.computer_id, jid)
+        };
+        let claim = |conn: &Connection, aid: i64| {
+            claim_job(conn, aid, Some(1.0))
+                .unwrap()
+                .unwrap()
+                .job_uid
+                .unwrap()
+        };
+        let requeue = |conn: &Connection, aid: i64| {
+            let uid = claim(conn, aid);
+            assert_eq!(
+                requeue_stale(conn, 300.0, 2, Some(1000.0), false).unwrap(),
+                1
+            );
+            uid
+        };
+        let expire = |conn: &Connection, jid: i64| {
+            conn.execute("UPDATE jobs SET expires_at=1 WHERE id=?", [jid])
+                .unwrap();
+            assert_eq!(expire_jobs(conn, None).unwrap(), 1);
+        };
+
+        // not finished yet: no statement, also after a requeue
+        let (conn, aid, jid) = fresh();
+        assert!(!maybe(&conn, jid));
+        claim(&conn, aid);
+        assert!(!maybe(&conn, jid));
+        assert_eq!(
+            requeue_stale(&conn, 300.0, 2, Some(1000.0), false).unwrap(),
+            1
+        );
+        assert!(!maybe(&conn, jid));
+
+        // never handed out: certain, whatever ended it
+        let (conn, _, jid) = fresh();
+        expire(&conn, jid);
+        assert!(!maybe(&conn, jid));
+        let (conn, _, jid) = fresh();
+        assert_eq!(
+            purge_jobs(&conn, 1, Some(crate::now() + 3.0 * DAY))
+                .unwrap()
+                .abandoned,
+            1
+        );
+        assert!(!maybe(&conn, jid));
+        let (conn, _, jid) = fresh();
+        cancel_job(&conn, jid, None).unwrap();
+        assert!(!maybe(&conn, jid));
+
+        // the agent answered the only hand-out: certain
+        let (conn, aid, jid) = fresh();
+        claim(&conn, aid);
+        finish_job(&conn, jid, aid, true, None).unwrap();
+        assert!(!maybe(&conn, jid));
+        let (conn, aid, jid) = fresh();
+        claim(&conn, aid);
+        finish_job(&conn, jid, aid, false, Some("out of paper")).unwrap();
+        assert!(!maybe(&conn, jid));
+
+        // handed out, never answered, then ended: by its deadline, retention, a cancel ...
+        let (conn, aid, jid) = fresh();
+        let uid = requeue(&conn, aid);
+        expire(&conn, jid);
+        assert!(maybe(&conn, jid));
+        // ... and a late result makes it certain again
+        finish_job_by_uid(&conn, jid, &uid, aid, true, None).unwrap();
+        assert_eq!(state_of(&conn, jid), "done");
+        assert!(!maybe(&conn, jid));
+        let (conn, aid, jid) = fresh();
+        requeue(&conn, aid);
+        assert_eq!(
+            purge_jobs(&conn, 1, Some(crate::now() + 3.0 * DAY))
+                .unwrap()
+                .abandoned,
+            1
+        );
+        assert!(maybe(&conn, jid));
+        let (conn, aid, jid) = fresh();
+        requeue(&conn, aid);
+        cancel_job(&conn, jid, None).unwrap();
+        assert!(maybe(&conn, jid));
+
+        // the last hand-out ran into the retry limit, even when it was the first one
+        let (conn, aid, jid) = fresh();
+        claim(&conn, aid);
+        requeue_stale(&conn, 300.0, 0, Some(1000.0), false).unwrap();
+        assert_eq!(
+            job_row(&conn, jid).1.as_deref(),
+            Some("retry limit exceeded")
+        );
+        assert!(maybe(&conn, jid));
+
+        // the second hand-out failed for certain, the first one is still unknown
+        let (conn, aid, jid) = fresh();
+        requeue(&conn, aid);
+        claim(&conn, aid);
+        finish_job(&conn, jid, aid, false, Some("out of paper")).unwrap();
+        assert!(maybe(&conn, jid));
+
+        // an operator lock cancels a job that is out at an agent
+        let (conn, aid, jid) = fresh();
+        claim(&conn, aid);
+        conn.execute(
+            "INSERT INTO org_locks(org_id, org_created_at, reason, locked_at) \
+             SELECT id, created_at, 'r', 1 FROM orgs WHERE id=?",
+            [DEFAULT_ORG],
+        )
+        .unwrap();
+        requeue_stale(&conn, 300.0, 2, Some(1000.0), true).unwrap();
+        assert_eq!(job_row(&conn, jid).1.as_deref(), Some("org locked"));
+        assert!(maybe(&conn, jid));
     }
 
     #[test]

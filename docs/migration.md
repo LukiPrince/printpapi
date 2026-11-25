@@ -10,14 +10,20 @@ you need to.
 ## What stays the same
 
 - **The database.** v3 opens a `printpapi.db` written by v2.5.1 or older without a migration step.
-  It adds a few indexes on first start, which v2.5.1 ignores, so the file still opens in v2.5.1
-  afterwards. Orgs, users, passwords, sessions, API keys, agents, printers and the job history all
+  It adds indexes, columns, tables and four cleanup triggers on first start; the file still
+  opens in v2.5.1 afterwards. Orgs, users, passwords, sessions, API keys, agents, printers and the job history all
   carry over.
 - **The environment.** `PRINTAPI_TOKEN`, `PRINT_DB`, `PRINT_PORT`, `PRINTAPI_SIGNUP`, `PUBLIC_URL`,
   `PRINTAPI_PLANS`, `PRINTAPI_BILLING_SECRET`, `LOG_REQUESTS` and the `SMTP_*` variables mean what
   they meant before.
 - **The API.** Same routes, status codes, error texts and JSON (formatted the way Python's
-  `json.dumps` did it, so a script that greps `"state": "done"` still matches). The
+  `json.dumps` did it, so a script that greps `"state": "done"` still matches). Later 3.x
+  versions add routes, fields and rights to it (key rights, pairing, receipts, the OpenAPI
+  document: see [api.md](api.md)); a key issued before the rights existed is `full` and may do
+  all it could. One behaviour changed: a job the server had failed (retry limit exceeded,
+  expired, retention) can become `done` when its agent delivers the result late, and its webhook
+  then fires again. A client that resubmits on `failed` can print twice, see
+  [Webhooks](api.md#webhooks). The
   PrintNode-compatible layer, Star CloudPRNT, the Shopify webhook, the WooCommerce plugin and the
   billing webhook need no changes. `tools/parity/parity.py` replays 785 scripted requests against
   v2.5.1 and v3 and compares every answer.
@@ -191,3 +197,18 @@ read and cancel every job, and an Agent only key can submit. Revoke the limited 
 others before going back. v2.5.1 also accepts an agent whose key was revoked (its agent check does
 not look at the key's state), so revoking a key does not stop its agent there either. Jobs
 submitted before the rights existed have no `api_key_id`; no Print only key ever sees them.
+
+Later 3.x versions also add tables, and every server creates all of them on start:
+`label_templates`, `receipt_profiles`, `job_receipts`, `pairing_codes`, `terms_acceptances`,
+`org_locks`, `settings`, `support_grants` and `operator_audit`, plus four triggers. v2.5.1 does
+not read them: the file opens, pairing codes, receipt profiles and label templates are not used,
+and a device that was reconnected and not yet swapped is not swapped. A lock set through the
+operator API no longer holds: the older server lets that org submit again. The printers the
+reconnect key declared are shown as ordinary printers by the older server, and a job for one of
+them fails on the Rust agent with `unknown printer id`: finish the swap, or revoke the reconnect
+key and let the reaper run, before going back. If you go back anyway and upgrade again, the reaper
+deletes the pending printers of a takeover that ended, except one that already has a job (the older
+server listed it and accepted a job for it): that printer stays with its job, and the start shows it as an ordinary printer again. A pairing
+code of an org that the older server deleted goes with the org (a trigger does it under every
+binary), so the next org that gets the same id does not inherit it. A [sealed agent key](agent.md#going-back-to-an-older-version-or-to-the-python-agent)
+needs `unprotect-key` first.

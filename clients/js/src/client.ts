@@ -147,6 +147,8 @@ function messageOf(status: number, body: unknown): string {
   return typeof e === "string" ? e : "HTTP " + status;
 }
 
+// what the last poll of wait() may fail with at the deadline without that being an answer about the job
+const NO_ANSWER_ABOUT_JOB = new Set<ErrorKind>(["network", "timeout", "unavailable", "bad_gateway", "rate_limited"]);
 const TERMINAL = new Set<T.JobState>(["done", "failed", "cancelled"]);
 
 class JobsApi {
@@ -224,7 +226,9 @@ class JobsApi {
     const onAbort = () => deadline.abort();
     o.signal?.addEventListener("abort", onAbort, { once: true });
     // what a poll gets for its own: the last one is not cut by the deadline that has passed
-    const lastPollMs = Math.min(LAST_POLL_MS, this.#c.timeout(DEFAULT_TIMEOUT_MS, undefined));
+    // (a client timeout that is no number is no timer for its own calls, but the last poll always has one)
+    const own = this.#c.timeout(DEFAULT_TIMEOUT_MS, undefined);
+    const lastPollMs = Number.isNaN(own) ? LAST_POLL_MS : Math.min(LAST_POLL_MS, own);
     let final = false;
     try {
       for (;;) {
@@ -236,7 +240,13 @@ class JobsApi {
           job = await this.get(id, poll);
         } catch (e) {
           if (o.signal?.aborted) throw e;
-          const cut = e instanceof PrintpapiError && (final ? e.kind === "timeout" : e.kind === "network" && deadline.signal.aborted);
+          // the last poll, with an answer behind it: a server that gives none now (restarting, refusing,
+          // busy) leaves the job as it was seen, which is the deadline's timeout; only an answer
+          // about the job or the key is the caller's to see
+          const noAnswer = e instanceof PrintpapiError && last !== undefined && NO_ANSWER_ABOUT_JOB.has(e.kind);
+          if (final && noAnswer) throw timeout();
+          // a poll the deadline cut during its retry pause fails with the error it was retrying
+          const cut = e instanceof PrintpapiError && (final ? e.kind === "timeout" : deadline.signal.aborted && (e.kind === "network" || noAnswer));
           if (!cut) throw e;
           // a poll that the deadline cut has an answer of the server behind it, so one more is asked with a
           // budget of its own; a server that never answered is not asked again

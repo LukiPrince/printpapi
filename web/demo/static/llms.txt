@@ -25,6 +25,7 @@ PrintNode is a trademark of PrintNode Ltd. printpapi is not affiliated with, end
 - [PrintNode-compatible API](https://raw.githubusercontent.com/LukiPrince/printpapi/main/docs/printnode-compat.md): pointing an existing PrintNode client at printpapi
 - [E-commerce](https://raw.githubusercontent.com/LukiPrince/printpapi/main/docs/ecommerce.md): WooCommerce plugin, Shopify webhook, POST /orders
 - [Recipes](https://raw.githubusercontent.com/LukiPrince/printpapi/main/docs/recipes.md): printing from n8n, Zapier, Make and curl
+- [Agent skill](https://raw.githubusercontent.com/LukiPrince/printpapi/main/skills/printpapi/SKILL.md): one file for AI coding agents that print through the HTTP API
 
 ## Optional
 

@@ -391,6 +391,36 @@ pub fn finish(db: &Db, job_id: i64, agent_id: i64, ok: bool, error: Option<&str>
     );
 }
 
+/// Sets `created_at` of jobs explicitly, in the order given: the earliest value they have, plus 10
+/// microseconds per place. They stay where they were in time (a test that counts "jobs today" or
+/// "this month" must not see them move across midnight). The claim order is `created_at, id` and `created_at` is the wall clock, so a test
+/// that claims several queued jobs and expects them in insert order must not lean on two
+/// `enqueue` calls microseconds apart: a clock that steps back (seen in a Docker VM) swaps them.
+pub fn stamp_in_order(db: &Db, jobs: &[i64]) {
+    db.with(|c| {
+        let base: f64 = c
+            .query_row(
+                &format!(
+                    "SELECT MIN(created_at) FROM jobs WHERE id IN ({})",
+                    jobs.iter()
+                        .map(i64::to_string)
+                        .collect::<Vec<_>>()
+                        .join(",")
+                ),
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        for (i, id) in jobs.iter().enumerate() {
+            c.execute(
+                "UPDATE jobs SET created_at=? WHERE id=?",
+                rusqlite::params![base + 1e-5 * i as f64, id],
+            )
+            .unwrap();
+        }
+    });
+}
+
 pub fn job_state(db: &Db, job_id: i64) -> String {
     db.with(|c| store::get_job(c, job_id, None))
         .unwrap()
