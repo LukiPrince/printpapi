@@ -1,12 +1,13 @@
 "use client";
 
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { AnimatePresence, motion } from "motion/react";
 import { toast } from "sonner";
-import { ChevronRight, History, Pause, Play, Search, X } from "lucide-react";
+import { ChevronRight, History, Loader2, Pause, Play, Receipt, Search, X } from "lucide-react";
 import { usePoll } from "@/hooks/use-poll";
-import { ApiError, cancelJob, listJobs, type Job, type JobState } from "@/lib/api";
+import { ApiError, cancelJob, getJobPreview, getSupportAccess, listJobs, type Job, type JobState } from "@/lib/api";
 import { JOB_STATES, STATE_ORDER } from "@/lib/job-state";
+import { showReceiptFailure } from "@/lib/receipt";
 import { fmtAgo, fmtDuration, fmtTime } from "@/lib/format";
 import { Card, CardContent } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
@@ -21,8 +22,24 @@ export default function HistoryPage() {
   const [query, setQuery] = useState("");
   const [filter, setFilter] = useState<JobState | "all">("all");
   const [open, setOpen] = useState<number | null>(null);
+  // May a receipt be shown? Only where the operator API is off: there the server keeps a copy of
+  // the document, and a machine key (401 here, no sign-out) cannot read it back anyway.
+  const [canShow, setCanShow] = useState<boolean | null>(null);
 
   const all = useMemo(() => jobs ?? [], [jobs]);
+  const hasReceipt = all.some((j) => j.type === "receipt");
+  useEffect(() => {
+    if (!hasReceipt || canShow !== null) return;
+    let alive = true;
+    getSupportAccess().then(
+      (s) => alive && setCanShow(!s.enabled),
+      () => alive && setCanShow(false),
+    );
+    return () => {
+      alive = false;
+    };
+  }, [hasReceipt, canShow]);
+
   const counts = useMemo(() => {
     const c = Object.fromEntries(STATE_ORDER.map((s) => [s, 0])) as Record<JobState, number>;
     for (const j of all) c[j.state] += 1;
@@ -189,6 +206,11 @@ export default function HistoryPage() {
                               </dd>
                             </div>
                           )}
+                          {job.type === "receipt" && canShow && (
+                            <div className="sm:col-span-2">
+                              <ShowReceipt jobId={job.id} />
+                            </div>
+                          )}
                           {job.state === "queued" && (
                             <div className="sm:col-span-2">
                               <Button variant="destructive" size="sm" onClick={() => cancel(job)}>
@@ -206,6 +228,40 @@ export default function HistoryPage() {
           )}
         </CardContent>
       </Card>
+    </div>
+  );
+}
+
+/** "Show receipt": loads the picture on click, from the copy of the document the server keeps. */
+function ShowReceipt({ jobId }: { jobId: number }) {
+  const [state, setState] = useState<{ image: string } | { note: string; retry: boolean } | "loading" | null>(null);
+
+  async function show() {
+    setState("loading");
+    try {
+      setState({ image: await getJobPreview(jobId) });
+    } catch (e) {
+      setState(showReceiptFailure(e instanceof ApiError ? e.status : null, e instanceof Error ? e.message : String(e)));
+    }
+  }
+
+  return (
+    <div>
+      {(state === null || state === "loading" || ("note" in state && state.retry)) && (
+        <Button variant="outline" size="sm" onClick={show} disabled={state === "loading"}>
+          {state === "loading" ? <Loader2 className="animate-spin" /> : <Receipt />} Show receipt
+        </Button>
+      )}
+      {state !== null && state !== "loading" && "note" in state && (
+        <p className="text-sm text-muted-foreground">{state.note}</p>
+      )}
+      {state !== null && state !== "loading" && "image" in state && (
+        <div className="max-h-96 overflow-auto rounded-lg bg-background p-3">
+          {/* a data: URL of the server's PNG: the optimiser has nothing to do */}
+          {/* eslint-disable-next-line @next/next/no-img-element */}
+          <img src={state.image} alt={`The receipt of job #${jobId}`} className="mx-auto h-auto max-w-full" />
+        </div>
+      )}
     </div>
   );
 }

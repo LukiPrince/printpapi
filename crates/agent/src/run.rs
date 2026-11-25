@@ -246,6 +246,20 @@ pub fn run_once(
     fns: &Fns,
     report_sleep: Sleep,
 ) -> PollOutcome {
+    run_once_with(base, key, printers, http, fns, report_sleep, &|| {})
+}
+
+/// [`run_once`] with `claimed`, called once right after a job with an id arrived and before it is
+/// printed: the status file then says `busy`, which is what an update waits for.
+pub fn run_once_with(
+    base: &str,
+    key: &str,
+    printers: &PrinterMap,
+    http: &dyn Http,
+    fns: &Fns,
+    report_sleep: Sleep,
+    claimed: &dyn Fn(),
+) -> PollOutcome {
     let Some(job) = http
         .get(&format!("{base}/agent/jobs"), key)
         .map_err(|e| e.to_string())?
@@ -260,6 +274,7 @@ pub fn run_once(
     if job.get("printer_id").is_none() {
         return Err("job reply has no printer_id".into());
     }
+    claimed();
     let outcome = execute(&job, &job_id, base, key, printers, http, fns);
     let (ok, error) = match &outcome {
         Ok(()) => (true, None),
@@ -319,9 +334,14 @@ pub fn poll_forever(
     sleep: Sleep,
     log: Log,
     observe: &mut dyn FnMut(&PollOutcome),
+    claimed: &dyn Fn(),
 ) {
     poll_while(
-        &mut || Some(run_once(base, key, printers, http, fns, sleep)),
+        &mut || {
+            Some(run_once_with(
+                base, key, printers, http, fns, sleep, claimed,
+            ))
+        },
         observe,
         sleep,
         log,
@@ -978,6 +998,41 @@ mod tests {
         );
         assert_eq!(*logged.borrow(), vec!["poll error: down", "poll recovered"]);
         assert_eq!(*slept.borrow(), vec![2, 2]); // only the two failing calls sleep
+    }
+
+    #[test]
+    fn the_claim_hook_fires_once_per_job_before_printing_and_not_for_an_empty_poll() {
+        let order = std::rc::Rc::new(RefCell::new(Vec::<&str>::new()));
+        let (o1, o2) = (order.clone(), order.clone());
+        let http = FakeHttp::new(
+            Some(json!({"job_id": 7, "printer_id": 1, "mode": "raw"})),
+            b"Z",
+        );
+        let fns = Fns {
+            raw: Box::new(move |_, _| {
+                o1.borrow_mut().push("print");
+                Ok(())
+            }),
+            ..Fns::refusing()
+        };
+        let p = pm(1, entry("Zebra", false, "Zebra"));
+        let hook = || o2.borrow_mut().push("claimed");
+        let r = run_once_with("http://x", "k", &p, &http, &fns, &no_sleep, &hook);
+        assert_eq!(r, Ok(Some(JobDone { id: 7, ok: true })));
+        assert_eq!(*order.borrow(), vec!["claimed", "print"]);
+        // an empty poll: the hook stays quiet
+        order.borrow_mut().clear();
+        let empty = FakeHttp::new(None, b"");
+        assert_eq!(
+            run_once_with("http://x", "k", &p, &empty, &fns, &no_sleep, &hook),
+            Ok(None)
+        );
+        assert!(order.borrow().is_empty());
+        // run_once is the same call without a hook
+        assert_eq!(
+            run_once("http://x", "k", &p, &http, &fns, &no_sleep),
+            Ok(Some(JobDone { id: 7, ok: true }))
+        );
     }
 
     // --- start-up: printers by id ---

@@ -52,6 +52,10 @@ pub struct AgentStatus {
     error: Option<String>,
     /// The key stored in agent.ini cannot be read on this computer: the connection card says so.
     key_unreadable: bool,
+    /// `notify`, `auto` or `off` as the agent applies it; empty when the agent does not say.
+    updates: String,
+    /// The mirror folder the agent was told to look at, `None` for the release folder.
+    update_url: Option<String>,
 }
 
 impl AgentStatus {
@@ -68,6 +72,8 @@ impl AgentStatus {
             header_names: Vec::new(),
             error: None,
             key_unreadable: false,
+            updates: String::new(),
+            update_url: None,
         }
     }
 }
@@ -89,6 +95,11 @@ struct StatusFile {
     /// Absent in the file of an agent older than this field.
     #[serde(default)]
     key_unreadable: bool,
+    /// Absent in the file of an agent older than updates.
+    #[serde(default)]
+    updates: String,
+    #[serde(default)]
+    update_url: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -147,6 +158,8 @@ pub fn parse_status(text: Option<&str>, now: f64) -> AgentStatus {
         header_names: file.header_names,
         error: file.error.or(silence),
         key_unreadable: file.key_unreadable,
+        updates: file.updates,
+        update_url: file.update_url,
     }
 }
 
@@ -259,7 +272,7 @@ pub fn tray_source(
 }
 
 /// Is `source` the installed tray program? Windows file names do not differ by case.
-fn is_installed(os: Os, source: &Path, installed: &Path) -> bool {
+pub(crate) fn is_installed(os: Os, source: &Path, installed: &Path) -> bool {
     if os == Os::Windows {
         source
             .to_string_lossy()
@@ -427,6 +440,25 @@ mod tests {
                 {"name": "HP", "pdf": true, "target": null, "locked": false}
             ])
         );
+    }
+
+    #[test]
+    fn a_status_file_without_the_update_fields_still_parses_and_one_with_them_shows_them() {
+        // what an agent up to 3.6.0 writes: no updates, update_url, busy
+        let old = file("online", NOW - 10.0);
+        let status = parse_status(Some(&old), NOW);
+        assert_eq!(status.state, AgentState::Online);
+        assert_eq!(
+            (status.updates.as_str(), status.update_url.as_deref()),
+            ("", None)
+        );
+        let mut written: Value = serde_json::from_str(&old).unwrap();
+        written["updates"] = json!("auto");
+        written["update_url"] = json!("https://m.example/x");
+        written["busy"] = json!(true);
+        let status = parse_status(Some(&written.to_string()), NOW);
+        assert_eq!(status.updates, "auto");
+        assert_eq!(status.update_url.as_deref(), Some("https://m.example/x"));
     }
 
     #[test]

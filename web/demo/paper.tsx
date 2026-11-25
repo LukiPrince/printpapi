@@ -180,7 +180,8 @@ export function Paper({ job, state, feeding }: { job: DemoJob; state: DemoState;
   if (p?.paper === "receipt") {
     return (
       <div className={`${styles.paper} ${styles.rcpt}${feed}`} role="img" aria-label="Test receipt">
-        <b className={styles.c}>printpapi test</b>
+        {/* a test print keeps its text; a receipt a visitor printed shows what it was called */}
+        <b className={styles.c}>{job.kind === "doc" ? job.title : "printpapi test"}</b>
         <hr />
         <span className={styles.c}>{p.name}</span>
         <span className={styles.c}>job #{job.id}</span>

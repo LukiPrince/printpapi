@@ -12,12 +12,14 @@ pub mod ini;
 pub mod install;
 pub mod keystore;
 pub mod log;
+pub mod marker;
 pub mod print;
 pub mod proc;
 pub mod pyrepr;
 pub mod run;
 pub mod setup;
 pub mod status;
+pub mod update;
 
 use std::io::Write;
 use std::path::Path;
@@ -44,6 +46,12 @@ pub fn out_line(msg: &str) {
     #[cfg(test)]
     OUT_LINES.with(|l| l.borrow_mut().push(msg.to_string()));
     let _ = writeln!(std::io::stdout(), "{msg}");
+}
+
+/// What `printpapi-agent --version` prints, and what an update expects to read from the new
+/// program before it replaces anything (see [`update`]).
+pub fn version_line() -> String {
+    format!("printpapi-agent {}", env!("CARGO_PKG_VERSION"))
 }
 
 /// Print to stderr, ignoring a closed or missing stderr.
@@ -430,6 +438,7 @@ pub fn run(base_dir: &Path) -> Result<(), Fatal> {
                 &sleep,
                 &log::log_error,
                 &mut |outcome| report(&|r| r.polled(outcome, unix_now())),
+                &|| report(&|r| r.claimed(unix_now())),
             )
         },
     };

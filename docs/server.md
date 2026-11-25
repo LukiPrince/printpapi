@@ -46,7 +46,7 @@ Environment variables:
 | `PRINTAPI_TERMS_VERSION` | *(unset: no consent asked)* | A non-empty version string of at most 100 characters without control characters, e.g. `2026-11-13`. Set: `POST /signup` must carry `accept_terms` equal to it, `GET /health` reports it with the links below, and the dashboard's sign-up form shows a checkbox for the terms and the data processing agreement. Each acceptance (org, user, version, time) is stored in the `terms_acceptances` table. See [Self-signup](api.md#self-signup). With signup open and no version, startup prints a warning |
 | `PRINTAPI_TERMS_URL` | *(required with the version)* | `http(s)` link to the terms. Anything else, or a version without it, stops the server at startup |
 | `PRINTAPI_DPA_URL`, `PRINTAPI_PRIVACY_URL` | *(unset)* | Optional `http(s)` links to the data processing agreement and the privacy policy, shown next to the checkbox. Anything else stops the server at startup |
-| `PRINTAPI_FETCHES_PER_ORG` | `4` with open signup or an [operator token](operator.md#hosted-mode), else `0` (no cap) | Payload downloads (`*_uri`, `*_uri_post`, `label_uri`) one org may have in flight at once; the next one answers `503`. A non-negative integer, `0` = no cap; anything else stops the server at startup. Keeps one hosted tenant from using every download slot; a single-org box has no reason for it, since four hung upstream hosts would then block every other fetching job |
+| `PRINTAPI_FETCHES_PER_ORG` | `4` with open signup or an [operator token](operator.md#hosted-mode), else `0` (no cap) | Payload downloads (`*_uri`, `*_uri_post`, `label_uri`) and [receipts with images](receipts.md#concurrent-image-receipts) one org may have in flight at once; the next one answers `503`. A non-negative integer, `0` = no cap; anything else stops the server at startup. Keeps one hosted tenant from using every download slot; a single-org box has no reason for it, since four hung upstream hosts would then block every other fetching job |
 | `PRINTAPI_PRIVATE_URLS` | `deny` with open signup or an [operator token](operator.md#hosted-mode), else `allow` | `deny`: payload URLs (`*_uri`, `*_uri_post`), job `callback_url`s and org `event_url`s may only reach public addresses — no loopback, LAN, link-local/cloud-metadata or other private ranges, checked after DNS on every redirect hop. `allow`: anywhere (a self-hosted box fetching PDFs from an internal service). Set `deny` whenever people you do not trust get keys |
 | `PRINTAPI_TRUSTED_PROXIES` | *(unset: nobody)* | Comma-separated IPs or CIDRs (IPv4 and IPv6, e.g. `127.0.0.1,::1` or the one pinned proxy address `172.30.0.2` of the Compose example; list nothing wider) of the reverse proxies in front of printpapi. Only a request whose socket peer is listed has its `X-Forwarded-For` read: the rightmost entry that is not itself listed is the client, which the signup throttle (IPv6 per /64) and the `LOG_REQUESTS` line then use. Unset, the socket peer is the client, so behind a proxy every signup shares one throttle slot. An invalid entry stops the server at startup. See [Behind a reverse proxy](#behind-a-reverse-proxy) |
 | `PRINTAPI_OPEN_ENROLLMENT` | *(off)* | `1`: any Bearer value enrolls a new agent into the default org (the v2 rule). Off: a new agent needs an issued key or the root token |
@@ -152,11 +152,11 @@ may do is its **rights**, one of five:
 
 | Rights (`scope`) | For | May |
 |---|---|---|
-| Everything (`full`, the default) | what every key was until now | print, read, label templates, agents, CloudPRNT |
+| Everything (`full`, the default) | what every key was until now | print (receipts too), read, label templates, receipt profiles, agents, CloudPRNT |
 | Agent only (`agent`) | one computer with printers | enrol, poll, download and report its own jobs; list the org's computers |
 | CloudPRNT only (`cloudprnt`) | the URL of a Star printer | act as a Star printer, nothing else |
 | Print only (`print`) | a shop, n8n, a script | submit and read jobs, but see and cancel only its own; read printers |
-| Read only (`read`) | monitoring | read jobs, printers, label templates and metrics |
+| Read only (`read`) | monitoring | read jobs, printers, label templates, receipt profiles and metrics |
 
 Keys are stored SHA-256-hashed; revoking one cuts access immediately.
 
@@ -229,6 +229,11 @@ A job holds its payload (labels, packing slips, addresses) until you say otherwi
   ago are deleted. The current month's rows stay, because the [monthly quota](api.md#quotas) counts
   them: deleting them would hand quota back. The 7 day floor keeps the row, and with it the
   idempotency key, long enough for a webhook redelivery (Shopify retries for 48 h).
+
+The server keeps a copy of a [receipt](receipts.md#the-preview-of-a-job-in-the-history) job's document
+for the history preview (only without the operator API). It goes with the payload: a database
+trigger removes it when the payload is emptied and when the job row is deleted, so every pass above
+removes it and an older server does too; deleting an org removes its copies and receipt profiles.
 
 `claimed` jobs are never touched. The server always opens SQLite with `secure_delete=ON`, so freed
 pages are zeroed instead of keeping the old bytes (this also covers deleting an org), and after a

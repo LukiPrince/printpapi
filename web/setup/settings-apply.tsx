@@ -23,27 +23,34 @@ export function useApplyPatch(onDone: () => void) {
   const [run, setRun] = useState<Run>({ at: "idle" });
   const [baseline, setBaseline] = useState<number | null>(null);
 
-  async function wait(since: number) {
+  /** True when the agent reported in again. */
+  async function wait(since: number): Promise<boolean> {
     setRun({ at: "waiting" });
     try {
       const online = await setup.waitOnline(since);
       setRun(online ? { at: "done" } : { at: "slow" });
       if (online) onDone();
+      return online;
     } catch (e) {
       setRun({ at: "failed", message: errorText(toSetupError(e)) });
+      return false;
     }
   }
 
-  /** `before` runs first (a download), inside the same busy state; its failure ends the run. */
-  async function apply(patch: ConfigPatch, before?: () => Promise<void>) {
+  /**
+   * `before` runs first (a download), inside the same busy state; its failure ends the run. True
+   * when the change was made and the agent reported in again.
+   */
+  async function apply(patch: ConfigPatch, before?: () => Promise<void>): Promise<boolean> {
     setRun({ at: "applying" });
     try {
       await before?.();
       const since = await setup.applyPatch(patch);
       setBaseline(since);
-      await wait(since);
+      return await wait(since);
     } catch (e) {
       setRun({ at: "failed", message: errorText(toSetupError(e)) });
+      return false;
     }
   }
 
@@ -74,11 +81,13 @@ export function RunNotice({
   platform,
   onKeepWaiting,
   doneText = "Applied. The agent is running with the new settings.",
+  doneTone = "ok",
 }: {
   run: Run;
   platform: Platform;
   onKeepWaiting: () => void;
   doneText?: string;
+  doneTone?: "ok" | "warn";
 }) {
   switch (run.at) {
     case "idle":
@@ -96,7 +105,7 @@ export function RunNotice({
         </p>
       );
     case "done":
-      return <Notice tone="ok">{doneText}</Notice>;
+      return <Notice tone={doneTone}>{doneText}</Notice>;
     case "slow":
       return (
         <Notice tone="error">

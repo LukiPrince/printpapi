@@ -1,4 +1,5 @@
 // printpapi — self-hosted PrintNode alternative. Elastic License 2.0 (see LICENSE).
+import { readFileSync } from "node:fs";
 import test from "node:test";
 import assert from "node:assert/strict";
 import type { FakeResponse } from "./fake-api.ts";
@@ -427,4 +428,106 @@ test("GET /support-access is off in the demo", () => {
   assert.equal(r.status, 200);
   assert.deepEqual(r.json, { enabled: false, grants: [] });
   assert.equal(isFakeRoute("GET", "/support-access"), true);
+});
+
+// ---- receipts ----
+
+const sample = JSON.parse(readFileSync(new URL("../lib/receipt-sample.json", import.meta.url), "utf8"));
+
+test("POST /receipts/preview answers the asset of the printer's paper for the sample", () => {
+  const s = seedState(now);
+  // the receipt printer (id 4) has 58 mm paper, every other printer the 80 mm default
+  assert.deepEqual(call(s, "POST", "/receipts/preview", { receipt: sample, printer_id: 4 }), { status: 200, asset: "/receipt-sample-58.png" });
+  assert.deepEqual(call(s, "POST", "/receipts/preview", { receipt: sample, printer_id: 1 }), { status: 200, asset: "/receipt-sample-80.png" });
+  assert.deepEqual(call(s, "POST", "/receipts/preview", { receipt: sample }), { status: 200, asset: "/receipt-sample-80.png" });
+  assert.deepEqual(call(s, "POST", "/receipts/preview", { receipt: sample, profile: { paper_mm: 58 } }), { status: 200, asset: "/receipt-sample-58.png" });
+  // key order does not matter
+  const shuffled = { content: sample.content, cut: sample.cut };
+  assert.equal(call(s, "POST", "/receipts/preview", { receipt: shuffled }).status, 200);
+});
+
+test("POST /receipts/preview refuses other receipts with a note, and bad bodies with the server's texts", () => {
+  const s = seedState(now);
+  const text = (r: FakeResponse) => json(r).error;
+  assert.equal(text(call(s, "POST", "/receipts/preview", { receipt: { content: [{ type: "cut" }] } })), "the demo draws the sample receipt only, a real server draws yours");
+  assert.equal(text(call(s, "POST", "/receipts/preview", {})), "missing 'receipt'");
+  assert.equal(text(call(s, "POST", "/receipts/preview", { receipt: sample, printer_id: 4, profile: {} })), "send printer_id or profile, not both");
+  assert.equal(text(call(s, "POST", "/receipts/preview", { receipt: sample, printer_id: 99 })), "unknown printer: 99");
+  assert.equal(text(call(s, "POST", "/receipts/preview", { receipt: sample, profile: { paper_mm: 57 } })), "paper_mm must be 58 or 80");
+  assert.equal(text(call(s, "POST", "/receipts/preview", { receipt: sample, profile: [] })), "profile must be an object");
+  assert.equal(call(s, "POST", "/receipts/preview", "nope").status, 400);
+});
+
+test("receipt profiles: two printers keep different ones, and put, get and delete work", () => {
+  const s = seedState(now);
+  const get = (id: number) => json(call(s, "GET", `/printers/${id}/receipt-profile`));
+  assert.equal(get(4).stored, true);
+  assert.equal(get(4).profile.paper_mm, 58);
+  assert.deepEqual(get(1), { printer_id: 1, stored: false, profile: { paper_mm: 80, width_dots: 576, codepage: "raster", codepage_number: 16, cut: "partial", output: "auto" } });
+  const put = call(s, "PUT", "/printers/1/receipt-profile", { paper_mm: 58, codepage: "cp1252", cut: "none" });
+  assert.equal(put.status, 200);
+  assert.deepEqual(json(put), { printer_id: 1, stored: true, profile: { paper_mm: 58, width_dots: 384, codepage: "cp1252", codepage_number: 16, cut: "none", output: "auto" } });
+  assert.equal(get(1).profile.cut, "none");
+  assert.equal(get(4).profile.cut, "partial"); // the other printer is untouched
+  assert.equal(get(4).profile.codepage, "raster");
+  assert.equal(call(s, "DELETE", "/printers/1/receipt-profile").status, 200);
+  assert.equal(get(1).stored, false);
+  assert.equal(call(s, "GET", "/printers/99/receipt-profile").status, 404);
+  assert.equal(call(s, "DELETE", "/printers/99/receipt-profile").status, 404);
+  assert.equal(call(s, "PUT", "/printers/99/receipt-profile", {}).status, 404);
+  assert.equal(json(call(s, "PUT", "/printers/1/receipt-profile", { colour: 1 })).error, "unknown field in profile: colour");
+  assert.equal(json(call(s, "PUT", "/printers/1/receipt-profile", { width_dots: 4000 })).error, "width_dots must be a multiple of 8 from 192 to 640");
+  // the most is paper_mm * 8: heads of 416 and 464 dots on 58 mm paper, 640 on 80 mm paper
+  assert.equal(call(s, "PUT", "/printers/1/receipt-profile", { paper_mm: 58, width_dots: 464 }).status, 200);
+  assert.equal(get(1).profile.width_dots, 464);
+  assert.equal(json(call(s, "PUT", "/printers/1/receipt-profile", { paper_mm: 58, width_dots: 472 })).error, "width_dots must be a multiple of 8 from 192 to 464");
+  assert.equal(call(s, "PUT", "/printers/1/receipt-profile", { width_dots: 640 }).status, 200);
+  assert.equal(json(call(s, "PUT", "/printers/1/receipt-profile", { width_dots: 648 })).error, "width_dots must be a multiple of 8 from 192 to 640");
+  assert.equal(json(call(s, "PUT", "/printers/1/receipt-profile", { output: "pdf" })).error, "output must be auto or escpos");
+});
+
+test("POST /jobs takes type receipt; its mode follows can_pdf unless the profile says escpos", () => {
+  const s = seedState(now);
+  const mode = (id: number) => json(call(s, "GET", "/jobs")).jobs.find((j: J) => j.id === id).mode;
+  const post = (printer_id: number) => call(s, "POST", "/jobs", { printer_id, type: "receipt", receipt: sample, title: "Test receipt" });
+  const raw = post(4);
+  assert.equal(raw.status, 200);
+  assert.equal(mode(json(raw).job_id), "raw");
+  const pdf = post(3);
+  assert.equal(mode(json(pdf).job_id), "pdf");
+  call(s, "PUT", "/printers/3/receipt-profile", { output: "escpos" });
+  assert.equal(mode(json(post(3)).job_id), "raw");
+  // the receipt itself is not kept in the state (sessionStorage)
+  assert.equal(JSON.stringify(s).includes("Weißbrot"), false);
+  assert.equal(s.jobs[0].kind, "doc");
+  // the server's texts for a missing receipt and an unknown printer
+  assert.equal(json(call(s, "POST", "/jobs", { printer_id: 4, type: "receipt" })).error, "missing 'receipt'");
+  assert.equal(json(call(s, "POST", "/jobs", { printer_id: 99, type: "receipt", receipt: sample })).error, "unknown printer: 99");
+});
+
+test("GET /jobs/{id}/preview answers the asset of that receipt job and nothing for others", () => {
+  const s = seedState(now);
+  const id = json(call(s, "POST", "/jobs", { printer_id: 4, type: "receipt", receipt: sample })).job_id;
+  assert.deepEqual(call(s, "GET", `/jobs/${id}/preview`), { status: 200, asset: "/receipt-sample-58.png" });
+  const other = json(call(s, "POST", "/jobs", { printer_id: 3, type: "receipt", receipt: sample })).job_id;
+  assert.deepEqual(call(s, "GET", `/jobs/${other}/preview`), { status: 200, asset: "/receipt-sample-80.png" });
+  // a job that is no receipt, and one that does not exist
+  assert.equal(call(s, "GET", "/jobs/1291/preview").status, 404);
+  assert.equal(call(s, "GET", "/jobs/999999/preview").status, 404);
+});
+
+test("the path id is the first number, so suffixed routes and the old routes both find their id", () => {
+  const s = seedState(now);
+  assert.equal(isFakeRoute("GET", "/printers/4/receipt-profile"), true);
+  assert.equal(isFakeRoute("GET", "/jobs/4/preview"), true);
+  assert.equal(isFakeRoute("GET", "/printers/abc/receipt-profile"), false);
+  assert.equal(isFakeRoute("POST", "/receipts/preview"), true);
+  assert.equal(isFakeRoute("GET", "/receipts/preview"), false);
+  // an old route with its id at the end
+  assert.equal(call(s, "GET", "/orgs/1").status, 200);
+  assert.equal(call(s, "GET", "/orgs/2").status, 404);
+  assert.equal(call(s, "DELETE", "/jobs/1291").status, 409);
+  assert.equal(json(call(s, "PUT", "/apikeys/1", { scope: "read" })).scope, "read");
+  // and the new one reads its printer id, not 0
+  assert.equal(json(call(s, "GET", "/printers/4/receipt-profile")).printer_id, 4);
 });

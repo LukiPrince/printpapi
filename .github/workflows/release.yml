@@ -4,6 +4,13 @@ name: release
 # written by hand before it goes public; an existing one just gets the assets (re)uploaded.
 # The setup downloads (printpapi-setup-*) are listed in web/lib/setup-downloads.json, which also
 # feeds the downloads page: a file is uploaded under its listed label, "(Beta)" appended when set.
+#
+# Signed updates (docs/agent.md, "Updates"): the setup jobs also name the plain program files
+# (printpapi-update-agent-*, -tray-*, -appimage-*, -app-*.zip), and the last step of publish builds
+# printpapi-update.txt from them and signs it with the key in the GitHub environment release-signing
+# (secret UPDATE_SIGNING_KEY). Without the secret, or for a tag that is not vN.N.N, that step ends with a
+# notice and the release is published as before. The signed file is uploaded last, after the files it
+# names. The job waits for the approval of the environment's required reviewer once that is set.
 on:
   push:
     tags: ["v*"]
@@ -124,21 +131,37 @@ jobs:
         working-directory: crates/setup
         env:
           PRINTPAPI_AGENT_BIN: ${{ github.workspace }}/target/${{ matrix.target }}/release/printpapi-agent
-        run: cargo tauri build --target ${{ matrix.target }} --bundles dmg
+        # app and dmg: with dmg alone Tauri removes the .app, and the update needs it as a ZIP
+        run: cargo tauri build --target ${{ matrix.target }} --bundles app,dmg
       - name: name the files
         shell: bash
         run: |
           set -eux
           rel=crates/setup/target/${{ matrix.target }}/release
+          agent=target/${{ matrix.target }}/release/printpapi-agent${{ matrix.exe }}
           mkdir dist
+          # The plain program files an update swaps in (printpapi-update-*): the agent of this job
+          # and the program that is the tray icon and the window. Their names are the roles of
+          # tools/release/update_manifest.py.
+          cp "$agent" "dist/printpapi-update-agent-${{ matrix.name }}${{ matrix.exe }}"
           case "$RUNNER_OS" in
-            Windows) cp "$rel/printpapi-setup.exe" dist/printpapi-setup-${{ matrix.name }}.exe ;;
-            macOS) cp "$rel"/bundle/dmg/*.dmg dist/printpapi-setup-${{ matrix.name }}.dmg ;;
+            Windows)
+              cp "$rel/printpapi-setup.exe" dist/printpapi-setup-${{ matrix.name }}.exe
+              cp "$rel/printpapi-setup.exe" dist/printpapi-update-tray-${{ matrix.name }}.exe ;;
+            macOS)
+              cp "$rel"/bundle/dmg/*.dmg dist/printpapi-setup-${{ matrix.name }}.dmg
+              # one .app, zipped with its folder as ditto -x -k unpacks it
+              ditto -c -k --keepParent "$rel"/bundle/macos/*.app dist/printpapi-update-app-${{ matrix.name }}.zip ;;
             Linux)
               cp "$rel"/bundle/deb/*.deb dist/printpapi-setup-${{ matrix.name }}.deb
+              # the program inside the .deb is the tray icon and the window
+              mkdir deb-root
+              dpkg-deb -x "$rel"/bundle/deb/*.deb deb-root
+              cp deb-root/usr/bin/printpapi-setup dist/printpapi-update-tray-${{ matrix.name }}
               # a failed (allowed) aarch64 AppImage leaves no file; publish skips what is missing
               if ls "$rel"/bundle/appimage/*.AppImage >/dev/null 2>&1; then
                 cp "$rel"/bundle/appimage/*.AppImage dist/printpapi-setup-${{ matrix.name }}.AppImage
+                cp "$rel"/bundle/appimage/*.AppImage dist/printpapi-update-appimage-${{ matrix.name }}
               fi ;;
           esac
           ls -l dist
@@ -153,6 +176,11 @@ jobs:
     # Publish whatever built: one broken platform must not hold back the others' archives.
     if: ${{ !cancelled() && startsWith(github.ref, 'refs/tags/') }}
     runs-on: ubuntu-latest
+    # The environment that holds the signing key (secret UPDATE_SIGNING_KEY): its secrets reach this
+    # job only after its rules (required reviewer, tags v*) are met. An environment that does not
+    # exist is created by GitHub without rules and without secrets, so releases work before it is set up.
+    # https://docs.github.com/en/actions/reference/workflows-and-actions/deployments-and-environments
+    environment: release-signing
     permissions:
       contents: write
     steps:
@@ -191,3 +219,25 @@ jobs:
             if [ "$beta" = true ]; then label="$label (Beta)"; fi
             gh release upload "$TAG" "dist/$asset#$label" -R "$GITHUB_REPOSITORY" --clobber
           done < <(jq -r '.[] | [.asset, .label, .beta] | @tsv' web/lib/setup-downloads.json)
+      # The signed update file, last: it names the files above, so a client never sees a signed file
+      # whose files are not there yet. The key is in the environment of this step only.
+      - name: sign and publish the update files
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+          UPDATE_SIGNING_KEY: ${{ secrets.UPDATE_SIGNING_KEY }}
+        run: |
+          set -euo pipefail
+          if ! version=$(python3 tools/release/update_manifest.py tag "$TAG"); then
+            echo "::notice::$TAG is not a vN.N.N release tag, so no update is published."
+            exit 0
+          fi
+          if [ -z "$UPDATE_SIGNING_KEY" ]; then
+            echo "::notice::No UPDATE_SIGNING_KEY in the release-signing environment, so no update is published (see SECURITY.md)."
+            exit 0
+          fi
+          python3 tools/release/update_manifest.py build --version "$version" --dist dist --out update-payload.json
+          python3 tools/release/update_manifest.py sign --payload update-payload.json --out dist/printpapi-update.txt
+          files=$(ls dist/printpapi-update-* | grep -v '^dist/printpapi-update\.txt$')
+          gh release upload "$TAG" $files -R "$GITHUB_REPOSITORY" --clobber
+          gh release upload "$TAG" dist/printpapi-update.txt -R "$GITHUB_REPOSITORY" --clobber

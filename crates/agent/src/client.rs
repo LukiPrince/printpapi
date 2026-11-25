@@ -253,6 +253,119 @@ impl Client {
     }
 }
 
+/// [`download`] as a value, for a caller that can be given a fake.
+pub type DownloadFn<'a> = dyn Fn(&str, u64, Duration) -> Result<Vec<u8>, DownloadError> + 'a;
+
+/// A browser's User-Agent. A WAF or Cloudflare in front of a download host answers a bare HTTP
+/// client with 403 (AGENTS.md, pitfall 3), so downloads send this and never the agent's own.
+pub const BROWSER_UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36";
+
+/// Why [`download`] failed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DownloadError {
+    /// The server says there is no such file (404).
+    NotFound,
+    /// Anything else: the text names what went wrong and never holds a header value.
+    Other(String),
+}
+
+impl fmt::Display for DownloadError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            DownloadError::NotFound => f.write_str("server returned 404"),
+            DownloadError::Other(m) => f.write_str(m),
+        }
+    }
+}
+
+/// `GET url` into memory, for a file that is not for the server of this agent: an update, a
+/// SumatraPDF. http and https only; the proxy choice of every other call; the browser
+/// User-Agent; **no Authorization and none of the `[headers]` of agent.ini**, because the host is
+/// not the printpapi server. `limit` bytes at most, and `deadline` for the whole call, redirects
+/// and body included (ureq's `timeout_global`: "the whole request including redirects", checked in
+/// ureq 3.5.0 src/config.rs `timeout_global`), so a host that trickles bytes cannot hold it.
+pub fn download(url: &str, limit: u64, deadline: Duration) -> Result<Vec<u8>, DownloadError> {
+    download_with(&ProxyEnv::from_env(), url, limit, deadline)
+}
+
+fn download_with(
+    env: &ProxyEnv,
+    url: &str,
+    limit: u64,
+    deadline: Duration,
+) -> Result<Vec<u8>, DownloadError> {
+    let scheme_ok = url
+        .split_once("://")
+        .is_some_and(|(s, _)| s.eq_ignore_ascii_case("http") || s.eq_ignore_ascii_case("https"));
+    if !scheme_ok {
+        return Err(DownloadError::Other(
+            "only http and https can be downloaded".into(),
+        ));
+    }
+    let mut builder = Config::builder()
+        .timeout_global(Some(deadline))
+        .http_status_as_error(false)
+        .user_agent(BROWSER_UA)
+        .tls_config(
+            TlsConfig::builder()
+                .root_certs(RootCerts::PlatformVerifier)
+                .build(),
+        );
+    match env.plan(url) {
+        ProxyPlan::Default => {}
+        ProxyPlan::Direct => builder = builder.proxy(None),
+        ProxyPlan::Via => {
+            let https = url
+                .split_once("://")
+                .is_some_and(|(s, _)| s.eq_ignore_ascii_case("https"));
+            let value = if https { &env.https } else { &env.http };
+            let proxy = value.as_deref().and_then(|p| {
+                let p = if p.contains("://") {
+                    p.to_string()
+                } else {
+                    format!("http://{p}")
+                };
+                ureq::Proxy::new(&p).ok()
+            });
+            // an unparsable proxy value is skipped: that scheme then goes direct, as in Client
+            builder = builder.proxy(proxy);
+        }
+    }
+    let agent = ureq::Agent::new_with_config(builder.build());
+    let mut request = agent.get(url);
+    // a bare GET: the User-Agent is the browser's, nothing else is added
+    request = request.header("Accept", "*/*");
+    let resp = request
+        .call()
+        .map_err(|e| DownloadError::Other(map_err(e).to_string()))?;
+    let status = resp.status().as_u16();
+    if status == 404 {
+        return Err(DownloadError::NotFound);
+    }
+    if !(200..300).contains(&status) {
+        return Err(DownloadError::Other(format!("server returned {status}")));
+    }
+    // ureq's LimitReader fails the read that looks for the end of a body of exactly `limit`
+    // bytes (src/body/limit.rs, 3.5.0), so ask for one byte more and compare afterwards
+    let body = resp
+        .into_body()
+        .with_config()
+        .limit(limit.saturating_add(1))
+        .read_to_vec()
+        .map_err(|e| match e {
+            ureq::Error::BodyExceedsLimit(_) => too_large(limit),
+            other => DownloadError::Other(map_err(other).to_string()),
+        })?;
+    if body.len() as u64 > limit {
+        return Err(too_large(limit));
+    }
+    Ok(body)
+}
+
+fn too_large(limit: u64) -> DownloadError {
+    DownloadError::Other(format!("the file is larger than {limit} bytes"))
+}
+
 fn map_err(e: ureq::Error) -> HttpError {
     match e {
         ureq::Error::Http(_) | ureq::Error::BadUri(_) => HttpError::Value(e.to_string()),
@@ -441,6 +554,184 @@ mod tests {
             .get_bytes(&format!("{url}/p"), "k")
             .unwrap();
         assert_eq!(got, Some(b"%PDF-1.4".to_vec()));
+    }
+
+    /// A loopback server that answers one connection per entry of `replies`, in order, and sends
+    /// each raw request back.
+    fn serve_many(replies: Vec<String>) -> (String, mpsc::Receiver<String>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            for reply in replies {
+                let Ok((mut s, _)) = listener.accept() else {
+                    return;
+                };
+                let mut buf = Vec::new();
+                let mut chunk = [0u8; 1024];
+                while !buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                    let n = s.read(&mut chunk).unwrap_or(0);
+                    if n == 0 {
+                        break;
+                    }
+                    buf.extend_from_slice(&chunk[..n]);
+                }
+                let _ = tx.send(String::from_utf8_lossy(&buf).into_owned());
+                let _ = s.write_all(reply.as_bytes());
+            }
+        });
+        (url, rx)
+    }
+
+    fn ok(body: &str) -> String {
+        format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+    }
+
+    const DEADLINE: Duration = Duration::from_secs(10);
+
+    #[test]
+    fn download_sends_the_browser_ua_and_neither_the_key_nor_the_headers() {
+        let (url, rx) = serve_many(vec![ok("file bytes")]);
+        let got = download_with(
+            &ProxyEnv::default(),
+            &format!("{url}/a.bin"),
+            1000,
+            DEADLINE,
+        )
+        .unwrap();
+        assert_eq!(got, b"file bytes");
+        let req = rx.recv().unwrap().to_lowercase();
+        assert!(req.starts_with("get /a.bin http/1.1"), "{req}");
+        assert!(
+            req.contains(&format!("user-agent: {}", BROWSER_UA.to_lowercase())),
+            "{req}"
+        );
+        assert!(!req.contains("authorization"), "{req}");
+        assert!(!req.contains("printpapi-agent"), "{req}");
+        assert!(!req.contains("cf-access"), "{req}");
+    }
+
+    #[test]
+    fn download_follows_a_redirect_without_adding_anything() {
+        let (url, rx) = serve_many(vec![
+            "HTTP/1.1 302 Found\r\nLocation: /real\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".into(),
+            ok("moved"),
+        ]);
+        let got = download_with(&ProxyEnv::default(), &format!("{url}/a"), 1000, DEADLINE).unwrap();
+        assert_eq!(got, b"moved");
+        assert!(rx.recv().unwrap().starts_with("GET /a "));
+        let second = rx.recv().unwrap().to_lowercase();
+        assert!(second.starts_with("get /real "), "{second}");
+        assert!(!second.contains("authorization"));
+    }
+
+    #[test]
+    fn download_enforces_the_size_limit() {
+        let (url, _rx) = serve_many(vec![ok("0123456789")]);
+        let e = download_with(&ProxyEnv::default(), &format!("{url}/a"), 5, DEADLINE).unwrap_err();
+        assert!(
+            matches!(&e, DownloadError::Other(m) if m.contains("larger than 5 bytes")),
+            "{e}"
+        );
+    }
+
+    #[test]
+    fn download_takes_a_body_of_exactly_the_limit_and_refuses_one_byte_more() {
+        // ureq's LimitReader fails the read that looks for the end of a body that is exactly
+        // `limit` long, and both callers ask for the size the signed file names
+        let (url, _rx) = serve_many(vec![ok("0123456789")]);
+        let got = download_with(&ProxyEnv::default(), &format!("{url}/a"), 10, DEADLINE).unwrap();
+        assert_eq!(got, b"0123456789");
+        let (url, _rx) = serve_many(vec![ok("0123456789")]);
+        let e = download_with(&ProxyEnv::default(), &format!("{url}/a"), 9, DEADLINE).unwrap_err();
+        assert!(
+            matches!(&e, DownloadError::Other(m) if m.contains("larger than 9 bytes")),
+            "{e}"
+        );
+    }
+
+    #[test]
+    fn download_enforces_one_deadline_for_the_whole_call() {
+        // headers arrive at once, the body stalls: only a global deadline ends this
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        std::thread::spawn(move || {
+            let Ok((mut s, _)) = listener.accept() else {
+                return;
+            };
+            let mut buf = [0u8; 1024];
+            let _ = s.read(&mut buf);
+            let _ = s.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\nabc");
+            std::thread::sleep(Duration::from_secs(4));
+        });
+        let started = std::time::Instant::now();
+        let e = download_with(
+            &ProxyEnv::default(),
+            &format!("{url}/a"),
+            1000,
+            Duration::from_millis(500),
+        )
+        .unwrap_err();
+        assert!(matches!(e, DownloadError::Other(_)), "{e}");
+        assert!(started.elapsed() < Duration::from_secs(3));
+    }
+
+    #[test]
+    fn download_says_not_found_for_404_and_names_other_statuses() {
+        let (url, _rx) = serve_many(vec![
+            "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".into(),
+            "HTTP/1.1 503 Busy\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".into(),
+        ]);
+        assert_eq!(
+            download_with(&ProxyEnv::default(), &format!("{url}/a"), 10, DEADLINE),
+            Err(DownloadError::NotFound)
+        );
+        assert_eq!(
+            download_with(&ProxyEnv::default(), &format!("{url}/a"), 10, DEADLINE),
+            Err(DownloadError::Other("server returned 503".into()))
+        );
+    }
+
+    #[test]
+    fn download_refuses_everything_but_http_and_https() {
+        for url in ["file:///c:/x", "ftp://h/x", "h/x", "javascript:1", ""] {
+            let e = download_with(&ProxyEnv::default(), url, 10, DEADLINE).unwrap_err();
+            assert!(
+                matches!(&e, DownloadError::Other(m) if m.contains("only http and https")),
+                "{url}"
+            );
+        }
+    }
+
+    #[test]
+    fn download_uses_the_proxy_of_the_url_scheme_and_skips_no_proxy_hosts() {
+        // ureq talks to an HTTP proxy with CONNECT: the loopback server plays a proxy that refuses
+        // it, which is enough to see where the request went
+        let refuse = "HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+        let (proxy, rx) = serve_many(vec![refuse.to_string()]);
+        let env = penv(Some(&proxy), None, None);
+        assert!(download_with(&env, "http://files.example.invalid/x.bin", 100, DEADLINE).is_err());
+        let req = rx
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap()
+            .to_lowercase();
+        assert!(
+            req.starts_with("connect files.example.invalid:80 http/1.1"),
+            "{req}"
+        );
+        // only HTTPS_PROXY is set: a plain http URL goes direct, and the proxy hears nothing
+        let (proxy, rx) = serve_many(vec![refuse.to_string()]);
+        let env = penv(None, Some(&proxy), None);
+        assert!(download_with(&env, "http://files.example.invalid/x.bin", 100, DEADLINE).is_err());
+        assert!(rx.recv_timeout(Duration::from_millis(300)).is_err());
+        // no_proxy: that host goes direct as well
+        let (proxy, rx) = serve_many(vec![refuse.to_string()]);
+        let env = penv(Some(&proxy), None, Some("files.example.invalid"));
+        assert!(download_with(&env, "http://files.example.invalid/x.bin", 100, DEADLINE).is_err());
+        assert!(rx.recv_timeout(Duration::from_millis(300)).is_err());
     }
 
     #[test]

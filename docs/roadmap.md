@@ -50,6 +50,11 @@ v1 is deliberately small (see [CONTRIBUTING.md](../CONTRIBUTING.md) for the YAGN
   (machine scope), with a lasting opt-out and an agent that waits instead of ending when the key
   cannot be read; `read-config` hands the window only the headers. Linux and macOS keep the file.
   See [agent.md](agent.md#where-the-key-is-stored).
+- ~~**Signed updates**~~ ✅ the setup's agent and tray program check a signed file once a day and
+  install a new version in one click, or at night when you allow it; a version that does not
+  connect is replaced by the old one. Modes Tell me, Install automatically and Off, a mirror for
+  companies, Ed25519 signature checked before anything changes. See [agent.md](agent.md#updates)
+  and [SECURITY.md](../SECURITY.md#signed-updates).
 
 ## v2 candidates
 
@@ -111,8 +116,12 @@ order of pull:
    capability discovery.
 10. **Scales API** — USB HID scales at packing stations (NetSuite/Dynamics workflows read weight
     through PrintNode's client). Biggest hardware gap, but niche; needs agent-side HID + a push channel.
-11. **ESC/POS receipt rendering/templating** — images/QR/receiptline-style markdown → ESC-POS. Where
-    Home-Assistant/hobbyist efforts stall today; expensive to do well, raw passthrough already works.
+11. ~~**ESC/POS receipt rendering/templating**~~ ✅ **shipped** — a `receipt` job is a JSON document
+    (text, columns, divider, logo, QR code, Code 128 / EAN-13, cut, cash drawer) that the server lays
+    out once and writes as ESC/POS (drawn text by default, native Windows-1252 text as an opt-in), as a
+    PDF for a printer that takes one, or as a live preview in the dashboard. The agent is unchanged.
+    See [receipts.md](receipts.md). Left open: **verification on real 58 and 80 mm printers**, images
+    by URL, a per-job profile override, stored receipt templates, Star output.
 12. **Code-signed Windows agent installer** — the one blocker that needs a certificate, not code.
 13. **Opt-in: reject unknown keys on `/agent/register`.** Today an unrecognised bearer enrolls into
     the default org - harmless on a LAN, but anyone who can reach `/agent/*` from outside can add

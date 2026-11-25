@@ -4,12 +4,24 @@
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Skeleton } from "@/components/ui/skeleton";
 import { fmtAgo } from "@/lib/format";
-import type { AgentStatus } from "./api";
+import { Button } from "@/components/ui/button";
+import type { AgentStatus, UpdateInfo } from "./api";
 import { lastJobText } from "./model";
 import { AgentStateLine, Notice } from "./bits";
 
 /** The first section: whether the agent runs, and what it last did. Reads the status file only. */
-export function Overview({ status, error }: { status: AgentStatus | null; error: string | null }) {
+export function Overview({
+  status,
+  error,
+  update,
+  onUpdates,
+}: {
+  status: AgentStatus | null;
+  error: string | null;
+  /** The info when a newer version is known, else null. */
+  update: UpdateInfo | null;
+  onUpdates: () => void;
+}) {
   if (!status) {
     return error ? <Notice tone="error">{error}</Notice> : <Skeleton className="h-48 w-full" />;
   }
@@ -22,6 +34,14 @@ export function Overview({ status, error }: { status: AgentStatus | null; error:
         </CardDescription>
       </CardHeader>
       <CardContent className="space-y-3">
+        {update && (
+          <Notice tone="info">
+            Version {update.latest} is available.
+            <Button type="button" variant="link" size="sm" className="ml-1 h-auto p-0" onClick={onUpdates}>
+              Open Updates
+            </Button>
+          </Notice>
+        )}
         {status.state === "offline" && (
           <Notice tone="error">{status.error ?? "The agent cannot reach the server."}</Notice>
         )}

@@ -7,7 +7,10 @@ mod elevate;
 mod settings;
 mod staging;
 mod tray;
+mod updates;
 
+use std::ffi::OsString;
+use std::io::Write;
 use std::process::ExitCode;
 use std::sync::{Mutex, PoisonError};
 
@@ -28,8 +31,52 @@ fn startup_problem(webview: Result<String, String>, on_windows: bool) -> Option<
     (on_windows && webview.is_err()).then_some(WEBVIEW_MISSING)
 }
 
+/// What this run of the program is for. One parser, so every mode has one rule for its arguments.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Mode {
+    /// Exactly `--version`: print the version and end, before anything else is looked at.
+    Version,
+    /// Any argument `--tray`: the icon.
+    Tray,
+    /// The settings window or the setup, opened on a section when `--section <word>` names one.
+    Window { section: Option<&'static str> },
+}
+
+/// The mode for the arguments after the program name. A `--section` word that is not one of
+/// [`updates::SECTIONS`] is ignored.
+pub fn mode(args: &[OsString]) -> Mode {
+    if args.len() == 1 && args[0] == "--version" {
+        return Mode::Version;
+    }
+    if args.iter().any(|a| a == "--tray") {
+        return Mode::Tray;
+    }
+    let section = args
+        .windows(2)
+        .find(|w| w[0] == "--section")
+        .and_then(|w| w[1].to_str())
+        .and_then(|word| updates::SECTIONS.iter().copied().find(|s| *s == word));
+    Mode::Window { section }
+}
+
 fn main() -> ExitCode {
-    let tray_mode = std::env::args().skip(1).any(|a| a == "--tray");
+    let args: Vec<OsString> = std::env::args_os().skip(1).collect();
+    let mode = mode(&args);
+    updates::note_start();
+    // the updater starts the new program with this before it changes anything: no lock, no web
+    // view check, no window. `let _`: a program without a console may have no stdout.
+    if mode == Mode::Version {
+        let _ = writeln!(
+            std::io::stdout(),
+            "printpapi-setup {}",
+            env!("CARGO_PKG_VERSION")
+        );
+        return ExitCode::SUCCESS;
+    }
+    if let Mode::Window { section } = &mode {
+        updates::set_start_section(*section);
+    }
+    let tray_mode = mode == Mode::Tray;
     // The icon lives as long as the process; a second icon of this user ends, once the first one
     // has had time to end itself after an update (see `tray::single_instance_within`).
     let _single = if tray_mode {
@@ -84,6 +131,13 @@ fn main() -> ExitCode {
             commands::apply_patch,
             commands::restart_agent,
             commands::header_values,
+            updates::update_info,
+            updates::check_update,
+            updates::download_update,
+            updates::install_update,
+            updates::open_release_notes,
+            updates::open_installed,
+            updates::start_section,
         ])
         .build(tauri::generate_context!());
     let app = match built {
@@ -150,6 +204,64 @@ mod tests {
         assert_eq!(startup_problem(Ok("130.0".into()), true), None);
         // elsewhere the web view is part of the system or the program does not start at all
         assert_eq!(startup_problem(Err("x".into()), false), None);
+    }
+
+    fn words(args: &[&str]) -> Vec<OsString> {
+        args.iter().map(OsString::from).collect()
+    }
+
+    #[test]
+    fn version_is_exactly_one_argument_and_comes_before_everything() {
+        assert_eq!(mode(&words(&["--version"])), Mode::Version);
+        for not in [
+            &["--version", "--tray"][..],
+            &["--tray", "--version"],
+            &["--version", "x"],
+            &["-V"],
+            &["--VERSION"],
+        ] {
+            assert_ne!(mode(&words(not)), Mode::Version, "{not:?}");
+        }
+    }
+
+    #[test]
+    fn tray_is_any_argument_tray() {
+        assert_eq!(mode(&words(&["--tray"])), Mode::Tray);
+        assert_eq!(mode(&words(&["--x", "--tray"])), Mode::Tray);
+        assert_eq!(
+            mode(&words(&["--tray", "--section", "updates"])),
+            Mode::Tray
+        );
+    }
+
+    #[test]
+    fn a_window_opens_on_a_known_section_and_ignores_the_rest() {
+        assert_eq!(mode(&[]), Mode::Window { section: None });
+        assert_eq!(
+            mode(&words(&["--section", "updates"])),
+            Mode::Window {
+                section: Some("updates")
+            }
+        );
+        assert_eq!(
+            mode(&words(&["x", "--section", "log"])),
+            Mode::Window {
+                section: Some("log")
+            }
+        );
+        for unknown in [
+            &["--section", "remove"][..],
+            &["--section"],
+            &["--section", ""],
+            &["updates"],
+            &["--section", "UPDATES"],
+        ] {
+            assert_eq!(
+                mode(&words(unknown)),
+                Mode::Window { section: None },
+                "{unknown:?}"
+            );
+        }
     }
 
     /// The setup and the agent are released together: one number.

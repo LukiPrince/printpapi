@@ -1,8 +1,8 @@
 // printpapi — self-hosted PrintNode alternative. Elastic License 2.0 (see LICENSE).
 import test from "node:test";
 import assert from "node:assert/strict";
-import { DEFAULT_RAW_PORT, addNetworkPrinter, canLeavePrinters, canSwitchOn, canTest, connectMayHelp, errorText, fromFound, lastJobText, logLocation, keepsOldName, needsNewName, needsSumatra, patchFor, pathParts, returnsToConnect, statusWord, timeoutProblem } from "./model.ts";
-import type { FoundPrinter, PrinterChoice } from "./api.ts";
+import { DEFAULT_RAW_PORT, addNetworkPrinter, canLeavePrinters, canSwitchOn, canTest, connectMayHelp, errorText, fromFound, lastJobText, logLocation, keepsOldName, needsNewName, needsSumatra, patchFor, pathParts, returnsToConnect, statusWord, timeoutProblem, MODES, NEEDS_CONNECTED, UPDATE_URL_TEXT, autoLine, goBackNote, goBackPatch, installedIsNewer, isNewer, modePatch, modeStillOff, olderCardShown, ownIsNewer, updateAvailable, updateErrorText, updateLine } from "./model.ts";
+import type { FoundPrinter, PrinterChoice, UpdateInfo } from "./api.ts";
 
 const choice = (over: Partial<PrinterChoice> = {}): PrinterChoice => ({
   name: "Zebra",
@@ -236,4 +236,139 @@ test("a path breaks only after a separator", () => {
   ]);
   assert.deepEqual(pathParts("/var/lib/x.log"), ["/", "var/", "lib/", "x.log"]);
   assert.deepEqual(pathParts("plain"), ["plain"]);
+});
+
+const info = (over: Partial<UpdateInfo> = {}): UpdateInfo => ({
+  supported: true,
+  mode: "notify",
+  own: "3.7.0",
+  installed: "3.7.0",
+  fromInstalled: true,
+  latest: null,
+  checkedAt: null,
+  lastAttempt: null,
+  error: null,
+  ...over,
+});
+const ago = (ts: number | null) => (ts === 7200 ? "2 h ago" : "just now");
+
+test("versions compare number by number", () => {
+  assert.ok(isNewer("3.10.0", "3.9.9"));
+  assert.ok(isNewer("4.0.0", "3.99.99"));
+  assert.ok(!isNewer("3.7.0", "3.7.0"));
+  assert.ok(!isNewer("3.6.9", "3.7.0"));
+  // something that is no version is never newer, and nothing is newer than it
+  for (const bad of [null, undefined, "", "3.7", "v3.7.0", "3.7.0-rc1", "3.7.x"]) {
+    assert.ok(!isNewer(bad, "3.0.0"), String(bad));
+    assert.ok(!isNewer("3.0.0", bad), String(bad));
+  }
+});
+
+test("the update line says one thing for every state", () => {
+  assert.equal(updateLine(info({ supported: false }), ago), "This build has no update key, so it cannot check for updates.");
+  assert.equal(
+    updateLine(info({ mode: "off" }), ago),
+    "Checking is switched off in agent.ini (updates = off, or an update_url that is not a usable folder).",
+  );
+  assert.match(updateLine(info({ mode: "unknown" }), ago), /has not said how it is set up/);
+  // a restart cannot help an agent that is older than updates: the line points to the install
+  assert.doesNotMatch(updateLine(info({ mode: "unknown" }), ago), /restart/i);
+  assert.match(updateLine(info({ mode: "unknown" }), ago), /install this program/);
+  assert.equal(updateLine(info({ latest: "3.8.0" }), ago), "Version 3.8.0 is available.");
+  assert.equal(updateLine(info({ latest: "3.7.0", checkedAt: 7200 }), ago), "Up to date. Checked 2 h ago.");
+  assert.equal(updateLine(info(), ago), "Not checked yet.");
+  assert.equal(updateLine(info({ error: "The update server could not be reached: x" }), ago), "The update server could not be reached: x");
+  const tried = { version: "3.8.0", ok: false, message: "Version 3.8.0 did not connect, so 3.7.0 was put back. It is running again.", at: 1 };
+  // the stored sentence says it all: it is not wrapped into a second one
+  assert.equal(updateLine(info({ latest: "3.8.0", lastAttempt: tried }), ago), tried.message);
+  assert.equal(
+    updateLine(info({ latest: "3.8.0", lastAttempt: { ...tried, message: "The agent did not stop, so nothing was changed." } }), ago),
+    "Version 3.8.0 was not installed: The agent did not stop, so nothing was changed.",
+  );
+  // once that very version is installed, an old failure is history
+  assert.equal(
+    updateLine(info({ installed: "3.8.0", own: "3.8.0", latest: "3.8.0", checkedAt: 7200, lastAttempt: tried }), ago),
+    "Up to date. Checked 2 h ago.",
+  );
+  // nothing published (a 404) is no "up to date"
+  assert.equal(
+    updateLine(info({ latest: null, checkedAt: 7200, error: "No signed update has been published yet." }), ago),
+    "No signed update has been published yet.",
+  );
+  // an attempt at another version does not hide a newer one
+  assert.equal(updateLine(info({ latest: "3.9.0", lastAttempt: tried }), ago), "Version 3.9.0 is available.");
+  assert.equal(autoLine("auto"), "Installed automatically, usually at night.");
+  assert.equal(autoLine("notify"), null);
+});
+
+test("an update is available when the newest is newer than the installed one, else than this program", () => {
+  assert.ok(updateAvailable(info({ latest: "3.8.0" })));
+  assert.ok(!updateAvailable(info({ latest: "3.7.0" })));
+  assert.ok(updateAvailable(info({ latest: "3.7.1", installed: null })));
+  assert.ok(!updateAvailable(info({ latest: "3.8.0", installed: "3.9.0" })));
+});
+
+test("the older card appears only for an installed agent that is newer than this program", () => {
+  assert.ok(installedIsNewer(info({ installed: "3.8.0" })));
+  assert.ok(!installedIsNewer(info({ installed: "3.7.0" })));
+  assert.ok(!installedIsNewer(info({ installed: null })));
+  assert.ok(ownIsNewer(info({ installed: "3.6.0" })));
+  assert.ok(!ownIsNewer(info({ installed: null })));
+});
+
+test("a change of mode is a patch only when it is a change, and going back leaves auto", () => {
+  assert.deepEqual(modePatch("notify", "auto"), { updates: "auto" });
+  assert.equal(modePatch("auto", "auto"), null);
+  assert.deepEqual(modePatch("unknown", "off"), { updates: "off" });
+  assert.deepEqual(goBackPatch("auto"), { updates: "notify", goBack: true });
+  assert.deepEqual(goBackPatch("notify"), { goBack: true });
+  assert.deepEqual(goBackPatch("off"), { goBack: true });
+  // a stopped agent does not say its mode: the install reads the file and lowers only "auto", so
+  // an "off" that somebody chose stays off
+  assert.deepEqual(goBackPatch("unknown"), { updates: "notify-if-auto", goBack: true });
+  assert.match(goBackNote("auto") ?? "", /switched to "Tell me"/);
+  assert.match(goBackNote("unknown") ?? "", /If updates are set to "Install automatically"/);
+  assert.equal(goBackNote("notify"), null);
+  assert.equal(goBackNote("off"), null);
+  assert.deepEqual(
+    MODES.map((m) => [m.value, m.label]),
+    [["notify", "Tell me"], ["auto", "Install automatically"], ["off", "Off"]],
+  );
+});
+
+test("a card or a section that started an install stays on screen until it is done", () => {
+  const newer = info({ installed: "3.8.0" });
+  const same = info({ installed: "3.7.0" });
+  // nothing running: the card shows for a newer installed agent, unless this window installed it
+  assert.ok(olderCardShown(newer, false, null));
+  assert.ok(!olderCardShown(newer, true, null));
+  assert.ok(!olderCardShown(same, false, null));
+  assert.ok(!olderCardShown(null, false, null));
+  // Go back runs: the marker reads 3.7.0 in the middle of it, and the card (with its notice) stays
+  assert.ok(olderCardShown(same, false, "card"));
+  assert.ok(olderCardShown(newer, false, "card"));
+  // an install from Updates runs: the marker is new before the install has finished
+  assert.ok(!olderCardShown(newer, false, "section"));
+});
+
+test("a mode that was chosen and is still off says why", () => {
+  assert.ok(modeStillOff("notify", "off"));
+  assert.ok(modeStillOff("auto", "off"));
+  assert.ok(!modeStillOff("off", "off"));
+  assert.ok(!modeStillOff("notify", "notify"));
+  assert.ok(!modeStillOff("auto", "unknown"));
+  assert.match(UPDATE_URL_TEXT, /update_url/);
+});
+
+test("the failures of an update have their own sentences", () => {
+  const e = (code: string, message = "x") => updateErrorText({ code, message });
+  assert.equal(e("not_published"), "No signed update has been published yet.");
+  assert.equal(e("bad_signature"), "The update is not signed with a key this program knows. It was not installed.");
+  assert.equal(e("bad_file"), "A downloaded file is not the one the release lists. Try again in a few minutes.");
+  assert.equal(e("wont_start"), "The new version cannot be started on this computer (it may be blocked). Nothing was changed.");
+  assert.equal(e("no_target"), "This release has no file for this installation. Use the setup program.");
+  assert.equal(e("offline"), NEEDS_CONNECTED);
+  assert.equal(e("unreachable", "The update server could not be reached: refused"), "The update server could not be reached: refused");
+  assert.equal(e("rolled_back", "Version 3.8.0 did not connect, so 3.7.0 was put back. It is running again."), "Version 3.8.0 did not connect, so 3.7.0 was put back. It is running again.");
+  assert.equal(e("proxy"), errorText({ code: "proxy", message: "x" }));
 });

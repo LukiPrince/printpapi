@@ -441,6 +441,161 @@ fn write_a_database_for_python_to_read() {
 }
 
 #[test]
+fn a_python_database_gets_the_receipt_tables_and_triggers_and_keeps_its_columns() {
+    let (dir, db) = open();
+    let names = |db: &Db, kind: &str| -> Vec<String> {
+        db.with(|c| {
+            let mut stmt = c
+                .prepare("SELECT name FROM sqlite_master WHERE type=? AND name LIKE '%receipt%' ORDER BY name")
+                .unwrap();
+            stmt.query_map([kind], |r| r.get(0))
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap()
+        })
+    };
+    let check = |db: &Db| {
+        assert_eq!(names(db, "table"), ["job_receipts", "receipt_profiles"]);
+        assert_eq!(
+            names(db, "trigger"),
+            [
+                "job_receipts_gone",
+                "job_receipts_scrub",
+                "receipt_profiles_gone"
+            ]
+        );
+    };
+    check(&db);
+    // the Python-era columns of the two tables the triggers watch are as they were
+    let columns = |db: &Db, table: &str| -> Vec<String> {
+        db.with(|c| {
+            let mut stmt = c.prepare(&format!("PRAGMA table_info({table})")).unwrap();
+            stmt.query_map([], |r| r.get(1))
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap()
+        })
+    };
+    let jobs = columns(&db, "jobs");
+    for want in [
+        "id",
+        "org_id",
+        "user_id",
+        "printer_id",
+        "agent_id",
+        "type",
+        "mode",
+        "state",
+        "payload",
+        "error",
+        "created_at",
+        "claimed_at",
+        "finished_at",
+    ] {
+        assert!(jobs.iter().any(|c| c == want), "jobs.{want}");
+    }
+    let printers = columns(&db, "printers");
+    for want in [
+        "id",
+        "org_id",
+        "agent_id",
+        "name",
+        "can_pdf",
+        "state",
+        "created_at",
+    ] {
+        assert!(printers.iter().any(|c| c == want), "printers.{want}");
+    }
+    // a profile and a document work on the old rows, and survive a second start
+    let pid: i64 = db
+        .with(|c| {
+            c.query_row(
+                "SELECT id FROM printers WHERE org_id=? LIMIT 1",
+                [ORG],
+                |r| r.get(0),
+            )
+        })
+        .unwrap();
+    let p = printpapi_server::receipt::parse_profile(json!({"paper_mm": 58}).as_object().unwrap())
+        .unwrap();
+    assert!(
+        db.with(|c| put_receipt_profile(c, pid, Some(ORG), &p))
+            .unwrap()
+    );
+    drop(db);
+    let db = Db::open(dir.path().join("python_v2.sqlite3").to_str().unwrap()).unwrap();
+    check(&db);
+    assert_eq!(
+        db.with(|c| get_receipt_profile(c, pid, Some(ORG))).unwrap(),
+        Some(p)
+    );
+    // a receipt job and its document copy work on a Python printer, and the triggers fire on the
+    // old jobs table: the copy goes with the payload and with the row
+    let doc = json!({
+        "receipt": {"content": [{"type": "text", "text": "x"}]},
+        "profile": printpapi_server::receipt::profile_json(&Default::default()),
+    })
+    .to_string();
+    let copies = |db: &Db| -> i64 {
+        db.with(|c| c.query_row("SELECT COUNT(*) FROM job_receipts", [], |r| r.get(0)))
+            .unwrap()
+    };
+    let printer = json!(pid);
+    let enqueue = |db: &Db| {
+        db.with(|c| {
+            enqueue_receipt_job(
+                c,
+                &NewJob {
+                    printer_id: &printer,
+                    type_: "receipt",
+                    mode: "raw",
+                    payload: b"\x1b@",
+                    user_id: 2,
+                    title: None,
+                    copies: 1,
+                    callback_url: None,
+                    options: None,
+                    org_id: Some(ORG),
+                    idempotency_key: None,
+                    expire_after: None,
+                    api_key_id: None,
+                },
+                false,
+                Some(&doc),
+            )
+        })
+        .unwrap()
+        .job_id
+    };
+    let (emptied, removed) = (enqueue(&db), enqueue(&db));
+    assert_eq!(copies(&db), 2);
+    assert!(
+        db.with(|c| get_job_receipt(c, emptied, Some(ORG)))
+            .unwrap()
+            .is_some()
+    );
+    db.with(|c| c.execute("UPDATE jobs SET payload=x'' WHERE id=?", [emptied]))
+        .unwrap();
+    assert_eq!(copies(&db), 1);
+    db.with(|c| c.execute("DELETE FROM jobs WHERE id=?", [removed]))
+        .unwrap();
+    assert_eq!(copies(&db), 0);
+    // the profile goes with its printer
+    db.with(|c| c.execute("DELETE FROM jobs WHERE printer_id=?", [pid]))
+        .unwrap();
+    db.with(|c| c.execute("DELETE FROM printers WHERE id=?", [pid]))
+        .unwrap();
+    assert_eq!(
+        db.with(|c| get_receipt_profile(c, pid, Some(ORG))).unwrap(),
+        None
+    );
+    // opening twice more changes nothing
+    drop(db);
+    let db = Db::open(dir.path().join("python_v2.sqlite3").to_str().unwrap()).unwrap();
+    check(&db);
+}
+
+#[test]
 fn a_python_database_gets_the_label_templates_table_at_startup() {
     let (dir, db) = open();
     let has_table = |db: &Db| -> bool {

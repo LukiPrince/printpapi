@@ -7,6 +7,13 @@ the documented Python snippet prints it, a patch keeps it sealed, `unprotect-key
 a blob that cannot be read (the agent waits, offline, with a fresh status file), the repair by hand
 and by a connection patch. On every system `read-config` is checked to hand out no key.
 
+With --update-agent, --sign-update and --fake-tray it also tries the signed update (see
+`check_updates`): a build that is version 99.0.0 and has the test key is signed with the committed test
+seed (`crates/agent/examples/sign_update.rs`), put back when the server is gone (`rolled_back`), installed,
+refused a second time (`not_newer`), refused when a file or a program is not what the signed file
+says (`bad_file`, `wont_start`), and the nightly schedule of `updates = auto` exists and is removed again
+by the uninstall. The installed agent must be a build with the Cargo feature `update-test-key`.
+
 Starts the server, installs the agent with `printpapi-agent install` (a `file://` printer, so no
 paper is needed) together with a placeholder tray program, waits until the agent is online, checks
 the status file and the tray autostart, sends a raw job and waits for `job-<id>.prn`, runs
@@ -20,8 +27,10 @@ Python 3 stdlib only.
 """
 import argparse
 import base64
+from hashlib import sha256
 import json
 import os
+import platform
 import re
 import secrets
 import shutil
@@ -171,6 +180,30 @@ def remove_foreign_file(foreign):
 
 def agent_ini_path():
     return INSTALL_DIR / "agent.ini"
+
+
+def root_read(path):
+    """The bytes of a file the install made readable for root (and the service user) only: the
+    runner user is not root off Windows, the agent commands get sudo."""
+    if WIN:
+        return Path(path).read_bytes()
+    try:
+        return subprocess.run(["sudo", "cat", str(path)], check=True, capture_output=True,
+                              timeout=60).stdout
+    except subprocess.CalledProcessError as e:
+        raise Fail(f"cannot read {path}: {e.stderr.decode(errors='replace').strip()}")
+
+
+def root_list(path):
+    """The sorted names in a folder of the install that only root may list (`.update` is 0700)."""
+    if WIN:
+        return sorted(p.name for p in Path(path).iterdir())
+    try:
+        out = subprocess.run(["sudo", "ls", "-A", str(path)], check=True, capture_output=True,
+                             text=True, timeout=60).stdout
+    except subprocess.CalledProcessError as e:
+        raise Fail(f"cannot list {path}: {e.stderr.strip()}")
+    return sorted(out.splitlines())
 
 
 def read_installed_ini():
@@ -323,6 +356,172 @@ def run_agent(agent, sub, staging):
     return result
 
 
+def update_target():
+    """`<os>-<arch>` as the signed file names a target (Rust's std::env::consts)."""
+    system = {"win32": "windows", "darwin": "macos"}.get(sys.platform, "linux")
+    arch = "aarch64" if platform.machine().lower() in ("arm64", "aarch64") else "x86_64"
+    return f"{system}-{arch}"
+
+
+INSTALLED_AGENT = INSTALL_DIR / ("printpapi-agent.exe" if WIN else "printpapi-agent")
+MARKER = INSTALL_DIR / ".installed-by-setup"
+
+
+def make_release(dest, version, agent_bytes, fake_tray, sign):
+    """The signed file and the files it names, into `dest` (the staging folder). The tray is the
+    placeholder program that prints its version; on macOS it is zipped as an .app."""
+    t = update_target()
+    ext = ".exe" if WIN else ""
+    agent_name = f"printpapi-update-agent-{t}{ext}"
+    (dest / agent_name).write_bytes(agent_bytes)
+    roles = {"agent": agent_name}
+    if sys.platform == "darwin":
+        app = dest / "build" / "printpapi Agent.app"
+        (app / "Contents" / "MacOS").mkdir(parents=True, exist_ok=True)
+        shutil.copy(fake_tray, app / "Contents" / "MacOS" / "printpapi-setup")
+        os.chmod(app / "Contents" / "MacOS" / "printpapi-setup", 0o755)
+        tray_name = f"printpapi-update-app-{t}.zip"
+        subprocess.run(["ditto", "-c", "-k", "--keepParent", str(app), str(dest / tray_name)],
+                       check=True)
+        shutil.rmtree(dest / "build")
+        roles["app"] = tray_name
+    else:
+        tray_name = f"printpapi-update-tray-{t}{ext}"
+        shutil.copy(fake_tray, dest / tray_name)
+        roles["tray"] = tray_name
+    targets = {}
+    for role, name in roles.items():
+        data = (dest / name).read_bytes()
+        targets[role] = {"file": name, "size": len(data), "sha256": sha256(data).hexdigest()}
+    payload = dest / "payload.json"
+    payload.write_text(json.dumps({"schema": 1, "version": version, "targets": {t: targets}},
+                                  separators=(",", ":")), encoding="utf-8")
+    subprocess.run([str(sign), str(payload), str(dest / "printpapi-update.txt")], check=True)
+    payload.unlink()
+
+
+def update_result(staging, command=None):
+    """Run `restart --update-from <staging>` of the INSTALLED agent and read what it reports."""
+    cmd = [str(INSTALLED_AGENT), "restart", "--update-from", str(staging)]
+    p = subprocess.run(cmd if WIN else ["sudo", *cmd], capture_output=True, text=True,
+                       timeout=1200)
+    print(f"--- update: exit {p.returncode}\n{p.stdout}{p.stderr}".rstrip(), flush=True)
+    try:
+        return json.loads((staging / "result.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError) as e:
+        raise Fail(f"the update left no readable result.json: {e}")
+
+
+def clear_release(staging):
+    for p in staging.iterdir():
+        if p.name != "result.json":
+            shutil.rmtree(p, ignore_errors=True) if p.is_dir() else p.unlink()
+
+
+def schedule_exists():
+    """Is the nightly update registered with the system?"""
+    if WIN:
+        return subprocess.run(["schtasks", "/Query", "/TN", "printpapi-agent-update"],
+                              capture_output=True).returncode == 0
+    if LINUX:
+        return Path("/etc/systemd/system/printpapi-agent-update.timer").is_file()
+    return Path("/Library/LaunchDaemons/com.printpapi.agent-update.plist").is_file()
+
+
+def check_updates(agent, new_agent, sign, fake_tray, staging, base, token, name, work,
+                  stop_server, start_server, print_a_job):
+    """The signed update on this system, step by step (the five cases of the spec)."""
+    old_bytes = INSTALLED_AGENT.read_bytes()
+    new_bytes = Path(new_agent).read_bytes()
+    ini_before = root_read(agent_ini_path())
+    if not root_read(MARKER).decode("utf-8").startswith("version="):
+        raise Fail("the marker holds no version")
+
+    # (1) the server goes away as soon as the new agent is in place: the new version cannot
+    # connect, so the old one is put back by the updater itself, with no network
+    make_release(staging, "99.0.0", new_bytes, fake_tray, sign)
+    cmd = [str(INSTALLED_AGENT), "restart", "--update-from", str(staging)]
+    proc = subprocess.Popen(cmd if WIN else ["sudo", *cmd], stdout=subprocess.PIPE,
+                            stderr=subprocess.STDOUT, text=True)
+    try:
+        wait_for("the new agent to be put in place",
+                 lambda: INSTALLED_AGENT.read_bytes() == new_bytes, timeout=180)
+        stop_server()
+        wait_for("the old agent to be put back",
+                 lambda: INSTALLED_AGENT.read_bytes() == old_bytes, timeout=300)
+        start_server()
+        out, _ = proc.communicate(timeout=600)
+    except BaseException:
+        proc.kill()
+        raise
+    print(f"--- update (server gone): exit {proc.returncode}\n{out}".rstrip(), flush=True)
+    result = json.loads((staging / "result.json").read_text(encoding="utf-8"))
+    if result.get("ok") or result.get("code") != "rolled_back":
+        raise Fail(f"the update without a server must be rolled back: {result}")
+    if INSTALLED_AGENT.read_bytes() != old_bytes or root_read(MARKER).decode("utf-8").startswith(
+            "version=99"):
+        raise Fail("the old agent and the old marker must be back")
+    wait_for("the old agent online again",
+             lambda: read_status().get("state") == "online" and read_status().get("version") != "99.0.0",
+             timeout=120)
+
+    # (2) the same update with the server there
+    clear_release(staging)
+    make_release(staging, "99.0.0", new_bytes, fake_tray, sign)
+    result = update_result(staging)
+    if not result.get("ok") or result.get("version") != "99.0.0":
+        raise Fail(f"the update failed: {result}")
+    wait_for("the new version online",
+             lambda: read_status().get("state") == "online" and read_status().get("version") == "99.0.0")
+    if INSTALLED_AGENT.read_bytes() != new_bytes:
+        raise Fail("the installed agent is not the new one")
+    marker = root_read(MARKER).decode("utf-8")
+    if marker != "version=99.0.0\n":
+        raise Fail(f"the marker is {marker!r}")
+    tray_file = TRAY / "Contents" / "MacOS" / "printpapi-setup" if sys.platform == "darwin" else TRAY
+    if tray_file.read_bytes() != Path(fake_tray).read_bytes():
+        raise Fail("the tray program was not replaced")
+    if root_read(agent_ini_path()) != ini_before:
+        raise Fail("an update must leave agent.ini byte for byte as it was")
+    leftovers = root_list(INSTALL_DIR / ".update")
+    if leftovers != ["lock"]:
+        raise Fail(f"the private folder holds {leftovers}")
+    print_a_job("after the update")
+
+    # (3) again: nothing newer
+    clear_release(staging)
+    make_release(staging, "99.0.0", new_bytes, fake_tray, sign)
+    result = update_result(staging)
+    if result.get("code") != "not_newer":
+        raise Fail(f"a second update must say not_newer: {result}")
+
+    # (4) a file that is not what the signed file says, and a program that is another version
+    clear_release(staging)
+    make_release(staging, "99.9.9", new_bytes, fake_tray, sign)
+    flipped = bytearray(new_bytes)
+    flipped[len(flipped) // 2] ^= 1
+    (staging / f"printpapi-update-agent-{update_target()}{'.exe' if WIN else ''}").write_bytes(
+        bytes(flipped))
+    result = update_result(staging)
+    if result.get("code") != "bad_file":
+        raise Fail(f"a flipped byte must be bad_file: {result}")
+    clear_release(staging)
+    make_release(staging, "99.9.9", new_bytes, fake_tray, sign)  # the 99.0.0 program says 99.0.0
+    result = update_result(staging)
+    if result.get("code") != "wont_start":
+        raise Fail(f"a program of another version must be wont_start: {result}")
+    if INSTALLED_AGENT.read_bytes() != new_bytes or read_status().get("version") != "99.0.0":
+        raise Fail("a refused update changed the installation")
+    clear_release(staging)
+
+    # (5) the nightly schedule follows the mode
+    result = install_patch(agent, staging, {"updates": "auto"})
+    wait_for("the agent online after the change", online_after(result["baseline_local"]), timeout=90)
+    if not schedule_exists():
+        raise Fail("updates = auto left no schedule")
+    return True
+
+
 def dump_logs(server_log):
     print("\n===== server log =====", flush=True)
     print(server_log.read_text(errors="replace") if server_log.exists() else "(none)")
@@ -339,8 +538,14 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("--server", required=True, help="path of the printpapi server binary")
     ap.add_argument("--agent", required=True, help="path of the printpapi-agent binary")
+    ap.add_argument("--update-agent", help="the agent built as version 99.0.0 (with the test key)")
+    ap.add_argument("--sign-update", help="the sign_update example binary")
+    ap.add_argument("--fake-tray", help="the fake_tray example binary")
     args = ap.parse_args()
     agent = Path(args.agent).resolve()
+    update_files = [args.update_agent, args.sign_update, args.fake_tray]
+    if any(update_files) and not all(update_files):
+        ap.error("--update-agent, --sign-update and --fake-tray come together")
 
     work = Path(tempfile.mkdtemp(prefix="printpapi-smoke-"))
     # every folder the service touches sits under one parent it can walk through
@@ -354,13 +559,29 @@ def main():
     env = dict(os.environ, PRINTAPI_TOKEN=token, PRINT_DB=str(work / "smoke.db"),
                PRINT_PORT=str(port))
     server = None
+    servers = []
     installed = False
     foreign = None
     try:
-        with server_log.open("wb") as log:
-            server = subprocess.Popen([args.server], env=env, stdout=log, stderr=log)
-        wait_for("the server", lambda: urllib.request.urlopen(base + "/health", timeout=2),
-                 timeout=30)
+        def start_server():
+            nonlocal server
+            with server_log.open("ab") as log:
+                server = subprocess.Popen([args.server], env=env, stdout=log, stderr=log)
+            servers.append(server)
+            wait_for("the server", lambda: urllib.request.urlopen(base + "/health", timeout=2),
+                     timeout=30)
+
+        def stop_server():
+            nonlocal server
+            if server:
+                server.terminate()
+                try:
+                    server.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    server.kill()
+                server = None
+
+        start_server()
 
         key = call(base, token, "POST", "/apikeys", {"label": "setup smoke"})["key"]
         name = "smoke-" + secrets.token_hex(3)
@@ -442,6 +663,23 @@ def main():
         if started_at() < result["baseline_local"] - 1:
             raise Fail("the new started_at is older than the restart")
 
+        if args.update_agent:
+            def print_a_job(what):
+                body = b"^XA^FDupdate smoke " + what.encode() + b"^FS^XZ"
+                job = call(base, token, "POST", "/jobs", {
+                    "printer_id": pid, "type": "raw_base64", "title": what,
+                    "content": base64.b64encode(body).decode()})["job_id"]
+                out = archive / f"job-{job}.prn"
+                wait_for(f"{out.name} to arrive {what}", out.is_file)
+                if out.read_bytes() != body:
+                    raise Fail(f"{out.name} has the wrong content")
+
+            check_updates(agent, args.update_agent, args.sign_update, args.fake_tray, staging,
+                          base, token, name, work, stop_server, start_server, print_a_job)
+        else:
+            print("setup smoke: no update program given, the update steps are skipped",
+                  flush=True)
+
         foreign = plant_foreign_file()
         run_agent(agent, "uninstall", staging)
         installed = False
@@ -456,6 +694,8 @@ def main():
             raise Fail(f"uninstall left {left}")
         if tray_registered():
             raise Fail("uninstall left the tray autostart")
+        if schedule_exists():
+            raise Fail("uninstall left the nightly update schedule")
         if WIN:
             q = subprocess.run(["schtasks", "/Query", "/TN", "printpapi-agent"],
                                capture_output=True)
@@ -463,7 +703,7 @@ def main():
                 raise Fail("uninstall left the scheduled task")
         print("setup smoke: ok", flush=True)
         return 0
-    except (Fail, subprocess.SubprocessError) as e:
+    except (Fail, OSError, subprocess.SubprocessError) as e:
         print(f"setup smoke FAILED: {e}", file=sys.stderr, flush=True)
         dump_logs(server_log)
         return 1
@@ -479,12 +719,13 @@ def main():
                 remove_foreign_file(foreign)
             except (OSError, subprocess.SubprocessError):
                 pass
-        if server:
-            server.terminate()
-            try:
-                server.wait(timeout=10)
-            except subprocess.TimeoutExpired:
-                server.kill()
+        for s in servers:
+            if s.poll() is None:
+                s.terminate()
+                try:
+                    s.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    s.kill()
         shutil.rmtree(work, ignore_errors=True)
 
 

@@ -315,10 +315,60 @@ pub fn file_stamp(path: &Path) -> Option<FileStamp> {
     })
 }
 
-/// Was the program, which was there at the start, replaced or removed? An icon that never saw it
-/// there has nothing to compare (a development run from elsewhere) and does not end.
-pub fn replaced(at_start: Option<&FileStamp>, now: Option<&FileStamp>) -> bool {
-    at_start.is_some() && at_start != now
+/// What the icon does after a look at its program file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Step {
+    Stay,
+    /// The file differs from the one the icon started from and is there: start it, and end if that
+    /// worked.
+    Replace,
+    /// The file has been missing at two looks in a row: the installation was removed.
+    End,
+}
+
+/// The icon's view of its own program file. An icon that never saw the file (a development run from
+/// elsewhere) has nothing to compare and stays.
+pub struct Watching {
+    reference: Option<FileStamp>,
+    missing: bool,
+}
+
+impl Watching {
+    pub fn new(at_start: Option<FileStamp>) -> Watching {
+        Watching {
+            reference: at_start,
+            missing: false,
+        }
+    }
+
+    /// One look. A file that is gone ends the icon only at the second look in a row: an update
+    /// renames the old file aside and puts the new one in a moment later.
+    pub fn look(&mut self, now: Option<FileStamp>) -> Step {
+        if self.reference.is_none() {
+            return Step::Stay;
+        }
+        match now {
+            None if self.missing => Step::End,
+            None => {
+                self.missing = true;
+                Step::Stay
+            }
+            Some(stamp) => {
+                self.missing = false;
+                if Some(&stamp) == self.reference.as_ref() {
+                    Step::Stay
+                } else {
+                    Step::Replace
+                }
+            }
+        }
+    }
+
+    /// The new icon could not be started: this stamp counts as the one to compare with from now on,
+    /// so there is one try per replacement and not one every few seconds.
+    pub fn gave_up(&mut self, now: Option<FileStamp>) {
+        self.reference = now;
+    }
 }
 
 /// Where the agent leaves its status file: `status.json` in the agent's own status folder.
@@ -332,15 +382,44 @@ fn now_secs() -> f64 {
         .map_or(0.0, |d| d.as_secs_f64())
 }
 
+/// The arguments that make the window open on a section: `--section <word>`, for a word the window
+/// knows (see `crate::mode`). Nothing for anything else.
+pub fn section_args(section: Option<&str>) -> Vec<OsString> {
+    match section.filter(|s| crate::updates::SECTIONS.contains(s)) {
+        Some(s) => vec!["--section".into(), s.into()],
+        None => Vec::new(),
+    }
+}
+
 /// Start the settings window: this program again, without `--tray`, as a process of its own.
-fn open_settings() {
+fn open_settings(section: Option<&str>) {
     if let Ok(exe) = std::env::current_exe() {
         let _ = std::process::Command::new(exe)
+            .args(section_args(section))
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .spawn();
     }
+}
+
+/// Start the installed program as the icon, for the user of this icon. Not waited for.
+fn start_replacement() -> std::io::Result<()> {
+    let cmd = crate::settings::tray_start_cmd(
+        Os::host(),
+        &install::layout(Os::host(), &install::program_files()),
+    );
+    let (program, args) = cmd
+        .argv
+        .split_first()
+        .ok_or_else(|| std::io::Error::other("no program to start"))?;
+    std::process::Command::new(program)
+        .args(args)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .map(|_| ())
 }
 
 /// Open `url` if it is one that may be opened; a thread, so that a slow program does not hold
@@ -411,6 +490,7 @@ pub fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
 
     let line = MenuItem::with_id(app, "status", "Agent is not running", false, None::<&str>)?;
     let settings = MenuItem::with_id(app, "settings", "Settings…", true, None::<&str>)?;
+    let updates = MenuItem::with_id(app, "updates", "Updates…", true, None::<&str>)?;
     let dashboard = MenuItem::with_id(app, "dashboard", "Open dashboard", false, None::<&str>)?;
     let quit = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
     let menu = Menu::with_items(
@@ -419,6 +499,7 @@ pub fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
             &line,
             &PredefinedMenuItem::separator(app)?,
             &settings,
+            &updates,
             &dashboard,
             &PredefinedMenuItem::separator(app)?,
             &quit,
@@ -434,7 +515,8 @@ pub fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
             .menu(&menu)
             .show_menu_on_left_click(true)
             .on_menu_event(move |app, event| match event.id.as_ref() {
-                "settings" => open_settings(),
+                "settings" => open_settings(None),
+                "updates" => open_settings(Some("updates")),
                 "dashboard" => open_dashboard(
                     for_menu
                         .lock()
@@ -462,7 +544,24 @@ pub fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
     };
     let handle = app.handle().clone();
     std::thread::spawn(move || watch(&handle, &tray, &line, &dashboard, &address));
+    std::thread::spawn(move || look_for_updates(&updates));
     Ok(())
+}
+
+/// When the first look for an update happens after the icon started, and how often the menu text
+/// is refreshed after that (the look itself asks the network at most once a day, see
+/// `updates::check`).
+const FIRST_LOOK: Duration = Duration::from_secs(60);
+const LOOK_EVERY: Duration = Duration::from_secs(3600);
+
+/// Keep the text of the "Updates…" item: "Update to 3.7.0…" while a newer version is known.
+fn look_for_updates(item: &MenuItem<tauri::Wry>) {
+    std::thread::sleep(FIRST_LOOK);
+    loop {
+        let info = crate::updates::look(false);
+        let _ = item.set_text(crate::updates::menu_text(&info));
+        std::thread::sleep(LOOK_EVERY);
+    }
 }
 
 /// Read the status file every [`POLL`] and change icon, tooltip and menu when something differs.
@@ -479,16 +578,33 @@ fn watch(
     address: &Mutex<Option<String>>,
 ) {
     let path = status_path();
-    let program =
-        (!cfg!(windows)).then(|| install::layout(Os::host(), &install::program_files()).tray);
-    let at_start = program.as_deref().and_then(file_stamp);
+    let program = install::layout(Os::host(), &install::program_files()).tray;
+    let mut watching = Watching::new(file_stamp(&program));
     let mut shown: Option<(TrayState, String, bool)> = None;
     loop {
-        if let Some(program) = &program
-            && replaced(at_start.as_ref(), file_stamp(program).as_ref())
-        {
-            app.exit(0);
-            return;
+        let stamp = file_stamp(&program);
+        match watching.look(stamp.clone()) {
+            Step::Stay => {}
+            Step::End => {
+                app.exit(0);
+                return;
+            }
+            Step::Replace => match start_replacement() {
+                // the new icon waits for this one's lock (`LOCK_WAIT`) while this one ends
+                Ok(()) => {
+                    app.exit(0);
+                    return;
+                }
+                Err(e) => {
+                    if let Some(lock) = lock_path() {
+                        append_icon_log(
+                            &log_path_beside(&lock),
+                            &format!("the installed icon could not be started: {e}"),
+                        );
+                    }
+                    watching.gave_up(stamp);
+                }
+            },
         }
         let text = load_status(&path, SystemTime::now());
         let (state, text_line) = read_state(text.as_deref(), now_secs());
@@ -812,26 +928,64 @@ mod tests {
         assert!(t.elapsed() >= Duration::from_millis(250));
     }
 
+    fn stamp_of(dir: &Path, bytes: &[u8]) -> Option<FileStamp> {
+        let program = dir.join("printpapi-tray");
+        std::fs::write(&program, bytes).unwrap();
+        file_stamp(&program)
+    }
+
     #[test]
-    fn the_icon_ends_when_its_program_is_replaced_or_removed() {
+    fn an_icon_that_never_saw_its_program_stays() {
         let dir = tempfile::tempdir().unwrap();
+        assert_eq!(file_stamp(&dir.path().join("printpapi-tray")), None);
+        let mut w = Watching::new(None);
+        assert_eq!(w.look(None), Step::Stay);
+        assert_eq!(w.look(stamp_of(dir.path(), b"a program")), Step::Stay);
+    }
+
+    #[test]
+    fn a_replaced_program_is_started_and_a_failed_start_is_tried_once_per_replacement() {
+        let dir = tempfile::tempdir().unwrap();
+        let start = stamp_of(dir.path(), b"old program");
+        let mut w = Watching::new(start.clone());
+        assert_eq!(w.look(start), Step::Stay);
+        // an update puts a new file in place, as the install does: a rename over it
         let program = dir.path().join("printpapi-tray");
-        // not installed where this icon looks: nothing to watch, it never ends for that
-        assert_eq!(file_stamp(&program), None);
-        assert!(!replaced(None, None));
-        std::fs::write(&program, b"old program").unwrap();
-        let start = file_stamp(&program);
-        assert!(start.is_some());
-        assert!(!replaced(start.as_ref(), file_stamp(&program).as_ref()));
-        // an update puts a new file in place, as `place_file` of the install does
         let new = dir.path().join(".printpapi-tray.new");
         std::fs::write(&new, b"a newer program, other length").unwrap();
         std::fs::rename(&new, &program).unwrap();
-        assert!(replaced(start.as_ref(), file_stamp(&program).as_ref()));
+        let replaced = file_stamp(&program);
+        assert_eq!(w.look(replaced.clone()), Step::Replace);
+        // the start failed: the new stamp is the reference, and the icon stays
+        w.gave_up(replaced.clone());
+        assert_eq!(w.look(replaced.clone()), Step::Stay);
+        assert_eq!(w.look(replaced), Step::Stay);
+        // the next replacement is tried once more
+        std::fs::write(&new, b"yet another program").unwrap();
+        std::fs::rename(&new, &program).unwrap();
+        assert_eq!(w.look(file_stamp(&program)), Step::Replace);
+    }
+
+    #[test]
+    fn a_missing_program_ends_the_icon_only_at_the_second_look_in_a_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let start = stamp_of(dir.path(), b"program");
+        let mut w = Watching::new(start.clone());
+        // an update has the file aside for a moment
+        assert_eq!(w.look(None), Step::Stay);
+        assert_eq!(w.look(start.clone()), Step::Stay);
         // a removal
-        let start = file_stamp(&program);
-        std::fs::remove_file(&program).unwrap();
-        assert!(replaced(start.as_ref(), file_stamp(&program).as_ref()));
+        assert_eq!(w.look(None), Step::Stay);
+        assert_eq!(w.look(None), Step::End);
+    }
+
+    #[test]
+    fn the_window_opens_on_a_known_section_only() {
+        assert_eq!(section_args(Some("updates")), ["--section", "updates"]);
+        assert_eq!(section_args(Some("log")), ["--section", "log"]);
+        assert!(section_args(Some("remove")).is_empty());
+        assert!(section_args(Some("../x")).is_empty());
+        assert!(section_args(None).is_empty());
     }
 
     #[test]

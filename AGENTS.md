@@ -32,6 +32,7 @@ cd crates/setup && cargo test   # the setup app, not a workspace member
 python -m pytest agent/tests    # legacy Python agent
 git config core.hooksPath tools/githooks   # once per clone: docs check before every push
 python -m pytest tools/docs
+python -m pytest tools/release tools/smoke   # the signed update file's script, the smoke helpers
 python tools/docs/check_docs.py   # docs at HEAD: links and anchors to files in git, setup file names, source-available wording
 cd web && npm run build:app     # after any web/ change; commit crates/server/web with it
 ```
@@ -46,7 +47,7 @@ cd web && npm run build:app     # after any web/ change; commit crates/server/we
 ## Server (`crates/server`)
 
 - Few well-known crates, no web framework (`hyper` directly). A new dependency needs a reason.
-- Pure modules (`dispatch`, `label`, `orders`, `packing_slip`, `printnode`, `billing`,
+- Pure modules (`dispatch`, `label`, `receipt`, `orders`, `packing_slip`, `printnode`, `billing`,
   `cloudprnt`, `auth`) do no IO and take injected fetchers. `store` (SQLite), `server`, `http`,
   `web` and `mail` own the IO. Keep that split.
 - Key rights live in one table, `auth::Scope::allows`; nothing else decides what a machine key may do
@@ -57,6 +58,12 @@ cd web && npm run build:app     # after any web/ change; commit crates/server/we
 - Agents only ever connect outbound (long-poll) because they sit behind NAT. Design new features
   around that. No platform assumptions in the server.
 - `crates/server/web/` is the built dashboard, embedded at compile time. Never edit it by hand.
+- Receipts (`receipt`, docs/receipts.md): `crates/server/assets/terminus/` holds the Terminus Font files
+  byte for byte (SIL OFL 1.1, `-text` in `.gitattributes`, with `web/public/licenses/`): never edit or
+  re-encode them. A receipt profile has no `pdf` output (a raw printer never gets a PDF), and no
+  `job_receipts` row is written while `PRINTAPI_OPERATOR_TOKEN` is set. The goldens in
+  `crates/server/tests/fixtures/receipts/` and `web/demo/static/receipt-sample-*.png` are rewritten
+  with `UPDATE_GOLDEN=1 cargo test -p printpapi-server --test receipt_golden`.
 - `python tools/parity/parity.py --rust target/release/printpapi.exe` compares behaviour with the
   v2.5.1 Python server (it extracts that server from the `v2.5.1` tag).
 
@@ -80,6 +87,26 @@ cd web && npm run build:app     # after any web/ change; commit crates/server/we
   opts out, only `install` seals (the agent never writes `agent.ini`), and a key that cannot be
   read makes a setup-installed agent wait and report `key_unreadable` instead of exiting.
   `read-config` exports `[headers]` only, never the key or the blob.
+- **Signed updates** (`crates/agent/src/update.rs`, the module doc has the steps). The elevated
+  program is the installed agent, never a file from staging: it reads each file once into memory,
+  checks those bytes and writes only those bytes, and an update never writes `agent.ini`, the unit,
+  the rights or the status folder. The public keys are in `crates/agent/update-keys.txt` (committed,
+  one hex key per line, built in with `include_str!`): no environment variable, no runtime override.
+  The Cargo feature `update-test-key` adds the public half of the committed test seed and shortens the
+  health wait; only the CI smoke build enables it, `release.yml` never does. Do not commit a private key.
+- **A new admin command line is at least three words long, the known first word included**
+  (`restart --update-from <dir>`, `restart --update now`). Every released agent (3.3.0 to 3.6.0) answers a known first word with exactly
+  three arguments with usage and exit 2 and does nothing, so a new form that is two or four words
+  would run as something else there. A command a person types may be a new first word
+  (`unprotect-key`, `--version`); an older agent just starts. Any other unknown first word keeps
+  running the agent.
+- **Frozen from the first release that has them** (an older updater on an installed machine relies
+  on them; a mistake cannot be fixed there): the format of `printpapi-update.txt` and schema 1;
+  `--version` of both programs (`printpapi-agent N.N.N`, `printpapi-setup N.N.N`); the `status.json`
+  fields `version`, `state`, `started_at`, `last_contact`, `busy`, `last_job.at`; the marker
+  `.installed-by-setup` as UTF-8 `key=value` lines (`version=`, `brand=`; unknown lines are kept when
+  the version is rewritten); and that a new agent runs with the existing unit, `agent.ini`, rights
+  and paths, else the schema is raised and the setup is needed.
 - The agent writes `status.json` (never the key, never a header value) into the status folder
   (`status::status_dir_in`) only when the `.installed-by-setup` marker sits next to it. It is what
   the tray icon reads: it opens no port and takes no commands. Keep secrets out of it, and keep
@@ -97,6 +124,10 @@ cd web && npm run build:app     # after any web/ change; commit crates/server/we
   the settings window (`web/setup/settings*.tsx`) behind "Settings...". A change from the window
   stages only the changed fields (`patch.json`) and goes through the admin subcommands, so it asks
   for elevation once. "Quit" ends the icon, never the agent.
+- `fn mode(args: &[OsString]) -> Mode` in `crates/setup/src/main.rs` is the one parser of the program's
+  arguments: exactly `--version` prints the version before anything else, any argument `--tray` is the
+  icon, `--section <word>` opens a window section. The updater starts the new program with
+  `--version` before it swaps anything, so keep that path free of locks, web view and windows.
 - `web/lib/setup-downloads.json` is the one list of setup files. The downloads page and
   `release.yml` both read it; a variant nobody has run by hand is `"beta": true`.
 

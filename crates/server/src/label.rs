@@ -35,7 +35,7 @@ const MAX_PLACE_AREA: f64 = 64_000_000.0;
 /// `^GF` takes at most 99999 bytes of data per field.
 const GF_MAX_BYTES: usize = 99_999;
 /// Luma below this prints black.
-const THRESHOLD: u8 = 140;
+pub(crate) const THRESHOLD: u8 = 140;
 /// Line pitch of text, as a multiple of the font height.
 const LINE_PITCH: f64 = 1.1;
 /// Zebra documents 10 dots as the smallest height and width of a scalable font.
@@ -333,16 +333,16 @@ fn place_dots(s: &Spec) -> (f64, f64, f64, f64) {
 // ---------------------------------------------------------------- bitmap
 
 /// A 1-bit label: 1 = black, most significant bit first, rows padded to whole bytes.
-#[derive(Debug)]
-struct Bitmap {
-    w: u32,
-    h: u32,
-    bytes_per_row: usize,
-    data: Vec<u8>,
+#[derive(Debug, Clone)]
+pub struct Bitmap {
+    pub w: u32,
+    pub h: u32,
+    pub bytes_per_row: usize,
+    pub data: Vec<u8>,
 }
 
 impl Bitmap {
-    fn from_gray(g: &GrayImage) -> Bitmap {
+    pub fn from_gray(g: &GrayImage) -> Bitmap {
         let (w, h) = g.dimensions();
         let bytes_per_row = (w as usize).div_ceil(8);
         let mut data = vec![0u8; bytes_per_row * h as usize];
@@ -365,13 +365,15 @@ impl Bitmap {
     }
 }
 
-/// Decode the first frame of a GIF, PNG or JPEG and flatten transparency onto white.
-fn decode(bytes: &[u8]) -> Result<GrayImage, String> {
+/// Decode the first frame of a GIF, PNG or JPEG and flatten transparency onto white. An image of
+/// more than `max_pixels` pixels, or one the decoder would need more than `max_alloc` bytes for,
+/// is refused from its header, before anything is allocated.
+pub(crate) fn decode(bytes: &[u8], max_pixels: u64, max_alloc: u64) -> Result<GrayImage, String> {
     let mut reader = ImageReader::new(Cursor::new(bytes))
         .with_guessed_format()
         .map_err(|e| format!("cannot read image: {e}"))?;
     let mut limits = Limits::default();
-    limits.max_alloc = Some(MAX_ALLOC);
+    limits.max_alloc = Some(max_alloc);
     limits.max_image_width = Some(MAX_EDGE);
     limits.max_image_height = Some(MAX_EDGE);
     reader.limits(limits);
@@ -381,9 +383,9 @@ fn decode(bytes: &[u8]) -> Result<GrayImage, String> {
         .map_err(|e| format!("not a supported image (GIF, PNG or JPEG): {e}"))?;
     let (w, h) = decoder.dimensions();
     // (`limits` above already refuses an edge over MAX_EDGE while the decoder is built.)
-    if w == 0 || h == 0 || u64::from(w) * u64::from(h) > MAX_PIXELS {
+    if w == 0 || h == 0 || u64::from(w) * u64::from(h) > max_pixels {
         return Err(format!(
-            "image is too large ({w}x{h}, at most {MAX_PIXELS} pixels)"
+            "image is too large ({w}x{h}, at most {max_pixels} pixels)"
         ));
     }
     // EXIF orientation, as browsers and phones show the picture (the editor's canvas does too).
@@ -408,9 +410,24 @@ fn decode(bytes: &[u8]) -> Result<GrayImage, String> {
     Ok(out)
 }
 
+/// Resample to `w` x `h`. `imageops::resize` first resamples into an Rgba32F buffer of source width
+/// x target height (`RESIZE_BYTES_PER_PIXEL`), which `Limits` does not cover; a buffer over
+/// `max_alloc` bytes is refused before it is allocated.
+pub(crate) fn resize_gray(
+    src: &GrayImage,
+    w: u32,
+    h: u32,
+    max_alloc: u64,
+) -> Result<GrayImage, String> {
+    if u64::from(src.width()) * u64::from(h) * RESIZE_BYTES_PER_PIXEL > max_alloc {
+        return Err("image is too large for this placement".into());
+    }
+    Ok(imageops::resize(src, w, h, imageops::FilterType::Lanczos3))
+}
+
 /// Decode, rotate, crop, scale and place an image on a white label, then threshold to 1 bit.
 fn raster(s: &Spec, bytes: &[u8]) -> Result<Bitmap, String> {
-    let gray = decode(bytes)?;
+    let gray = decode(bytes, MAX_PIXELS, MAX_ALLOC)?;
     let rotated = match s.rotate {
         90 => imageops::rotate90(&gray),
         180 => imageops::rotate180(&gray),
@@ -434,10 +451,7 @@ fn raster(s: &Spec, bytes: &[u8]) -> Result<Bitmap, String> {
     let placed = if cropped.dimensions() == (pw, ph) {
         cropped
     } else {
-        if u64::from(cropped.width()) * u64::from(ph) * RESIZE_BYTES_PER_PIXEL > MAX_ALLOC {
-            return Err("image is too large for this placement".into());
-        }
-        imageops::resize(&cropped, pw, ph, imageops::FilterType::Lanczos3)
+        resize_gray(&cropped, pw, ph, MAX_ALLOC)?
     };
 
     let (lw, lh) = label_dots(s);
@@ -501,16 +515,16 @@ fn zpl_image(s: &Spec, bm: &Bitmap) -> Vec<u8> {
 // ---------------------------------------------------------------- PDF
 
 /// Points with at most two decimals and no trailing zeros: `288`, `72.5`.
-fn pt(v: f64) -> String {
+pub(crate) fn pt(v: f64) -> String {
     let s = format!("{v:.2}");
     s.trim_end_matches('0').trim_end_matches('.').to_string()
 }
 
-fn mm_to_pt(mm: f64) -> f64 {
+pub(crate) fn mm_to_pt(mm: f64) -> f64 {
     mm * 72.0 / 25.4
 }
 
-fn stream(dict: &str, data: &[u8]) -> Vec<u8> {
+pub(crate) fn stream(dict: &str, data: &[u8]) -> Vec<u8> {
     let mut o = format!("<< {dict} /Length {} >>\nstream\n", data.len()).into_bytes();
     o.extend_from_slice(data);
     o.extend_from_slice(b"\nendstream");
@@ -519,7 +533,7 @@ fn stream(dict: &str, data: &[u8]) -> Vec<u8> {
 
 /// Assemble numbered objects (object `i + 1` is `bodies[i]`) into a file with a classic xref
 /// table. Object 1 must be the catalog.
-fn assemble(bodies: &[Vec<u8>]) -> Vec<u8> {
+pub(crate) fn assemble(bodies: &[Vec<u8>]) -> Vec<u8> {
     let mut out = b"%PDF-1.4\n".to_vec();
     let mut offsets = Vec::with_capacity(bodies.len());
     for (i, body) in bodies.iter().enumerate() {
@@ -545,27 +559,67 @@ fn assemble(bodies: &[Vec<u8>]) -> Vec<u8> {
     out
 }
 
-fn pdf_image(s: &Spec, bm: &Bitmap) -> Vec<u8> {
-    let (pw, ph) = (pt(mm_to_pt(s.label_w_mm)), pt(mm_to_pt(s.label_h_mm)));
-    // PDF DeviceGray: 0 is black, so the bits flip. Padding bits become 1 (white).
-    let inverted: Vec<u8> = bm.data.iter().map(|b| !b).collect();
-    let content = format!("q {pw} 0 0 {ph} 0 0 cm /Im0 Do Q");
-    // ponytail: the image stays uncompressed (no deflate dependency); a 4x6 inch label at 203 dpi
-    // is about 124 KB, and the job store holds it as is.
-    assemble(&[
+/// One page of `pdf_pages`: its size in points, a 1-bit image and where the image sits on it
+/// (x, y from the bottom left, width, height, all in points).
+pub(crate) struct PdfPage<'a> {
+    pub(crate) w_pt: f64,
+    pub(crate) h_pt: f64,
+    pub(crate) bitmap: &'a Bitmap,
+    pub(crate) place: (f64, f64, f64, f64),
+}
+
+/// A PDF with one page per entry, each holding one 1-bit image. Object 1 is the catalog, 2 the
+/// page tree, then three objects per page (page, contents, image): one page gives exactly the
+/// objects 3, 4 and 5 of a label.
+pub(crate) fn pdf_pages(pages: &[PdfPage<'_>]) -> Vec<u8> {
+    let kids: Vec<String> = (0..pages.len())
+        .map(|i| format!("{} 0 R", 3 + 3 * i))
+        .collect();
+    let mut bodies = vec![
         b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
-        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
-        format!("<< /Type /Page /Parent 2 0 R /MediaBox [0 0 {pw} {ph}] /Resources << /XObject << /Im0 5 0 R >> >> /Contents 4 0 R >>")
+        format!(
+            "<< /Type /Pages /Kids [{}] /Count {} >>",
+            kids.join(" "),
+            pages.len()
+        )
+        .into_bytes(),
+    ];
+    for (i, p) in pages.iter().enumerate() {
+        let (pw, ph) = (pt(p.w_pt), pt(p.h_pt));
+        let (x, y, w, h) = p.place;
+        // PDF DeviceGray: 0 is black, so the bits flip. Padding bits become 1 (white).
+        let inverted: Vec<u8> = p.bitmap.data.iter().map(|b| !b).collect();
+        let content = format!("q {} 0 0 {} {} {} cm /Im0 Do Q", pt(w), pt(h), pt(x), pt(y));
+        // ponytail: the image stays uncompressed (no deflate dependency); a 4x6 inch label at 203 dpi
+        // is about 124 KB, and the job store holds it as is.
+        bodies.push(
+            format!(
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 {pw} {ph}] /Resources << /XObject << /Im0 {} 0 R >> >> /Contents {} 0 R >>",
+                5 + 3 * i,
+                4 + 3 * i
+            )
             .into_bytes(),
-        stream("", content.as_bytes()),
-        stream(
+        );
+        bodies.push(stream("", content.as_bytes()));
+        bodies.push(stream(
             &format!(
                 "/Type /XObject /Subtype /Image /Width {} /Height {} /ColorSpace /DeviceGray /BitsPerComponent 1",
-                bm.w, bm.h
+                p.bitmap.w, p.bitmap.h
             ),
             &inverted,
-        ),
-    ])
+        ));
+    }
+    assemble(&bodies)
+}
+
+fn pdf_image(s: &Spec, bm: &Bitmap) -> Vec<u8> {
+    let (pw, ph) = (mm_to_pt(s.label_w_mm), mm_to_pt(s.label_h_mm));
+    pdf_pages(&[PdfPage {
+        w_pt: pw,
+        h_pt: ph,
+        bitmap: bm,
+        place: (0.0, 0.0, pw, ph),
+    }])
 }
 
 // ---------------------------------------------------------------- rendering
@@ -1190,6 +1244,30 @@ mod tests {
             .expect("offset");
         assert!(pdf[n..].starts_with(b"xref"));
         assert!(pdf.ends_with(b"%%EOF\n"));
+    }
+
+    #[test]
+    fn a_one_page_pdf_keeps_the_objects_of_a_label() {
+        // The receipt PDF shares `pdf_pages`; a label must stay byte for byte what it was:
+        // objects 1-5 in this order, the same dictionaries and the same contents string.
+        let s = dots((16, 8), (0, 0, 16, 8), 0, (0.0, 0.0, 0.0, 0.0));
+        let pdf = render_image(&s, &png(16, 8, |_, _| BLACK), Output::Pdf).expect("pdf");
+        let text = String::from_utf8_lossy(&pdf).into_owned();
+        let (pw, ph) = (pt(mm_to_pt(s.label_w_mm)), pt(mm_to_pt(s.label_h_mm)));
+        for want in [
+            "1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n".to_string(),
+            "2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n".to_string(),
+            format!(
+                "3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 {pw} {ph}] /Resources << /XObject << /Im0 5 0 R >> >> /Contents 4 0 R >>\nendobj\n"
+            ),
+            format!(
+                "4 0 obj\n<<  /Length {} >>\nstream\nq {pw} 0 0 {ph} 0 0 cm /Im0 Do Q\nendstream\nendobj\n",
+                format!("q {pw} 0 0 {ph} 0 0 cm /Im0 Do Q").len()
+            ),
+            "5 0 obj\n<< /Type /XObject /Subtype /Image /Width 16 /Height 8 /ColorSpace /DeviceGray /BitsPerComponent 1 /Length 16 >>\nstream\n".to_string(),
+        ] {
+            assert!(text.contains(&want), "missing: {want}");
+        }
     }
 
     #[test]

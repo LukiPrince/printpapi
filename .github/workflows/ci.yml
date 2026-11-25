@@ -44,6 +44,8 @@ jobs:
           python-version: "3.12"
       - run: pip install pytest
       - run: python -m pytest -q tools/docs
+      # the signed update file's script (needs the openssl of the runner) and the smoke helpers
+      - run: python -m pytest -q tools/release tools/smoke
       - run: python tools/docs/check_docs.py
 
   # Black-box parity: the Rust server must answer every scripted request exactly like the last
@@ -79,13 +81,23 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - run: cargo build --release --locked -p printpapi-server -p printpapi-agent
-      - name: install, print, uninstall
+      # the agent of this build trusts the public half of the committed test seed (Cargo feature
+      # update-test-key, never enabled by release.yml), so the smoke test can sign an update
+      - run: cargo build --release --locked -p printpapi-server -p printpapi-agent --features printpapi-agent/update-test-key
+      # the same agent as version 99.0.0, and the two examples the update steps use, into target-new
+      # (built without --locked: the version lives in Cargo.toml and Cargo.lock; the script puts both back)
+      - run: python tools/smoke/build_update_fixture.py
+      - name: install, update, print, uninstall
         shell: bash
         run: |
           ext=''
           if [ "$RUNNER_OS" = "Windows" ]; then ext='.exe'; fi
-          python tools/smoke/setup_smoke.py             --server "target/release/printpapi$ext"             --agent "target/release/printpapi-agent$ext"
+          python tools/smoke/setup_smoke.py \
+            --server "target/release/printpapi$ext" \
+            --agent "target/release/printpapi-agent$ext" \
+            --update-agent "target-new/release/printpapi-agent$ext" \
+            --sign-update "target-new/release/examples/sign_update$ext" \
+            --fake-tray "target-new/release/examples/fake_tray$ext"
 
   # The setup window (Tauri) is not a workspace member, so `rust` above never builds it. It embeds
   # the agent binary and the `web/out-setup` pages, so both are built first. Tauri builds against

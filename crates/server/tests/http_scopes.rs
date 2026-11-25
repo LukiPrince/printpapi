@@ -259,12 +259,20 @@ fn every_client_route_follows_the_rights_table() {
         ("GET", "/jobs/1", &["full", "print", "read"]),
         ("GET", "/metrics", &["full", "print", "read"]),
         ("GET", "/plans", &["full", "print", "read"]),
+        (
+            "GET",
+            "/printers/1/receipt-profile",
+            &["full", "print", "read"],
+        ),
         ("POST", "/jobs", &["full", "print"]),
+        ("POST", "/receipts/preview", &["full", "print"]),
         ("POST", "/orders", &["full", "print"]),
         ("DELETE", "/jobs/1", &["full", "print"]),
         ("POST", "/labels", &["full"]),
         ("PUT", "/labels/1", &["full"]),
         ("DELETE", "/labels/1", &["full"]),
+        ("PUT", "/printers/1/receipt-profile", &["full"]),
+        ("DELETE", "/printers/1/receipt-profile", &["full"]),
     ];
     for (method, path, allowed) in rows {
         for (word, key) in &keys {
@@ -292,6 +300,7 @@ fn every_client_route_follows_the_rights_table() {
         ("GET", "/orgs/1"),
         ("PUT", "/orgs/1"),
         ("GET", "/support-access"),
+        ("GET", "/jobs/1/preview"),
     ] {
         for (word, key) in &keys {
             let r = app
@@ -316,6 +325,8 @@ fn the_right_is_checked_before_the_body_is_read() {
         ("POST", "/orders", "read"),
         ("POST", "/labels", "print"),
         ("PUT", "/labels/1", "print"),
+        ("POST", "/receipts/preview", "read"),
+        ("PUT", "/printers/1/receipt-profile", "print"),
     ] {
         let r = app
             .call(method, path)

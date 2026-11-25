@@ -210,6 +210,11 @@ pub struct AppState {
     /// Image renders (`label_uri`, `label_base64`) running at once. A decode can take a few
     /// hundred MB, and the fetcher's slots are free again by the time the render starts.
     pub render_slots: RenderSlots,
+    /// Receipts with images rendering at once. Separate from `render_slots`, so receipts never
+    /// block labels and labels never block receipts. A receipt without images takes no slot.
+    pub receipt_slots: RenderSlots,
+    /// Orgs with a receipt preview being drawn now (see `AppState::try_preview`).
+    previews: Mutex<std::collections::HashSet<i64>>,
     /// When the retention purge last ran (the reaper ticks far more often than once an hour).
     last_retention: Mutex<Option<f64>>,
     /// Payload fetches running now, per org (see `MAX_FETCHES_PER_ORG`).
@@ -234,6 +239,16 @@ pub struct AppState {
 /// org, and a full house answers 503 instead of queueing. A render is worth up to ~0.9 GB at the
 /// size limits, so 4 bound the worst case to a few GB; a typical label takes milliseconds.
 pub const RENDER_SLOTS: usize = 4;
+
+/// Image receipts rendering at once: a decode can take up to 64 MiB for the resize and a little
+/// less for the decoder, and the blocking pool has 512 threads, so it stays bounded.
+pub const RECEIPT_SLOTS: usize = 4;
+/// How long an image receipt waits for a slot before it answers 503, and how often it looks.
+/// ponytail: polling, no queue order.
+pub const RECEIPT_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
+const RECEIPT_POLL: std::time::Duration = std::time::Duration::from_millis(25);
+/// Previews drawn at once on the whole server, and per org (a set of orgs).
+pub const PREVIEWS_PER_SERVER: usize = 2;
 
 /// A counter of running renders, shaped like the fetcher's slots (`dispatch::HttpFetcher::slot`).
 pub struct RenderSlots {
@@ -271,6 +286,20 @@ impl RenderSlots {
             return None;
         }
         Some(RenderSlot(&self.in_flight))
+    }
+
+    /// A slot, trying every 25 ms for up to `wait`.
+    pub fn enter_within(&self, wait: std::time::Duration) -> Option<RenderSlot<'_>> {
+        let start = std::time::Instant::now();
+        loop {
+            if let Some(slot) = self.try_enter() {
+                return Some(slot);
+            }
+            if start.elapsed() >= wait {
+                return None;
+            }
+            std::thread::sleep(RECEIPT_POLL);
+        }
     }
 }
 
@@ -337,6 +366,31 @@ impl AppState {
         }))
     }
 
+    /// The right to draw one receipt preview: one per `org` (the caller's org, 0 for root without
+    /// a printer) and `PREVIEWS_PER_SERVER` on the whole server, else `None`. It uses neither
+    /// `render_slots` nor `receipt_slots`, so a preview can never block a print job.
+    pub fn try_preview(&self, org: i64) -> Option<PreviewGuard<'_>> {
+        let mut set = self
+            .previews
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if set.len() >= PREVIEWS_PER_SERVER || !set.insert(org) {
+            return None;
+        }
+        Some(PreviewGuard { state: self, org })
+    }
+
+    /// Payload downloads and image receipts `org_id` has in flight now (what `try_fetch_slot`
+    /// counts). Only the tests look at it, to wait for a request to hold its slot.
+    pub fn fetches_in_flight(&self, org_id: i64) -> usize {
+        self.org_fetches
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&org_id)
+            .copied()
+            .unwrap_or(0)
+    }
+
     /// Marks `(org_id, key)` as being fetched, or `None` when another request already does.
     fn try_key_in_flight(&self, org_id: i64, key: &str) -> Option<KeyGuard<'_>> {
         let mut set = self
@@ -351,6 +405,22 @@ impl AppState {
             org_id,
             key: key.to_string(),
         })
+    }
+}
+
+/// Holds an org's preview entry; dropping it (success, error or panic unwind) frees it.
+pub struct PreviewGuard<'a> {
+    state: &'a AppState,
+    org: i64,
+}
+
+impl Drop for PreviewGuard<'_> {
+    fn drop(&mut self) {
+        self.state
+            .previews
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&self.org);
     }
 }
 
@@ -397,6 +467,8 @@ impl AppState {
             dummy_hash,
             poll_slots: Arc::new(tokio::sync::Semaphore::new(POLL_SLOTS)),
             render_slots: RenderSlots::new(RENDER_SLOTS),
+            receipt_slots: RenderSlots::new(RECEIPT_SLOTS),
+            previews: Mutex::new(std::collections::HashSet::new()),
             last_retention: Mutex::new(None),
             org_fetches: Mutex::new(std::collections::HashMap::new()),
             keys_in_flight: Mutex::new(std::collections::HashSet::new()),
@@ -560,7 +632,9 @@ impl Resp {
 use crate::auth::Right;
 use crate::pyfmt::{as_sql_int, py_str, repr, repr_str, truthy};
 use crate::store::{self, StoreError};
-use crate::{auth, billing, cloudprnt, dispatch, label, orders, packing_slip, printnode, web};
+use crate::{
+    auth, billing, cloudprnt, dispatch, label, orders, packing_slip, printnode, receipt, web,
+};
 use base64::{Engine, engine::general_purpose::STANDARD as B64};
 use hmac::{Hmac, KeyInit, Mac};
 use serde::Serialize;
@@ -570,6 +644,33 @@ use sha2::Sha256;
 type Obj = Map<String, Value>;
 
 const LABEL_NAME_TAKEN: &str = "label template name already in use";
+const RECEIPT_CLOUDPRNT: &str = "CloudPRNT printers cannot print receipts — send raw Star commands";
+const RECEIPT_BUSY: &str = "receipt rendering is busy, try again later";
+const PREVIEW_BUSY: &str = "preview is busy, try again shortly";
+
+/// A receipt goes out as a PDF only where the printer takes PDF and its profile says `auto`; every
+/// other printer gets ESC/POS bytes, so a raw printer can never be sent a PDF.
+fn receipt_mode(printer: &store::PrinterRef, profile: &receipt::Profile) -> &'static str {
+    if printer.can_pdf && profile.output == receipt::OutputMode::Auto {
+        "pdf"
+    } else {
+        "raw"
+    }
+}
+
+/// The bytes of a receipt for `mode`: ESC/POS, or a PDF (an error when it prints nothing).
+fn render_receipt(
+    doc: &receipt::Doc,
+    profile: &receipt::Profile,
+    mode: &str,
+) -> Result<Vec<u8>, String> {
+    let laid = receipt::layout(doc, profile)?;
+    if mode == "pdf" {
+        receipt::pdf(&laid, profile)
+    } else {
+        Ok(receipt::escpos(&laid, profile))
+    }
+}
 /// A handler outcome: a response, or a store failure nobody handled (answered 500).
 type R = Result<Resp, StoreError>;
 /// A precondition that already holds the response to send when it fails.
@@ -925,6 +1026,19 @@ struct Held<'a> {
 enum Labeled<'a> {
     Existing(store::Enqueued),
     Ready(&'static str, Option<Obj>, Vec<u8>, Held<'a>),
+}
+
+/// What `receipt_payload` made: an existing job (idempotent resubmit), or the job's mode, its
+/// validated options, the bytes, what it holds until queued, and the copy of the document.
+enum Receipted<'a> {
+    Existing(store::Enqueued),
+    Ready {
+        mode: &'static str,
+        options: Option<Obj>,
+        data: Vec<u8>,
+        held: Held<'a>,
+        copy: Option<String>,
+    },
 }
 
 /// The job types whose payload the server fetches itself (`label_uri` has its own path).
@@ -1473,8 +1587,11 @@ impl Ctx<'_> {
         let copies = dispatch::parse_copies(body)?;
         let callback_url = dispatch::parse_callback_url(body)?;
         let label = dispatch::parse_label_job(body)?;
-        // A label job's mode is its printer's, so its options are checked once that is known.
-        let mut options = if label.is_none() {
+        let receipt = dispatch::parse_receipt_job(body)?;
+        // A label or receipt job's mode is its printer's, so its options are checked once that is
+        // known.
+        let mut copy: Option<String> = None;
+        let mut options = if label.is_none() && receipt.is_none() {
             dispatch::parse_options(body, mode)?
         } else {
             None
@@ -1483,34 +1600,55 @@ impl Ctx<'_> {
         let expire_after = dispatch::parse_expire_after(body)?;
         // the key stays marked until the job is queued, so a second request cannot fetch meanwhile
         let mut _held = Held::default();
-        let data = match &label {
-            None => {
-                // The gate runs only for types that fetch; the rest keep their order of checks.
-                if fetches_payload(type_v) {
-                    // a bad url still 400s before the printer is looked at
-                    dispatch::checked_http_url(body.get("url"))?;
-                    let printer_v = body.get("printer_id").unwrap_or(&null);
-                    let printer = self
-                        .db(|c| store::get_printer(c, printer_v, org))
-                        .map_err(SubmitErr::Store)?
-                        .ok_or_else(|| {
-                            SubmitErr::Invalid(format!("unknown printer: {}", py_str(printer_v)))
-                        })?;
-                    match self.gate_printer(&printer, idempotency_key.as_deref(), true)? {
-                        Gate2::Existing(e) => return Ok(e),
-                        Gate2::Go(held) => _held = held,
-                    }
-                }
-                dispatch::decode_payload(body, &*self.s.fetcher)?
-            }
-            Some(l) => match self.label_payload(body, l, org, idempotency_key.as_deref())? {
-                Labeled::Existing(e) => return Ok(e),
-                Labeled::Ready(m, o, d, h) => {
+        let data = if let Some(r) = &receipt {
+            match self.receipt_payload(body, r, org, idempotency_key.as_deref())? {
+                Receipted::Existing(e) => return Ok(e),
+                Receipted::Ready {
+                    mode: m,
+                    options: o,
+                    data: d,
+                    held: h,
+                    copy: c,
+                } => {
                     (mode, options) = (m, o);
                     _held = h;
+                    copy = c;
                     d
                 }
-            },
+            }
+        } else {
+            match &label {
+                None => {
+                    // The gate runs only for types that fetch; the rest keep their order of checks.
+                    if fetches_payload(type_v) {
+                        // a bad url still 400s before the printer is looked at
+                        dispatch::checked_http_url(body.get("url"))?;
+                        let printer_v = body.get("printer_id").unwrap_or(&null);
+                        let printer = self
+                            .db(|c| store::get_printer(c, printer_v, org))
+                            .map_err(SubmitErr::Store)?
+                            .ok_or_else(|| {
+                                SubmitErr::Invalid(format!(
+                                    "unknown printer: {}",
+                                    py_str(printer_v)
+                                ))
+                            })?;
+                        match self.gate_printer(&printer, idempotency_key.as_deref(), true)? {
+                            Gate2::Existing(e) => return Ok(e),
+                            Gate2::Go(held) => _held = held,
+                        }
+                    }
+                    dispatch::decode_payload(body, &*self.s.fetcher)?
+                }
+                Some(l) => match self.label_payload(body, l, org, idempotency_key.as_deref())? {
+                    Labeled::Existing(e) => return Ok(e),
+                    Labeled::Ready(m, o, d, h) => {
+                        (mode, options) = (m, o);
+                        _held = h;
+                        d
+                    }
+                },
+            }
         };
         let job = store::NewJob {
             printer_id: body.get("printer_id").unwrap_or(&null),
@@ -1527,7 +1665,7 @@ impl Ctx<'_> {
             expire_after,
             api_key_id: p.key_id,
         };
-        self.enqueue(&job)
+        self.enqueue_copy(&job, copy.as_deref())
     }
 
     /// The checks before any outbound fetch, cheapest first (the printer is already resolved):
@@ -1671,9 +1809,88 @@ impl Ctx<'_> {
         Ok(Labeled::Ready(mode, options, data, held))
     }
 
+    /// A `receipt` job: the printer, then its profile, then the layout, each before the next so
+    /// that an unknown printer never costs a render. The printer decides the output: ESC/POS bytes
+    /// (mode raw) unless it takes PDF and its profile says `auto`, then a PDF (never to a raw
+    /// printer: AGENTS.md pitfall 1). Receipts without images take no render slot; one with images
+    /// waits up to two seconds for one of `receipt_slots`, and counts against the org's download
+    /// cap and idempotency-key guard like a fetching job.
+    fn receipt_payload(
+        &self,
+        body: &Obj,
+        doc: &receipt::Doc,
+        org: Option<i64>,
+        key: Option<&str>,
+    ) -> Result<Receipted<'_>, SubmitErr> {
+        let null = Value::Null;
+        let printer_v = body.get("printer_id").unwrap_or(&null);
+        let printer = self
+            .db(|c| store::get_printer(c, printer_v, org))
+            .map_err(SubmitErr::Store)?
+            .ok_or_else(|| SubmitErr::Invalid(format!("unknown printer: {}", py_str(printer_v))))?;
+        let (stored, cloud) = self
+            .db(|c| -> Result<_, StoreError> {
+                Ok((
+                    store::get_receipt_profile(c, printer.id, Some(printer.org_id))?,
+                    store::is_cloudprnt_agent(c, printer.agent_id)?,
+                ))
+            })
+            .map_err(SubmitErr::Store)?;
+        if cloud {
+            return Err(SubmitErr::Invalid(RECEIPT_CLOUDPRNT.into()));
+        }
+        let profile = stored.unwrap_or_default();
+        let mode = receipt_mode(&printer, &profile);
+        let options = dispatch::parse_options(body, mode)?;
+        let images = doc.has_images();
+        let mut held = match self.gate_printer(&printer, key, images) {
+            Ok(Gate2::Existing(e)) => return Ok(Receipted::Existing(e)),
+            Ok(Gate2::Go(held)) => held,
+            Err(SubmitErr::Busy(_)) => return Err(SubmitErr::Busy(RECEIPT_BUSY.into())),
+            Err(e) => return Err(e),
+        };
+        let data = {
+            let _slot = if images {
+                Some(
+                    self.s
+                        .receipt_slots
+                        .enter_within(RECEIPT_WAIT)
+                        .ok_or_else(|| SubmitErr::Busy(RECEIPT_BUSY.into()))?,
+                )
+            } else {
+                None
+            };
+            render_receipt(doc, &profile, mode).map_err(SubmitErr::Invalid)?
+        };
+        // the download slot is free again; the key stays held until the job is queued
+        held.slot = None;
+        // No copy of the document while the operator token is set: a session-readable copy would
+        // be a way round the audited support access (docs/receipts.md).
+        let copy = self.cfg().operator_token.is_none().then(|| {
+            json!({ "receipt": body.get("receipt"), "profile": receipt::profile_json(&profile) })
+                .to_string()
+        });
+        Ok(Receipted::Ready {
+            mode,
+            options,
+            data,
+            held,
+            copy,
+        })
+    }
+
     fn enqueue(&self, job: &store::NewJob<'_>) -> Result<store::Enqueued, SubmitErr> {
+        self.enqueue_copy(job, None)
+    }
+
+    /// `enqueue`, keeping `copy` (a receipt's document) with the job in one transaction.
+    fn enqueue_copy(
+        &self,
+        job: &store::NewJob<'_>,
+        copy: Option<&str>,
+    ) -> Result<store::Enqueued, SubmitErr> {
         let locks = self.cfg().operator_token.is_some();
-        match self.db(|c| store::enqueue_job_with(c, job, locks)) {
+        match self.db(|c| store::enqueue_receipt_job(c, job, locks, copy)) {
             Ok(e) => {
                 if e.created {
                     self.s.waker.wake(e.agent_id);
@@ -1712,6 +1929,155 @@ impl Ctx<'_> {
             Err(StoreError::Conflict) => Ok(jerr(409, LABEL_NAME_TAKEN)),
             Err(e) => Err(e),
         }
+    }
+
+    // --- receipts -------------------------------------------------------------------------------
+
+    /// The printer of a receipt route and its stored profile (`None`: the defaults apply), or the
+    /// answer: 404 unknown or foreign, 400 for a CloudPRNT device.
+    fn receipt_printer(
+        &self,
+        id: i64,
+        org: Option<i64>,
+    ) -> Result<Gate<(store::PrinterRef, Option<receipt::Profile>)>, StoreError> {
+        let found = self.db(|c| -> Result<_, StoreError> {
+            let Some(p) = store::get_printer(c, &json!(id), org)? else {
+                return Ok(None);
+            };
+            let cloud = store::is_cloudprnt_agent(c, p.agent_id)?;
+            let stored = store::get_receipt_profile(c, p.id, Some(p.org_id))?;
+            Ok(Some((p, cloud, stored)))
+        })?;
+        Ok(match found {
+            None => Err(not_found()),
+            Some((_, true, _)) => Err(jerr(400, RECEIPT_CLOUDPRNT)),
+            Some((p, false, stored)) => Ok((p, stored)),
+        })
+    }
+
+    fn profile_answer(id: i64, stored: bool, profile: &receipt::Profile) -> Resp {
+        Resp::json(
+            200,
+            &json!({ "printer_id": id, "stored": stored, "profile": receipt::profile_json(profile) }),
+        )
+    }
+
+    /// `GET /printers/{id}/receipt-profile`: what receipts to this printer are laid out with.
+    fn get_receipt_profile(&self, id: i64) -> R {
+        let org = gate!(self.client(Right::Look)?).org_id;
+        let (_, stored) = gate!(self.receipt_printer(id, org)?);
+        Ok(Self::profile_answer(
+            id,
+            stored.is_some(),
+            &stored.clone().unwrap_or_default(),
+        ))
+    }
+
+    /// `PUT /printers/{id}/receipt-profile`: replaces the whole profile; omitted fields take the
+    /// defaults.
+    fn put_receipt_profile(&self, id: i64) -> R {
+        let org = gate!(self.client(Right::Edit)?).org_id;
+        let body = gate!(self.read_obj());
+        let profile = gate!(receipt::parse_profile(&body).map_err(|m| jerr(400, m)));
+        gate!(self.receipt_printer(id, org)?);
+        Ok(
+            if self.db(|c| store::put_receipt_profile(c, id, org, &profile))? {
+                Self::profile_answer(id, true, &profile)
+            } else {
+                not_found()
+            },
+        )
+    }
+
+    /// A PNG, never cached and never sniffed into anything else.
+    fn png(bytes: Vec<u8>) -> Resp {
+        Resp {
+            status: 200,
+            headers: vec![
+                ("Content-Type", "image/png".into()),
+                ("Cache-Control", "no-store".into()),
+                ("X-Content-Type-Options", "nosniff".into()),
+            ],
+            body: RespBody::Bytes(bytes.into()),
+        }
+    }
+
+    /// The preview of a laid out receipt. `pdf`: the printer would get a PDF, which has no page
+    /// for a receipt that prints nothing, so the preview refuses it with the same text.
+    fn draw_preview(doc: &receipt::Doc, profile: &receipt::Profile, pdf: bool) -> Resp {
+        match receipt::layout(doc, profile) {
+            Err(m) => jerr(400, m),
+            Ok(l) if pdf && !l.has_pages() => jerr(400, "receipt prints nothing on a PDF printer"),
+            Ok(l) => Self::png(receipt::preview_png(&l)),
+        }
+    }
+
+    /// `POST /receipts/preview`: draws a receipt as a PNG. Prints nothing and spends no quota.
+    /// Body: `{"receipt": {...}`, then `"printer_id": n` (its stored profile) or `"profile": {...}`,
+    /// or neither (the defaults).
+    fn receipt_preview(&self) -> R {
+        let p = gate!(self.client(Right::Submit)?);
+        let body = gate!(self.read_obj());
+        let Some(rv) = body.get("receipt").filter(|v| !v.is_null()) else {
+            return Ok(jerr(400, "missing 'receipt'"));
+        };
+        let named = body.get("printer_id").filter(|v| !v.is_null());
+        let given = body.get("profile").filter(|v| !v.is_null());
+        if named.is_some() && given.is_some() {
+            return Ok(jerr(400, "send printer_id or profile, not both"));
+        }
+        let doc = gate!(receipt::parse_doc(rv).map_err(|m| jerr(400, m)));
+        let (mut profile, mut pdf, mut org) = (receipt::Profile::default(), false, p.org_id);
+        if let Some(v) = named {
+            let unknown = || jerr(400, format!("unknown printer: {}", py_str(v)));
+            let Some(id) = as_sql_int(v) else {
+                return Ok(unknown());
+            };
+            let (printer, stored) = gate!(
+                self.receipt_printer(id, p.org_id)?
+                    .map_err(|r| if r.status == 404 { unknown() } else { r })
+            );
+            profile = stored.unwrap_or_default();
+            pdf = receipt_mode(&printer, &profile) == "pdf";
+            org = Some(printer.org_id);
+        } else if let Some(v) = given {
+            let Some(m) = v.as_object() else {
+                return Ok(jerr(400, "profile must be an object"));
+            };
+            profile = gate!(receipt::parse_profile(m).map_err(|m| jerr(400, m)));
+        }
+        // a locked org gets no preview where the lock can be seen (the operator API is on)
+        if self.cfg().operator_token.is_some()
+            && let Some(o) = org
+        {
+            match self.db(|c| store::check_not_locked(c, o)) {
+                Ok(()) => {}
+                Err(StoreError::Locked) => return Ok(jerr(403, ORG_LOCKED)),
+                Err(e) => return Err(e),
+            }
+        }
+        let Some(_turn) = self.s.try_preview(org.unwrap_or(0)) else {
+            return Ok(jerr(503, PREVIEW_BUSY));
+        };
+        Ok(Self::draw_preview(&doc, &profile, pdf))
+    }
+
+    /// `GET /jobs/{id}/preview`: the receipt of a finished or queued job, drawn from the copy
+    /// of its document. A login that can manage only (a machine key is 401), and never while the
+    /// operator token is set: there no copy is kept, so the audited support access stays the only
+    /// way to a customer's content.
+    fn job_preview(&self, id: i64) -> R {
+        let p = gate!(self.manager()?);
+        if self.cfg().operator_token.is_some() {
+            return Ok(not_found());
+        }
+        let Some((doc, profile)) = self.db(|c| store::get_job_receipt(c, id, p.org_id))? else {
+            return Ok(not_found());
+        };
+        let Some(_turn) = self.s.try_preview(p.org_id.unwrap_or(0)) else {
+            return Ok(jerr(503, PREVIEW_BUSY));
+        };
+        Ok(Self::draw_preview(&doc, &profile, false))
     }
 
     fn post_jobs(&self) -> R {
@@ -2379,6 +2745,12 @@ impl Ctx<'_> {
                 None => not_found(),
             });
         }
+        if let Some(id) = id_of(t, "/jobs/", "/preview") {
+            return self.job_preview(id);
+        }
+        if let Some(id) = id_of(t, "/printers/", "/receipt-profile") {
+            return self.get_receipt_profile(id);
+        }
         if let Some(id) = id_of(t, "/jobs/", "") {
             let p = gate!(self.client(Right::Look)?);
             if !self.owns(&p, id)? {
@@ -2525,6 +2897,7 @@ impl Ctx<'_> {
             "/jobs" => return self.post_jobs(),
             "/orders" => return self.post_orders(),
             "/labels" => return self.post_labels(),
+            "/receipts/preview" => return self.receipt_preview(),
             "/billing/webhook" => return self.billing_webhook(),
             "/login" => return self.login(),
             "/signup" => return self.signup(),
@@ -2796,6 +3169,9 @@ impl Ctx<'_> {
         if let Some(id) = id_of(t, "/labels/", "") {
             return self.put_label(id);
         }
+        if let Some(id) = id_of(t, "/printers/", "/receipt-profile") {
+            return self.put_receipt_profile(id);
+        }
         if let Some(id) = id_of(t, "/apikeys/", "") {
             return self.put_apikey(id);
         }
@@ -2932,6 +3308,16 @@ impl Ctx<'_> {
                 // secure_delete zeroed the pages; this clears the WAL frames too. A reader can
                 // block it: logged, never a failed request (the org is gone either way).
                 self.db(|c| store::truncate_wal_logged(c, "delete org"));
+                ok_true()
+            } else {
+                not_found()
+            });
+        }
+        if let Some(id) = id_of(t, "/printers/", "/receipt-profile") {
+            let org = gate!(self.client(Right::Edit)?).org_id;
+            // the same answers as GET and PUT: 404 unknown or foreign, 400 for a CloudPRNT device
+            gate!(self.receipt_printer(id, org)?);
+            return Ok(if self.db(|c| store::delete_receipt_profile(c, id, org))? {
                 ok_true()
             } else {
                 not_found()

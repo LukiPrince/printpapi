@@ -117,7 +117,10 @@ export type NewJob = {
     | "raw_uri"
     | "label_uri"
     | "label_base64"
-    | "label_text";
+    | "label_text"
+    | "receipt";
+  /** receipt: the document (see docs/receipts.md). */
+  receipt?: unknown;
   content?: string;
   url?: string;
   /** label_*: a label template by name or id. */
@@ -128,6 +131,18 @@ export type NewJob = {
   copies?: number;
   callback_url?: string | null;
 };
+
+/** How one printer wants its receipts laid out (GET /printers/{id}/receipt-profile). */
+export type ReceiptProfile = {
+  paper_mm: 58 | 80;
+  width_dots: number;
+  codepage: "raster" | "cp1252";
+  codepage_number: number;
+  cut: "partial" | "full" | "none";
+  output: "auto" | "escpos";
+};
+
+export type ReceiptProfileAnswer = { printer_id: number; stored: boolean; profile: ReceiptProfile };
 
 /** A box on the label in millimetres, measured from its top-left corner. */
 export type LabelBox = { x: number; y: number; w: number; h: number };
@@ -401,3 +416,36 @@ export function fileToBase64(file: File): Promise<string> {
     reader.readAsDataURL(file);
   });
 }
+
+/** Read a Blob as a data: URL. The demo's CSP allows images from 'self' and data: only, and a data:
+ *  URL needs no revoking. */
+function blobToDataUrl(blob: Blob): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(String(reader.result));
+    reader.onerror = () => reject(new Error("could not read the image"));
+    reader.readAsDataURL(blob);
+  });
+}
+
+/** Draw a receipt as a PNG without printing it. The body names a printer (its stored profile) or
+ *  carries a profile, or neither (80 mm defaults). Answers a data: URL. */
+export const previewReceipt = (body: { receipt: unknown; printer_id?: number; profile?: Partial<ReceiptProfile> }) =>
+  request("/receipts/preview", jsonBody(body))
+    .then((r) => r.blob())
+    .then(blobToDataUrl);
+
+/** The receipt of a job as it was printed (a login that can manage; 404 when there is none). */
+export const getJobPreview = (id: number) =>
+  request(`/jobs/${id}/preview`)
+    .then((r) => r.blob())
+    .then(blobToDataUrl);
+
+export const getReceiptProfile = (printerId: number) =>
+  getJSON<ReceiptProfileAnswer>(`/printers/${printerId}/receipt-profile`);
+
+/** Replaces the whole profile; omitted fields take the defaults. */
+export const putReceiptProfile = (printerId: number, profile: Partial<ReceiptProfile>) =>
+  request(`/printers/${printerId}/receipt-profile`, { ...jsonBody(profile), method: "PUT" }).then(
+    (r) => r.json() as Promise<ReceiptProfileAnswer>,
+  );

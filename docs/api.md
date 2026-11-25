@@ -27,10 +27,13 @@ Token comparison is constant-time (`hmac.compare_digest`).
 | `GET /metrics` | client (`Look`) | Prometheus text: job counts by state, agent/printer liveness |
 | `POST /jobs` | client (`Submit`) | Submit a job → `{job_id}` |
 | `GET\|POST /labels`, `GET\|PUT\|DELETE /labels/{id}` | client (`Look` to read, `Edit` to write) | [Label templates](labels.md): where the content sits on a label; jobs of type `label_*` render through them |
+| `POST /receipts/preview` | client (`Submit`) | Draw a [receipt](receipts.md) as a PNG without printing it; one in flight per org, two per server (`503`) |
+| `GET\|PUT\|DELETE /printers/{id}/receipt-profile` | client (`Look` to read, `Edit` to write) | The [receipt profile](receipts.md#printer-profile) of a printer: paper, width, text mode, cutter, output |
 | `POST /orders` | client (`Submit`) | Render an order as a packing slip and print it → `{job_id}` ([e-commerce](ecommerce.md)) |
 | `POST /integrations/shopify/orders` | HMAC + key (`Submit`) | Shopify order webhook (key in the URL, signature in the header) |
 | `GET /jobs` | client (`Look`) | Recent job history. With [retention](server.md#retention) set, old jobs lose payload and title (`title` is `null`), and rows from before the current month disappear after at least 7 days |
 | `GET /jobs/{id}` | client (`Look`) | One job's state: `queued` \| `claimed` \| `done` \| `failed` \| `cancelled` |
+| `GET /jobs/{id}/preview` | manage | The [receipt](receipts.md#the-preview-of-a-job-in-the-history) of a job as it was printed, a PNG. `404` while the operator API is on |
 | `DELETE /jobs/{id}` | client (`Submit`) | Cancel a still-`queued` job (`409` once claimed, `404` if unknown) |
 | `GET /printers` | client (`Look`) | Registered printers + online/offline + capabilities |
 | `GET /computers` | client (`Computers`) | Registered agents + online/offline + printer count |
@@ -77,15 +80,16 @@ existed is), `agent`, `cloudprnt`, `print` or `read`. The scope narrows what a *
 call. It does not touch the bootstrap token, browser sessions or agent keys that were never issued
 (self-chosen v2 keys). Managing keys, users, the org and the support log (`/apikeys`, `/users`,
 `/orgs`, `/support-access`, including `event_url` and `shopify_secret`) stays with root and sessions:
-every key, a full one included, still gets `401` there.
+every key, a full one included, still gets `401` there. So does `GET /jobs/{id}/preview`, the
+picture of a receipt job.
 
 | Right | Routes | full | agent | cloudprnt | print | read |
 |---|---|---|---|---|---|---|
 | (none) | `GET /me` | yes | yes | yes | yes | yes |
 | `Computers` | `GET /computers` | yes | yes | no | yes | yes |
-| `Look` | `GET /printers`, `/labels`, `/labels/{id}`, `/jobs`, `/jobs/{id}`, `/metrics`, `/plans`; every PrintNode `GET` (`/whoami`, `/computers`, `/printers`, `/printjobs`) | yes | no | no | yes (jobs: own only) | yes |
-| `Submit` | `POST /jobs`, `POST /orders`, the Shopify webhook, `DELETE /jobs/{id}`; PrintNode `POST /printjobs`, `DELETE /printjobs/{set}` | yes | no | no | yes (cancel: own only) | no |
-| `Edit` | `POST /labels`, `PUT /labels/{id}`, `DELETE /labels/{id}` | yes | no | no | no | no |
+| `Look` | `GET /printers`, `/printers/{id}/receipt-profile`, `/labels`, `/labels/{id}`, `/jobs`, `/jobs/{id}`, `/metrics`, `/plans`; every PrintNode `GET` (`/whoami`, `/computers`, `/printers`, `/printjobs`) | yes | no | no | yes (jobs: own only) | yes |
+| `Submit` | `POST /jobs`, `POST /receipts/preview`, `POST /orders`, the Shopify webhook, `DELETE /jobs/{id}`; PrintNode `POST /printjobs`, `DELETE /printjobs/{set}` | yes | no | no | yes (cancel: own only) | no |
+| `Edit` | `POST /labels`, `PUT /labels/{id}`, `DELETE /labels/{id}`, `PUT /printers/{id}/receipt-profile`, `DELETE /printers/{id}/receipt-profile` | yes | no | no | no | no |
 | `Agent` | `POST /agent/register`, `GET /agent/jobs`, `GET /agent/jobs/{id}/payload`, `POST /agent/jobs/{id}/result` | yes | yes | no | no | no |
 | `CloudPrnt` | `POST\|GET\|DELETE /cloudprnt[/{key}]` | yes | no | yes | no | no |
 
@@ -148,7 +152,7 @@ What a key without the right gets:
 | CloudPRNT | `401` | `403`, and nothing is enrolled |
 | `POST /agent/register` | `401` | `401` with a message naming the rights needed |
 | other `/agent/*` | `401` | `401` |
-| `/apikeys`, `/users`, `/orgs`, `/support-access` | `401` | `401` (no key may) |
+| `/apikeys`, `/users`, `/orgs`, `/support-access`, `/jobs/{id}/preview` | `401` | `401` (no key may) |
 
 On the Bearer routes and on PrintNode `POST /printjobs` the right is checked before the body is
 parsed: a refused key with a broken JSON body gets `403`. CloudPRNT and `POST /agent/register`
@@ -237,6 +241,7 @@ agent 3.2.0; older agents ignore it. Measured with SumatraPDF 3.4.6, 3.5.2 and 3
 | `label_uri` | `url` + `template` | GETs an image, renders it through the [label template](labels.md) |
 | `label_base64` | `content` + `template` | decodes a base64 image, renders it through the template |
 | `label_text` | `text` + `template` | renders the text through the template |
+| `receipt` | `receipt`: the document | lays it out for the printer: ESC/POS bytes, or a PDF where the printer takes one ([receipts.md](receipts.md)) |
 
 URL fetches are `http(s)`-only and sent with a browser User-Agent (WAF/CDN-fronted services
 reject a default library one such as Python's).
@@ -256,6 +261,17 @@ The `label_*` types are the odd ones out: the server does not queue the bytes it
 printer, so `options` are accepted on a PDF printer and refused on a ZPL one. The template is
 named by `template` (its name or its integer id). Templates, errors and examples:
 [labels.md](labels.md).
+
+`receipt` is its sibling: a JSON document (texts, columns, a QR code, a barcode, a cut, the drawer)
+that the server renders for the printer: ESC/POS bytes for a raw printer, and a PDF for a printer that
+takes one unless its receipt profile says `output: escpos`. Elements, limits, the profile and the
+preview are in [receipts.md](receipts.md). `copies` repeats the whole stream, the drawer kick
+included. A receipt with images takes one of 4 render slots of its own and answers `503` `receipt
+rendering is busy, try again later` when none frees within about two seconds. It also counts against
+the per-org limit of downloads in flight above (when that applies, a fifth one answers the same `503`
+at once, without waiting) and holds its `idempotency_key` while it renders (a concurrent request with
+the same new key answers `409`). A receipt without images does neither. A CloudPRNT printer is
+refused.
 
 ## Webhooks
 

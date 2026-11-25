@@ -24,19 +24,21 @@ installed, and the folder only when nothing else is in it.
 The setup also installs a small icon (next to the clock on Windows, in the menu bar on macOS, in
 the status area on Linux) that starts with every user's login. Its colour, symbol and word show
 the agent: connected, offline, or not running. Its menu has the status line, **Settings...**,
-**Open dashboard** and **Quit**; Quit ends only the icon, the agent keeps printing.
+**Updates...** ([below](#updates)), **Open dashboard** and **Quit**; Quit ends only the icon, the
+agent keeps printing.
 
 **Settings...** opens a window with Overview, Printers (add, remove, change the kind, test print),
 Connection (another server or key), Advanced (`timeout` and the `[headers]` values), Log,
-SumatraPDF (Windows), Restart and Remove. Looking needs no administrator rights; each change asks
+SumatraPDF (Windows), Restart and Remove, and Updates after Overview. Looking needs no administrator rights; each change asks
 for them once.
 
 - The icon only reads `status.json`, which the agent rewrites every 30 seconds from a thread of
   its own, so it stays young while a long job prints or a connection hangs: Windows
   `%ProgramData%\printpapi-agent\`, macOS `/Library/Application Support/printpapi-agent/`, Linux
   `/var/lib/printpapi-agent/`. The file holds the server, device name, state, last contact and job, the
-  printers, the header names, the time the agent process started and whether the stored key can be
-  read, never the key and never a header value. A file that is missing or older than two minutes shows "not running"; an agent that
+  printers, the header names, the time the agent process started, whether the stored key can be
+  read, the update mode and mirror, and whether a job is being printed, never the key and never a
+  header value. A file that is missing or older than two minutes shows "not running"; an agent that
   has not been in touch with the server for two minutes shows "offline" with the time it has been
   silent. The agent still opens no port and takes no commands.
   The crash log of an agent the setup installed lives in the same folder.
@@ -67,6 +69,109 @@ for them once.
 - Linux without a desktop or without systemd: use the manual steps below.
 - An agent you set up by hand is not taken over: the setup stops and says so, so a job is never
   printed twice.
+
+## Updates
+
+The agent and the tray icon / settings program of a setup install can update themselves. This
+applies only to an agent the setup installed (the folder has the marker file
+`.installed-by-setup`). An agent you set up by hand from an archive, the Python agent and the server
+are never touched, and an agent from an archive makes no request for updates at all.
+
+**What the person sees.** The tray menu has an **Updates...** item, which reads **Update to 3.7.0...**
+while a newer version is known. It opens the settings window on its **Updates** section; the
+Overview shows one line when a version is available. **Install 3.7.0** downloads the files, asks for
+administrator rights once, replaces the agent and the setup program, checks that the new agent
+connects to the server, and reopens the window as the new version. A new version that does not
+connect is replaced by the old one automatically, and the window says so.
+
+**Three modes**, in `agent.ini` under `[agent]` (the select in the window changes it for you and asks
+for administrator rights once):
+
+| `updates` | in the window | what happens |
+|---|---|---|
+| `notify` (default) | Tell me | the icon, and the window when it opens, look once a day and say when a version is out |
+| `auto` | Install automatically | also installs it, at night, from a scheduled task (Windows), a systemd timer (Linux) or a launchd job (macOS) of its own that exists only in this mode |
+| `off` | Off | no look, no request, no schedule |
+
+Any other value counts as `off`, so a typo never switches unattended installs on. After a hand edit
+of `updates`, restart the agent from the window (Restart), because that is when the schedule is
+brought in line with the file.
+
+**What is sent.** In `notify` and `auto` every signed-in user who has the icon makes one request a
+day for one file, `printpapi-update.txt`, from the release page (GitHub answers it with redirects).
+The window looks once when it opens (the answer is kept for a day, so it adds no second request) and
+again when you press **Check now**. A file that is missing (404) or that this program refuses
+(another key, a newer format) is remembered for a day, by the program that got that answer (a newer setup, installed by hand, asks again); the look is repeated hourly only while the
+network fails. With `updates = off`, or an `update_url` the agent refuses, the icon and the window
+make no request, show no notice and cannot start a download. Installing downloads the files named in it.
+No version, device name or id is sent, only a browser's User-Agent; the agent's key and the
+`[headers]` of `agent.ini` are never sent, because the address is not your printpapi server. The
+unattended update asks the same way as the root or SYSTEM user, with the proxy settings of that
+user. A company that wants none of this sets `updates = off`, or points `update_url` at its own
+mirror (below), or builds the agent with its own keys.
+
+**Mirror.** `update_url = https://mirror.example/printpapi` names a folder that holds the files of a
+release exactly as they are on the release page (`printpapi-update.txt` and the `printpapi-update-*`
+files). `http` is allowed, because the content is protected by a signature, not by the connection. An
+address with a user name, a query or a fragment, or another scheme, switches checking off.
+
+**What is checked.** The update is one file with an Ed25519 signature, `printpapi-update.txt`. It
+lists the size and SHA-256 of every program file of the release. The public keys that may sign it
+are in `crates/agent/update-keys.txt` and built into the agent; there is no setting and no
+environment variable that changes them (see [SECURITY.md](../SECURITY.md#signed-updates)). TLS, the
+host and a mirror are not trusted: a file that does not match, a version that is not newer than the
+installed one, or a signature that no key verifies is refused before anything on the computer
+changes. An agent that was built without a key (this is the case until the owner of a release adds
+one) says "This build has no update key, so it cannot check for updates." and makes no request.
+
+**What an install of an update does.** The installed agent, which only administrators can write,
+reads each file once into memory, checks those bytes and starts the new agent and the new setup
+program once with `--version`, so a program that cannot run here (Smart App Control, a wrong
+architecture, a missing library) stops the update before anything is changed. It waits until the
+agent is connected and not printing, swaps the two program files by renaming them, restarts the agent
+the way the Restart section does, and waits up to five minutes for the new version to report in
+twice with the same process. If it does not, the old files are renamed back (this needs no network)
+and the old agent is started again. The result says which: "Version 3.7.0 did not connect, so 3.6.0
+was put back. It is running again." Only the two program files and the marker change: `agent.ini`,
+the service unit or task, the rights and the status folder stay as they were. The last attempt is
+in `update-state.json` in the install folder (no secrets): `message` is the sentence the window shows,
+`detail` the reason behind it (for example why the new agent did not connect), which the Windows
+task and a click, both without a console, would otherwise lose. An unattended run gives a version up
+after two failed nights; a click in the window always tries.
+
+- The agent has to be connected: an agent that is stopped or offline is never updated, by click or at
+  night ("The agent has to be connected, so that the update can check the new version. Otherwise run
+  the setup of the new version."). A queue that is printing, or one long job (a slow printer can hold the agent busy for more than two
+  minutes without a contact with the server), is waited for, up to two minutes.
+- A job that was claimed between the last look and the stop is requeued and can print twice, as with
+  every restart.
+- The marker file now holds the installed version (`version=3.7.0`); an empty marker, which setups up
+  to 3.6.0 wrote, still means "installed by the setup". A setup program that finds a newer agent than
+  itself offers the installed version instead of its sections, and a deliberate **Go back to X**
+  behind a confirmation. Going back needs `updates` on **Tell me** or **Off** first. The card does
+  that for an automatic setting: it switches **Install automatically** to **Tell me**, so that the
+  nightly update does not install the newer version again, and leaves **Tell me** and **Off** as they
+  are. When the agent is stopped the window cannot read the mode, so the install reads `agent.ini`
+  and lowers only an automatic setting; an `updates = off` stays off.
+- Before you go back to 3.6.0 or older by other means, choose **Tell me** or **Off**. Otherwise the
+  nightly entry stays behind, answers the command `restart --update now` with a usage error and does
+  nothing; removing the agent then leaves the folder `.update` and `update-state.json`.
+- A setup program from an older release cannot be stopped from putting an older agent back.
+- The `.deb`, `.rpm` and `.msi` programs belong to the package manager or the installer, and an
+  update never replaces them: it replaces the agent and the copy of the setup program in the install
+  folder. A window started from such a program that is older than the installed agent shows only
+  the card "A newer version is installed" (open the installed version, or go back on purpose). An AppImage stays an
+  AppImage and an ELF program stays one; an AppImage is not started before it is put in place,
+  because starting it as root needs FUSE.
+- Every machine starts at the version its setup was. The first release that can be updated has to be
+  installed by hand once; opening the newer setup offers **Install X from this setup** in one click.
+- Only the server, its Docker image, the WooCommerce plugin and the Python agent are outside this.
+  SumatraPDF is never updated.
+- On the command line, an administrator can run `printpapi-agent restart --update now` (the look and
+  install the nightly job does). It says nothing and does nothing, and exits 0, unless `updates = auto`
+  with a valid folder, the agent is installed by the setup, connected, and a newer signed release is
+  there; check `update-state.json` in the install folder for the last attempt. An older agent answers
+  it with a usage line and does nothing.
 
 ## Install
 
@@ -109,6 +214,11 @@ name       = office-pc
 ; or file:///path/to/dir to archive the job to disk instead of printing it.
 printers   = Zebra GK420d ; HP LaserJet|pdf ; warehouse-label = socket://192.168.1.50:9100
 ```
+
+### Optional: updates
+
+`updates = notify` (default), `auto` or `off`, and `update_url` for a mirror: see [Updates](#updates).
+Both are ignored by older agents and by the Python agent.
 
 ### Optional: timeout and extra headers
 
@@ -335,9 +445,13 @@ Brother QL and other raster label printers work the same way — driver + `|pdf`
 ### ESC/POS receipt printers — `raw`
 
 Same as Zebra: the printer interprets the byte stream. Network models take
-`socket://IP:9100`; USB models go through the vendor driver as a RAW target. printpapi passes the
-bytes through — building the ESC/POS stream (text, cuts, QR) is your job, any `escpos` library
-does it.
+`socket://IP:9100`; USB models go through the vendor driver as a RAW target. The agent passes the
+bytes through. You can build the ESC/POS stream yourself, with any `escpos` library, and send it
+as `raw_base64`; or send a JSON `receipt` job and let the **server** lay it out (texts, columns,
+logo, QR code, barcode, cut, cash drawer, with umlauts and the euro sign drawn right): the agent
+then gets ordinary `raw` bytes and needs no change. See [receipts.md](receipts.md). The printer
+must support `GS v 0` raster graphics; a driver-based receipt printer that is also marked `|pdf`
+should have `"output": "escpos"` in its receipt profile.
 
 ### Star CloudPRNT models — no agent at all
 
@@ -362,6 +476,9 @@ printers = Zebra GK420d ; archive = file:///srv/paperless/consume
 - One file per job, named after the job id: `job-42.pdf` for a `pdf` job, `job-42.prn` for a `raw`
   one (the exact bytes you submitted — ZPL, ESC/POS). `copies=3` writes `job-42.pdf`,
   `job-42-2.pdf`, `job-42-3.pdf`.
+- A receipt job to a `file://` printer writes a viewable `job-42.pdf` (the printer takes PDF), so a
+  directory is a virtual receipt printer to test with; `"output": "escpos"` in its
+  [receipt profile](receipts.md#printer-profile) writes the `.prn` instead.
 - A file printer accepts **both** modes and needs no `|pdf` tag — a directory has no renderer to
   get wrong. Print `options` (duplex/tray/…) are hardware settings and are ignored here.
 - Nothing changes server-side: it is a normal printer on the Devices page, jobs report `done` when

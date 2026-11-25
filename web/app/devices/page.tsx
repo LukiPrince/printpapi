@@ -4,7 +4,7 @@ import { useMemo, useState } from "react";
 import Link from "next/link";
 import { AnimatePresence, motion } from "motion/react";
 import { toast } from "sonner";
-import { Check, FileText, Loader2, Printer, Server, Zap } from "lucide-react";
+import { Check, FileText, Loader2, Printer, Receipt, Server, Zap } from "lucide-react";
 import { usePoll } from "@/hooks/use-poll";
 import { createJob, listComputers, listPrinters, type Printer as PrinterT } from "@/lib/api";
 import { fmtAgo } from "@/lib/format";
@@ -14,6 +14,7 @@ import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { Skeleton } from "@/components/ui/skeleton";
 import { EmptyState, PulseDot } from "@/components/bits";
+import { ReceiptSettingsDialog } from "@/components/receipt/receipt-settings-dialog";
 
 type AgentGroup = {
   id: number;
@@ -125,6 +126,7 @@ export default function DevicesPage() {
 
 function PrinterCard({ printer, onPrinted }: { printer: PrinterT; onPrinted: () => void }) {
   const [state, setState] = useState<"idle" | "sending" | "sent">("idle");
+  const [settings, setSettings] = useState(false);
 
   async function test() {
     setState("sending");
@@ -164,10 +166,11 @@ function PrinterCard({ printer, onPrinted }: { printer: PrinterT; onPrinted: () 
           </Badge>
         </div>
 
+        <div className="mt-3 flex gap-1.5">
         <Button
           variant="outline"
           size="sm"
-          className="mt-3 w-full"
+          className="w-full flex-1"
           disabled={state !== "idle"}
           onClick={test}
         >
@@ -186,6 +189,17 @@ function PrinterCard({ printer, onPrinted }: { printer: PrinterT; onPrinted: () 
             </motion.span>
           </AnimatePresence>
         </Button>
+        <Button
+          variant="outline"
+          size="icon-sm"
+          aria-label="Receipt settings"
+          title="Receipt settings"
+          onClick={() => setSettings(true)}
+        >
+          <Receipt />
+        </Button>
+        </div>
+        {settings && <ReceiptSettingsDialog printer={printer} open={settings} onOpenChange={setSettings} />}
       </CardContent>
     </Card>
   );

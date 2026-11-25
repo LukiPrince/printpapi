@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, useState } from "react";
+import { AlertTriangle } from "lucide-react";
 import { motion, useReducedMotion, useSpring } from "motion/react";
 import { JOB_STATES } from "@/lib/job-state";
 import type { JobState } from "@/lib/api";
@@ -91,5 +92,23 @@ export function FieldLabel({ children, htmlFor }: { children: React.ReactNode; h
     >
       {children}
     </label>
+  );
+}
+
+/** A one-line problem or hint under a field: icon and text, never colour alone. Used inside an
+ *  `AnimatePresence`, so it grows in and shrinks out. */
+export function Note({ tone, children }: { tone: "warn" | "bad"; children: React.ReactNode }) {
+  const color = tone === "bad" ? "var(--state-failed)" : "var(--state-queued)";
+  return (
+    <motion.p
+      initial={{ opacity: 0, height: 0 }}
+      animate={{ opacity: 1, height: "auto" }}
+      exit={{ opacity: 0, height: 0 }}
+      className="mt-2 flex items-start gap-1.5 overflow-hidden text-sm"
+      style={{ color }}
+    >
+      <AlertTriangle className="mt-0.5 size-3.5 shrink-0" />
+      <span>{children}</span>
+    </motion.p>
   );
 }

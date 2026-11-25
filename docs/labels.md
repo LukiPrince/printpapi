@@ -154,7 +154,8 @@ The **printer** decides the output, not the template:
 
 "Raw" therefore means **ZPL** here. A raw printer that does not speak ZPL, such as an ESC/POS
 receipt printer, cannot print from a template: it would be handed ZPL commands it does not
-understand. Send those printers their own commands with `raw_base64` or `raw_uri`.
+understand. For a receipt printer send a [receipt](receipts.md) (a JSON document the server renders
+to ESC/POS), or your own commands with `raw_base64` or `raw_uri`.
 
 ### Images
 
