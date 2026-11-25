@@ -127,7 +127,7 @@ A scope this version does not know (a newer server wrote it) allows nothing, `GE
   layers, orders and Shopify jobs included. Another key's job reads exactly like a missing one:
   `404` on `/jobs/{id}`, absent from `GET /jobs` and the PrintNode lists, not counted by the
   PrintNode delete. `full` and `read` keys see the whole org. `/metrics` and `/whoami` show
-  org-wide counts to a print key; only job rows are restricted. Jobs submitted before this version
+  org-wide counts to a print key; only job rows are restricted. Jobs submitted before 3.7.0
   have no key and no print key sees them.
 - **Idempotency.** A resubmit with the same `idempotency_key` still returns the org's original
   `job_id`, even if another key made that job; a print key then gets `404` when it asks for it.
@@ -751,7 +751,7 @@ The dashboard's history marks such a job **May have printed**.
 | `expired`, `retention` or cancelled after an agent had it, `retry limit exceeded`, `org locked` while an agent had it, or a second attempt that failed after a first one nobody answered | `true` | the paper may be out. Look, or wait: when the agent reports late, a `failed` job becomes `done` and the field is gone |
 
 It says "may": a hand-out whose answer got lost on the way to the agent counts as well, although nothing
-printed. The legacy Python agent and Rust agents before this version do not report late, so with them
+printed. The legacy Python agent and Rust agents before 3.7.0 do not report late, so with them
 the field stays.
 
 A job with `expire_after` whose deadline passes is never handed to an agent (the claim query skips

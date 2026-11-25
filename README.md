@@ -27,7 +27,13 @@ up and prints it: documents **and** label printers (Zebra/ZPL, Bixolon, thermal)
 - Agent **polls outbound**, so printers behind NAT/firewall work with **no inbound ports**
 - Server is **one small Rust binary**: no Python, no Node, nothing else to install (the dashboard is embedded)
 - React dashboard (live queue, job history, test print, API keys), REST API, SQLite job queue
-- Cross-platform agent, also a single Rust binary: Windows (spooler + SumatraPDF), Linux and macOS (CUPS)
+- Cross-platform agent, also a single Rust binary: Windows x64 and ARM64 (spooler + SumatraPDF), Linux
+  and macOS (CUPS)
+- **Connect a device with a link or a one-time code** from the dashboard: no key is copied by hand
+  ([docs](docs/agent.md#connect-with-a-link-or-a-code))
+- **A lost connection does not print a job twice**: the agent writes down what it printed and delivers
+  the result later ([docs](docs/agent.md#the-print-journal)). Where nobody can know whether paper came
+  out, the job says `maybe_printed` ([docs](docs/api.md#did-it-print))
 - Print options per job (copies, duplex, paper size, tray, color, page ranges, orientation) +
   capability discovery per printer
 - **Shop order → packing slip**: WooCommerce plugin, Shopify webhook, built-in PDF renderer
@@ -100,22 +106,31 @@ docker run -e PRINTAPI_TOKEN=change-me -p 3460:3460 ghcr.io/lukiprince/printpapi
 Or `docker compose up -d`, which keeps the DB in a volume (see [`docker-compose.yml`](docker-compose.yml)).
 Prefer to build it yourself? `docker build -t printpapi .`
 
-**Agent**, on the machine with the printers. The easiest way is the setup app: download the
-`printpapi-setup-<platform>` file for your system from the
-[latest release](https://github.com/LukiPrince/printpapi/releases/latest) (`.exe` or `.msi` on
-Windows, x64 or ARM64; `.dmg` on macOS; `.deb`, `.rpm` or `.AppImage` on Linux; an AppImage needs
-`chmod +x` first), open it and follow the four steps ([docs](docs/agent.md#setup-app)); the dashboard's **Connect device** button
-(Devices page) makes the link or one-time code you paste in the first step, so no key is copied by
-hand ([docs](docs/agent.md#connect-with-a-link-or-a-code), also [from a terminal](docs/agent.md#pair-from-the-terminal)). The `.msi`
-can also install the agent silently on many PCs, one key and one file per PC
-([docs](docs/agent.md#managed-windows-install-msi)); the `.rpm` is for Fedora and openSUSE with a
-desktop. The setup also installs a tray icon with a settings window
-([docs](docs/agent.md#tray-icon-and-settings)). The agent and the icon can update themselves from a
-signed file, in one click or at night, and go back to the old version when the new one does not
-connect ([docs](docs/agent.md#updates)). An IT provider that runs printpapi for one client can build the
-setup under its own name ([docs](docs/white-label.md)). Every setup download is Beta until someone has run
-it by hand. It is not code-signed yet, so the system warns first, and Smart App Control / WDAC block
-it: use the Python agent there ([docs](docs/agent.md#locked-down-windows)). Or by hand:
+**Agent**, on the machine with the printers. The easiest way is the setup app:
+
+1. On the dashboard's **Devices** page click **Connect device** and copy the link or the code.
+2. Download the `printpapi-setup-<platform>` file for your system from the
+   [latest release](https://github.com/LukiPrince/printpapi/releases/latest) and open it: `.exe` or
+   `.msi` on Windows (x64 or ARM64), `.dmg` on macOS, `.deb`, `.rpm` (Fedora, openSUSE) or `.AppImage`
+   on Linux (an AppImage needs `chmod +x` first).
+3. Paste the link or the code and follow the four steps ([docs](docs/agent.md#setup-app)).
+
+The setup also installs a tray icon with a settings window ([docs](docs/agent.md#tray-icon-and-settings)).
+Every setup download is **Beta** until someone has run it by hand. It is not code-signed yet, so the
+system warns first, and Smart App Control / WDAC block it: use the Python agent there
+([docs](docs/agent.md#locked-down-windows)).
+
+- **Many Windows PCs:** the `.msi` can install the agent silently, one key and one file per PC
+  ([docs](docs/agent.md#managed-windows-install-msi)).
+- **No desktop:** `printpapi-agent pair` redeems the code in a terminal
+  ([docs](docs/agent.md#pair-from-the-terminal)).
+- **Updates:** the agent and the icon can install a signed new version in one click or at night, and go
+  back to the old one when it does not connect ([docs](docs/agent.md#updates)). This is built in but **not
+  switched on yet**: no release has been signed so far, so nothing is checked and no request is made.
+- **Your own name on it:** an IT provider that runs printpapi for one client can build the setup under
+  its own name ([docs](docs/white-label.md)).
+
+Or set the agent up by hand:
 
 1. Download the `printpapi-agent-<platform>` archive from the
    [latest release](https://github.com/LukiPrince/printpapi/releases/latest) and unpack it (Windows
@@ -162,8 +177,8 @@ v3 (Rust) against v2.5.1 (the last Python server), measured with
 A waiting agent is woken the moment its job is queued (Python polled the database once a second
 per waiting agent). Submit and cycle throughput are bound by the disk: every job state is
 committed durably (`synchronous=FULL`, like v2.5.1), so both servers wait for the same fsyncs. The
-numbers are from v3.0.0; the Windows release builds of this version are 10 MB for the server (the
-dashboard embedded) and 3.2 MB for the agent.
+numbers are from v3.0.0; the Windows programs of v3.7.0 are 10.5 MB for the server (the dashboard
+embedded) and 3.5 MB for the agent.
 
 ## Why not QZ Tray or PrintNode?
 

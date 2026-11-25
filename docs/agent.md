@@ -148,9 +148,13 @@ applies only to an agent the setup installed (the folder has the marker file
 `.installed-by-setup`). An agent you set up by hand from an archive, the Python agent and the server
 are never touched, and an agent from an archive makes no request for updates at all.
 
-**What the person sees.** The tray menu has an **Updates...** item, which reads **Update to 3.7.0...**
+**Status:** 3.7.0 is built without an update key, so nothing described here happens yet. The window says
+"This build has no update key, so it cannot check for updates." and makes no request. From the first
+release that has a key, the programs of that release can update to later ones.
+
+**What the person sees.** The tray menu has an **Updates...** item, which reads **Update to 3.8.0...**
 while a newer version is known. It opens the settings window on its **Updates** section; the
-Overview shows one line when a version is available. **Install 3.7.0** downloads the files, asks for
+Overview shows one line when a version is available. **Install 3.8.0** downloads the files, asks for
 administrator rights once, replaces the agent and the setup program, checks that the new agent
 connects to the server, and reopens the window as the new version. A new version that does not
 connect is replaced by the old one automatically, and the window says so.
@@ -202,7 +206,7 @@ architecture, a missing library) stops the update before anything is changed. It
 agent is connected and not printing, swaps the two program files by renaming them, restarts the agent
 the way the Restart section does, and waits up to five minutes for the new version to report in
 twice with the same process. If it does not, the old files are renamed back (this needs no network)
-and the old agent is started again. The result says which: "Version 3.7.0 did not connect, so 3.6.0
+and the old agent is started again. The result says which: "Version 3.8.0 did not connect, so 3.7.0
 was put back. It is running again." If the old tray program cannot be renamed back, the old agent still
 starts and the text ends "... It is running again. Run the setup again to put the tray program back."
 The old tray program stays under `.printpapi-tray.old` and the next update puts it back before it
@@ -598,7 +602,7 @@ installed:
 
 | Installed | The key is in `agent.ini` as | Who can read the file |
 |---|---|---|
-| Windows, with the setup app | `api_key_dpapi`: encrypted with DPAPI, machine scope (this version and later) | SYSTEM and Administrators |
+| Windows, with the setup app | `api_key_dpapi`: encrypted with DPAPI, machine scope (3.7.0 and later) | SYSTEM and Administrators |
 | By hand on any system, and the Python agent | `api_key`, plain text | what you set; a manual install keeps its plain `api_key`, and the running agent never rewrites the file (only `printpapi-agent pair`, which you run yourself, does) |
 | Linux, with the setup app | `api_key`, plain text | `root` and the service user (`root:printpapi-agent`, mode 0640) |
 | macOS, with the setup app | `api_key`, plain text | `root` (mode 0600) |
@@ -658,7 +662,7 @@ reinstall Windows, move to new hardware or rely on a file backup of this folder,
 - keep the key in a password manager (it is the one from the **Keys** page), or
 - run `printpapi-agent unprotect-key` (below) and back up the file afterwards.
 
-A plain backup made before this version stays valid, because the key never changed. To encrypt the
+A plain backup made before 3.7.0 stays valid, because the key never changed. To encrypt the
 key again later, delete the `seal_key` line as an administrator and make any change in Settings.
 
 #### Going back to an older version or to the Python agent
@@ -992,7 +996,7 @@ The journal holds, per job: its number and identity, whether it worked, the erro
 cut to 500 characters, never the key) and whether the server has confirmed it. Never the
 document, the title, a header value or the key. It is a text file of one JSON object per line,
 at most 1000 jobs and 16 MiB, compacted by the agent itself; delete it, with the agent stopped,
-to make the agent forget. It is only used between a server and an agent of this version: an older
+to make the agent forget. It is only used between a server and an agent of 3.7.0 or later: an older
 server hands out no identity, and then the agent works as before, as does the legacy Python agent.
 
 Where it lives: an agent that the setup installed keeps it next to `status.json` in its status folder (see
