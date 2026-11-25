@@ -45,6 +45,9 @@ up and prints it: documents **and** label printers (Zebra/ZPL, Bixolon, thermal)
   works with any payment provider ([docs](docs/billing.md))
 - Fleet monitoring: `GET /computers` + online/offline webhooks, Prometheus `/metrics`
 - Retry-safe submits (`idempotency_key`) and job deadlines (`expire_after`)
+- **Key rights**: a key can be Everything, Agent only, CloudPRNT only, Print only (sees just its own
+  jobs) or Read only, and be narrowed later without re-enrolling a computer
+  ([docs](docs/api.md#key-rights))
 - **PrintNode-compatible API layer**: point an existing SDK/integration at your server
   ([docs](docs/printnode-compat.md))
 - **Star CloudPRNT**: Star receipt/label printers poll the server themselves, so there is no agent

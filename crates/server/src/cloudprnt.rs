@@ -89,10 +89,15 @@ pub fn status_text(code: Option<&str>) -> String {
     }
 }
 
+/// The name prefix of every Star device. A computer may not register under it with a key that is
+/// not allowed to act as a Star printer (`Right::CloudPrnt`), and a key that holds such a computer
+/// may not be narrowed to the agent right alone.
+pub const NAME_PREFIX: &str = "cloudprnt-";
+
 /// The agent/printer name a device enrols under, keyed on the normalized MAC address: the one
 /// identifier the printer sends on every request of all three methods.
 pub fn device_name(mac: &str) -> String {
-    format!("cloudprnt-{}", py_trim(mac).to_lowercase())
+    format!("{NAME_PREFIX}{}", py_trim(mac).to_lowercase())
 }
 
 #[cfg(test)]

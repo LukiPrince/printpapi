@@ -10,7 +10,8 @@ Prints a packing slip on your own printer when an order comes in, through a self
 2. Activate **printpapi for WooCommerce**.
 3. Open *WooCommerce → printpapi* and fill in:
    - **Server URL** — e.g. `https://print.example.com`
-   - **API key** — a *client* key from the printpapi dashboard (never the root `PRINTAPI_TOKEN`)
+   - **API key** — a *client* key from the printpapi dashboard with the rights **Print only**
+     (never the root `PRINTAPI_TOKEN`); the plugin needs nothing more
    - **Printer** — picked from a dropdown of your printers; raw/label printers are disabled,
      a packing slip needs a PDF-capable printer
    - **Print when** — order created / processing / on hold / completed

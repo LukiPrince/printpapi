@@ -117,6 +117,10 @@ On each machine:
 6. Start it and check the dashboard's **Devices** page: the computer shows as online under its old
    name.
 
+An agent that the setup app installed on Windows stores its key encrypted from this version on; to go
+back to an older agent or to the Python agent, see
+[Going back to an older version or to the Python agent](agent.md#going-back-to-an-older-version-or-to-the-python-agent).
+
 Do not run the Python agent and the Rust agent with the same key at the same time. Each job still
 prints once, but you cannot tell which machine will print it.
 
@@ -176,3 +180,11 @@ v3 does not change the schema in a way v2.5.1 cannot read, so you can roll back 
 database file: stop v3, start v2.5.1 against the same `PRINT_DB` (`ghcr.io/lukiprince/printpapi:2.5.1`
 in Docker, or `git checkout v2.5.1 && python -m app.server`). Everything v3 wrote stays readable,
 including agents enrolled with issued keys and jobs submitted after the upgrade.
+
+Going back from a version that has [key rights](api.md#key-rights) is **not privilege-preserving**:
+the database now has `api_keys.scope` and `jobs.api_key_id`, which an older server ignores, and it
+treats every limited key as a full one. A key you gave to a shop with the rights Print only can then
+read and cancel every job, and an Agent only key can submit. Revoke the limited keys you gave to
+others before going back. v2.5.1 also accepts an agent whose key was revoked (its agent check does
+not look at the key's state), so revoking a key does not stop its agent there either. Jobs
+submitted before the rights existed have no `api_key_id`; no Print only key ever sees them.

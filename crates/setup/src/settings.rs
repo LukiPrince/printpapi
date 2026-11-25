@@ -50,6 +50,8 @@ pub struct AgentStatus {
     timeout: f64,
     header_names: Vec<String>,
     error: Option<String>,
+    /// The key stored in agent.ini cannot be read on this computer: the connection card says so.
+    key_unreadable: bool,
 }
 
 impl AgentStatus {
@@ -65,6 +67,7 @@ impl AgentStatus {
             timeout: 0.0,
             header_names: Vec::new(),
             error: None,
+            key_unreadable: false,
         }
     }
 }
@@ -83,6 +86,9 @@ struct StatusFile {
     timeout: f64,
     header_names: Vec<String>,
     error: Option<String>,
+    /// Absent in the file of an agent older than this field.
+    #[serde(default)]
+    key_unreadable: bool,
 }
 
 #[derive(Deserialize)]
@@ -140,6 +146,7 @@ pub fn parse_status(text: Option<&str>, now: f64) -> AgentStatus {
         timeout: file.timeout,
         header_names: file.header_names,
         error: file.error.or(silence),
+        key_unreadable: file.key_unreadable,
     }
 }
 
@@ -420,6 +427,25 @@ mod tests {
                 {"name": "HP", "pdf": true, "target": null, "locked": false}
             ])
         );
+    }
+
+    #[test]
+    fn a_status_file_without_key_unreadable_says_the_key_is_fine_and_one_with_it_says_so() {
+        // an agent older than this field writes none
+        let v: Value =
+            serde_json::to_value(parse_status(Some(&file("online", NOW - 10.0)), NOW)).unwrap();
+        assert_eq!(v["keyUnreadable"], false);
+        let mut written: Value = serde_json::from_str(&file("offline", NOW - 5.0)).unwrap();
+        written["key_unreadable"] = json!(true);
+        written["error"] = json!("The key stored in agent.ini cannot be read.");
+        let s = parse_status(Some(&written.to_string()), NOW);
+        let v = serde_json::to_value(&s).unwrap();
+        assert_eq!(v["keyUnreadable"], true);
+        // name, server and printers are there for the repair
+        assert_eq!(v["name"], "PACKTISCH-1");
+        assert_eq!(v["printers"].as_array().unwrap().len(), 4);
+        assert_eq!(parse_status(None, NOW), AgentStatus::not_running());
+        assert!(!AgentStatus::not_running().key_unreadable);
     }
 
     #[test]

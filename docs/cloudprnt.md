@@ -19,12 +19,14 @@ your server URL and it enrols itself.
 
 ## Set it up
 
-1. Issue a client key for the org the printer belongs to (dashboard → API keys, or
-   `POST /apikeys`). This key **is** the printer's credential — treat it like one.
+1. Issue a key with the rights **CloudPRNT only** for the org the printer belongs to (dashboard →
+   API keys, or `POST /apikeys` with `"scope": "cloudprnt"`), one per printer or site. This key
+   **is** the printer's credential — treat it like one. It can do nothing but act as a Star
+   printer; it cannot print, read or enrol a computer.
 2. In the printer's CloudPRNT settings, set the server URL to:
 
    ```
-   https://your-server.example.com/cloudprnt/<client-key>
+   https://your-server.example.com/cloudprnt/<cloudprnt-key>
    ```
 
    If the printer's settings page has **User Name** / **Password** fields, you can instead point it
@@ -32,11 +34,13 @@ your server URL and it enrols itself.
    the password empty) — that keeps the key out of URLs and access logs.
 3. Power-cycle or save; the printer starts polling. Within a poll interval it appears in
    **Devices** as `cloudprnt-<mac>` and in `GET /printers`.
-4. Print to it like any other printer — the printer id from `GET /printers`:
+4. Print to it like any other printer — the printer id from `GET /printers`. Use another key for
+   this, one that may print (**Print only** or **Everything**); the CloudPRNT key may not list
+   printers or submit:
 
    ```bash
    curl -X POST http://localhost:3460/jobs \
-     -H "Authorization: Bearer <client-key>" -H "Content-Type: application/json" \
+     -H "Authorization: Bearer <print-key>" -H "Content-Type: application/json" \
      -d '{"printer_id": 4, "type": "raw_base64", "content": "'"$(printf 'Hello\n\n\n' | base64)"'"}'
    ```
 
@@ -66,7 +70,8 @@ One URL serves all three of the protocol's methods.
 | `DELETE` | `?mac=…&code=200%20OK&token=…` | `200`, empty — the job is marked `done`, or `failed` carrying the printer's status code |
 
 The device is identified by its **MAC address**, and authorized by the client key in the path (or
-in HTTP Basic). A request without a valid key is `401`; without a MAC, `400`.
+in HTTP Basic). A request without a valid key is `401`; a key that may not act as a Star printer
+(`agent`, `print`, `read`) is `403` and enrols nothing; without a MAC, `400`.
 
 **Media type.** We never transcode: the job's bytes go out as submitted, and the media type is only
 the label the printer honours. The one offered is picked from the printer's own `Accept` header, in
@@ -119,5 +124,10 @@ Deliberate, and cheap to lift if someone needs them:
   CloudPRNT can carry are ignored; `clientAction` requests are not issued.
 - **No capability discovery.** The printer reports its paper width in `X-Star-*` headers; we do not
   store them, so `GET /printers` shows no capabilities for these devices.
-- **Enrolment is automatic.** Any device polling with a valid client key creates a printer row in
-  that org. Revoking the key stops it; there is no per-device approval step.
+- **Enrolment is automatic.** Any device polling with a valid CloudPRNT or full key creates a
+  printer row in that org. Revoking the key stops it; there is no per-device approval step.
+- **A key reaches every Star printer of its org.** The device is told apart only by the MAC the
+  caller sends, no key is bound to it, so a `cloudprnt` key (and a `full` one) can act as any of
+  them. Use one key per printer or site anyway, so you can cut off one.
+- **No exception for a job in flight.** Take the key out of the printer before you narrow or
+  revoke it: a job the printer is printing at that moment can otherwise print again later.

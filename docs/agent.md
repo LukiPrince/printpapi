@@ -35,14 +35,15 @@ for them once.
   its own, so it stays young while a long job prints or a connection hangs: Windows
   `%ProgramData%\printpapi-agent\`, macOS `/Library/Application Support/printpapi-agent/`, Linux
   `/var/lib/printpapi-agent/`. The file holds the server, device name, state, last contact and job, the
-  printers, the header names and the time the agent process started, never the key and never a
-  header value. A file that is missing or older than two minutes shows "not running"; an agent that
+  printers, the header names, the time the agent process started and whether the stored key can be
+  read, never the key and never a header value. A file that is missing or older than two minutes shows "not running"; an agent that
   has not been in touch with the server for two minutes shows "offline" with the time it has been
   silent. The agent still opens no port and takes no commands.
   The crash log of an agent the setup installed lives in the same folder.
 - A new key on the same server needs a new device name, because the server ties a name to its
   key. The printers then get new ids and the old device stays in the dashboard; the window warns
-  before it does that.
+  before it does that. When the stored key cannot be read, the same key with the same name is
+  accepted ([When the key cannot be read](#when-the-key-cannot-be-read)).
 - On Linux the icon needs the library `libayatana-appindicator3` (`libayatana-appindicator3.so.1`;
   `libappindicator3` works too). On Debian and Ubuntu it is the package `libayatana-appindicator3-1`
   ([packages.debian.org](https://packages.debian.org/sid/libs/libayatana-appindicator3-1)).
@@ -138,11 +139,140 @@ window shows it under Log.)
 `api_key` is a key issued for the agent — on the dashboard's **Keys** page or with
 `POST /apikeys` — and the agent lands in that key's org. A made-up key is refused (`401`) since
 v3; agents that enrolled with one under v2 keep working, and `PRINTAPI_OPEN_ENROLLMENT=1` on the
-server restores the old rule. Issue one key per machine: revoking it on the Keys page stops that
-agent at once.
+server restores the old rule. Issue one key per machine, with the rights **Agent only**: it can
+enrol, poll, download and report its own jobs and list the org's computer names (the setup app
+needs that), nothing else, so a lost machine cannot submit jobs or read the history. A key for printing, reading or Star printers is refused at enrolment, and
+the setup app says so in step 1. Revoking the key on the Keys page stops that agent at once.
+
+A machine that is already set up keeps its name and printer ids when you narrow its key (**Rights**
+on the Keys page, or `PUT /apikeys/{id}`), so there is no need to enrol it again. Narrowing
+Everything to Agent only interrupts nothing: the agent keeps its right. Only if you take the agent
+right away (Print only, Read only, CloudPRNT only) does the computer stop at its next poll; a job it
+has already been handed still finishes, and queued jobs wait until it has the right again or they
+expire. A computer named `cloudprnt-...` (reserved for Star printers) can only be narrowed to a
+right set that is not Agent only. See [Key rights](api.md#key-rights).
 
 When exposing the server to agents outside your LAN, publishing only `/agent/*` (behind TLS) is
 still the smallest surface.
+
+### Where the key is stored
+
+The agent key is the one secret on the machine. Where it lives depends on how the agent was
+installed:
+
+| Installed | The key is in `agent.ini` as | Who can read the file |
+|---|---|---|
+| Windows, with the setup app | `api_key_dpapi`: encrypted with DPAPI, machine scope (this version and later) | SYSTEM and Administrators |
+| By hand on any system, and the Python agent | `api_key`, plain text | what you set; a manual install keeps its plain `api_key` and the agent never rewrites the file |
+| Linux, with the setup app | `api_key`, plain text | `root` and the service user (`root:printpapi-agent`, mode 0640) |
+| macOS, with the setup app | `api_key`, plain text | `root` (mode 0600) |
+
+**What DPAPI does.** The setup stores the key with the Windows Data Protection API in machine
+scope: the key is encrypted for this Windows installation. A copy of `agent.ini` that leaves the
+machine by itself (a folder backup, a file collected by remote management, a mail to support, the
+folder copied to a second PC) holds no usable key, and two PCs cannot end up fighting over one
+device. **What it does not do.** Every program that runs on that computer can ask Windows to
+decrypt a machine-scope value, so the rights on the file are still the protection between local
+users: only SYSTEM and Administrators may read `agent.ini`. A local administrator can read the key
+anyway. A stolen disk is answered by disk encryption (BitLocker on Windows, LUKS on Linux, FileVault on macOS), not by this. The values under
+`[headers]` stay plain text in `agent.ini`. If a machine is lost, revoke its key on the **Keys**
+page.
+
+**How to see whether the key is stored encrypted.** `agent.ini` (as an administrator) has an
+`api_key_dpapi` line and no `api_key` line. If encrypting fails when the setup installs over a file
+that was not encrypted yet (rare), the install carries on with the plain `api_key` under the same
+rights rather than fail on a print station. A file that was encrypted becomes plain text in three
+cases only: you run `unprotect-key` (below), the file says `seal_key = no` (at the next change in
+Settings), or you type a new key in Settings, Connection and Windows cannot encrypt it. In the last
+case the install still goes through, with the new key as plain text; the `api_key_dpapi` line tells
+you which state the file is in. A change of the printers or the timeout never does this: if the key
+cannot be encrypted again, nothing is changed.
+
+**Rules the agent follows.**
+
+- A non-empty `api_key` always wins over `api_key_dpapi`. That is also the recovery by hand: add
+  `api_key = ...` as an administrator and the agent uses it.
+- `seal_key = no` in `[agent]` (also `false`, `off` or `0`) keeps the setup from encrypting the key
+  again. An existing `api_key_dpapi` is still read. A change in Settings never sets or removes this
+  line; `unprotect-key` (below) sets it.
+- Every install and every change in Settings encrypts the key again, unless `seal_key = no` is
+  set. An agent that was installed by an earlier version has its key encrypted at the next change
+  or update; the key, the device and the printer ids stay the same.
+- The agent itself never writes `agent.ini`. Settings shows the header values by having an
+  elevated command copy only the `[headers]` into the working folder, never the key.
+
+**Linux and macOS keep the file.** On Linux a key sealed to the host would need `systemd-creds`
+(systemd 250 and later; Ubuntu 22.04 ships 249), and the agent runs as an unprivileged user that
+cannot decrypt it by itself. A credential file that is missing stops the unit before the agent can
+log anything. Disk encryption (LUKS) also covers the print jobs and the headers. On macOS a daemon
+can only use the file-based keychain, whose access lists an unsigned program that changes at every
+update cannot satisfy unattended
+([Apple TN3137](https://developer.apple.com/documentation/technotes/tn3137-on-mac-keychains)); for a
+stolen Mac, turn on FileVault. macOS is looked at again together with code signing.
+
+#### Before you replace or reinstall this PC, or rely on a backup of it
+
+A backup of an encrypted `agent.ini` restores only on the same Windows installation. What to do
+when the key is lost is in [When the key cannot be read](#when-the-key-cannot-be-read). Before you
+reinstall Windows, move to new hardware or rely on a file backup of this folder, do one of these:
+
+- keep the key in a password manager (it is the one from the **Keys** page), or
+- run `printpapi-agent unprotect-key` (below) and back up the file afterwards.
+
+A plain backup made before this version stays valid, because the key never changed. To encrypt the
+key again later, delete the `seal_key` line as an administrator and make any change in Settings.
+
+#### Going back to an older version or to the Python agent
+
+An older agent and the Python agent read only `api_key`. Before you go back, as an administrator in
+a console, run the agent that sealed the file; a freshly downloaded `printpapi-agent.exe` in any
+folder will do, it works on the installed folder:
+
+```powershell
+& "C:\Program Files\printpapi-agent\printpapi-agent.exe" unprotect-key
+```
+
+It writes the key back as plain text, sets `seal_key = no` so later changes keep it that way, and
+prints no key. The running agent needs no restart. (An older exe does not know the word and just
+starts the agent, so use a current one.)
+
+On a PC that blocks the exe, read the key with the signed Python interpreter from an administrator
+console, and put it into `agent.ini` as `api_key`:
+
+```python
+# printpapi: show the stored agent key
+import ctypes, re
+from ctypes import wintypes
+
+class Blob(ctypes.Structure):
+    _fields_ = [("size", wintypes.DWORD), ("data", ctypes.c_void_p)]
+
+ini = open(r"C:\Program Files\printpapi-agent\agent.ini", "rb").read()
+raw = bytes.fromhex(re.search(rb"(?m)^api_key_dpapi *= *([0-9a-f]+)", ini).group(1).decode())
+src, out = Blob(len(raw), ctypes.cast(raw, ctypes.c_void_p)), Blob()
+if not ctypes.windll.crypt32.CryptUnprotectData(
+        ctypes.byref(src), None, None, None, None, 1, ctypes.byref(out)):
+    raise ctypes.WinError()
+print(ctypes.string_at(out.data, out.size)[32:].decode())
+```
+
+#### When the key cannot be read
+
+This happens when `agent.ini` was copied from another Windows installation, after a Windows
+reset, or when the value is damaged. A setup-installed agent does not end then: it shows "offline"
+with the reason in Overview and writes it once to its log, and it looks at `agent.ini` again every
+minute. So a short DPAPI failure heals by itself, and a key you put in by hand works within a
+minute without a restart. `status.json` says so with `key_unreadable`. An agent set up by hand
+ends at once with the text on its console.
+
+1. Settings, Connection: enter the server and the key again. The name, the server and the printers
+   are filled in from the status file; the timeout and the headers stay. The window lets you keep
+   the old name, because it is the same key.
+2. By hand: as an administrator add `api_key = ...` to `agent.ini`. This is the way for an agent
+   with `[headers]` (an access proxy), because the window's connection check sends no headers. If
+   the stored key keeps failing on that PC, add `seal_key = no` too, or the next change in
+   Settings encrypts it again.
+3. If the key is lost, create a new key on the **Keys** page and use a new device name; the printers then get new ids.
 
 ### Printer syntax
 
@@ -366,6 +496,8 @@ PSF-signed, and the `.py` file is data, not an executable:
 
    (`nssm install printpapi-agent <pythonw.exe> <script>` works too; the per-user printer caveat
    and the note on tasks made with `schtasks /create` above apply.)
+
+A key that the setup stored encrypted has to be turned back into plain text first, see [Going back to an older version or to the Python agent](#going-back-to-an-older-version-or-to-the-python-agent).
 
 Switch to the Rust agent once a code-signed build is released.
 

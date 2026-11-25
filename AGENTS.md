@@ -49,6 +49,9 @@ cd web && npm run build:app     # after any web/ change; commit crates/server/we
 - Pure modules (`dispatch`, `label`, `orders`, `packing_slip`, `printnode`, `billing`,
   `cloudprnt`, `auth`) do no IO and take injected fetchers. `store` (SQLite), `server`, `http`,
   `web` and `mail` own the IO. Keep that split.
+- Key rights live in one table, `auth::Scope::allows`; nothing else decides what a machine key may do
+  (no scope lists in SQL). A new route names its `auth::Right` and gets a row in the matrix of
+  `crates/server/tests/http_scopes.rs`.
 - Tests in `crates/server/tests/` use real loopback HTTP and in-memory SQLite with injected
   fetchers: no HTTP mocks, no printers.
 - Agents only ever connect outbound (long-poll) because they sit behind NAT. Design new features
@@ -72,6 +75,11 @@ cd web && npm run build:app     # after any web/ change; commit crates/server/we
   run as admin. They never trust the staging folder, which any user can write: absolute program paths only,
   the key never in argv or output. Test them with a fake `Runner`, never against the real
   scheduler, systemd or launchd.
+- The agent key at rest (`keystore.rs`): on Windows a setup install stores it as `api_key_dpapi`
+  (DPAPI machine scope, SHA-256 in front). A non-empty plain `api_key` always wins, `seal_key = no`
+  opts out, only `install` seals (the agent never writes `agent.ini`), and a key that cannot be
+  read makes a setup-installed agent wait and report `key_unreadable` instead of exiting.
+  `read-config` exports `[headers]` only, never the key or the blob.
 - The agent writes `status.json` (never the key, never a header value) into the status folder
   (`status::status_dir_in`) only when the `.installed-by-setup` marker sits next to it. It is what
   the tray icon reads: it opens no port and takes no commands. Keep secrets out of it, and keep

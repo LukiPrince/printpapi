@@ -374,6 +374,7 @@ pub fn enqueue(
         org_id: None,
         idempotency_key: None,
         expire_after: None,
+        api_key_id: None,
     };
     tweak(&mut job);
     db.with(|c| store::enqueue_job(c, &job)).unwrap().job_id

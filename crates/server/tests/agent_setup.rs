@@ -55,6 +55,57 @@ fn a_valid_key_passes_and_a_wrong_one_is_bad_key() {
     );
 }
 
+/// A key issued with these rights, the way the dashboard's Keys page does it.
+fn key_with_scope(base: &str, http: &Client, scope: &str) -> String {
+    let issued = http
+        .post(
+            &format!("{base}/apikeys"),
+            "root-token",
+            &json!({"label": scope, "scope": scope}),
+        )
+        .unwrap()
+        .unwrap();
+    issued["key"].as_str().expect("the issued key").to_string()
+}
+
+#[test]
+fn an_agent_key_passes_every_setup_step() {
+    let (base, _, http) = server_with_key();
+    let key = key_with_scope(&base, &http, "agent");
+    assert_eq!(check_connection(&http, &base, &key, "shop-pc"), Ok(false));
+    register(&http, &base, &key, "shop-pc");
+    assert_eq!(check_connection(&http, &base, &key, "shop-pc"), Ok(true));
+    let baseline = http
+        .get(&format!("{base}/computers"), &key)
+        .unwrap()
+        .unwrap()["computers"][0]["last_seen_at"]
+        .as_f64()
+        .unwrap();
+    assert_eq!(
+        agent_seen_after(&http, &base, &key, "shop-pc", baseline),
+        Ok(false)
+    );
+}
+
+#[test]
+fn a_key_for_something_else_is_not_an_agent_key() {
+    let (base, full, http) = server_with_key();
+    for scope in ["print", "cloudprnt", "read"] {
+        let key = key_with_scope(&base, &http, scope);
+        assert_eq!(
+            check_connection(&http, &base, &key, "shop-pc"),
+            Err(ConnectError::NotAgentKey),
+            "{scope}"
+        );
+    }
+    // a full key is unchanged, a wrong key is still a wrong key
+    assert_eq!(check_connection(&http, &base, &full, "shop-pc"), Ok(false));
+    assert_eq!(
+        check_connection(&http, &base, "not-a-key", "shop-pc"),
+        Err(ConnectError::BadKey)
+    );
+}
+
 #[test]
 fn the_check_registers_nothing() {
     let (base, key, http) = server_with_key();

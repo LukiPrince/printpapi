@@ -43,7 +43,8 @@ file can mount it):
 - **The first plan is the default**: where an org lands when a subscription ends. Make it the free
   tier (or one with `"jobs": 0` if a lapsed account should print nothing).
 
-`GET /plans` (any credential) returns the catalogue with the links already filled in, plus
+`GET /plans` (root, a session, or a key that may look: Everything, Print only or Read only; see
+[key rights](api.md#key-rights)) returns the catalogue with the links already filled in, plus
 `"current"` — the caller's plan. That is what the dashboard's Settings page renders.
 
 ## 2. Point the provider at the webhook

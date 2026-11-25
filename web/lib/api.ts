@@ -4,6 +4,7 @@
 import { getToken } from "./token";
 import { parseTerms, type Terms } from "./terms";
 import type { SupportAccess } from "./support-access";
+import { signInCheck, type KeyScope, type SignInCheck } from "./key-scopes";
 
 export { TOKEN_KEY, clearToken, getToken, setToken, subscribeToken } from "./token";
 export const UNAUTHORIZED_EVENT = "printpapi:unauthorized";
@@ -48,6 +49,8 @@ export type ApiKey = {
   label: string;
   active: number;
   created_at: number;
+  /** Absent for a full key (and from a server that has no rights yet). */
+  scope?: string;
 };
 
 /** Who the stored credential belongs to. `session` is an account login, `key` a machine key. */
@@ -56,6 +59,8 @@ export type Me = {
   org_id: number | null;
   email?: string;
   user_id?: number;
+  /** A key's rights; absent for a full key. */
+  scope?: string;
 };
 
 export type OrgUser = {
@@ -196,11 +201,14 @@ const jsonBody = (body: unknown): RequestInit => ({
   body: JSON.stringify(body),
 });
 
-export async function checkToken(token: string): Promise<boolean> {
-  const res = await fetch("/printers", { headers: { Authorization: `Bearer ${token}` } });
-  // Only a real 2xx counts. Anything else (a 404 from something that isn't this API, a 5xx)
-  // must not be mistaken for a good token — otherwise you get "signed in" to nothing.
-  return res.ok;
+/** Asks GET /me, which every valid credential may call: no status code is read as rights, and a
+ *  proxy that filters other paths does not matter. Only a real 2xx with this API's JSON counts. A
+ *  404 from something that isn't this API, a 5xx or an HTML page must not be mistaken for a good
+ *  token — otherwise you get "signed in" to nothing. */
+export async function checkToken(token: string): Promise<SignInCheck> {
+  const res = await fetch("/me", { headers: { Authorization: `Bearer ${token}` } });
+  if (!res.ok) return "rejected";
+  return signInCheck(await res.json().catch(() => null));
 }
 
 /** Exchange e-mail + password for a session token. Sent without a bearer header — it *is* the
@@ -322,10 +330,18 @@ export const createJob = (job: NewJob) =>
 
 export const cancelJob = (id: number) => request(`/jobs/${id}`, { method: "DELETE" });
 
-export const issueApiKey = (label: string) =>
-  request("/apikeys", jsonBody({ label })).then(
-    (r) => r.json() as Promise<{ id: number; label: string; key: string }>,
+/** A full key sends no scope, so an older server is not confused by it. */
+export const issueApiKey = (label: string, scope: KeyScope = "full") =>
+  request("/apikeys", jsonBody(scope === "full" ? { label } : { label, scope })).then(
+    (r) => r.json() as Promise<{ id: number; label: string; key: string; scope?: string }>,
   );
+
+export const setApiKeyScope = (id: number, scope: KeyScope) =>
+  request(`/apikeys/${id}`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ scope }),
+  });
 
 export const revokeApiKey = (id: number) => request(`/apikeys/${id}`, { method: "DELETE" });
 

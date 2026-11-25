@@ -17,7 +17,7 @@ use printpapi_agent::apply::{SUMATRA_EXE_SHA256, SUMATRA_URL, SUMATRA_ZIP_SHA256
 use printpapi_agent::client::Client;
 use printpapi_agent::config::{
     Config, HttpSettings, IniUpdate, Printer, apply_patch as merge_patch, decode_ini,
-    format_printers, parse_patch, parse_printers, update_ini,
+    format_printers, parse_patch, update_ini,
 };
 use printpapi_agent::discover::discover;
 use printpapi_agent::install::{self, Installed, Layout, Os};
@@ -74,14 +74,6 @@ pub struct PrinterChoice {
     locked: bool,
 }
 
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct Existing {
-    server_url: String,
-    name: String,
-    printers: Vec<PrinterChoice>,
-}
-
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ApplyRequest {
@@ -103,9 +95,6 @@ struct Conn {
 pub struct AppState {
     staging: Option<Staging>,
     conn: Option<Conn>,
-    /// The installed agent.ini while its printers are being changed, so that `[headers]`,
-    /// `timeout` and comments survive the rewrite.
-    ini_text: Option<String>,
 }
 
 impl AppState {
@@ -123,7 +112,6 @@ impl AppState {
     pub fn clear(&mut self) {
         self.staging = None;
         self.conn = None;
-        self.ini_text = None;
     }
 }
 
@@ -257,11 +245,10 @@ pub fn poll_until(
     }
 }
 
-/// The `agent.ini` the install writes. A new install has no earlier text; with an earlier text,
-/// changing printers sets only `printers`, and a new connection sets only `server_url`, `api_key`
-/// and `name` besides, so `[headers]`, `timeout` and comments of the installed file stay.
+/// The `agent.ini` of a new install: every setting this window knows. A change of an installed
+/// agent is a patch (`patch_json`), which the elevated install merges into the installed file, so
+/// that `[headers]`, `timeout` and comments stay and the key never has to be read here.
 pub fn build_ini(
-    existing: Option<&str>,
     conn: Option<(&str, &str, &str)>,
     printers: &[PrinterChoice],
 ) -> Result<String, String> {
@@ -275,7 +262,7 @@ pub fn build_ini(
         timeout: None,
         headers: None,
     };
-    Ok(update_ini(existing, &update))
+    Ok(update_ini(None, &update))
 }
 
 /// The arguments of an admin subcommand, with `--keep-pid <this window>` added to the two that end
@@ -419,74 +406,25 @@ pub fn list_printers() -> Vec<FoundPrinter> {
         .collect()
 }
 
-/// The installed `agent.ini`, understood: what the window shows, what the later steps need, and
-/// the text itself (kept so that a rewrite of the printers leaves the rest alone).
-struct InstalledConfig {
-    existing: Existing,
-    conn: Conn,
-    text: String,
-}
-
-/// Read the installed settings the way the agent does, so that a hand-edited file means the same
-/// to the window: the trailing slashes of `server_url` are dropped (`crates/agent/src/lib.rs`
-/// `start`), `[headers]` and `timeout` come along.
-fn parse_installed(text: String) -> Result<InstalledConfig, SetupError> {
-    let unreadable = || SetupError::new("system", "The installed agent.ini cannot be read.");
-    let cfg = Config::from_text(&text).map_err(|_| unreadable())?;
-    let get = |key: &str| cfg.get(key).ok().flatten();
-    let (server_url, api_key) = (get("server_url"), get("api_key"));
-    let name = get("name").unwrap_or_else(|| "agent".into());
-    let printers =
-        parse_printers(&get("printers").unwrap_or_default()).map_err(|_| unreadable())?;
-    let settings = cfg.http_settings().map_err(|_| unreadable())?;
-    let (Some(server_url), Some(api_key)) = (server_url, api_key) else {
-        return Err(unreadable());
-    };
-    let server_url = server_url.trim_end_matches('/').to_string();
-
-    let existing = Existing {
-        server_url: server_url.clone(),
-        name: name.clone(),
-        printers: printers.iter().map(printer_to_choice).collect(),
-    };
-    Ok(InstalledConfig {
-        existing,
-        conn: Conn {
-            server_url,
-            api_key,
-            name,
-            settings,
-        },
-        text,
-    })
-}
-
-/// Have the installed `agent.ini` copied into the staging folder by an elevated `read-config`,
-/// read it and delete the copy again, whatever happened: it holds the key.
-fn read_existing_in(
+/// The `[headers]` of the installed `agent.ini`, from a copy that an elevated `read-config` leaves
+/// in the staging folder. The copy holds the headers only (never the key, whatever the installed
+/// file looks like), and is deleted whatever happened: it is in a folder the user owns.
+fn headers_of_installed(
     elevate: Elevator,
     agent: &Path,
     dir: &Path,
-) -> Result<InstalledConfig, SetupError> {
+) -> Result<std::collections::BTreeMap<String, String>, SetupError> {
     let ini = dir.join("agent.ini");
     let _ = std::fs::remove_file(&ini);
     let ran = run_elevated(elevate, agent, dir, "read-config");
     let text = std::fs::read(&ini).map(|b| decode_ini(&b));
-    // the copy holds the key: gone before anything else happens
     let _ = std::fs::remove_file(&ini);
     ran?;
     let text = text.map_err(|e| SetupError::io("cannot read the installed settings", e))?;
-    parse_installed(text)
-}
-
-#[tauri::command(async)]
-pub fn read_existing(state: Shared) -> Result<Existing, SetupError> {
-    let (agent, dir) = staged(&state)?;
-    let loaded = read_existing_in(&elevate::run, &agent, &dir)?;
-    let mut guard = lock(&state);
-    guard.conn = Some(loaded.conn);
-    guard.ini_text = Some(loaded.text);
-    Ok(loaded.existing)
+    Config::from_text(&text)
+        .and_then(|cfg| cfg.http_settings())
+        .map(|settings| settings.headers)
+        .map_err(|_| SetupError::new("system", "The installed agent.ini cannot be read."))
 }
 
 fn sumatra_in(dir: &Path) -> PathBuf {
@@ -654,7 +592,6 @@ fn apply_in(
     agent: &Path,
     dir: &Path,
     request: &ApplyRequest,
-    existing: Option<&str>,
 ) -> Result<Applied, SetupError> {
     let new_conn = match (&request.server_url, &request.api_key, &request.name) {
         (Some(url), Some(key), Some(name)) => {
@@ -662,14 +599,13 @@ fn apply_in(
         }
         _ => None,
     };
-    if new_conn.is_none() && existing.is_none() {
+    if new_conn.is_none() {
         return Err(SetupError::new(
             "system",
             "There is no connection to install with. Go back to the first step.",
         ));
     }
     let text = build_ini(
-        existing,
         new_conn
             .as_ref()
             .map(|(u, k, n)| (u.as_str(), k.as_str(), n.as_str())),
@@ -769,14 +705,13 @@ fn start_installed_tray() {
 }
 
 /// Does this install merge into the installed `agent.ini` instead of writing a new one? A new
-/// connection over an installed agent does when this window has not read the file (the settings
-/// window only knows the status file): `[headers]` and `timeout` of the installed file must
-/// survive, and reading it first would be a second administrator prompt. So the connection goes
-/// into the staging folder as a patch, and the elevated install merges it, like any other change.
-/// A first install has nothing to keep, a window that read the file builds on it itself, and a
-/// change of printers does not touch the connection.
-fn merges_into_installed(text_known: bool, new_connection: bool, installed_by_setup: bool) -> bool {
-    !text_known && new_connection && installed_by_setup
+/// connection over an installed agent does: `[headers]` and `timeout` of the installed file must
+/// survive, and the window never reads that file (it holds the key, which may be stored encrypted).
+/// So the connection goes into the staging folder as a patch, and the elevated install merges it,
+/// like any other change. A first install has nothing to keep, and a change of printers does not
+/// touch the connection.
+fn merges_into_installed(new_connection: bool, installed_by_setup: bool) -> bool {
+    new_connection && installed_by_setup
 }
 
 /// `elevate::run` for the commands that end icons: they are told to spare this window.
@@ -788,13 +723,8 @@ fn window_elevator() -> impl Fn(&Path, &[&OsStr]) -> Result<(), Elevate> {
 pub fn apply(state: Shared, request: ApplyRequest) -> Result<f64, SetupError> {
     let (agent, dir) = staged(&state)?;
     let tray_staged = stage_own_tray(&dir)?;
-    let existing = lock(&state).ini_text.clone();
     let elevate = window_elevator();
-    let merged = merges_into_installed(
-        existing.is_some(),
-        request.server_url.is_some(),
-        layout().marker.is_file(),
-    );
+    let merged = merges_into_installed(request.server_url.is_some(), layout().marker.is_file());
     let applied = if merged {
         // the window has no key to ask the server with: its wait reads the status file
         apply_over_installed_in(&elevate, &agent, &dir, &request).map(|baseline| Applied {
@@ -802,7 +732,7 @@ pub fn apply(state: Shared, request: ApplyRequest) -> Result<f64, SetupError> {
             conn: None,
         })
     } else {
-        apply_in(&elevate, &agent, &dir, &request, existing.as_deref())
+        apply_in(&elevate, &agent, &dir, &request)
     };
     restart_icon(
         &applied,
@@ -1020,15 +950,15 @@ pub fn restart_agent(state: Shared) -> Result<f64, SetupError> {
     restart_in(&elevate::run, &agent, &dir)
 }
 
-/// The `[headers]` of the installed file, read by an elevated `read-config` like the key would be.
-/// Only the headers go back to the window.
+/// The `[headers]` of the installed file, for Settings, Advanced, "show header values".
 fn header_values_in(
     elevate: Elevator,
     agent: &Path,
     dir: &Path,
 ) -> Result<Vec<(String, String)>, SetupError> {
-    let loaded = read_existing_in(elevate, agent, dir)?;
-    Ok(loaded.conn.settings.headers.into_iter().collect())
+    Ok(headers_of_installed(elevate, agent, dir)?
+        .into_iter()
+        .collect())
 }
 
 #[tauri::command(async)]
@@ -1040,6 +970,7 @@ pub fn header_values(state: Shared) -> Result<Vec<(String, String)>, SetupError>
 #[cfg(test)]
 mod tests {
     use super::*;
+    use printpapi_agent::config::parse_printers;
     use serde_json::json;
     use std::cell::Cell;
 
@@ -1119,7 +1050,6 @@ mod tests {
     #[test]
     fn a_new_install_writes_every_setting_and_keeps_umlauts() {
         let text = build_ini(
-            None,
             Some(("https://print.example.com", "KEY%1", "Büro-PC")),
             &[choice("Büro Drucker", true, None)],
         )
@@ -1135,26 +1065,8 @@ mod tests {
     }
 
     #[test]
-    fn changing_printers_leaves_everything_else_of_the_file_alone() {
-        let before = "# mine\n[agent]\nserver_url = https://x\napi_key = K\nname = pc\nprinters = Old\n\n[headers]\nCF-Access = abc\n";
-        let text = build_ini(Some(before), None, &[choice("New", false, None)]).unwrap();
-        assert!(text.contains("# mine"));
-        assert!(text.contains("api_key = K"));
-        assert!(text.contains("[headers]\nCF-Access = abc"));
-        assert!(text.contains("printers = New"));
-        assert!(!text.contains("Old"));
-    }
-
-    #[test]
     fn a_printer_the_file_cannot_spell_is_refused() {
-        assert!(
-            build_ini(
-                None,
-                Some(("https://x", "k", "n")),
-                &[choice("a;b", false, None)]
-            )
-            .is_err()
-        );
+        assert!(build_ini(Some(("https://x", "k", "n")), &[choice("a;b", false, None)]).is_err());
     }
 
     #[test]
@@ -1194,10 +1106,9 @@ mod tests {
         let mut state = AppState::default();
         let dir = state.staging().unwrap().dir().to_path_buf();
         std::fs::write(dir.join("agent.ini"), "key").unwrap();
-        state.ini_text = Some("key".into());
         state.clear();
         assert!(!dir.exists());
-        assert!(state.staging.is_none() && state.conn.is_none() && state.ini_text.is_none());
+        assert!(state.staging.is_none() && state.conn.is_none());
     }
 
     /// A one-shot HTTP server on loopback: answers the first request with `status_line` and `body`
@@ -1361,7 +1272,8 @@ mod tests {
     // ---- the installed agent.ini
 
     const KEY: &str = "SECRET-KEY-123";
-    const INSTALLED: &str = "[agent]\nserver_url = https://x/\napi_key = SECRET-KEY-123\nname = pc\nprinters = Büro Drucker|pdf\n\n[headers]\nCF-Access = abc\n";
+    /// What `read-config` leaves in the staging folder: the headers, never the key.
+    const HEADERS_ONLY: &str = "[headers]\nCF-Access = abc\n";
 
     fn staging_dir_of(args: &[&OsStr]) -> PathBuf {
         PathBuf::from(args[1])
@@ -1381,39 +1293,7 @@ mod tests {
     }
 
     #[test]
-    fn a_hand_edited_server_url_is_read_the_way_the_agent_reads_it() {
-        let loaded = parse_installed(INSTALLED.replace("https://x/", "https://x//")).unwrap();
-        assert_eq!(loaded.conn.server_url, "https://x");
-        assert_eq!(loaded.existing.server_url, "https://x");
-        assert_eq!(loaded.conn.name, "pc");
-        assert_eq!(loaded.conn.settings.headers.len(), 1);
-        assert_eq!(
-            loaded.existing.printers,
-            vec![choice("Büro Drucker", true, None)]
-        );
-        assert_eq!(loaded.text, INSTALLED.replace("https://x/", "https://x//"));
-    }
-
-    #[test]
-    fn an_agent_ini_without_a_key_or_with_a_broken_printer_list_is_unreadable() {
-        for text in [
-            "[agent]\nserver_url = https://x\nprinters = A\n",
-            "[agent]\napi_key = k\nprinters = A\n",
-            "[agent]\nserver_url = https://x\napi_key = k\nprinters = a;;\n= \n",
-            "[agent]
-server_url = https://x
-api_key = k
-printers = Z = socket://nohost
-",
-            "not an ini [",
-        ] {
-            let e = parse_installed(text.into()).err().expect(text);
-            assert_eq!(e.code, "system", "{text}");
-        }
-    }
-
-    #[test]
-    fn reading_the_installed_file_hands_over_its_settings_but_never_the_key_to_the_window() {
+    fn header_values_come_from_a_copy_that_holds_only_the_headers_and_is_deleted() {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path();
         // a copy left behind by an earlier run must not be taken for this one's
@@ -1422,20 +1302,20 @@ printers = Z = socket://nohost
             assert_eq!(args[0], "read-config");
             let dir = staging_dir_of(args);
             assert!(!dir.join("agent.ini").exists());
-            std::fs::write(dir.join("agent.ini"), INSTALLED).unwrap();
+            std::fs::write(dir.join("agent.ini"), HEADERS_ONLY).unwrap();
             write_result(&dir, json!({"ok": true}));
             Ok(())
         };
-        let loaded = read_existing_in(&elevate, Path::new("agent"), dir).unwrap();
+        let headers = headers_of_installed(&elevate, Path::new("agent"), dir).unwrap();
         assert!(!dir.join("agent.ini").exists());
-        assert_eq!(loaded.conn.api_key, KEY);
-        let for_the_window = serde_json::to_string(&loaded.existing).unwrap();
-        assert!(!for_the_window.contains(KEY), "{for_the_window}");
-        assert!(for_the_window.contains("\"serverUrl\":\"https://x\""));
+        assert_eq!(
+            headers.into_iter().collect::<Vec<_>>(),
+            vec![("cf-access".to_string(), "abc".to_string())]
+        );
     }
 
     #[test]
-    fn the_copy_with_the_key_is_deleted_after_a_failed_or_cancelled_read() {
+    fn the_copy_is_deleted_after_a_failed_or_cancelled_read() {
         for (outcome, result, code) in [
             (
                 Err(Elevate::Failed("exit 1".into())),
@@ -1450,15 +1330,13 @@ printers = Z = socket://nohost
             let dir = tmp.path();
             let elevate = |_: &Path, args: &[&OsStr]| {
                 let dir = staging_dir_of(args);
-                std::fs::write(dir.join("agent.ini"), INSTALLED).unwrap();
+                std::fs::write(dir.join("agent.ini"), HEADERS_ONLY).unwrap();
                 if let Some(r) = &result {
                     write_result(&dir, r.clone());
                 }
                 outcome.clone()
             };
-            let e = read_existing_in(&elevate, Path::new("agent"), dir)
-                .err()
-                .expect("an error");
+            let e = headers_of_installed(&elevate, Path::new("agent"), dir).expect_err("an error");
             assert_eq!(e.code, code);
             assert!(!dir.join("agent.ini").exists(), "{code}");
         }
@@ -1471,9 +1349,8 @@ printers = Z = socket://nohost
             write_result(&staging_dir_of(args), json!({"ok": true}));
             Ok(())
         };
-        let e = read_existing_in(&elevate, Path::new("agent"), tmp.path())
-            .err()
-            .expect("an error");
+        let e =
+            headers_of_installed(&elevate, Path::new("agent"), tmp.path()).expect_err("an error");
         assert_eq!(e.code, "system");
         assert_eq!(names_in(tmp.path()), ["result.json"]);
     }
@@ -1518,7 +1395,7 @@ printers = Z = socket://nohost
             Some(("https://x/", KEY, "pc")),
             vec![choice("Büro", true, None)],
         );
-        let applied = apply_in(&elevate, Path::new("agent"), dir, &req, None).unwrap();
+        let applied = apply_in(&elevate, Path::new("agent"), dir, &req).unwrap();
         assert_eq!(applied.baseline, 12.5);
         let conn = applied.conn.expect("a new connection");
         assert_eq!(
@@ -1555,7 +1432,7 @@ printers = Z = socket://nohost
                 Some(("https://x", KEY, "pc")),
                 vec![choice("A", false, None)],
             );
-            let e = apply_in(&elevate, Path::new("agent"), dir, &req, None)
+            let e = apply_in(&elevate, Path::new("agent"), dir, &req)
                 .err()
                 .expect("an error");
             assert_eq!(e.code, code);
@@ -1572,7 +1449,7 @@ printers = Z = socket://nohost
             Ok(())
         };
         let req = request(None, vec![choice("A", false, None)]);
-        let e = apply_in(&elevate, Path::new("agent"), tmp.path(), &req, None)
+        let e = apply_in(&elevate, Path::new("agent"), tmp.path(), &req)
             .err()
             .expect("an error");
         assert_eq!(e.code, "system");
@@ -1584,78 +1461,12 @@ printers = Z = socket://nohost
             Some(("https://x", KEY, "pc")),
             vec![choice("a;b", false, None)],
         );
-        let e = apply_in(&elevate, Path::new("agent"), tmp.path(), &req, None)
+        let e = apply_in(&elevate, Path::new("agent"), tmp.path(), &req)
             .err()
             .expect("an error");
         assert_eq!(e.code, "printers");
         assert!(!asked.get());
         assert!(names_in(tmp.path()).is_empty());
-    }
-
-    #[test]
-    fn changing_printers_rewrites_only_them_and_keeps_the_connection() {
-        let tmp = tempfile::tempdir().unwrap();
-        let elevate = |_: &Path, args: &[&OsStr]| {
-            let dir = staging_dir_of(args);
-            let ini = std::fs::read_to_string(dir.join("agent.ini")).unwrap();
-            assert!(ini.contains("printers = New"), "{ini}");
-            assert!(ini.contains("[headers]\nCF-Access = abc"), "{ini}");
-            assert!(ini.contains("server_url = https://x/"), "{ini}");
-            write_result(&dir, json!({"ok": true, "baseline_last_seen": 3.0}));
-            Ok(())
-        };
-        let req = request(None, vec![choice("New", false, None)]);
-        let applied = apply_in(
-            &elevate,
-            Path::new("agent"),
-            tmp.path(),
-            &req,
-            Some(INSTALLED),
-        )
-        .unwrap();
-        assert_eq!(applied.baseline, 3.0);
-        assert!(applied.conn.is_none());
-        assert!(!tmp.path().join("agent.ini").exists());
-    }
-
-    #[test]
-    fn a_new_connection_keeps_the_headers_and_the_timeout_of_the_installed_file() {
-        let tmp = tempfile::tempdir().unwrap();
-        let installed = INSTALLED.replace("name = pc\n", "name = pc\ntimeout = 45\n");
-        let elevate = |_: &Path, args: &[&OsStr]| {
-            let dir = staging_dir_of(args);
-            let ini = std::fs::read_to_string(dir.join("agent.ini")).unwrap();
-            // the new server, key and name replace the old ones, nothing of the old key is left
-            assert!(ini.contains("server_url = https://y\n"), "{ini}");
-            assert!(ini.contains("api_key = NEW\n"), "{ini}");
-            assert!(ini.contains("name = pc2\n"), "{ini}");
-            assert!(!ini.contains(KEY) && !ini.contains("https://x"), "{ini}");
-            // what the connection did not change stays: the headers an auth proxy needs, and the
-            // timeout (they can be changed under Advanced)
-            assert!(ini.contains("[headers]\nCF-Access = abc"), "{ini}");
-            assert!(ini.contains("timeout = 45\n"), "{ini}");
-            write_result(&dir, json!({"ok": true, "baseline_last_seen": 2.0}));
-            Ok(())
-        };
-        let req = request(
-            Some(("https://y", "NEW", "pc2")),
-            vec![choice("A", false, None)],
-        );
-        let applied = apply_in(
-            &elevate,
-            Path::new("agent"),
-            tmp.path(),
-            &req,
-            Some(&installed),
-        )
-        .unwrap();
-        // the wait that follows asks the new server with the same headers and timeout
-        let settings = applied.conn.unwrap().settings;
-        assert_eq!(settings.timeout, 45.0);
-        assert_eq!(
-            settings.headers.get("cf-access").map(String::as_str),
-            Some("abc")
-        );
     }
 
     #[test]
@@ -1675,7 +1486,7 @@ printers = Z = socket://nohost
             Some(("https://y", "NEW", "pc2")),
             vec![choice("A", false, None)],
         );
-        let applied = apply_in(&elevate, Path::new("agent"), tmp.path(), &req, None).unwrap();
+        let applied = apply_in(&elevate, Path::new("agent"), tmp.path(), &req).unwrap();
         assert_eq!(applied.conn.unwrap().settings, HttpSettings::default());
     }
 
@@ -1683,11 +1494,10 @@ printers = Z = socket://nohost
     fn a_new_connection_over_an_installed_agent_is_merged_by_the_agent_not_read_by_the_window() {
         // the settings window knows no text of the installed file: reading it would be a second
         // administrator prompt, so the elevated install merges the connection into it instead
-        assert!(merges_into_installed(false, true, true));
-        // already read in this window (the wizard), a change of printers, or a first install
-        assert!(!merges_into_installed(true, true, true));
-        assert!(!merges_into_installed(false, false, true));
-        assert!(!merges_into_installed(false, true, false));
+        assert!(merges_into_installed(true, true));
+        // a change of printers (a patch of its own), or a first install
+        assert!(!merges_into_installed(false, true));
+        assert!(!merges_into_installed(true, false));
     }
 
     #[test]
@@ -1984,14 +1794,14 @@ printers = Z = socket://nohost
     }
 
     #[test]
-    fn header_values_come_from_the_installed_file_and_the_key_stays_here() {
+    fn header_values_come_from_the_headers_only_copy_and_the_key_never_reaches_this_side() {
         let tmp = tempfile::tempdir().unwrap();
         let elevate = |_: &Path, args: &[&OsStr]| {
             assert_eq!(args[0], "read-config");
             let dir = staging_dir_of(args);
             std::fs::write(
                 dir.join("agent.ini"),
-                INSTALLED.replace("CF-Access = abc", "CF-Access = abc\nX-Other = 100%"),
+                HEADERS_ONLY.replace("CF-Access = abc", "CF-Access = abc\nX-Other = 100%"),
             )
             .unwrap();
             write_result(&dir, json!({"ok": true}));

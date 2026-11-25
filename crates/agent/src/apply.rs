@@ -9,6 +9,10 @@
 //! instead of a whole `agent.ini`, an optional `patch.json` that it merges into the installed
 //! `agent.ini` itself, so a change needs the key neither in the window nor in a second prompt.
 //!
+//! `read-config` hands the window only the `[headers]` of the installed file, never the key.
+//! `unprotect-key` (typed by a person on an administrator console, no staging folder) writes the
+//! key back as plain text and sets `seal_key = no`.
+//!
 //! The key lives in `<dir>/agent.ini`, never in argv. The outcome goes back as `<dir>/result.json`
 //! (the elevation prompt separates the output from the calling window).
 //!
@@ -28,6 +32,7 @@ use crate::config::{
     Config, HttpSettings, Printer, apply_patch, decode_ini, parse_patch, parse_printers,
 };
 use crate::install::{self, Layout, Os};
+use crate::keystore::{self, KeyStore};
 use crate::proc::{Runner, real_runner};
 
 /// SumatraPDF 3.6.1 (64 bit), pinned: 3.7 and later need a DLL next to the exe, and `orientation`
@@ -81,9 +86,9 @@ impl fmt::Display for ApplyError {
                 "This key already belongs to another device. Create a new key in the dashboard.",
             ),
             ApplyError::NameTaken => f.write_str(
-                "The server refused this key. Either the key was revoked, or this device name \
-                 belongs to a different key. Check the key on the Keys page of your dashboard, \
-                 or pick another name.",
+                "The server refused this key. Either the key was revoked or is not meant for \
+                 agents, or this device name belongs to a different key. Check the key on the \
+                 Keys page of your dashboard, or pick another name.",
             ),
             ApplyError::Proxy => f.write_str(
                 "A proxy or firewall in front of the server refused the agent's request. Add the \
@@ -117,6 +122,8 @@ pub struct Env<'a> {
     pub owner_sid: &'a dyn Fn(&Path) -> Option<String>,
     /// Whether a process serves a FUSE mount (Linux only; the process of an AppImage's mount).
     pub serves_mount: &'a dyn Fn(u32) -> bool,
+    /// The system's store for the agent key (DPAPI on Windows), `None` where the file keeps it.
+    pub keystore: Option<KeyStore>,
 }
 
 fn bad(msg: impl Into<String>) -> ApplyError {
@@ -197,6 +204,9 @@ struct Staged {
     printers: Vec<Printer>,
     sumatra: Option<Vec<u8>>,
     tray: Option<TrayStaged>,
+    /// The key came out of the installed `api_key_dpapi` (a patch that does not name a new one),
+    /// so the file must stay sealed or the change must not happen.
+    was_sealed: bool,
 }
 
 /// The tray icon program as staged.
@@ -219,11 +229,13 @@ fn required(cfg: &Config, key: &str) -> Result<String, ApplyError> {
 }
 
 /// The `agent.ini` text to install: the staged file, or, when only a `patch.json` is staged, the
-/// installed file with the patch merged in. The installed file is looked at only after the install
-/// folder passed its checks, because this runs as root and would follow a planted link.
-fn staged_ini_text(staging: &Path, env: &Env) -> Result<String, ApplyError> {
+/// installed file with the patch merged in (and whether its key was stored encrypted). The installed
+/// file is looked at only after the install folder passed its checks, because this runs as root and
+/// would follow a planted link. A staged file is never opened as a sealed one: the folder is
+/// writable by the user who started the setup.
+fn staged_ini_text(staging: &Path, env: &Env) -> Result<(String, bool), ApplyError> {
     match std::fs::read(staging.join("agent.ini")) {
-        Ok(bytes) => Ok(decode_ini(&bytes)),
+        Ok(bytes) => Ok((decode_ini(&bytes), false)),
         Err(e)
             if e.kind() == std::io::ErrorKind::NotFound
                 && std::fs::symlink_metadata(staging.join("patch.json")).is_ok() =>
@@ -235,8 +247,23 @@ fn staged_ini_text(staging: &Path, env: &Env) -> Result<String, ApplyError> {
             check_install_dir(&env.layout)?;
             let installed = std::fs::read(&env.layout.ini)
                 .map_err(|e| system("cannot read the installed agent.ini", e))?;
+            let installed = decode_ini(&installed);
+            // A new connection brings its own key and drops the stored one, so an unreadable
+            // blob must not block the repair. Any other change needs the key: the install
+            // registers with it.
+            let (base, was_sealed) = if patch.connection.is_some() {
+                (installed, false)
+            } else {
+                match keystore::open(&installed, env.keystore.as_ref()) {
+                    Ok(Some(opened)) => (opened, true),
+                    Ok(None) => (installed, false),
+                    Err(text) => return Err(ApplyError::System(text)),
+                }
+            };
             // the messages of `apply_patch` never quote the file: it holds the key
-            apply_patch(&decode_ini(&installed), &patch).map_err(bad)
+            apply_patch(&base, &patch)
+                .map(|text| (text, was_sealed))
+                .map_err(bad)
         }
         Err(e) => Err(bad(format!("agent.ini cannot be read: {e}"))),
     }
@@ -334,7 +361,7 @@ fn staged_tray(staging: &Path, os: Os) -> Result<Option<TrayStaged>, ApplyError>
 
 fn read_staged(staging: &Path, env: &Env, sumatra_sha: &str) -> Result<Staged, ApplyError> {
     check_staging(staging)?;
-    let text = staged_ini_text(staging, env)?;
+    let (text, was_sealed) = staged_ini_text(staging, env)?;
     // No parser text goes into an error from here on: the key never shows up in an output, and
     // the parsers quote the lines and values they choke on.
     let cfg = Config::from_text(&text).map_err(|_| {
@@ -379,6 +406,7 @@ fn read_staged(staging: &Path, env: &Env, sumatra_sha: &str) -> Result<Staged, A
         printers,
         sumatra,
         tray,
+        was_sealed,
     })
 }
 
@@ -437,7 +465,12 @@ fn set_mode(_: &Path, _: u32) -> std::io::Result<()> {
 
 /// A new file at `path` that only this process has open. On Unix it is created with `mode` (the
 /// umask of the caller can only narrow it), so it is never wider than that, not even for a moment.
-fn create_new_file(path: &Path, mode: u32) -> std::io::Result<std::fs::File> {
+///
+/// On Windows nobody else can open it while the handle lives (share mode 0): `write_ini` holds it
+/// across the rights commands, so a handle that a user opened in the gap cannot keep read access to
+/// what is written afterwards.
+/// https://doc.rust-lang.org/std/os/windows/fs/trait.OpenOptionsExt.html#tymethod.share_mode
+pub(crate) fn create_new_file(path: &Path, mode: u32) -> std::io::Result<std::fs::File> {
     // a leftover of a run that died keeps its owner and rights when written into again
     match std::fs::remove_file(path) {
         Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e),
@@ -449,6 +482,11 @@ fn create_new_file(path: &Path, mode: u32) -> std::io::Result<std::fs::File> {
     {
         use std::os::unix::fs::OpenOptionsExt;
         opts.mode(mode);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        opts.share_mode(0);
     }
     #[cfg(not(unix))]
     let _ = mode;
@@ -489,11 +527,16 @@ fn install_binary(from: &Path, to: &Path) -> std::io::Result<()> {
 fn write_ini(env: &Env, text: &str) -> Result<(), ApplyError> {
     let tmp = env.layout.ini.with_file_name(".agent.ini.new");
     let result = (|| {
-        create_new_file(&tmp, 0o600).map_err(|e| system("cannot create agent.ini", e))?;
+        // the handle stays open across the rights commands and the write, and is closed before the
+        // rename (Windows refuses to rename an open file)
+        let mut file =
+            create_new_file(&tmp, 0o600).map_err(|e| system("cannot create agent.ini", e))?;
         for c in install::ini_acl_cmds(env.os, &tmp, &env.sys) {
             (env.run)(&c).map_err(|e| system("cannot restrict agent.ini", e))?;
         }
-        std::fs::write(&tmp, text.as_bytes()).map_err(|e| system("cannot write agent.ini", e))?;
+        file.write_all(text.as_bytes())
+            .map_err(|e| system("cannot write agent.ini", e))?;
+        drop(file);
         std::fs::rename(&tmp, &env.layout.ini).map_err(|e| system("cannot replace agent.ini", e))
     })();
     if result.is_err() {
@@ -585,6 +628,9 @@ pub struct Baselines {
     /// The time on this computer right before the agent was started, for a window that has no key
     /// and reads the status file's `last_contact` (the agent's clock is this computer's).
     pub local: f64,
+    /// Windows only: whether the key went into `agent.ini` encrypted. `None` on a system that has
+    /// no store for it.
+    pub key_sealed: Option<bool>,
 }
 
 /// Install. Returns the [`Baselines`] the window compares against to know the agent really started.
@@ -593,10 +639,34 @@ pub fn apply(staging: &Path, env: &Env) -> Result<Baselines, ApplyError> {
 }
 
 fn apply_with(staging: &Path, env: &Env, sumatra_sha: &str) -> Result<Baselines, ApplyError> {
-    let staged = read_staged(staging, env, sumatra_sha)?;
+    let mut staged = read_staged(staging, env, sumatra_sha)?;
     let l = &env.layout;
     // before the server or the machine is touched
     check_install_dir(l)?;
+    // Before the server and every stop command, so a refusal changes nothing. An install is the
+    // only place that seals: every first install, reinstall and change of the settings ends here.
+    let key_sealed = match keystore::seal(&staged.text, env.keystore.as_ref()) {
+        Ok(Some(sealed)) => {
+            staged.text = sealed;
+            Some(true)
+        }
+        Ok(None) => env.keystore.is_some().then_some(false),
+        // a file that was sealed is never rewritten as plain text because the store failed now
+        Err(_) if staged.was_sealed => {
+            return Err(ApplyError::System(
+                "The key could not be encrypted again, so nothing was changed. The agent keeps running with the old settings."
+                    .into(),
+            ));
+        }
+        // a print station must not fail to install because of encryption at rest: the file stays
+        // plain under today's rights, never worse than before this run
+        Err(_) => {
+            crate::err_line(
+                "The key could not be encrypted on this Windows installation, so agent.ini keeps it as plain text (readable for administrators and SYSTEM only).",
+            );
+            Some(false)
+        }
+    };
 
     // Registering first: it is where a wrong key, a taken name or a proxy show up, and until it
     // worked nothing on the machine or the server has changed.
@@ -643,14 +713,16 @@ fn apply_with(staging: &Path, env: &Env, sumatra_sha: &str) -> Result<Baselines,
     if staged.tray.is_some() {
         stop_trays(env);
     }
-    replace_install(env, &staged, &*http, computer_id, first_seen).inspect_err(|_| {
-        if was_installed {
-            // best effort: the original error is the one the window shows
-            for c in install::start_cmds(env.os, l, &env.sys) {
-                let _ = (env.run)(&c);
+    replace_install(env, &staged, &*http, computer_id, first_seen)
+        .map(|b| Baselines { key_sealed, ..b })
+        .inspect_err(|_| {
+            if was_installed {
+                // best effort: the original error is the one the window shows
+                for c in install::start_cmds(env.os, l, &env.sys) {
+                    let _ = (env.run)(&c);
+                }
             }
-        }
-    })
+        })
 }
 
 /// Everything after the old agent is stopped: files, key, marker, autostart, start. Returns the
@@ -697,7 +769,11 @@ fn replace_install(
     // new agent's first one
     let local = (env.now)();
     start_agent(env)?;
-    Ok(Baselines { last_seen, local })
+    Ok(Baselines {
+        last_seen,
+        local,
+        key_sealed: None,
+    })
 }
 
 /// End the tray icons of all sessions but the window that asked (`env.keep_pid`). Failures are
@@ -1291,13 +1367,63 @@ pub fn remove(env: &Env) -> Result<(), ApplyError> {
     .map_err(|e| system("cannot delete the install folder", e))
 }
 
-/// Copy the protected `agent.ini` into the staging folder for "change printers", owned by whoever
-/// owns that folder.
+/// Write what the window may know of the protected `agent.ini` into the staging folder, owned by
+/// whoever owns that folder: only the `[headers]`, which Settings shows. Never the key, a stored
+/// key or anything else of `[agent]`: the folder belongs to the user who started the setup.
 pub fn export_config(staging: &Path, env: &Env) -> Result<(), ApplyError> {
     check_install_dir(&env.layout)?;
     let ini = std::fs::read(&env.layout.ini)
         .map_err(|e| system("cannot read the installed agent.ini", e))?;
-    write_fresh(staging, "agent.ini", &ini).map_err(|e| system("cannot write the copy", e))
+    let unreadable = || ApplyError::System("The installed agent.ini cannot be read.".into());
+    let settings = Config::from_text(&decode_ini(&ini))
+        .and_then(|cfg| cfg.http_settings())
+        .map_err(|_| unreadable())?;
+    let mut copy = String::from("[headers]\n");
+    for (name, value) in &settings.headers {
+        copy.push_str(&format!("{name} = {}\n", value.replace('\n', "\n\t")));
+    }
+    write_fresh(staging, "agent.ini", copy.as_bytes())
+        .map_err(|e| system("cannot write the copy", e))
+}
+
+/// What `unprotect-key` says when there is no store on this system.
+const PLAIN_ANYWAY: &str = "This system keeps the key as plain text in agent.ini, readable for administrators and the agent only.";
+/// What `unprotect-key` says when it is done (also when the key was plain already).
+const UNPROTECTED: &str = "agent.ini holds the key as plain text, for administrators only. Later changes leave it that way (seal_key = no).";
+
+/// `printpapi-agent unprotect-key`: the installed `agent.ini` gets the key as plain text and
+/// `seal_key = no`, so later changes keep it that way. It is the opt-out and the way back before
+/// an older version or the Python agent is used. The running agent needs no restart. Returns what
+/// to tell the person; the key is never part of it.
+pub fn unprotect_key(env: &Env) -> Result<&'static str, ApplyError> {
+    let Some(store) = env.keystore.as_ref() else {
+        return Ok(PLAIN_ANYWAY);
+    };
+    check_install_dir(&env.layout)?;
+    if !env.layout.marker.is_file() {
+        return Err(ApplyError::System(
+            "This agent was not installed by the setup, so the setup leaves it alone.".into(),
+        ));
+    }
+    let ini = std::fs::read(&env.layout.ini)
+        .map_err(|e| system("cannot read the installed agent.ini", e))?;
+    let text = decode_ini(&ini);
+    let text = match keystore::open(&text, Some(store)) {
+        Ok(Some(opened)) => opened,
+        Ok(None) => text,
+        Err(message) => return Err(ApplyError::System(message)),
+    };
+    let has_key = Config::from_text(&text)
+        .ok()
+        .and_then(|cfg| cfg.get("api_key").ok().flatten())
+        .is_some_and(|key| !key.is_empty());
+    if !has_key {
+        return Err(ApplyError::System(
+            "The installed agent.ini has no key to keep as plain text.".into(),
+        ));
+    }
+    write_ini(env, &keystore::keep_plain(&text))?;
+    Ok(UNPROTECTED)
 }
 
 /// `result.json` in the staging folder.
@@ -1371,6 +1497,7 @@ pub fn cli(args: &[String]) -> Option<ExitCode> {
             delete_at_reboot: &delete_at_reboot,
             owner_sid: &owner_sid,
             serves_mount: &serves_mount,
+            keystore: keystore::host(),
         })
         .map_err(|e| system("cannot find the running program", e));
     run_args(args, env.as_ref().map_err(Clone::clone)).map(ExitCode::from)
@@ -1400,16 +1527,38 @@ fn parse_pid(text: &str) -> Option<u32> {
     text.parse().ok()
 }
 
+/// `unprotect-key` for `run_args`: 0 done, 1 failed, 2 a wrong call.
+fn run_unprotect_key(args: &[String], env: Result<&Env, ApplyError>) -> u8 {
+    if args.len() != 1 {
+        crate::err_line("usage: printpapi-agent unprotect-key");
+        return 2;
+    }
+    match env.and_then(unprotect_key) {
+        Ok(text) => {
+            crate::out_line(text);
+            0
+        }
+        Err(e) => {
+            crate::err_line(&e.to_string());
+            1
+        }
+    }
+}
+
 /// `cli` with the machine handed in, so tests never touch the real one. The exit code is 0 for
 /// success, 1 for a failure and 2 for a wrong call.
 fn run_args(args: &[String], env: Result<&Env, ApplyError>) -> Option<u8> {
+    // typed by a person on an administrator console, no staging folder and no result.json
+    if args.first().map(String::as_str) == Some("unprotect-key") {
+        return Some(run_unprotect_key(args, env));
+    }
     let command = match args.first().map(String::as_str) {
         Some(c @ ("install" | "uninstall" | "read-config" | "restart")) => c,
         _ => return None,
     };
     let usage = || {
         crate::err_line(
-            "usage: printpapi-agent install|uninstall|read-config|restart <staging folder> [--keep-pid <number>]",
+            "usage: printpapi-agent install|uninstall|read-config|restart <staging folder> [--keep-pid <number>]\n       printpapi-agent unprotect-key",
         );
         Some(2)
     };
@@ -1429,9 +1578,13 @@ fn run_args(args: &[String], env: Result<&Env, ApplyError>) -> Option<u8> {
     let outcome =
         env.as_ref().map_err(Clone::clone).and_then(|env| {
             match command {
-        "install" => apply(staging, env).map(
-            |b| json!({"ok": true, "baseline_last_seen": b.last_seen, "baseline_local": b.local}),
-        ),
+        "install" => apply(staging, env).map(|b| {
+            let mut done = json!({"ok": true, "baseline_last_seen": b.last_seen, "baseline_local": b.local});
+            if let Some(sealed) = b.key_sealed {
+                done["key_sealed"] = json!(sealed);
+            }
+            done
+        }),
         "uninstall" => remove(env).map(|()| json!({"ok": true})),
         "restart" => restart(env).map(|b| json!({"ok": true, "baseline_local": b})),
         _ => export_config(staging, env).map(|()| json!({"ok": true})),
@@ -1522,6 +1675,11 @@ mod tests {
         task_states: Rc<RefCell<std::collections::VecDeque<String>>>,
         /// the seconds `sleep` was asked for
         slept: Rc<RefCell<Vec<u64>>>,
+        /// what opening the new agent.ini by somebody else gave while a rights command ran (the
+        /// OS error code, `None` when the open worked)
+        probes: Rc<RefCell<Vec<Option<i32>>>>,
+        /// the store of the system: a reversible fake on a Windows fixture, none elsewhere
+        keystore: std::cell::Cell<Option<KeyStore>>,
         /// whether a look at the clock shows up in the events (as "baseline_local")
         note_now: Rc<std::cell::Cell<bool>>,
         /// the process id of the window that asked, which the icons' end spares
@@ -1593,18 +1751,20 @@ mod tests {
             let plant: Rc<RefCell<Vec<(String, PathBuf)>>> = Rc::default();
             let task_states: Rc<RefCell<std::collections::VecDeque<String>>> = Rc::default();
             let slept: Rc<RefCell<Vec<u64>>> = Rc::default();
+            let probes: Rc<RefCell<Vec<Option<i32>>>> = Rc::default();
             let note_now: Rc<std::cell::Cell<bool>> = Rc::default();
             let pids: Rc<RefCell<String>> = Rc::default();
             let at_reboot: Rc<RefCell<Vec<PathBuf>>> = Rc::default();
             let mount_servers: Rc<RefCell<Vec<u32>>> = Rc::default();
             let run: Runner = {
-                let (events, failing, running, plant, task_states, pids) = (
+                let (events, failing, running, plant, task_states, pids, probes) = (
                     events.clone(),
                     failing.clone(),
                     running.clone(),
                     plant.clone(),
                     task_states.clone(),
                     pids.clone(),
+                    probes.clone(),
                 );
                 let layout = layout.clone();
                 Rc::new(move |c| {
@@ -1618,6 +1778,13 @@ mod tests {
                         if let Some(file) = c.argv.iter().find(|a| a.starts_with(&dir)) {
                             let len = std::fs::metadata(file).map(|m| m.len());
                             note.push_str(&format!(" [ini len {len:?}]"));
+                            // somebody else who tries to open it right now
+                            if file.ends_with(".agent.ini.new") {
+                                let tried = std::fs::File::open(file);
+                                probes
+                                    .borrow_mut()
+                                    .push(tried.err().and_then(|e| e.raw_os_error()));
+                            }
                         }
                     }
                     if line.contains("enable") || line.contains("/create") {
@@ -1698,6 +1865,8 @@ mod tests {
                 plant,
                 task_states,
                 slept: slept.clone(),
+                probes,
+                keystore: std::cell::Cell::new((os == Os::Windows).then_some(FAKE_STORE)),
                 note_now: note_now.clone(),
                 keep_pid: Rc::default(),
                 pids,
@@ -1746,6 +1915,7 @@ mod tests {
                 delete_at_reboot: &*self.reboot,
                 owner_sid: &|_| Some("S-1-5-21-1-2-3-1001".into()),
                 serves_mount: &*self.serves,
+                keystore: self.keystore.get(),
             }
         }
 
@@ -1781,6 +1951,8 @@ mod tests {
         let text = ApplyError::NameTaken.to_string();
         assert!(text.contains("revoked"), "{text}");
         assert!(text.contains("name"), "{text}");
+        // a key issued for printing, reading or Star printers is refused with the same 401
+        assert!(text.contains("not meant for agents"), "{text}");
         assert_eq!(ApplyError::NameTaken.code(), "name_taken");
     }
 
@@ -1854,6 +2026,26 @@ mod tests {
         assert!(fx.layout.marker.exists());
         let unit = std::fs::read_to_string(&fx.layout.autostart).unwrap();
         assert!(unit.contains("User=printpapi-agent"), "{unit}");
+    }
+
+    #[test]
+    fn nobody_else_can_open_the_new_agent_ini_while_its_rights_are_set() {
+        // A handle opened between the creation (inherited rights, users may read) and the rights
+        // commands would keep its read access and see the key written afterwards. The new file is
+        // held with share mode 0 across the commands: another open fails with
+        // ERROR_SHARING_VIOLATION (32). Measured: icacls itself works on such a file.
+        let fx = Fixture::new(Os::Windows);
+        apply(&fx.staging, &fx.env()).unwrap();
+        let probes = fx.probes.borrow().clone();
+        assert!(!probes.is_empty());
+        // only Windows can refuse a second open; elsewhere the file is open to anybody the mode allows
+        if cfg!(windows) {
+            assert!(probes.iter().all(|p| *p == Some(32)), "{probes:?}");
+        }
+        // after the rename the file is complete and readable
+        let ini = std::fs::read_to_string(&fx.layout.ini).unwrap();
+        assert!(ini.contains("name = shop-pc"), "{ini}");
+        assert!(!fx.layout.dir.join(".agent.ini.new").exists());
     }
 
     #[test]
@@ -2462,13 +2654,13 @@ mod tests {
     }
 
     #[test]
-    fn export_config_copies_the_protected_ini_over_what_is_there() {
+    fn export_config_replaces_what_is_there_with_the_headers_only() {
         let fx = Fixture::new(Os::Linux);
         apply(&fx.staging, &fx.env()).unwrap();
         std::fs::write(fx.staging.join("agent.ini"), b"old").unwrap();
         export_config(&fx.staging, &fx.env()).unwrap();
         let copy = std::fs::read_to_string(fx.staging.join("agent.ini")).unwrap();
-        assert!(copy.contains("api_key = SECRET-KEY"), "{copy}");
+        assert_eq!(copy, "[headers]\n");
     }
 
     #[test]
@@ -2860,10 +3052,10 @@ mod tests {
         let args = ["read-config".to_string(), dir.clone()];
         assert_eq!(run_args(&args, Ok(&fx.env())), Some(0));
         assert_eq!(result(&fx), json!({"ok": true}));
+        let copy = std::fs::read_to_string(fx.staging.join("agent.ini")).unwrap();
         assert!(
-            std::fs::read_to_string(fx.staging.join("agent.ini"))
-                .unwrap()
-                .contains("api_key = SECRET-KEY")
+            copy.starts_with("[headers]") && !copy.contains("SECRET-KEY"),
+            "{copy}"
         );
         assert!(fx.layout.dir.exists());
         let args = ["uninstall".to_string(), dir.clone()];
@@ -4144,5 +4336,613 @@ X-Via = proxy
         assert!(result()["baseline_local"].as_f64().unwrap() > 1000.0);
         // one argument only, like the others
         assert_eq!(run_args(&["restart".to_string()], Ok(&fx.env())), Some(2));
+    }
+
+    // ---- the key at rest ----
+
+    use crate::keystore::{self, KeyStore};
+
+    fn fake_xor(b: &[u8]) -> std::io::Result<Vec<u8>> {
+        Ok(b.iter().map(|x| x ^ 0x5a).collect())
+    }
+    fn fake_refuse(_: &[u8]) -> std::io::Result<Vec<u8>> {
+        Err(std::io::Error::other("refused"))
+    }
+    const FAKE_STORE: KeyStore = KeyStore {
+        protect: fake_xor,
+        unprotect: fake_xor,
+    };
+    const REFUSING_STORE: KeyStore = KeyStore {
+        protect: fake_refuse,
+        unprotect: fake_xor,
+    };
+
+    impl Fixture {
+        /// A Windows fixture after a first install: the installed file is sealed, nothing is
+        /// recorded of it any more, and a patch can be staged.
+        fn sealed_install(ini: &str) -> Fixture {
+            let fx = Fixture::new(Os::Windows);
+            std::fs::write(fx.staging.join("agent.ini"), ini).unwrap();
+            let b = apply(&fx.staging, &fx.env()).unwrap();
+            assert_eq!(b.key_sealed, Some(true));
+            fx.after_an_elevated_install();
+            fx.events.borrow_mut().clear();
+            fx.seen.borrow_mut().clear();
+            crate::ERR_LINES.with(|l| l.borrow_mut().clear());
+            fx
+        }
+
+        fn installed(&self) -> String {
+            std::fs::read_to_string(&self.layout.ini).unwrap()
+        }
+
+        fn blob(&self) -> String {
+            self.installed()
+                .lines()
+                .find_map(|l| l.strip_prefix("api_key_dpapi = "))
+                .unwrap()
+                .to_string()
+        }
+
+        fn opened(&self) -> Config {
+            let text = keystore::open(&self.installed(), Some(&FAKE_STORE))
+                .unwrap()
+                .unwrap_or_else(|| self.installed());
+            Config::from_text(&text).unwrap()
+        }
+    }
+
+    fn result_of(fx: &Fixture) -> Value {
+        serde_json::from_slice(&std::fs::read(fx.staging.join("result.json")).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn an_install_on_windows_writes_a_sealed_file_and_reports_it() {
+        let fx = Fixture::new(Os::Windows);
+        let b = apply(&fx.staging, &fx.env()).unwrap();
+        assert_eq!(b.key_sealed, Some(true));
+        let ini = fx.installed();
+        assert!(
+            !ini.contains("SECRET-KEY") && !ini.contains("api_key ="),
+            "{ini}"
+        );
+        assert_eq!(fx.opened().require("api_key").unwrap(), "SECRET-KEY");
+        // registered with the real key, never with the blob
+        assert!(fx.seen.borrow().iter().all(|(_, k)| k == "SECRET-KEY"));
+        // the rest of the file is what was staged
+        assert_eq!(fx.opened().require("name").unwrap(), "shop-pc");
+        let args = ["install".to_string(), fx.staging.display().to_string()];
+        fx.after_an_elevated_install();
+        assert_eq!(run_args(&args, Ok(&fx.env())), Some(0));
+        assert_eq!(result_of(&fx)["key_sealed"], json!(true));
+    }
+
+    #[test]
+    fn linux_and_macos_keep_the_plain_file_and_say_nothing_of_sealing() {
+        for os in [Os::Linux, Os::Macos] {
+            let fx = Fixture::new(os);
+            let b = apply(&fx.staging, &fx.env()).unwrap();
+            assert_eq!(b.key_sealed, None, "{os:?}");
+            assert!(fx.installed().contains("api_key = SECRET-KEY"), "{os:?}");
+            fx.after_an_elevated_install();
+            let args = ["install".to_string(), fx.staging.display().to_string()];
+            assert_eq!(run_args(&args, Ok(&fx.env())), Some(0));
+            assert!(result_of(&fx).get("key_sealed").is_none(), "{os:?}");
+        }
+    }
+
+    #[test]
+    fn an_install_over_an_old_plain_windows_file_seals_it_with_the_same_key() {
+        let fx = Fixture::new(Os::Windows);
+        std::fs::create_dir_all(&fx.layout.dir).unwrap();
+        std::fs::write(&fx.layout.ini, INI).unwrap();
+        fx.stage_patch(r#"{"timeout": 45}"#);
+        let b = apply(&fx.staging, &fx.env()).unwrap();
+        assert_eq!(b.key_sealed, Some(true));
+        assert!(!fx.installed().contains("SECRET-KEY"));
+        assert!(fx.seen.borrow().iter().all(|(_, k)| k == "SECRET-KEY"));
+        assert_eq!(fx.opened().require("api_key").unwrap(), "SECRET-KEY");
+        assert_eq!(fx.opened().get("timeout").unwrap().as_deref(), Some("45"));
+    }
+
+    #[test]
+    fn a_printers_patch_over_a_sealed_file_registers_with_the_real_key_and_stays_sealed() {
+        let fx =
+            Fixture::sealed_install(&format!("{INI}timeout = 45\n\n[headers]\nX-Via = proxy\n"));
+        let before = fx.blob();
+        fx.stage_patch(r#"{"printers": "Zebra GK420d"}"#);
+        let b = apply(&fx.staging, &fx.env()).unwrap();
+        assert_eq!(b.key_sealed, Some(true));
+        assert!(fx.seen.borrow().iter().all(|(_, k)| k == "SECRET-KEY"));
+        let ini = fx.installed();
+        assert!(
+            !ini.contains("SECRET-KEY") && ini.contains("api_key_dpapi = "),
+            "{ini}"
+        );
+        assert!(!before.is_empty());
+        let cfg = fx.opened();
+        assert_eq!(cfg.require("printers").unwrap(), "Zebra GK420d");
+        assert_eq!(cfg.require("name").unwrap(), "shop-pc");
+        let s = cfg.http_settings().unwrap();
+        assert_eq!(s.timeout, 45.0);
+        assert_eq!(s.headers.get("x-via").map(String::as_str), Some("proxy"));
+        // the server was reached with the headers too
+        let settings = fx.settings.borrow();
+        assert_eq!(
+            settings
+                .last()
+                .unwrap()
+                .headers
+                .get("x-via")
+                .map(String::as_str),
+            Some("proxy")
+        );
+    }
+
+    #[test]
+    fn a_printers_patch_over_a_file_with_seal_key_no_stays_plain() {
+        let fx = Fixture::new(Os::Windows);
+        std::fs::write(
+            fx.staging.join("agent.ini"),
+            INI.replace("name = shop-pc", "name = shop-pc\nseal_key = no"),
+        )
+        .unwrap();
+        let b = apply(&fx.staging, &fx.env()).unwrap();
+        assert_eq!(b.key_sealed, Some(false));
+        assert!(fx.installed().contains("api_key = SECRET-KEY"));
+        fx.after_an_elevated_install();
+        fx.stage_patch(r#"{"printers": "Zebra GK420d"}"#);
+        let b = apply(&fx.staging, &fx.env()).unwrap();
+        assert_eq!(b.key_sealed, Some(false));
+        let ini = fx.installed();
+        assert!(
+            ini.contains("api_key = SECRET-KEY") && ini.contains("seal_key = no"),
+            "{ini}"
+        );
+        assert!(!ini.contains("api_key_dpapi"), "{ini}");
+    }
+
+    #[test]
+    fn a_patch_over_an_unreadable_blob_is_a_system_error_before_anything_happens() {
+        let fx = Fixture::sealed_install(INI);
+        let ini = fx.installed().replace(&fx.blob(), &"00".repeat(8));
+        std::fs::write(&fx.layout.ini, &ini).unwrap();
+        fx.stage_patch(r#"{"printers": "Zebra GK420d"}"#);
+        let e = apply(&fx.staging, &fx.env()).unwrap_err();
+        assert_eq!(e, ApplyError::System(keystore::UNREADABLE.to_string()));
+        assert!(fx.events().is_empty(), "{:?}", fx.events());
+        assert_eq!(fx.installed(), ini);
+    }
+
+    #[test]
+    fn a_patch_over_an_unparsable_installed_file_says_so_and_not_the_key_text() {
+        let fx = Fixture::new(Os::Windows);
+        std::fs::create_dir_all(&fx.layout.dir).unwrap();
+        std::fs::write(
+            &fx.layout.ini,
+            "[agent]\napi_key = SECRET-KEY\napi_key = again\nprinters = p\n",
+        )
+        .unwrap();
+        fx.stage_patch(r#"{"timeout": 45}"#);
+        let e = apply(&fx.staging, &fx.env()).unwrap_err();
+        assert!(
+            e.to_string()
+                .contains("the changed agent.ini cannot be read"),
+            "{e}"
+        );
+        assert!(
+            !e.to_string().contains("SECRET") && !e.to_string().contains("Windows"),
+            "{e}"
+        );
+        assert!(fx.events().is_empty());
+    }
+
+    #[test]
+    fn a_connection_patch_over_an_unreadable_blob_repairs_it() {
+        let fx = Fixture::sealed_install(&format!("{INI}timeout = 45\n"));
+        let old = fx.blob();
+        let ini = fx.installed().replace(&old, &"00".repeat(8));
+        std::fs::write(&fx.layout.ini, &ini).unwrap();
+        fx.stage_patch(
+            r#"{"server_url": "https://print.example.com", "api_key": "SECRET-KEY", "name": "shop-pc"}"#,
+        );
+        let b = apply(&fx.staging, &fx.env()).unwrap();
+        assert_eq!(b.key_sealed, Some(true));
+        assert!(!fx.installed().contains(&"00".repeat(8)));
+        assert_eq!(fx.opened().require("api_key").unwrap(), "SECRET-KEY");
+        // timeout stays, it is not part of the connection
+        assert_eq!(fx.opened().get("timeout").unwrap().as_deref(), Some("45"));
+    }
+
+    #[test]
+    fn a_staged_ini_with_a_blob_and_no_key_is_refused() {
+        let fx = Fixture::new(Os::Windows);
+        std::fs::write(
+            fx.staging.join("agent.ini"),
+            "[agent]\nserver_url = https://print.example.com\napi_key_dpapi = 00ff\nprinters = p\n",
+        )
+        .unwrap();
+        let e = apply(&fx.staging, &fx.env()).unwrap_err();
+        assert_eq!(e.code(), "bad_staging");
+        assert!(e.to_string().contains("api_key is missing"), "{e}");
+        assert!(fx.events().is_empty());
+    }
+
+    #[test]
+    fn a_failing_protect_installs_plain_text_over_a_first_install_and_a_plain_file() {
+        // first install
+        let fx = Fixture::new(Os::Windows);
+        fx.keystore.set(Some(REFUSING_STORE));
+        crate::ERR_LINES.with(|l| l.borrow_mut().clear());
+        let b = apply(&fx.staging, &fx.env()).unwrap();
+        assert_eq!(b.key_sealed, Some(false));
+        assert!(fx.installed().contains("api_key = SECRET-KEY"));
+        let said = crate::ERR_LINES.with(|l| l.borrow().join("\n"));
+        assert!(
+            said.contains("encrypted") && !said.contains("SECRET"),
+            "{said}"
+        );
+        // a printers patch over a plain file
+        fx.after_an_elevated_install();
+        fx.stage_patch(r#"{"printers": "Zebra GK420d"}"#);
+        let b = apply(&fx.staging, &fx.env()).unwrap();
+        assert_eq!(b.key_sealed, Some(false));
+        assert!(fx.installed().contains("api_key = SECRET-KEY"));
+    }
+
+    /// The documented exception (docs/agent.md, "Where the key is stored"): a key that was just
+    /// typed replaces the sealed one, and when it cannot be encrypted either, it is installed plain
+    /// rather than leaving the repair undone.
+    #[test]
+    fn a_failing_protect_installs_a_newly_typed_key_plain_over_a_sealed_file() {
+        let fx = Fixture::sealed_install(INI);
+        fx.keystore.set(Some(REFUSING_STORE));
+        fx.stage_patch(
+            r#"{"server_url": "https://print.example.com", "api_key": "NEW-KEY", "name": "shop-pc"}"#,
+        );
+        let b = apply(&fx.staging, &fx.env()).unwrap();
+        assert_eq!(b.key_sealed, Some(false));
+        let ini = fx.installed();
+        assert!(
+            ini.contains("api_key = NEW-KEY") && !ini.contains("api_key_dpapi"),
+            "{ini}"
+        );
+    }
+
+    #[test]
+    fn a_failing_protect_never_rewrites_a_sealed_file_as_plain_text() {
+        let fx = Fixture::sealed_install(INI);
+        let before = std::fs::read(&fx.layout.ini).unwrap();
+        fx.keystore.set(Some(REFUSING_STORE));
+        fx.stage_patch(r#"{"printers": "Zebra GK420d"}"#);
+        let e = apply(&fx.staging, &fx.env()).unwrap_err();
+        assert_eq!(
+            e,
+            ApplyError::System(
+                "The key could not be encrypted again, so nothing was changed. The agent keeps running with the old settings."
+                    .into()
+            )
+        );
+        assert!(fx.events().is_empty(), "{:?}", fx.events());
+        assert_eq!(std::fs::read(&fx.layout.ini).unwrap(), before);
+        assert!(!fx.layout.dir.join(".agent.ini.new").exists());
+    }
+
+    #[test]
+    fn read_config_exports_the_headers_and_neither_the_key_nor_the_blob() {
+        let with_headers = format!(
+            "[DEFAULT]\napi_key = DEFAULT-SECRET\n\n{}timeout = 45\n\n[headers]\nCF-Access-Id = a%b\nX-Multi = one\n  two\nX-Echo = %(api_key)s\n",
+            INI.replace("api_key = SECRET-KEY\n", "")
+        );
+        let expect = |fx: &Fixture| {
+            export_config(&fx.staging, &fx.env()).unwrap();
+            let copy = std::fs::read_to_string(fx.staging.join("agent.ini")).unwrap();
+            for secret in [
+                "SECRET-KEY",
+                "DEFAULT-SECRET",
+                "api_key",
+                "api_key_dpapi",
+                "[agent]",
+            ] {
+                assert!(
+                    !copy.contains(secret) || secret == "api_key" && copy.contains("%(api_key)s"),
+                    "{secret}: {copy}"
+                );
+            }
+            assert!(copy.starts_with("[headers]\n"), "{copy}");
+            let s = Config::from_text(&copy).unwrap().http_settings().unwrap();
+            let want: Vec<(&str, &str)> = vec![
+                ("cf-access-id", "a%b"),
+                ("x-echo", "%(api_key)s"),
+                ("x-multi", "one\ntwo"),
+            ];
+            let got: Vec<(&str, &str)> = s
+                .headers
+                .iter()
+                .map(|(k, v)| (k.as_str(), v.as_str()))
+                .collect();
+            assert_eq!(got, want, "{copy}");
+        };
+        // plain, with the key in [DEFAULT]
+        let fx = Fixture::new(Os::Linux);
+        std::fs::create_dir_all(&fx.layout.dir).unwrap();
+        std::fs::write(&fx.layout.ini, &with_headers).unwrap();
+        expect(&fx);
+        // plain with a key of its own
+        let own = with_headers
+            .replace("[DEFAULT]\napi_key = DEFAULT-SECRET\n", "")
+            .replace("name = shop-pc", "name = shop-pc\napi_key = SECRET-KEY");
+        std::fs::write(&fx.layout.ini, own).unwrap();
+        expect(&fx);
+        // sealed
+        let sealed_text = format!(
+            "{}timeout = 45\n\n[headers]\nCF-Access-Id = a%b\nX-Multi = one\n  two\nX-Echo = %(api_key)s\n",
+            INI
+        );
+        let fx = Fixture::sealed_install(&sealed_text);
+        assert!(fx.installed().contains("api_key_dpapi"));
+        expect(&fx);
+    }
+
+    #[test]
+    fn read_config_of_a_file_without_headers_exports_an_empty_section() {
+        let fx = Fixture::new(Os::Linux);
+        apply(&fx.staging, &fx.env()).unwrap();
+        export_config(&fx.staging, &fx.env()).unwrap();
+        let copy = std::fs::read_to_string(fx.staging.join("agent.ini")).unwrap();
+        assert_eq!(copy, "[headers]\n");
+        assert!(
+            Config::from_text(&copy)
+                .unwrap()
+                .http_settings()
+                .unwrap()
+                .headers
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn read_config_of_an_unreadable_file_exports_nothing() {
+        let fx = Fixture::new(Os::Linux);
+        std::fs::create_dir_all(&fx.layout.dir).unwrap();
+        std::fs::write(
+            &fx.layout.ini,
+            "[agent]\napi_key = SECRET-KEY\napi_key = x\n",
+        )
+        .unwrap();
+        std::fs::remove_file(fx.staging.join("agent.ini")).unwrap();
+        let e = export_config(&fx.staging, &fx.env()).unwrap_err();
+        assert_eq!(
+            e,
+            ApplyError::System("The installed agent.ini cannot be read.".into())
+        );
+        assert!(!fx.staging.join("agent.ini").exists());
+        // a header the agent would refuse is no header to show either
+        std::fs::write(
+            &fx.layout.ini,
+            "[agent]\napi_key = k\n[headers]\nauthorization = x\n",
+        )
+        .unwrap();
+        assert!(export_config(&fx.staging, &fx.env()).is_err());
+        assert!(!fx.staging.join("agent.ini").exists());
+    }
+
+    #[test]
+    fn unprotect_key_writes_the_plain_key_and_keeps_it_that_way() {
+        let fx = Fixture::sealed_install(&format!("{INI}timeout = 45\n"));
+        let args = ["unprotect-key".to_string()];
+        crate::ERR_LINES.with(|l| l.borrow_mut().clear());
+        assert_eq!(run_args(&args, Ok(&fx.env())), Some(0));
+        let ini = fx.installed();
+        assert!(
+            ini.contains("api_key = SECRET-KEY") && ini.contains("seal_key = no"),
+            "{ini}"
+        );
+        assert!(
+            !ini.contains("api_key_dpapi") && !ini.contains("encrypted"),
+            "{ini}"
+        );
+        assert!(ini.contains("timeout = 45"), "{ini}");
+        // no result.json for a command with no staging folder
+        assert!(!fx.staging.join("result.json").exists());
+        // the next change leaves it plain
+        fx.stage_patch(r#"{"printers": "Zebra GK420d"}"#);
+        fx.after_an_elevated_install();
+        let b = apply(&fx.staging, &fx.env()).unwrap();
+        assert_eq!(b.key_sealed, Some(false));
+        assert!(fx.installed().contains("api_key = SECRET-KEY"));
+        // and again: the same, nothing piles up
+        assert_eq!(run_args(&args, Ok(&fx.env())), Some(0));
+        assert_eq!(fx.installed().matches("seal_key").count(), 1);
+        assert!(crate::ERR_LINES.with(|l| l.borrow().is_empty()));
+    }
+
+    #[test]
+    fn unprotect_key_says_what_it_did_without_the_key() {
+        let fx = Fixture::sealed_install(INI);
+        let text = unprotect_key(&fx.env()).unwrap();
+        assert_eq!(
+            text,
+            "agent.ini holds the key as plain text, for administrators only. Later changes leave it that way (seal_key = no)."
+        );
+        // the same text when it was plain already
+        assert_eq!(unprotect_key(&fx.env()).unwrap(), text);
+    }
+
+    #[test]
+    fn a_hand_indented_install_is_sealed_patched_and_unprotected_without_losing_a_setting() {
+        let indented: String = format!("{INI}timeout = 45\n")
+            .lines()
+            .map(|l| {
+                if l.starts_with('[') {
+                    format!("{l}\n")
+                } else {
+                    format!("  {l}\n")
+                }
+            })
+            .collect();
+        // sealed although it is indented (the install asserts key_sealed)
+        let fx = Fixture::sealed_install(&indented);
+        let check = |fx: &Fixture, printers: &str| {
+            let cfg = fx.opened();
+            assert_eq!(cfg.require("api_key").unwrap(), "SECRET-KEY");
+            assert_eq!(cfg.require("name").unwrap(), "shop-pc");
+            assert_eq!(cfg.require("printers").unwrap(), printers);
+            assert_eq!(cfg.http_settings().unwrap().timeout, 45.0);
+        };
+        check(&fx, "Büro Drucker|pdf = file:///tmp");
+        // a patch of the printers over it
+        fx.stage_patch(r#"{"printers": "Zebra GK420d"}"#);
+        let b = apply(&fx.staging, &fx.env()).unwrap();
+        assert_eq!(b.key_sealed, Some(true));
+        check(&fx, "Zebra GK420d");
+        // and the way back writes a file whose key is the key and nothing more
+        unprotect_key(&fx.env()).unwrap();
+        let cfg = Config::from_text(&fx.installed()).unwrap();
+        assert_eq!(cfg.require("api_key").unwrap(), "SECRET-KEY");
+        assert_eq!(cfg.require("name").unwrap(), "shop-pc");
+        assert_eq!(cfg.require("printers").unwrap(), "Zebra GK420d");
+    }
+
+    #[test]
+    fn unprotect_key_without_a_store_writes_nothing() {
+        let fx = Fixture::new(Os::Linux);
+        apply(&fx.staging, &fx.env()).unwrap();
+        let before = std::fs::read(&fx.layout.ini).unwrap();
+        fx.events.borrow_mut().clear();
+        assert_eq!(
+            unprotect_key(&fx.env()).unwrap(),
+            "This system keeps the key as plain text in agent.ini, readable for administrators and the agent only."
+        );
+        assert_eq!(std::fs::read(&fx.layout.ini).unwrap(), before);
+        assert!(fx.events().is_empty());
+        assert_eq!(
+            run_args(&["unprotect-key".to_string()], Ok(&fx.env())),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn unprotect_key_needs_the_marker_a_readable_blob_and_no_arguments() {
+        let fx = Fixture::new(Os::Windows);
+        // nothing installed by the setup
+        let e = unprotect_key(&fx.env()).unwrap_err();
+        assert!(e.to_string().contains("not installed by the setup"), "{e}");
+        assert_eq!(
+            run_args(&["unprotect-key".to_string()], Ok(&fx.env())),
+            Some(1)
+        );
+        // an unreadable blob is an error, the file stays
+        let fx = Fixture::sealed_install(INI);
+        let ini = fx.installed().replace(&fx.blob(), &"00".repeat(8));
+        std::fs::write(&fx.layout.ini, &ini).unwrap();
+        crate::ERR_LINES.with(|l| l.borrow_mut().clear());
+        assert_eq!(
+            run_args(&["unprotect-key".to_string()], Ok(&fx.env())),
+            Some(1)
+        );
+        assert_eq!(fx.installed(), ini);
+        let said = crate::ERR_LINES.with(|l| l.borrow().join("\n"));
+        assert!(
+            said.contains("cannot be read") && !said.contains("SECRET"),
+            "{said}"
+        );
+        // extra arguments are a wrong call
+        let words = ["unprotect-key".to_string(), "now".to_string()];
+        assert_eq!(run_args(&words, Ok(&fx.env())), Some(2));
+        assert_eq!(fx.installed(), ini);
+    }
+
+    /// Everything one run of a subcommand printed (stdout and stderr) and wrote to result.json.
+    fn everything_said(fx: &Fixture, args: &[String]) -> (Option<u8>, String) {
+        crate::ERR_LINES.with(|l| l.borrow_mut().clear());
+        crate::OUT_LINES.with(|l| l.borrow_mut().clear());
+        let code = run_args(args, Ok(&fx.env()));
+        let mut said = crate::ERR_LINES.with(|l| l.borrow().join("\n"));
+        said.push_str(&crate::OUT_LINES.with(|l| l.borrow().join("\n")));
+        if let Ok(result) = std::fs::read_to_string(fx.staging.join("result.json")) {
+            said.push_str(&result);
+        }
+        (code, said)
+    }
+
+    #[test]
+    fn no_subcommand_prints_the_key_or_the_blob() {
+        let fx = Fixture::sealed_install(INI);
+        let blob = fx.blob();
+        let dir = fx.staging.display().to_string();
+        let words = |c: &str| -> Vec<String> {
+            if c == "unprotect-key" {
+                vec![c.into()]
+            } else {
+                vec![c.into(), dir.clone()]
+            }
+        };
+        // every command that works: each one is run and says something
+        for command in [
+            "install",
+            "read-config",
+            "restart",
+            "unprotect-key",
+            "uninstall",
+        ] {
+            if command == "install" {
+                fx.stage_patch(r#"{"printers": "Zebra GK420d"}"#);
+            }
+            fx.after_an_elevated_install();
+            let (code, said) = everything_said(&fx, &words(command));
+            assert_eq!(code, Some(0), "{command}: {said}");
+            assert!(
+                !said.contains("SECRET-KEY") && !said.contains(&blob),
+                "{command}: {said}"
+            );
+        }
+        // the failures where the key is in memory: the store refuses to encrypt it again, the
+        // server refuses it
+        for case in ["store", "server"] {
+            let fx = Fixture::sealed_install(INI);
+            let blob = fx.blob();
+            if case == "store" {
+                fx.keystore.set(Some(REFUSING_STORE));
+            } else {
+                refuse(&fx, 401);
+            }
+            fx.stage_patch(r#"{"printers": "Zebra GK420d"}"#);
+            let dir = fx.staging.display().to_string();
+            let (code, said) = everything_said(&fx, &["install".to_string(), dir]);
+            assert_eq!(code, Some(1), "{case}: {said}");
+            assert!(said.contains("\"ok\":false"), "{case}: {said}");
+            assert!(
+                !said.contains("SECRET-KEY") && !said.contains(&blob),
+                "{case}: {said}"
+            );
+        }
+        // and the failures where nobody can read the key: a blob that is damaged, a wrong call
+        let fx = Fixture::sealed_install(INI);
+        let ini = fx.installed().replace(&fx.blob(), &"00".repeat(8));
+        std::fs::write(&fx.layout.ini, &ini).unwrap();
+        fx.stage_patch(r#"{"printers": "Zebra GK420d"}"#);
+        fx.after_an_elevated_install();
+        for (command, args, want) in [
+            ("install", words("install"), 1),
+            // the headers need no key
+            ("read-config", words("read-config"), 0),
+            ("unprotect-key", words("unprotect-key"), 1),
+            (
+                "unprotect-key now",
+                vec!["unprotect-key".to_string(), "now".to_string()],
+                2,
+            ),
+            ("install without a folder", vec!["install".to_string()], 2),
+        ] {
+            let (code, said) = everything_said(&fx, &args);
+            assert_eq!(code, Some(want), "{command}: {said}");
+            assert!(
+                !said.contains("SECRET-KEY") && !said.contains(&blob),
+                "{command}: {said}"
+            );
+        }
+        let (code, said) = everything_said(&Fixture::new(Os::Windows), &words("unprotect-key"));
+        assert_eq!(code, Some(1), "{said}");
     }
 }

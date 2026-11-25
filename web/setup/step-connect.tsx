@@ -8,13 +8,16 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { FieldLabel } from "@/components/bits";
 import { setup, toSetupError } from "./api";
-import { errorText, needsNewName } from "./model";
+import { errorText, keepsOldName, needsNewName } from "./model";
 import { Actions, Notice } from "./bits";
 
 export type Connection = { serverUrl: string; apiKey: string; name: string };
 
 /** What the connection of an installed agent is now, when it is being replaced. */
-export type Replacing = { serverUrl: string; name: string };
+export type Replacing = { serverUrl: string; name: string; keyUnreadable?: boolean };
+
+const KEY_UNREADABLE_NOTICE =
+  "The key stored on this computer cannot be read. Enter the key this device already uses and keep its name, or a new key with a new name.";
 
 const SAME_SERVER_WARNING =
   "A new key on the same server needs a new device name. The printers get new IDs, so integrations that use fixed printer IDs must be updated, and the old device stays in your dashboard.";
@@ -63,7 +66,7 @@ export function StepConnect({
 
   // the server ties a name to one key: the same server needs another name
   const sameServer = replacing !== null && needsNewName(replacing.serverUrl, serverUrl);
-  const keepsName = sameServer && name.trim() === replacing.name;
+  const keepsName = keepsOldName(replacing, serverUrl, name);
   const filled = serverUrl.trim() !== "" && apiKey.trim() !== "" && name.trim() !== "" && !keepsName;
   const current = (): Connection => ({
     serverUrl: serverUrl.trim(),
@@ -105,7 +108,7 @@ export function StepConnect({
       <CardHeader>
         <CardTitle>Connect to your server</CardTitle>
         <CardDescription>
-          Create one key per device on the Keys page of your dashboard.
+          Create one key per device on the Keys page of your dashboard, with the rights Agent only if it offers them.
         </CardDescription>
       </CardHeader>
       <CardContent>
@@ -144,7 +147,12 @@ export function StepConnect({
             <Input id="name" className="mt-1.5" autoComplete="off" value={name} onChange={edit(setName)} />
           </div>
 
-          {sameServer && (
+          {sameServer && replacing.keyUnreadable && (
+            <Notice tone="warn">
+              <p>{KEY_UNREADABLE_NOTICE}</p>
+            </Notice>
+          )}
+          {sameServer && !replacing.keyUnreadable && (
             <Notice tone="warn">
               <p>{SAME_SERVER_WARNING}</p>
               {keepsName && <p className="mt-1 font-medium">Pick a name other than {replacing.name}.</p>}

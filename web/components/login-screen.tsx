@@ -103,8 +103,13 @@ export function LoginScreen({ onSignIn }: { onSignIn: (token: string) => void })
       } else {
         const token = value.trim();
         if (!token) return;
-        if (await checkToken(token)) onSignIn(token);
-        else fail("That token was rejected.");
+        const check = await checkToken(token);
+        if (check === "ok") onSignIn(token);
+        else if (check === "limited") {
+          fail(
+            "This key cannot open the dashboard. Use an account, the server token, or a key that may read everything.",
+          );
+        } else fail("That token was rejected.");
       }
     } catch (err) {
       const status = err instanceof ApiError ? err.status : 0;

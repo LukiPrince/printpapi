@@ -146,19 +146,50 @@ served `no-cache`. Requests are confined to the embedded bundle — a path that 
 
 ## API keys
 
-The bootstrap `PRINTAPI_TOKEN` is root: it can do everything, including issuing scoped
-per-client keys (one per integration). Issued keys can submit and read jobs, but can't manage
-keys. Keys are stored SHA-256-hashed; revoking one cuts access immediately.
+The bootstrap `PRINTAPI_TOKEN` is root: it can do everything, including issuing per-client keys
+(one per integration or device). No issued key can manage keys, users or the org. What else a key
+may do is its **rights**, one of five:
+
+| Rights (`scope`) | For | May |
+|---|---|---|
+| Everything (`full`, the default) | what every key was until now | print, read, label templates, agents, CloudPRNT |
+| Agent only (`agent`) | one computer with printers | enrol, poll, download and report its own jobs; list the org's computers |
+| CloudPRNT only (`cloudprnt`) | the URL of a Star printer | act as a Star printer, nothing else |
+| Print only (`print`) | a shop, n8n, a script | submit and read jobs, but see and cancel only its own; read printers |
+| Read only (`read`) | monitoring | read jobs, printers, label templates and metrics |
+
+Keys are stored SHA-256-hashed; revoking one cuts access immediately.
 
 ```bash
 curl -s -X POST localhost:3460/apikeys \
      -H 'Authorization: Bearer <PRINTAPI_TOKEN>' -H 'Content-Type: application/json' \
      -d '{"label":"n8n"}'
 # -> {"id":1,"label":"n8n","org_id":1,"key":"<shown once — store it>"}
+
+curl -s -X POST localhost:3460/apikeys \
+     -H 'Authorization: Bearer <PRINTAPI_TOKEN>' -H 'Content-Type: application/json' \
+     -d '{"label":"shop","scope":"print"}'
+# -> {"id":2,"label":"shop","org_id":1,"key":"<shown once>","scope":"print"}
 ```
 
-Add `"org_id"` to put the key (and any agent registering with it) in another org — see
-[Multi-tenancy](api.md#multi-tenancy). Without it, everything stays in the single default org,
+The answer names the rights only when they are not `full`. Change them later on the same key.
+For an enrolled computer that is the only practical way: a new key means a new device name and new
+printer ids.
+
+```bash
+curl -s -X PUT localhost:3460/apikeys/2 \
+     -H 'Authorization: Bearer <PRINTAPI_TOKEN>' -d '{"scope":"read"}'     # -> {"ok":true,"scope":"read"}
+```
+
+Narrowing takes effect for every request that arrives after the change: a shop whose key may no
+longer submit gets `403`, and those orders do not appear in the history (Shopify retries for
+48 h). A computer whose key lost the agent right stops polling (`401`); its queued jobs wait until
+the right is back or they expire, and the job it is printing at that moment can still be reported.
+The dashboard's Keys page does the same with its **Rights** button. Every route and answer is in
+[Key rights](api.md#key-rights).
+
+Add `org_id` to `POST /apikeys` to put the key (and any agent registering with it) in another org
+— see [Multi-tenancy](api.md#multi-tenancy). Without it, everything stays in the single default org,
 which is what a plain self-hosted install wants.
 
 ## Accounts
@@ -215,7 +246,8 @@ Enforced at every trust boundary: bearer auth on every endpoint, constant-time t
 SHA-256-hashed agent, client and session credentials, salted `scrypt` password hashes with a
 throttled and non-enumerating login, `http(s)`-only URL fetches, 32 MB request-body cap,
 no `shell=True`, agent temp-file cleanup, and job payloads scoped so an agent can only touch
-its own jobs.
+its own jobs. A key with the rights **Agent only** reaches nothing but its own computer's jobs and
+the org's list of computer names; one with **Print only** sees only its own jobs.
 
 The [PrintNode-compatible layer](printnode-compat.md) accepts HTTP **Basic** auth as well — the key
 rides in the username, so it is the same secret with the same org scope, but base64 in a header is
@@ -223,9 +255,9 @@ not encryption: put TLS in front of it, as you should for the bearer token anywa
 
 [Star CloudPRNT](cloudprnt.md) printers carry the client key in their polling URL
 (`/cloudprnt/<key>`), because the printer appends its own query string to whatever URL it is given.
-A key in a URL ends up in access logs and proxy history — prefer the printer's Basic-auth
-**User Name** field where the model offers one, and revoke the key
-(`DELETE /apikeys/{id}`) if a device is lost.
+A key in a URL ends up in access logs and proxy history — issue it with the rights **CloudPRNT
+only**, so it can do nothing but that, prefer the printer's Basic-auth **User Name** field where the
+model offers one, and revoke the key (`DELETE /apikeys/{id}`) if a device is lost.
 
 The server speaks plain HTTP — put your own reverse proxy / TLS in front for anything beyond
 the LAN. Vulnerability reports: see [SECURITY.md](../SECURITY.md).

@@ -40,9 +40,16 @@ v1 is deliberately small (see [CONTRIBUTING.md](../CONTRIBUTING.md) for the YAGN
   HMAC-signed `POST /billing/webhook` that moves an org onto a plan (and its quota with it), and
   `DELETE /orgs/{id}` for the tenant that leaves. Provider-agnostic on purpose — no SDK, no
   dependency. See [billing.md](billing.md).
+- ~~**Key rights**~~ ✅ every key is Everything, Agent only, CloudPRNT only, Print only or Read
+  only; a Print only key sees just its own jobs, and rights can be changed on a key that is already
+  in use. See [api.md](api.md#key-rights).
 - ~~**Label templates**~~ ✅ a visual editor on the dashboard's Labels page and a catalogue of label
   sizes; the server rotates, crops and places an image or lays out text, and sends PDF or ZPL
   depending on the printer. See [labels.md](labels.md).
+- ~~**Agent key at rest**~~ ✅ on Windows the setup stores the agent key encrypted with DPAPI
+  (machine scope), with a lasting opt-out and an agent that waits instead of ending when the key
+  cannot be read; `read-config` hands the window only the headers. Linux and macOS keep the file.
+  See [agent.md](agent.md#where-the-key-is-stored).
 
 ## v2 candidates
 

@@ -46,7 +46,10 @@ Unknown fields are refused with `400`. An image template ignores `text`; a text 
 ### Endpoints
 
 All of them need a client key (or a session) and only ever see the caller's own org. A template of
-another org behaves like one that does not exist.
+another org behaves like one that does not exist. Reading templates and printing with them follow the
+rights to look and to submit (Everything, Print only, Read only may read; Everything and Print only
+may submit a `label_*` job); writing a template needs a key with the rights **Everything**, because a
+template changes what every job on its label prints. Any other key gets `403`.
 
 | Method & path | Result |
 |---|---|

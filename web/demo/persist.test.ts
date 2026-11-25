@@ -32,6 +32,14 @@ test("a saved state round-trips", () => {
   assert.deepEqual(loadState(saveState(s), now + 99), s);
 });
 
+test("stored keys without a scope still load, and read as Everything", () => {
+  const s = seedState(now);
+  for (const k of s.keys) delete (k as { scope?: string }).scope;
+  const back = loadState(saveState(s), now + 99);
+  assert.equal(back.keys.length, s.keys.length);
+  assert.ok(back.keys.every((k) => k.scope === undefined));
+});
+
 test("a state stored before label templates gets the sample ones", () => {
   const s = seedState(now) as unknown as Record<string, unknown> & { next: Record<string, unknown> };
   delete s.labels;

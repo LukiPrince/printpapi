@@ -135,6 +135,20 @@ export function needsNewName(oldServer: string, newServer: string): boolean {
   return old !== "" && old === normalizedServer(newServer);
 }
 
+/**
+ * Does the person keep the name of the device they are replacing the connection of, on the same
+ * server? The server binds the name to the old key, so that needs a new name, unless the stored key
+ * cannot be read: then the same key and name again is the repair, and the server stays the judge.
+ */
+export function keepsOldName(
+  replacing: { serverUrl: string; name: string; keyUnreadable?: boolean } | null,
+  serverUrl: string,
+  name: string,
+): boolean {
+  if (replacing === null || replacing.keyUnreadable) return false;
+  return needsNewName(replacing.serverUrl, serverUrl) && name.trim() === replacing.name;
+}
+
 /** The timeout the agent accepts: at least `MIN_TIMEOUT` of crates/agent/src/config.rs, in seconds. */
 const MIN_TIMEOUT = 30;
 

@@ -1,7 +1,7 @@
 // printpapi — self-hosted PrintNode alternative. Elastic License 2.0 (see LICENSE).
 import test from "node:test";
 import assert from "node:assert/strict";
-import { DEFAULT_RAW_PORT, addNetworkPrinter, canLeavePrinters, canSwitchOn, canTest, connectMayHelp, errorText, fromFound, lastJobText, logLocation, needsNewName, needsSumatra, patchFor, pathParts, returnsToConnect, statusWord, timeoutProblem } from "./model.ts";
+import { DEFAULT_RAW_PORT, addNetworkPrinter, canLeavePrinters, canSwitchOn, canTest, connectMayHelp, errorText, fromFound, lastJobText, logLocation, keepsOldName, needsNewName, needsSumatra, patchFor, pathParts, returnsToConnect, statusWord, timeoutProblem } from "./model.ts";
 import type { FoundPrinter, PrinterChoice } from "./api.ts";
 
 const choice = (over: Partial<PrinterChoice> = {}): PrinterChoice => ({
@@ -146,6 +146,22 @@ test("a new key on the same server needs a new device name, another server does 
   assert.equal(needsNewName("https://print.example.com", "http://print.example.com"), false);
   // nothing known about the old server (no status file): nothing to compare
   assert.equal(needsNewName("", "https://print.example.com"), false);
+});
+
+test("the old name is blocked on the same server, but not when the stored key cannot be read", () => {
+  const old = { serverUrl: "https://print.example.com", name: "PACKTISCH-1" };
+  assert.equal(keepsOldName(old, "https://print.example.com", "PACKTISCH-1"), true);
+  // the way the agent reads the address and the name as typed
+  assert.equal(keepsOldName(old, " https://Print.Example.com/ ", " PACKTISCH-1 "), true);
+  assert.equal(keepsOldName(old, "https://print.example.com", "PACKTISCH-2"), false);
+  // another server: the device is new there and the name can stay
+  assert.equal(keepsOldName(old, "https://other.example.com", "PACKTISCH-1"), false);
+  // the stored key cannot be read: the same key again with the same name must be possible
+  assert.equal(keepsOldName({ ...old, keyUnreadable: true }, "https://print.example.com", "PACKTISCH-1"), false);
+  assert.equal(keepsOldName({ ...old, keyUnreadable: false }, "https://print.example.com", "PACKTISCH-1"), true);
+  // nothing known of the old connection
+  assert.equal(keepsOldName(null, "https://print.example.com", "PACKTISCH-1"), false);
+  assert.equal(keepsOldName({ serverUrl: "", name: "" }, "https://print.example.com", "x"), false);
 });
 
 test("a change names only what is different", () => {

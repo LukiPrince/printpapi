@@ -35,6 +35,13 @@ Authorization is the same as everywhere else in printpapi: an issued key sees **
 the bootstrap token spans all of them (see [Multi-tenancy](api.md#multi-tenancy)). A foreign printer
 id is `400 unknown printer`, a foreign job id is simply absent from the list.
 
+The key's [rights](api.md#key-rights) apply here too. Every `GET` needs the right to look
+(Everything, Print only, Read only), `POST /printjobs` and `DELETE /printjobs/{set}` the right to
+submit (Everything, Print only). A key without it gets `403` with
+`{"code": "Forbidden", "message": "this key's rights (read) do not allow this"}`, before the body
+is parsed. A Print only key lists, reads and deletes only the print jobs it submitted; another
+key's job is absent from the list, and the delete does not count it.
+
 ## Endpoints
 
 | Method & path | Answers with |

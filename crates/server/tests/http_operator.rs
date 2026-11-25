@@ -4,6 +4,7 @@
 mod common;
 
 use common::*;
+use printpapi_server::auth::Scope;
 use printpapi_server::dispatch::HttpFetcher;
 use printpapi_server::http::spawn_test_server;
 use printpapi_server::mail::SmtpMailer;
@@ -252,6 +253,7 @@ fn routes() -> Vec<(&'static str, &'static str)> {
         ("POST", "/billing/webhook"),
         ("POST", "/apikeys"),
         ("GET", "/apikeys"),
+        ("PUT", "/apikeys/1"),
         ("DELETE", "/apikeys/1"),
         ("POST", "/agent/register"),
         ("GET", "/agent/jobs"),
@@ -860,6 +862,9 @@ fn org_detail_has_usage_users_agents_printers_keys_terms_and_lock() {
         rusqlite::params![month + 5.0, j2],
     );
     add_key(&app.db, "shop", "KEYSECRET-1234567890", acme);
+    app.db
+        .with(|c| store::add_api_key_scoped(c, "printer", "KEYSECRET-print", acme, Scope::Print))
+        .unwrap();
     sql(
         &app.db,
         "UPDATE agents SET last_seen_at=? WHERE org_id=?",
@@ -896,6 +901,10 @@ fn org_detail_has_usage_users_agents_printers_keys_terms_and_lock() {
     assert_eq!(k["label"], "shop");
     assert_eq!(k["active"], true);
     assert!(k["created_at"].is_f64());
+    // the scope word is always there, a full key included; nothing of the key itself
+    assert_eq!(k["scope"], "full");
+    assert_eq!(v["keys"][1]["scope"], "print");
+    assert!(!v.to_string().contains("KEYSECRET"));
     let terms: Vec<&str> = v["terms"]
         .as_array()
         .unwrap()

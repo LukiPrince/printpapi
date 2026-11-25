@@ -166,10 +166,10 @@ export function seedState(t: number): DemoState {
     jobs,
     outputs,
     keys: [
-      { id: 1, label: "woocommerce-shop", active: 1, created_at: t - DAY * 61 },
-      { id: 2, label: "agent · warehouse-pc", active: 1, created_at: t - DAY * 120 },
-      { id: 3, label: "agent · front-desk-mac", active: 1, created_at: t - DAY * 64 },
-      { id: 4, label: "n8n · labels + invoices", active: 1, created_at: t - DAY * 33 },
+      { id: 1, label: "woocommerce-shop", active: 1, created_at: t - DAY * 61, scope: "print" },
+      { id: 2, label: "agent · warehouse-pc", active: 1, created_at: t - DAY * 120, scope: "agent" },
+      { id: 3, label: "agent · front-desk-mac", active: 1, created_at: t - DAY * 64, scope: "agent" },
+      { id: 4, label: "n8n · labels + invoices", active: 1, created_at: t - DAY * 33, scope: "print" },
       { id: 5, label: "old-test-key", active: 0, created_at: t - DAY * 140 },
     ],
     users: [

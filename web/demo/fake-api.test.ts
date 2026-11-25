@@ -135,6 +135,53 @@ test("api keys: list, issue, revoke", () => {
   assert.deepEqual([nf.status, nf.json], [404, { error: "not found" }]);
 });
 
+const SCOPE_WORDS = "scope must be one of: full, agent, cloudprnt, print, read";
+
+test("api keys: a scope at issue, bad words are a 400, full is left out", () => {
+  const s = seedState(now);
+  for (const scope of ["agent", "cloudprnt", "print", "read"]) {
+    const r = json(call(s, "POST", "/apikeys", { label: scope, scope }));
+    assert.equal(r.scope, scope);
+    assert.equal(s.keys.find((k) => k.id === r.id)!.scope, scope);
+  }
+  for (const body of [{ label: "a" }, { label: "b", scope: null }, { label: "c", scope: "full" }]) {
+    const r = json(call(s, "POST", "/apikeys", body));
+    assert.equal("scope" in r, false);
+    assert.equal("scope" in s.keys.find((k) => k.id === r.id)!, false);
+  }
+  const before = s.keys.length;
+  for (const scope of ["", "admin", "Full", 5, []]) {
+    const r = call(s, "POST", "/apikeys", { label: "x", scope });
+    assert.deepEqual([r.status, r.json], [400, { error: SCOPE_WORDS }]);
+  }
+  assert.equal(s.keys.length, before);
+});
+
+test("api keys: PUT changes the scope, 404 for a revoked or unknown key", () => {
+  const s = seedState(now);
+  const r = call(s, "PUT", "/apikeys/2", { scope: "print" });
+  assert.deepEqual([r.status, r.json], [200, { ok: true, scope: "print" }]);
+  assert.equal(s.keys.find((k) => k.id === 2)!.scope, "print");
+  // back to full: the stored key carries no scope again
+  assert.deepEqual(call(s, "PUT", "/apikeys/2", { scope: "full" }).json, { ok: true, scope: "full" });
+  assert.equal("scope" in s.keys.find((k) => k.id === 2)!, false);
+  for (const body of [{}, { scope: null }, { scope: "root" }, { scope: 1 }]) {
+    const bad = call(s, "PUT", "/apikeys/2", body);
+    assert.deepEqual([bad.status, bad.json], [400, { error: SCOPE_WORDS }]);
+  }
+  assert.equal(call(s, "PUT", "/apikeys/5", { scope: "read" }).status, 404); // revoked
+  assert.equal(call(s, "PUT", "/apikeys/999", { scope: "read" }).status, 404);
+  assert.equal(isFakeRoute("PUT", "/apikeys/2"), true);
+});
+
+test("the seeded keys carry rights, the revoked one none", () => {
+  const s = seedState(now);
+  assert.deepEqual(
+    s.keys.map((k) => k.scope),
+    ["print", "agent", "agent", "print", undefined],
+  );
+});
+
 test("users: list, create, duplicates, deleting", () => {
   const s = seedState(now);
   assert.equal(json(call(s, "GET", "/users")).users.length, 2);

@@ -673,7 +673,8 @@ impl Ctx<'_> {
                     .keys
                     .iter()
                     .map(|k| json!({
-                        "id": k.id, "label": k.label, "active": k.active, "created_at": k.created_at
+                        "id": k.id, "label": k.label, "active": k.active, "created_at": k.created_at,
+                        "scope": k.scope.as_str()
                     }))
                     .collect::<Vec<_>>()
             ),
